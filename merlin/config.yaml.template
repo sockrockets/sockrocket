@@ -1,0 +1,130 @@
+# Sockrocket router configuration template
+# For AsusWRT-Merlin routers
+#
+# After editing this file run: /jffs/addons/sockrocket/scripts/sockrocket.sh restart
+
+# -- Basic listeners -----------------------------------------------------------
+listen_addr: "0.0.0.0"     # Router mode listens on all interfaces
+socks_port: 1080
+http_port: 1087
+dns_port: 5300             # Sockrocket built-in DNS listen port (dnsmasq forwards DNS queries here)
+dns_direct_server: "114.114.114.114"   # DNS server for direct domains (China ISP DNS)
+# api_port: 18188          # JSON API port for the Web UI (browser accesses http://<router>:18188/api;
+                           # change only if the default port is taken; run sockrocket.sh api-restart to apply)
+
+# -- Proxy mode ----------------------------------------------------------------
+# tun    : TUN transparent proxy (recommended, needs TUN device permission)
+# socks  : SOCKS5 + HTTP proxy ports only
+# system : set system proxy (for desktop clients; routers usually use tun)
+mode: "tun"
+
+# -- Active node ---------------------------------------------------------------
+# Active node index (0 = first node), null = direct mode
+active_node: 0
+
+# -- Subscriptions (fetched on startup) ---------------------------------------
+# Uncomment and fill in your subscription URL:
+# subscriptions:
+#   - name: "My Subscription"
+#     url: "https://example.com/subscribe?token=xxx"
+#     format: "auto"   # auto | clash | v2ray | singbox
+subscriptions: []
+
+# -- Manual nodes --------------------------------------------------------------
+# At least one subscription or node is required, otherwise sockrocket-cli cannot start
+nodes: []
+
+# -- DNS direct domains --------------------------------------------------------
+# These domains are resolved directly via dns_direct_server (not through the
+# Sockrocket proxy DNS); good for commonly used China domains.
+# Removing all entries sends every domain through Sockrocket DNS (full anti-leak mode)
+dns_direct_domains:
+  # Search / portals
+  - "baidu.com"
+  - "sogou.com"
+  - "so.com"
+  # Social / messaging
+  - "qq.com"
+  - "weixin.qq.com"
+  - "wechat.com"
+  - "weibo.com"
+  - "douyin.com"
+  - "tiktok.com.cn"
+  - "kuaishou.com"
+  - "xiaohongshu.com"
+  - "zhihu.com"
+  # E-commerce
+  - "taobao.com"
+  - "tmall.com"
+  - "jd.com"
+  - "pinduoduo.com"
+  - "alipay.com"
+  - "aliyun.com"
+  - "alicdn.com"
+  # Video
+  - "bilibili.com"
+  - "youku.com"
+  - "iqiyi.com"
+  - "mgtv.com"
+  - "v.qq.com"
+  # Cloud / CDN
+  - "qcloud.com"
+  - "qcloudcdn.com"
+  - "myqcloud.com"
+  - "huaweicloud.com"
+  - "163yun.com"
+  - "ucloud.cn"
+  # Mail / news
+  - "163.com"
+  - "126.com"
+  - "sina.com.cn"
+  - "sina.cn"
+  - "ifeng.com"
+  - "sohu.com"
+  # Maps
+  - "amap.com"
+  # Finance
+  - "eastmoney.com"
+  - "10jqka.com.cn"
+  # Domains that must resolve via domestic DNS (proxy DNS may hit overseas CDNs)
+  # Other common China sites
+  - "mi.com"
+  - "xiaomi.com"
+  - "huawei.com"
+  - "oppo.com"
+  - "vivo.com.cn"
+
+# -- Health check --------------------------------------------------------------
+health_check:
+  url: "http://www.gstatic.com/generate_204"
+  interval: 300      # Check interval (seconds)
+  timeout: 10        # Timeout (seconds)
+
+# -- Routing rules (matched in order) ------------------------------------------
+rules:
+  # Private addresses direct
+  - rule_type: "ip-cidr"
+    pattern: "10.0.0.0/8"
+    target: "direct"
+  - rule_type: "ip-cidr"
+    pattern: "172.16.0.0/12"
+    target: "direct"
+  - rule_type: "ip-cidr"
+    pattern: "192.168.0.0/16"
+    target: "direct"
+  - rule_type: "ip-cidr"
+    pattern: "100.64.0.0/10"
+    target: "direct"
+
+  # Mainland China IPs direct
+  - rule_type: "geoip"
+    pattern: "CN"
+    target: "direct"
+
+  # All other traffic goes through the proxy (default behavior, no explicit rule needed)
+
+# -- Logging -------------------------------------------------------------------
+# log_level: "info"   # error | warn | info | debug
+
+# -- Startup options -----------------------------------------------------------
+# auto_update_subscriptions: true   # Fetch latest subscriptions on startup

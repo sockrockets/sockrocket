@@ -1,0 +1,13 @@
+#!/bin/bash
+# Thin linker wrapper for aarch64-linux-musl: strip rustc flags zig rejects.
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --target=*) shift ;;
+    -target) shift 2 ;;
+    -Wl,--fix-cortex-a53-843419) shift ;;
+    -Wl,--no-fix-cortex-a53-843419) shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec zig cc -target aarch64-linux-musl "${args[@]}"
