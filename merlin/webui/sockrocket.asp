@@ -652,7 +652,7 @@ function showMsg(msg, type) {
   el.textContent = msg;
   el.className = type || 'info';
   el.style.display = 'block';
-  msgTimer = setTimeout(function () { el.style.display = 'none'; }, 4000);
+  msgTimer = setTimeout(function () { el.style.display = 'none'; }, type === 'err' ? 8000 : 4000);
 }
 function toastResp(d, fallback) {
   if (d.ok === false) showMsg(d.msg || 'Operation failed', 'err');
@@ -1035,16 +1035,19 @@ function addSub() {
     format: document.getElementById('sub-format').value,
   };
   if (!data.name || !data.url) { showMsg('Name and URL must not be empty', 'err'); return; }
+  showMsg('Fetching subscription…', 'info');
   api('add_sub', data, function (d) {
     toastResp(d);
+    loadSubs();
     if (d.ok !== false) {
       document.getElementById('sub-name').value = '';
       document.getElementById('sub-url').value = '';
-      loadSubs();
-      // Nodes appear after background update-subs / daemon restart
-      setTimeout(function () { loadNodes(); refreshStatus(); }, 6000);
-      setTimeout(function () { loadNodes(); refreshStatus(); }, 15000);
+      // Nodes are persisted before restart; refresh soon, then again after restart
+      setTimeout(function () { loadNodes(); refreshStatus(); }, 1500);
+      setTimeout(function () { loadNodes(); refreshStatus(); }, 8000);
     }
+  }, function () {
+    showMsg('Subscription request failed (timeout or network)', 'err');
   });
 }
 function delSub(i) {
@@ -1055,10 +1058,13 @@ function delSub(i) {
   });
 }
 function updateSubs() {
+  showMsg('Updating subscriptions…', 'info');
   api('update_subs', {}, function (d) {
     toastResp(d);
-    setTimeout(function () { loadNodes(); refreshStatus(); }, 5000);
-    setTimeout(function () { loadNodes(); refreshStatus(); }, 15000);
+    setTimeout(function () { loadNodes(); refreshStatus(); }, 1500);
+    setTimeout(function () { loadNodes(); refreshStatus(); }, 8000);
+  }, function () {
+    showMsg('Update request failed (timeout or network)', 'err');
   });
 }
 

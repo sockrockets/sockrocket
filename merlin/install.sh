@@ -396,6 +396,15 @@ ks_install() {
     # koolshare installer expects temp dir cleanup
     rm -rf "/tmp/${MODULE}" "/tmp/${MODULE}.tar.gz" 2>/dev/null || true
 
+    # Softcenter offline install does not run init.d hooks. Bring up the API
+    # bridge (and SOCKS-only daemon) so the Web UI works immediately — without
+    # this the page falls back to slow KSC polling and looks "stuck".
+    if [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ]; then
+        info "Starting API bridge and service..."
+        "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-start >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 || true
+        "$SOCKROCKET_SCRIPTS/sockrocket.sh" start >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 || true
+    fi
+
     echo ""
     ok "Sockrocket ${VER} installed successfully!"
     echo ""

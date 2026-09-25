@@ -505,9 +505,19 @@ do_start() {
     want_proxy=$(conf_bool transparent_proxy true)
     want_dns=$(conf_bool dns_hijack true)
 
-    if [ "$want_proxy" = "true" ] && [ "$force_socks" = "1" ]; then
-        want_proxy=false
-        warn "No usable nodes/subscriptions -- transparent proxy skipped (SOCKS/HTTP ports only)"
+    if [ "$force_socks" = "1" ]; then
+        # Empty config: never black-hole the LAN. Skip TUN *and* DNS hijack
+        # (hijack alone still steers every query into sockrocket's listener,
+        # which with outbound=direct makes the Web UI feel "stuck" and can
+        # break subscription fetches that rely on router DNS).
+        if [ "$want_proxy" = "true" ]; then
+            want_proxy=false
+            warn "No usable nodes/subscriptions -- transparent proxy skipped (SOCKS/HTTP ports only)"
+        fi
+        if [ "$want_dns" = "true" ]; then
+            want_dns=false
+            warn "No usable nodes/subscriptions -- DNS hijack skipped until a subscription or node is added"
+        fi
     fi
 
     # TUN must be up BEFORE handing --tun to sockrocket-cli.

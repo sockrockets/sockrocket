@@ -751,6 +751,52 @@ fn sub_entry(name: &str, url: &str, format: &str) -> Y {
     Y::Mapping(m)
 }
 
+/// Fetch + parse a subscription URL on a current-thread runtime (CGI / API
+/// handlers are sync). Returns nodes or a user-facing error string.
+fn fetch_sub_nodes(name: &str, url: &str, format: &str) -> Result<Vec<sockrocket_core::Node>, String> {
+    let sub = sockrocket_core::Subscription {
+        name: name.to_string(),
+        url: url.to_string(),
+        format: format.to_string(),
+        last_updated: None,
+        refresh_interval_hours: 24,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to start fetch runtime: {e}"))?;
+    rt.block_on(sockrocket_core::fetch_subscription(&sub))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Replace the `nodes` key in config.yaml with `existing ∪ extra` (deduped),
+/// preserving every other key. Returns the final node count.
+fn merge_and_persist_nodes(extra: Vec<sockrocket_core::Node>) -> Result<usize, String> {
+    let content =
+        fs::read_to_string(conf_path()).map_err(|e| format!("Failed to read config: {e}"))?;
+    let mut cfg: sockrocket_core::AppConfig =
+        serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))?;
+    cfg.nodes.extend(extra);
+    sockrocket_core::dedup_nodes(&mut cfg.nodes);
+    sockrocket_core::uniquify_node_names(&mut cfg.nodes);
+    let count = cfg.nodes.len();
+    let mut value: Y =
+        serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))?;
+    let Y::Mapping(map) = &mut value else {
+        return Err("Config root is not a mapping".into());
+    };
+    map.insert(
+        ykey("nodes"),
+        serde_yaml::to_value(&cfg.nodes).map_err(|e| format!("Serialize nodes failed: {e}"))?,
+    );
+    let tmp = conf_path().with_extension("yaml.tmp");
+    let out =
+        serde_yaml::to_string(&value).map_err(|e| format!("Serialize config failed: {e}"))?;
+    fs::write(&tmp, out).map_err(|e| format!("Failed to write temp config: {e}"))?;
+    fs::rename(&tmp, conf_path()).map_err(|e| format!("Failed to replace config: {e}"))?;
+    Ok(count)
+}
+
 fn act_add_sub(post: &J) -> J {
     let name = post.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let url = post.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -770,17 +816,40 @@ fn act_add_sub(post: &J) -> J {
     };
     seq.push(sub_entry(name, url, format));
     map.insert(ykey("subscriptions"), Y::Sequence(seq));
-    match save_conf(&map) {
-        Ok(()) => {
-            // Adding only wrote YAML before; users thought URLs "wouldn't parse"
-            // because fetch runs on restart/update-subs. Kick that off now.
-            spawn_sh("update-subs");
-            json!({
-                "ok": true,
-                "msg": "Subscription added; fetching nodes in the background…"
-            })
+    if let Err(e) = save_conf(&map) {
+        return json!({"ok": false, "msg": format!("Save failed: {e}")});
+    }
+
+    // Fetch + parse here (not only on restart) so the Web UI can show a real
+    // error instead of "saved but still 0 nodes" after a silent background fail.
+    match fetch_sub_nodes(name, url, format) {
+        Ok(nodes) if nodes.is_empty() => json!({
+            "ok": false,
+            "msg": "Subscription saved, but parsed 0 nodes — check URL / format (try auto, clash, or v2ray)",
+            "node_count": 0
+        }),
+        Ok(nodes) => {
+            let fetched = nodes.len();
+            match merge_and_persist_nodes(nodes) {
+                Ok(total) => {
+                    spawn_sh("restart");
+                    json!({
+                        "ok": true,
+                        "msg": format!("Parsed {fetched} node(s) (total {total}); restarting…"),
+                        "node_count": total
+                    })
+                }
+                Err(e) => json!({
+                    "ok": false,
+                    "msg": format!("Parsed {fetched} node(s) but failed to save: {e}")
+                }),
+            }
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => json!({
+            "ok": false,
+            "msg": format!("Subscription saved, but fetch/parse failed: {e}"),
+            "node_count": 0
+        }),
     }
 }
 
@@ -810,8 +879,69 @@ fn act_del_sub(post: &J) -> J {
 }
 
 fn act_update_subs() -> J {
-    spawn_sh("update-subs");
-    json!({"ok": true, "msg": "Subscription update started; the node list refreshes automatically when done"})
+    let Ok(map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let subs = conf_seq(&map, "subscriptions");
+    if subs.is_empty() {
+        return err_msg("No subscriptions configured");
+    }
+
+    let mut all = Vec::new();
+    let mut errors = Vec::new();
+    for s in &subs {
+        let get = |k: &str| match s.get(ykey(k)) {
+            Some(Y::String(v)) => v.clone(),
+            _ => String::new(),
+        };
+        let name = get("name");
+        let url = get("url");
+        let format = match get("format") {
+            f if f.is_empty() => "auto".into(),
+            f => f,
+        };
+        if url.is_empty() {
+            continue;
+        }
+        match fetch_sub_nodes(&name, &url, &format) {
+            Ok(nodes) if nodes.is_empty() => {
+                errors.push(format!("'{name}': parsed 0 nodes"));
+            }
+            Ok(mut nodes) => all.append(&mut nodes),
+            Err(e) => errors.push(format!("'{name}': {e}")),
+        }
+    }
+
+    if all.is_empty() {
+        let detail = if errors.is_empty() {
+            "no nodes returned".into()
+        } else {
+            errors.join("; ")
+        };
+        return json!({
+            "ok": false,
+            "msg": format!("Update failed — {detail}"),
+            "node_count": 0
+        });
+    }
+
+    let fetched = all.len();
+    match merge_and_persist_nodes(all) {
+        Ok(total) => {
+            spawn_sh("restart");
+            let warn = if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" (warnings: {})", errors.join("; "))
+            };
+            json!({
+                "ok": true,
+                "msg": format!("Updated {fetched} node(s) (total {total}); restarting…{warn}"),
+                "node_count": total
+            })
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Fetched nodes but save failed: {e}")}),
+    }
 }
 
 fn socks_port() -> u16 {
@@ -1889,11 +2019,13 @@ dns_direct_domains:
     #[test]
     fn subscription_add_del() {
         let _env = TestEnv::new(SAMPLE);
-        let r = act_add_sub(&json!({"name": "Sub 2", "url": "https://x.com/s", "format": "clash"}));
-        assert_eq!(r["ok"], J::Bool(true));
+        // Unreachable URL: entry is still saved; sync fetch reports failure.
+        let r = act_add_sub(&json!({"name": "Sub 2", "url": "https://127.0.0.1:1/s", "format": "clash"}));
+        assert!(r.get("msg").and_then(|v| v.as_str()).is_some());
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[1]["format"], J::from("clash"));
+        assert_eq!(subs[1]["name"], J::from("Sub 2"));
         let r = act_del_sub(&json!({"index": 0}));
         assert_eq!(r["ok"], J::Bool(true));
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
