@@ -346,7 +346,9 @@ jobs:
   # Cross-compile aarch64 + armv7 (hf/sf), then pack all koolcenter platforms
   # (arm / hnd / hnd_v8 / qca / mtk / ipq32 / ipq64) via merlin/pack.sh.
   merlin-binaries:
-    name: Merlin binaries
+    # Explicit name avoids GitHub appending the full Rust triple
+    # (…-unknown-linux-musl) into the Actions UI job title.
+    name: Merlin binaries (${{ matrix.name }})
     needs: verify-version
     runs-on: ubuntu-24.04
     strategy:
@@ -379,7 +381,7 @@ jobs:
         with:
           tool: cross
 
-      - name: Cross-compile CLI (${{ matrix.target }})
+      - name: Cross-compile CLI (${{ matrix.name }})
         run: cross build --package sockrocket-cli --release --target ${{ matrix.target }}
 
       - name: Upload binary artifact

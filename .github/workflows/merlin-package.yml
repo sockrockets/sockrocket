@@ -26,7 +26,9 @@ permissions:
 
 jobs:
   merlin:
-    name: Merlin binaries
+    # Explicit name avoids GitHub appending the full Rust triple
+    # (…-unknown-linux-musl) into the Actions UI job title.
+    name: Merlin binaries (${{ matrix.name }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -58,7 +60,7 @@ jobs:
         with:
           tool: cross
 
-      - name: Cross-compile CLI (${{ matrix.target }})
+      - name: Cross-compile CLI (${{ matrix.name }})
         run: cross build --package sockrocket-cli --release --target ${{ matrix.target }}
 
       - name: Upload binary artifact
