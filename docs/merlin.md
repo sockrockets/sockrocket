@@ -126,27 +126,35 @@ Prefer `uname -m` over the marketing model name — the same chassis can ship 32
 
 ## Install
 
+Preferred path for koolcenter / softcenter users is **offline install in the Software Center**. SSH is optional.
+
 ### 1. Download
 
-From [GitHub Releases](https://github.com/sockrockets/sockrocket/releases), get `sockrocket-merlin-<platform>.tar.gz` for your row in the tables above.
+From [GitHub Releases](https://github.com/sockrockets/sockrocket/releases), get `sockrocket-merlin-<platform>.tar.gz` for your row in the tables above. Checksums: `SHA256SUMS-merlin.txt`.
 
-### 2. Upload
+### 2. Software Center (recommended)
+
+1. Open the router Web UI → **Software Center** (koolcenter / softcenter).
+2. Use **Offline install** / upload package.
+3. Select the matching `sockrocket-merlin-*.tar.gz` → install.
+4. Open the **Sockrocket** tile (or `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`).
+
+Wrong platform `.valid` → softcenter rejects the package or the binary fails with *Exec format error*. Re-check `uname -m` and the model tables above (`hnd` vs `hnd_v8` is the usual mistake).
+
+Archive root is always `sockrocket/` (koolcenter module name).
+
+### 3. SSH (optional)
 
 ```bash
+# From your PC (replace host / package name)
 scp sockrocket-merlin-hnd_v8.tar.gz admin@<router-lan-ip>:/tmp/
-```
 
-### 3. Install on router
-
-```bash
 ssh admin@<router-lan-ip>
 cd /tmp
 tar -xzf sockrocket-merlin-hnd_v8.tar.gz
 sh sockrocket/install.sh            # auto-detect, or:
 sh sockrocket/install.sh hnd_v8     # force platform tag
 ```
-
-Archive root is always `sockrocket/` (koolcenter module name).
 
 ---
 

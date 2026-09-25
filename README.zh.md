@@ -208,10 +208,16 @@ uname -m
 
 ### 安装
 
-**方式 A — koolcenter / softcenter**  
-在软件中心上传对应的 `sockrocket-merlin-*.tar.gz` 并安装。
+**方式 A — 软件中心离线安装（推荐）**
 
-**方式 B — SSH**
+1. 从 [GitHub Releases](https://github.com/sockrockets/sockrocket/releases) 下载对应平台的 `sockrocket-merlin-*.tar.gz`。
+2. 路由器 Web UI → **软件中心** → **离线安装** / 上传插件。
+3. 选择该 tar.gz 并安装。
+4. 打开 **Sockrocket** 图标，或访问 `http://<路由器局域网IP>/ext/sockrocket/sockrocket.asp`。
+
+平台选错（尤其是 `hnd` vs `hnd_v8`）会导致软件中心拒装或 *Exec format error*。以 `uname -m` 与上表为准。
+
+**方式 B — SSH（可选）**
 
 ```bash
 # 在电脑上（改主机与包名）
@@ -295,13 +301,21 @@ sh /jffs/addons/sockrocket/uninstall.sh
 
 ---
 
+## 社区
+
+- **Telegram**（发布通知）：[t.me/sockrocket](https://t.me/sockrocket)
+- **GitHub Discussions**（提问 / 反馈）：[Discussions](https://github.com/sockrockets/sockrocket/discussions)
+- **Issues**（缺陷）：[Issues](https://github.com/sockrockets/sockrocket/issues)
+
+请勿在公开讨论中粘贴订阅链接、token 或可识别个人信息。
+
 ## 多语言
 
 | 位置 | 切换 |
 |------|------|
 | README | [English](README.md) · [Tiếng Việt](README.vi.md) · [中文](README.zh.md) |
 | GUI | 左下角状态栏 |
-| 官网 | 右上角 **EN / VI / 中文** |
+| 官网 | 右上角 **EN / VI / RU / 中文** |
 
 CLI 提示为英文。
 

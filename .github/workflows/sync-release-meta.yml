@@ -1,0 +1,57 @@
+name: Sync release meta
+
+# Updates GitHub Release notes from docs/releases/, sets topics.
+# Discussions may require a one-time enable in repo Settings if this step 403s.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to update"
+        required: true
+        default: "v0.1.0"
+      notes_path:
+        description: "Path to release notes markdown"
+        required: true
+        default: "docs/releases/v0.1.0.md"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Update release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          NOTES: ${{ inputs.notes_path }}
+        run: |
+          set -euo pipefail
+          test -f "$NOTES"
+          gh release edit "$TAG" --repo "${{ github.repository }}" --notes-file "$NOTES"
+          echo "Updated notes for $TAG"
+
+      - name: Set repository topics
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api -X PUT "repos/${{ github.repository }}/topics" \
+            -H "Accept: application/vnd.github+json" \
+            --input - <<'EOF'
+          {"names":["proxy","rust","gui","shadowsocks","vmess","vless","trojan","hysteria2","tuic","asuswrt-merlin","socks5"]}
+          EOF
+          echo "Topics updated"
+
+      - name: Try enable Discussions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/${{ github.repository }}" -f has_discussions=true
+          echo "Discussions enabled"

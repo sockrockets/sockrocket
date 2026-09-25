@@ -208,10 +208,16 @@ Bảng đầy đủ: **[docs/merlin.md](docs/merlin.md)**. Bản collab dùng c�
 
 ### Cài đặt
 
-**Cách A — koolcenter / softcenter**  
-Tải lên `sockrocket-merlin-*.tar.gz` khớp nền tảng và cài.
+**Cách A — Cài offline trên Software Center (khuyến nghị)**
 
-**Cách B — SSH**
+1. Tải `sockrocket-merlin-*.tar.gz` khớp nền tảng từ [GitHub Releases](https://github.com/sockrockets/sockrocket/releases).
+2. Web UI router → **Software Center** → **Offline install** / tải gói lên.
+3. Chọn tar.gz và cài.
+4. Mở ô **Sockrocket**, hoặc `http://<ip-lan-router>/ext/sockrocket/sockrocket.asp`.
+
+Sai platform (nhất là `hnd` vs `hnd_v8`) → softcenter từ chối hoặc *Exec format error*. Tin `uname -m` và bảng trên.
+
+**Cách B — SSH (tuỳ chọn)**
 
 ```bash
 # Từ máy tính (đổi host / tên gói)
@@ -295,13 +301,21 @@ Chi tiết: [docs/merlin.md](docs/merlin.md) · [docs/merlin-reference.md](docs/
 
 ---
 
+## Cộng đồng
+
+- **Telegram** (thông báo): [t.me/sockrocket](https://t.me/sockrocket)
+- **GitHub Discussions** (hỏi đáp / góp ý): [Discussions](https://github.com/sockrockets/sockrocket/discussions)
+- **Issues** (lỗi): [Issues](https://github.com/sockrockets/sockrocket/issues)
+
+Không đăng link subscription, token, hoặc thông tin nhận dạng cá nhân trên kênh công khai.
+
 ## Ngôn ngữ
 
 | Nơi | Cách chuyển |
 |-----|-------------|
 | README | [English](README.md) · [Tiếng Việt](README.vi.md) · [中文](README.zh.md) |
 | GUI | Góc dưới trái thanh trạng thái |
-| Website | Góc trên phải **EN / VI / 中文** |
+| Website | Góc trên phải **EN / VI / RU / 中文** |
 
 Thông báo CLI bằng tiếng Anh.
 

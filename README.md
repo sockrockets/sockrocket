@@ -208,10 +208,16 @@ Full tables (more SKUs, SoC notes): **[docs/merlin.md](docs/merlin.md)**. Co-bra
 
 ### Install
 
-**Option A — koolcenter / softcenter**  
-Upload the matching `sockrocket-merlin-*.tar.gz` in the software center and install.
+**Option A — Software Center offline install (recommended)**
 
-**Option B — SSH**
+1. Download the matching `sockrocket-merlin-*.tar.gz` from [GitHub Releases](https://github.com/sockrockets/sockrocket/releases).
+2. Router Web UI → **Software Center** → **Offline install** / upload package.
+3. Select the tar.gz and install.
+4. Open the **Sockrocket** tile, or `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`.
+
+Wrong platform (especially `hnd` vs `hnd_v8`) → softcenter rejects the package or *Exec format error*. Trust `uname -m` and the tables above.
+
+**Option B — SSH (optional)**
 
 ```bash
 # From your PC (replace host / package name)
@@ -295,13 +301,21 @@ More detail: [docs/merlin.md](docs/merlin.md) · [docs/merlin-reference.md](docs
 
 ---
 
+## Community
+
+- **Telegram** (announcements): [t.me/sockrocket](https://t.me/sockrocket)
+- **GitHub Discussions** (Q&A / feedback): [Discussions](https://github.com/sockrockets/sockrocket/discussions)
+- **Issues** (bugs): [Issues](https://github.com/sockrockets/sockrocket/issues)
+
+Please do not post subscription links, tokens, or personal identifiers in public threads.
+
 ## Languages
 
 | Where | Switch |
 |-------|--------|
 | README | [English](README.md) · [Tiếng Việt](README.vi.md) · [中文](README.zh.md) |
 | GUI | Bottom-left status bar |
-| Website | Top-right **EN / VI / 中文** |
+| Website | Top-right **EN / VI / RU / 中文** |
 
 CLI messages are English.
 

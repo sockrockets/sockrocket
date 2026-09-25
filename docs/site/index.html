@@ -65,7 +65,7 @@
       transition: color .2s;
     }
     .nav-links a:hover { color: #fff; text-decoration: none; }
-    .lang-row { display: flex; gap: .3rem; align-items: center; }
+    .lang-row { display: flex; gap: .3rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
     .lang-btn {
       background: transparent; border: 1px solid var(--line);
       color: var(--muted); padding: .28rem .55rem; border-radius: 6px;
@@ -473,11 +473,13 @@
     <a href="#merlin" data-i18n="nav-merlin">Merlin</a>
     <a href="#protocols" data-i18n="nav-protocols">Protocols</a>
     <a href="#download" data-i18n="nav-download">Download</a>
+    <a href="#community" data-i18n="nav-community">Community</a>
     <a href="https://github.com/sockrockets/sockrocket">GitHub</a>
   </div>
   <div class="lang-row">
     <button type="button" class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
     <button type="button" class="lang-btn" data-lang="vi" onclick="setLang('vi')">VI</button>
+    <button type="button" class="lang-btn" data-lang="ru" onclick="setLang('ru')">RU</button>
     <button type="button" class="lang-btn" data-lang="zh" onclick="setLang('zh')">中文</button>
     <a class="nav-cta" href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0" data-i18n="nav-cta">v0.1.0 ↓</a>
   </div>
@@ -617,9 +619,39 @@
     </div>
     <div id="tab-merlin" class="code" style="display:none">
       <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
-      <span class="c"># Install .tar.gz from Releases via Software Center / koolcenter</span><br/>
-      <span class="c"># or copy to /tmp and install from Merlin Web UI</span><br/>
-      <span class="n"># see</span> docs/merlin.md
+      <span class="c" data-i18n="merlin-step1"># 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from Releases</span><br/>
+      <span class="c" data-i18n="merlin-step2"># 2. Software Center → Offline install → upload the tar.gz</span><br/>
+      <span class="c" data-i18n="merlin-step3"># 3. Open Sockrocket tile · check uname -m (hnd vs hnd_v8)</span><br/>
+      <span class="n"># docs:</span> docs/merlin.md
+    </div>
+  </section>
+
+  <section id="community">
+    <div class="kicker" data-i18n="community-label">Community</div>
+    <h2 data-i18n="community-h2">Announcements and Q&amp;A.</h2>
+    <p class="lede" data-i18n="community-sub">Release notes on Telegram; questions on GitHub Discussions. Do not post subscription URLs, tokens, or personal identifiers.</p>
+    <div class="dl-row">
+      <div class="dl">
+        <h3>Telegram</h3>
+        <p data-i18n="community-tg">Channel for release announcements.</p>
+        <div class="dl-links">
+          <a href="https://t.me/sockrocket">t.me/sockrocket</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>Discussions</h3>
+        <p data-i18n="community-disc">Q&amp;A and feedback on GitHub.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/discussions">Open Discussions</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>Issues</h3>
+        <p data-i18n="community-issues">Bug reports and regressions.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/issues">Open Issues</a>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -670,6 +702,8 @@
     <a href="https://github.com/sockrockets/sockrocket">GitHub</a>
     <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a>
     <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">Merlin</a>
+    <a href="https://t.me/sockrocket">Telegram</a>
+    <a href="https://github.com/sockrockets/sockrocket/discussions">Discussions</a>
     <a href="https://github.com/sockrockets/sockrocket/blob/main/LICENSE">Apache 2.0</a>
   </div>
   <p data-i18n="footer-copy">Built in Rust. © 2026 Sockrocket Contributors.</p>
@@ -679,7 +713,7 @@
 const translations = {
   en: {
     'nav-features': 'Features', 'nav-merlin': 'Merlin', 'nav-protocols': 'Protocols',
-    'nav-download': 'Download', 'nav-cta': 'v0.1.0 ↓',
+    'nav-download': 'Download', 'nav-community': 'Community', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>Proxy that ships.',
     'hero-sub': 'Native GUI, CLI, and AsusWRT-Merlin — one Rust stack from your laptop to the whole LAN.',
@@ -719,10 +753,19 @@ const translations = {
     'dl-windows': 'x86_64 GUI + CLI .exe.',
     'dl-merlin': 'arm64 / armv7 soft & hard float packages.',
     'footer-copy': 'Built in Rust. © 2026 Sockrocket Contributors.',
+    'merlin-step1': '# 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from Releases',
+    'merlin-step2': '# 2. Software Center → Offline install → upload the tar.gz',
+    'merlin-step3': '# 3. Open Sockrocket tile · check uname -m (hnd vs hnd_v8)',
+    'community-label': 'Community',
+    'community-h2': 'Announcements and Q&amp;A.',
+    'community-sub': 'Release notes on Telegram; questions on GitHub Discussions. Do not post subscription URLs, tokens, or personal identifiers.',
+    'community-tg': 'Channel for release announcements.',
+    'community-disc': 'Q&amp;A and feedback on GitHub.',
+    'community-issues': 'Bug reports and regressions.',
   },
   vi: {
     'nav-features': 'Tính năng', 'nav-merlin': 'Merlin', 'nav-protocols': 'Giao thức',
-    'nav-download': 'Tải xuống', 'nav-cta': 'v0.1.0 ↓',
+    'nav-download': 'Tải xuống', 'nav-community': 'Cộng đồng', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · Mã nguồn mở · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>Proxy sẵn sàng.',
     'hero-sub': 'GUI gốc, CLI và AsusWRT-Merlin — một stack Rust từ laptop đến cả LAN.',
@@ -762,10 +805,71 @@ const translations = {
     'dl-windows': 'GUI + CLI .exe x86_64.',
     'dl-merlin': 'Gói arm64 / armv7 soft & hard float.',
     'footer-copy': 'Viết bằng Rust. © 2026 Sockrocket Contributors.',
+    'merlin-step1': '# 1. Tải sockrocket-merlin-&lt;platform&gt;.tar.gz từ Releases',
+    'merlin-step2': '# 2. Software Center → Offline install → tải tar.gz lên',
+    'merlin-step3': '# 3. Mở ô Sockrocket · kiểm tra uname -m (hnd vs hnd_v8)',
+    'community-label': 'Cộng đồng',
+    'community-h2': 'Thông báo và hỏi đáp.',
+    'community-sub': 'Phát hành trên Telegram; hỏi đáp trên GitHub Discussions. Không đăng URL subscription, token hay thông tin cá nhân.',
+    'community-tg': 'Kênh thông báo phát hành.',
+    'community-disc': 'Hỏi đáp và góp ý trên GitHub.',
+    'community-issues': 'Báo lỗi và hồi quy.',
+  },
+  ru: {
+    'nav-features': 'Возможности', 'nav-merlin': 'Merlin', 'nav-protocols': 'Протоколы',
+    'nav-download': 'Скачать', 'nav-community': 'Сообщество', 'nav-cta': 'v0.1.0 ↓',
+    'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
+    'hero-h1': 'Sockrocket<em>.</em><br/>Прокси, который работает.',
+    'hero-sub': 'Нативный GUI, CLI и AsusWRT-Merlin — один стек на Rust от ноутбука до всей LAN.',
+    'hero-btn-download': 'Скачать v0.1.0', 'hero-btn-github': 'Исходники',
+    'stat-protocols': 'Протоколы', 'stat-surfaces': 'Интерфейсы', 'stat-arch': 'Архитектуры', 'stat-rust': 'Rust',
+    'feat-label': 'Возможности', 'feat-h2': 'Для ежедневной работы,<br/>не для демо.',
+    'feat-sub': 'Задержка через прокси, настоящая маршрутизация и плагин Merlin на том же движке, что и десктоп.',
+    'fc1-title': 'Прогретые тесты через прокси',
+    'fc1-desc': 'Ранжирование узлов по RTT на стороне выхода по тёплому пути — как в браузере, а не фейковый TCP ping до server:port.',
+    'fc2-title': 'Умная маршрутизация',
+    'fc2-desc': 'Правила Domain, GeoIP и CIDR. Системный прокси для обычных приложений; TUN, если программа его игнорирует.',
+    'fc3-title': 'TLS fingerprint',
+    'fc3-desc': 'Патченый rustls (craftls) с REALITY и ClientHello как у браузера — для враждебных сетей.',
+    'fc4-title': 'Подписки',
+    'fc4-desc': 'Clash, V2Ray / VMess, SingBox. Автоопределение, обновление, дедуп, пакетный тест.',
+    'fc5-title': 'GUI + CLI',
+    'fc5-desc': 'Нативное GPUI-приложение и лёгкий CLI для headless и скриптов.',
+    'fc6-title': 'Merlin на всю LAN',
+    'fc6-desc': 'Официальный пакет AsusWRT-Merlin: один musl-бинарник, Web UI, iptables/DNS, hot-reload узлов.',
+    'merlin-tag': 'asuswrt-merlin · koolcenter',
+    'merlin-h2': 'Тот же движок на роутере.',
+    'merlin-sub': 'Что работает в GUI — работает на Merlin: прозрачный прокси для всех устройств в LAN.',
+    'merlin-p1': 'Пакеты: arm64 (hnd_v8), armv7 soft/hard float',
+    'merlin-p2': 'Hot-reload set_node без сброса слушателей',
+    'merlin-p3': 'Ограниченная конкурентность probe для стабильности роутера',
+    'merlin-cta': 'Гид по Merlin →',
+    'proto-label': 'Протоколы', 'proto-h2': 'Те, что важны.',
+    'proto-sub': 'Включая QUIC-транспорты нового поколения и Reality.',
+    'uc-ss': 'Лёгкий, универсальный', 'uc-vmess': 'Дружит с CDN', 'uc-vless': 'Малый overhead',
+    'uc-trojan': 'Маскировка под HTTPS', 'uc-tuic': 'Реконнект 0-RTT', 'uc-hy2': 'Потери пакетов',
+    'install-label': 'Быстрый старт', 'install-h2': 'Меньше минуты.',
+    'install-sub': 'Скачайте релиз. По умолчанию SOCKS5 :1080 · HTTP :1087.',
+    'dl-label': 'Скачать', 'dl-h2': 'Все платформы, которые мы собираем.',
+    'dl-sub': 'Готовые GUI, CLI и пакеты Merlin на GitHub Releases.',
+    'dl-linux': 'GUI + CLI для x86_64 и aarch64.',
+    'dl-macos': 'Нативно для Intel и Apple Silicon.',
+    'dl-windows': 'GUI + CLI .exe для x86_64.',
+    'dl-merlin': 'Пакеты arm64 / armv7 soft & hard float.',
+    'footer-copy': 'Написано на Rust. © 2026 Sockrocket Contributors.',
+    'merlin-step1': '# 1. Скачайте sockrocket-merlin-&lt;platform&gt;.tar.gz из Releases',
+    'merlin-step2': '# 2. Software Center → Offline install → загрузите tar.gz',
+    'merlin-step3': '# 3. Откройте Sockrocket · проверьте uname -m (hnd vs hnd_v8)',
+    'community-label': 'Сообщество',
+    'community-h2': 'Анонсы и вопросы.',
+    'community-sub': 'Релизы в Telegram; вопросы в GitHub Discussions. Не публикуйте URL подписок, токены и личные данные.',
+    'community-tg': 'Канал анонсов релизов.',
+    'community-disc': 'Вопросы и отзывы на GitHub.',
+    'community-issues': 'Баги и регрессии.',
   },
   zh: {
     'nav-features': '功能', 'nav-merlin': 'Merlin', 'nav-protocols': '协议',
-    'nav-download': '下载', 'nav-cta': 'v0.1.0 ↓',
+    'nav-download': '下载', 'nav-community': '社区', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · 开源 · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>代理，开箱即用。',
     'hero-sub': '原生 GUI、CLI 与华硕 Merlin 插件——同一套 Rust 栈，从笔记本到整网。',
@@ -805,26 +909,74 @@ const translations = {
     'dl-windows': 'x86_64 GUI + CLI .exe。',
     'dl-merlin': 'arm64 / armv7 软硬浮点包。',
     'footer-copy': '用 Rust 打造。© 2026 Sockrocket Contributors。',
+    'merlin-step1': '# 1. 从 Releases 下载 sockrocket-merlin-&lt;platform&gt;.tar.gz',
+    'merlin-step2': '# 2. 软件中心 → 离线安装 → 上传该 tar.gz',
+    'merlin-step3': '# 3. 打开 Sockrocket · 核对 uname -m（注意 hnd 与 hnd_v8）',
+    'community-label': '社区',
+    'community-h2': '发布通知与问答。',
+    'community-sub': '发版看 Telegram；提问用 GitHub Discussions。请勿公开粘贴订阅链接、token 或个人信息。',
+    'community-tg': '发布通知频道。',
+    'community-disc': '在 GitHub 提问与反馈。',
+    'community-issues': '缺陷与回归报告。',
   }
 };
 
+const langHtml = { en: 'en', vi: 'vi', ru: 'ru', zh: 'zh-CN' };
+const metaByLang = {
+  en: {
+    title: 'Sockrocket — Cross-Platform Proxy Client',
+    description: 'Rust proxy client with native GUI, CLI, and AsusWRT-Merlin plugin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+  },
+  vi: {
+    title: 'Sockrocket — Proxy đa nền tảng',
+    description: 'Client proxy Rust với GUI gốc, CLI và plugin AsusWRT-Merlin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+  },
+  ru: {
+    title: 'Sockrocket — кроссплатформенный прокси-клиент',
+    description: 'Прокси-клиент на Rust: нативный GUI, CLI и плагин AsusWRT-Merlin. Shadowsocks, VMess, VLess, Trojan, TUIC и Hysteria2.',
+  },
+  zh: {
+    title: 'Sockrocket — 跨平台代理客户端',
+    description: 'Rust 代理客户端：原生 GUI、CLI 与华硕 Merlin 插件。支持 Shadowsocks、VMess、VLess、Trojan、TUIC、Hysteria2。',
+  },
+};
+
+function detectLang() {
+  const saved = localStorage.getItem('sockrocket-lang');
+  if (saved && translations[saved]) return saved;
+  const nav = (navigator.languages && navigator.languages[0]) || navigator.language || '';
+  const low = String(nav).toLowerCase();
+  if (low.startsWith('zh')) return 'zh';
+  if (low.startsWith('vi')) return 'vi';
+  if (low.startsWith('ru')) return 'ru';
+  return 'en';
+}
+
 function applyLang(lang) {
-  const t = translations[lang] || translations.en;
+  const code = translations[lang] ? lang : 'en';
+  const t = translations[code];
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
     if (t[key] !== undefined) el.innerHTML = t[key];
   });
-  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang;
+  document.documentElement.lang = langHtml[code] || 'en';
   document.querySelectorAll('.lang-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.getAttribute('data-lang') === lang);
+    btn.classList.toggle('active', btn.getAttribute('data-lang') === code);
   });
+  const meta = metaByLang[code] || metaByLang.en;
+  document.title = meta.title;
+  const desc = document.querySelector('meta[name="description"]');
+  if (desc) desc.setAttribute('content', meta.description);
+  const ogTitle = document.querySelector('meta[property="og:title"]');
+  if (ogTitle) ogTitle.setAttribute('content', 'Sockrocket');
+  const ogDesc = document.querySelector('meta[property="og:description"]');
+  if (ogDesc) ogDesc.setAttribute('content', meta.description);
 }
 function setLang(lang) {
   localStorage.setItem('sockrocket-lang', lang);
   applyLang(lang);
 }
-const saved = localStorage.getItem('sockrocket-lang');
-applyLang(translations[saved] ? saved : (navigator.language || '').startsWith('zh') ? 'zh' : (navigator.language || '').startsWith('vi') ? 'vi' : 'en');
+applyLang(detectLang());
 
 function showTab(name) {
   ['gui', 'cli', 'merlin'].forEach(t => {
