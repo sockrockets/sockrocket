@@ -636,15 +636,30 @@ async fn resolve_config(mut config: AppConfig) -> Result<AppConfig> {
 
         let mut merged_nodes = config.nodes.clone();
         for subscription in &config.subscriptions {
-            let mut nodes = fetch_subscription(subscription)
-                .await
-                .with_context(|| format!("failed to fetch subscription '{}'", subscription.name))?;
-            tracing::info!(
-                "Fetched {} node(s) from subscription '{}'",
-                nodes.len(),
-                subscription.name
-            );
-            merged_nodes.append(&mut nodes);
+            match fetch_subscription(subscription).await {
+                Ok(mut nodes) => {
+                    if nodes.is_empty() {
+                        tracing::warn!(
+                            "Subscription '{}' fetched OK but produced 0 nodes (check format / content)",
+                            subscription.name
+                        );
+                    } else {
+                        tracing::info!(
+                            "Fetched {} node(s) from subscription '{}'",
+                            nodes.len(),
+                            subscription.name
+                        );
+                    }
+                    merged_nodes.append(&mut nodes);
+                }
+                Err(e) => {
+                    // One bad URL must not prevent the daemon (or other subs) from starting.
+                    tracing::error!(
+                        "failed to fetch subscription '{}': {e:#}",
+                        subscription.name
+                    );
+                }
+            }
         }
 
         let before = merged_nodes.len();

@@ -212,9 +212,18 @@ Details: [Merlin technical reference](./merlin-reference.md).
 
 ## Uninstall
 
+Software Center → Sockrocket → uninstall, **or**:
+
 ```bash
-sh /jffs/addons/sockrocket/uninstall.sh
+sh /jffs/addons/sockrocket/uninstall.sh --force
+# softcenter entry point (installed by install.sh):
+#   /koolshare/scripts/uninstall_sockrocket.sh
 ```
+
+Uninstall stops the daemon/API, removes iptables/DNS hooks, deletes
+`/jffs/addons/sockrocket`, softcenter files, and all `sockrocket*` dbus keys.
+If softcenter ever says it could not find the plugin uninstall script, run the
+path above manually — otherwise only registration is cleared and files remain.
 
 ---
 

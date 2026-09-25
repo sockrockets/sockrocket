@@ -83,6 +83,8 @@ Standard `outbounds` JSON is parsed into nodes.
 
 Supported prefixes: `ss://`, `vmess://`, `vless://`, `tuic://`, `trojan://`, `hysteria2://` / `hy2://`
 
+The format hint `v2ray` (Merlin / config) means this URI/base64 list. Use `v2ray-json` for a full V2Ray `outbounds` JSON document.
+
 ### Auto detection (`format: auto`)
 
 1. YAML with `proxies` → Clash  

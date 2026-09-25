@@ -51,7 +51,23 @@ pub fn parse_subscription_content(content: &str, format_hint: &str) -> Result<Ve
     match format_hint {
         "clash" => return clash::parse_clash_config(content),
         "singbox" | "sing-box" => return singbox::parse_singbox_config(content),
-        "v2ray" => return v2ray::parse_v2ray_config(content),
+        // UI / docs historically labeled base64 share-URI lists as "v2ray".
+        // Real V2Ray JSON (`outbounds`) is still accepted via fallback or
+        // the explicit `v2ray-json` hint.
+        "v2ray" => {
+            if let Ok(nodes) = parse_base64_lines(content) {
+                if !nodes.is_empty() {
+                    return Ok(nodes);
+                }
+            }
+            if let Ok(nodes) = parse_plain_lines(content) {
+                if !nodes.is_empty() {
+                    return Ok(nodes);
+                }
+            }
+            return v2ray::parse_v2ray_config(content);
+        }
+        "v2ray-json" => return v2ray::parse_v2ray_config(content),
         "base64" => return parse_base64_lines(content),
         _ => {} // "auto" or unknown → auto-detect
     }
@@ -211,6 +227,18 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].name, "SS-1");
         assert_eq!(nodes[1].name, "SS-2");
+    }
+
+    #[test]
+    fn test_v2ray_hint_accepts_base64_uri_list() {
+        use base64::engine::general_purpose;
+
+        // Selecting format=v2ray in the UI must not force V2Ray JSON-only.
+        let lines = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#SS-1\nss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@5.6.7.8:8388#SS-2\n";
+        let encoded = general_purpose::STANDARD.encode(lines);
+        let nodes = parse_subscription_content(&encoded, "v2ray").unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "SS-1");
     }
 
     #[test]

@@ -231,6 +231,11 @@ install_common_files() {
         xcp "$SCRIPT_DIR/res/icon-sockrocket.png" "$SOCKROCKET_DIR/res/icon-sockrocket.png" 2>/dev/null || true
     fi
     [ -f "$SCRIPT_DIR/version" ] && xcp "$SCRIPT_DIR/version" "$SOCKROCKET_DIR/version" 2>/dev/null || true
+    # Keep uninstall next to the install for SSH / manual removal
+    if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+        xcp "$SCRIPT_DIR/uninstall.sh" "$SOCKROCKET_DIR/uninstall.sh"
+        chmod +x "$SOCKROCKET_DIR/uninstall.sh" 2>/dev/null || true
+    fi
     chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" 2>/dev/null
     ok "Control scripts installed"
 
@@ -356,6 +361,16 @@ ks_install() {
     xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$KS_SCRIPTS/sockrocket_api.sh"
     chmod +x "$KS_SCRIPTS/sockrocket_api.sh" 2>/dev/null
     ok "API bridge installed to $KS_SCRIPTS/sockrocket_api.sh"
+
+    # Softcenter looks for /koolshare/scripts/uninstall_<module>.sh
+    # Without this file it only clears dbus and leaves /jffs/addons/sockrocket.
+    if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+        xcp "$SCRIPT_DIR/uninstall.sh" "$KS_SCRIPTS/uninstall_${MODULE}.sh"
+        chmod +x "$KS_SCRIPTS/uninstall_${MODULE}.sh" 2>/dev/null || true
+        ok "Softcenter uninstall script installed (uninstall_${MODULE}.sh)"
+    else
+        warn "uninstall.sh missing from package — softcenter uninstall will be incomplete"
+    fi
 
     # Register with koolshare init.d for auto-start
     xlink "$KS_SCRIPTS/${MODULE}_config.sh" "$KS_INIT/S98${MODULE}.sh"

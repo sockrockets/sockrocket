@@ -392,10 +392,11 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
             <div class="fg"><label>URL</label><input type="url" id="sub-url" placeholder="https://..."></div>
             <div class="fg"><label>Format</label>
               <select id="sub-format">
-                <option value="auto">auto</option>
+                <option value="auto" selected>auto</option>
                 <option value="clash">clash</option>
-                <option value="v2ray">v2ray</option>
-                <option value="sip008">sip008</option>
+                <option value="v2ray">v2ray (URI / base64)</option>
+                <option value="singbox">sing-box</option>
+                <option value="base64">base64</option>
               </select>
             </div>
             <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" onclick="addSub()">Add</button></div>
@@ -1036,7 +1037,14 @@ function addSub() {
   if (!data.name || !data.url) { showMsg('Name and URL must not be empty', 'err'); return; }
   api('add_sub', data, function (d) {
     toastResp(d);
-    if (d.ok !== false) { loadSubs(); refreshStatus(); }
+    if (d.ok !== false) {
+      document.getElementById('sub-name').value = '';
+      document.getElementById('sub-url').value = '';
+      loadSubs();
+      // Nodes appear after background update-subs / daemon restart
+      setTimeout(function () { loadNodes(); refreshStatus(); }, 6000);
+      setTimeout(function () { loadNodes(); refreshStatus(); }, 15000);
+    }
   });
 }
 function delSub(i) {
@@ -1050,6 +1058,7 @@ function updateSubs() {
   api('update_subs', {}, function (d) {
     toastResp(d);
     setTimeout(function () { loadNodes(); refreshStatus(); }, 5000);
+    setTimeout(function () { loadNodes(); refreshStatus(); }, 15000);
   });
 }
 

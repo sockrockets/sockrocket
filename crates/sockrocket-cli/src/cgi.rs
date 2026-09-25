@@ -771,7 +771,15 @@ fn act_add_sub(post: &J) -> J {
     seq.push(sub_entry(name, url, format));
     map.insert(ykey("subscriptions"), Y::Sequence(seq));
     match save_conf(&map) {
-        Ok(()) => json!({"ok": true, "msg": "Subscription added"}),
+        Ok(()) => {
+            // Adding only wrote YAML before; users thought URLs "wouldn't parse"
+            // because fetch runs on restart/update-subs. Kick that off now.
+            spawn_sh("update-subs");
+            json!({
+                "ok": true,
+                "msg": "Subscription added; fetching nodes in the background…"
+            })
+        }
         Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
     }
 }
