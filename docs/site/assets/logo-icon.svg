@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Transparent icon version -->
+  <g fill="none" stroke="#FF6A00" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M78 148
+             C78 96 96 52 128 28
+             C160 52 178 96 178 148"/>
+    <path d="M64 168 C96 156 160 156 192 168"/>
+    <path d="M108 188 L108 212"/>
+    <path d="M148 188 L148 236"/>
+  </g>
+</svg>

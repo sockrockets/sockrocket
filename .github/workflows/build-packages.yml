@@ -1,0 +1,260 @@
+name: Build Packages
+
+# On-demand multi-platform package build. Produces CLI + GUI binaries for
+# Linux / macOS / Windows, plus Merlin router plugin tarballs. Download from
+# the workflow run Artifacts tab. Does not create a GitHub Release unless you
+# use the Release workflow (push a v*.*.* tag).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master", "feat/**", "fix/**"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "merlin/**"
+      - ".github/workflows/build-packages.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cli_bin: sockrocket-cli
+            gui_bin: sockrocket
+            cli_out: sockrocket-cli-linux-x86_64
+            gui_out: sockrocket-linux-x86_64.tar.gz
+            arch_label: x86_64
+            artifact: sockrocket-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cli_bin: sockrocket-cli
+            gui_bin: sockrocket
+            cli_out: sockrocket-cli-linux-aarch64
+            gui_out: sockrocket-linux-aarch64.tar.gz
+            arch_label: aarch64
+            artifact: sockrocket-linux-aarch64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            cli_bin: sockrocket-cli
+            gui_bin: sockrocket
+            cli_out: sockrocket-cli-macos-aarch64
+            gui_out: sockrocket-macos-aarch64.dmg
+            arch_label: aarch64
+            artifact: sockrocket-macos-aarch64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            cli_bin: sockrocket-cli
+            gui_bin: sockrocket
+            cli_out: sockrocket-cli-macos-x86_64
+            gui_out: sockrocket-macos-x86_64.dmg
+            arch_label: x86_64
+            artifact: sockrocket-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cli_bin: sockrocket-cli.exe
+            gui_bin: sockrocket.exe
+            cli_out: sockrocket-cli-windows-x86_64.exe
+            gui_out: sockrocket-windows-x86_64.zip
+            arch_label: x86_64
+            artifact: sockrocket-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pkg-${{ matrix.target }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libgl1-mesa-dev \
+            libasound2-dev libfontconfig1-dev \
+            libfreetype6-dev pkg-config clang
+
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew install pkg-config
+
+      - name: Set GPUI_FXC_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "fxc.exe" |
+            Where-Object { $_.FullName -match "x64" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $fxc) {
+            Write-Error "fxc.exe not found in Windows Kits"
+            exit 1
+          }
+          echo "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+
+      - name: Build CLI (release)
+        run: cargo build --package sockrocket-cli --release --target ${{ matrix.target }}
+
+      - name: Build GUI (release)
+        # Linux GUI may fail in headless CI; still upload CLI.
+        continue-on-error: ${{ runner.os == 'Linux' }}
+        run: cargo build --package sockrocket-gui --release --target ${{ matrix.target }}
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION=$(grep -m1 -E '^version\s*=' Cargo.toml | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')
+          cp "target/${{ matrix.target }}/release/${{ matrix.cli_bin }}" "dist/${{ matrix.cli_out }}"
+          if [ -f "target/${{ matrix.target }}/release/${{ matrix.gui_bin }}" ]; then
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              chmod +x tools/macos_dmg.sh
+              ./tools/macos_dmg.sh \
+                "target/${{ matrix.target }}/release/${{ matrix.gui_bin }}" \
+                "$VERSION" \
+                "${{ matrix.arch_label }}" \
+                "dist/${{ matrix.gui_out }}" \
+                "${{ runner.temp }}/Sockrocket.app"
+              rm -rf "${{ runner.temp }}/Sockrocket.app"
+            elif [ "${{ runner.os }}" = "Linux" ]; then
+              chmod +x tools/linux_package.sh
+              ./tools/linux_package.sh \
+                "target/${{ matrix.target }}/release/${{ matrix.gui_bin }}" \
+                "$VERSION" \
+                "${{ matrix.arch_label }}" \
+                "dist/${{ matrix.gui_out }}"
+            elif [ "${{ runner.os }}" = "Windows" ]; then
+              pwsh -File tools/windows_package.ps1 \
+                -Binary "target/${{ matrix.target }}/release/${{ matrix.gui_bin }}" \
+                -Version "$VERSION" \
+                -Out "dist/${{ matrix.gui_out }}"
+            else
+              cp "target/${{ matrix.target }}/release/${{ matrix.gui_bin }}" "dist/${{ matrix.gui_out }}"
+            fi
+          fi
+          cd dist
+          SUMS="SHA256SUMS.txt"
+          : > "$SUMS"
+          for f in *; do
+            [ -f "$f" ] || continue
+            [ "$f" = "$SUMS" ] && continue
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" >> "$SUMS"
+            else
+              shasum -a 256 "$f" >> "$SUMS"
+            fi
+          done
+          ls -la
+          cat "$SUMS"
+
+      - name: Upload desktop package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  merlin:
+    # Explicit name avoids GitHub appending the full Rust triple
+    # (…-unknown-linux-musl) into the Actions UI job title.
+    name: Merlin binaries (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64
+            target: aarch64-unknown-linux-musl
+          - name: armv7hf
+            target: armv7-unknown-linux-musleabihf
+          - name: armv7sf
+            target: armv7-unknown-linux-musleabi
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pkg-merlin-${{ matrix.name }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cross-compile CLI (${{ matrix.name }})
+        run: cross build --package sockrocket-cli --release --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merlin-bin-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/sockrocket-cli
+          retention-days: 14
+
+  merlin-pack:
+    name: Merlin packages
+    needs: merlin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: merlin-bin-aarch64
+          path: target/aarch64-unknown-linux-musl/release
+
+      - name: Download armv7hf binary
+        uses: actions/download-artifact@v4
+        with:
+          name: merlin-bin-armv7hf
+          path: target/armv7-unknown-linux-musleabihf/release
+
+      - name: Download armv7sf binary
+        uses: actions/download-artifact@v4
+        with:
+          name: merlin-bin-armv7sf
+          path: target/armv7-unknown-linux-musleabi/release
+
+      - name: Make binaries executable
+        run: |
+          chmod +x target/aarch64-unknown-linux-musl/release/sockrocket-cli
+          chmod +x target/armv7-unknown-linux-musleabihf/release/sockrocket-cli
+          chmod +x target/armv7-unknown-linux-musleabi/release/sockrocket-cli
+
+      - name: Pack all platforms
+        run: ./merlin/pack.sh
+
+      - name: Upload Merlin packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: sockrocket-merlin-all
+          path: dist/merlin/*
+          retention-days: 14

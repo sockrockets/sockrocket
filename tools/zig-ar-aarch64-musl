@@ -1,0 +1,3 @@
+#!/bin/bash
+# Drop-in `ar` that routes through `zig ar` (needed by aws-lc-sys / ring cc-rs).
+exec zig ar "$@"

@@ -1,0 +1,32 @@
+# Sockrocket default configuration file
+# After startup, nodes can be added via subscription links or manually
+#
+# Usage: sockrocket-cli config.yaml
+
+listen_addr: "127.0.0.1"
+socks_port: 1080
+http_port: 1087
+
+# Active node index (null = direct mode)
+active_node: null
+
+# Node list (auto-populated via subscriptions after startup)
+nodes: []
+
+# Subscription sources (fetched on startup)
+# Uncomment and fill in your subscription URL:
+# subscriptions:
+#   - name: "My Subscription"
+#     url: "https://example.com/subscribe?token=xxx"
+#     format: "auto"
+subscriptions: []
+
+# Routing rules
+# Examples:
+#   - rule_type: "domain-suffix"
+#     pattern: "google.com"
+#     target: "proxy"
+#   - rule_type: "geoip"
+#     pattern: "CN"
+#     target: "direct"
+rules: []
