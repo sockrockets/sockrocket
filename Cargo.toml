@@ -1,0 +1,118 @@
+[workspace]
+members = [
+    "crates/sockrocket-core",
+    "crates/sockrocket-gui",
+    "crates/sockrocket-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Sockrocket"]
+
+[workspace.dependencies]
+# Internal crates
+sockrocket-core = { path = "crates/sockrocket-core" }
+
+# GPUI
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+
+# Async runtime (narrowed from "full" — add features back only when the
+# compiler asks for them)
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "process",
+    "fs",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Networking (default-features off: we only need rustls + json; this drops
+# native-tls/openssl, the `charset` transcoding, and the macOS system-config
+# watcher. HTTPS still works via rustls; responses are decoded as UTF-8.)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Crypto & proxy
+# default-features off drops the hickory DNS resolver stack; we only use
+# ProxyClientStream/config/context/crypto/relay::Address, which are
+# feature-gate-free. aead-cipher covers v1 AEAD ciphers, aead-cipher-2022 the
+# 2022-blake3 ciphers.
+shadowsocks = { version = "1", default-features = false, features = [
+    "aead-cipher",
+    "aead-cipher-2022",
+] }
+quinn = "0.11"
+sysproxy = "0.3.0"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+craft-tls = { package = "tokio-rustls", version = "0.25" }
+webpki-roots = "0.26"
+rustls-pki-types = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+
+# TUN proxy
+tun = { version = "0.8", features = ["async"] }
+ipstack = "1.0.0"
+etherparse = "0.19"
+
+# Crypto primitives
+sha2 = "0.10"
+hex = "0.4"
+md-5 = "0.10"
+hmac = "0.12"
+aes-gcm = "0.10"
+# VMess AEAD auth ID uses single-block AES-128-ECB; CRC32-IEEE for its checksum.
+aes = "0.8"
+crc32fast = "1"
+chacha20poly1305 = "0.10"
+
+# Utils
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+base64 = "0.22"
+url = "2"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+rand = "0.9"
+socket2 = "0.5"
+lru = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Pure-Rust QR code encoder (no image feature — we render the module matrix ourselves)
+qrcode = { version = "0.14", default-features = false }
+
+[patch.crates-io]
+rustls = { path = "crates/craftls" }
+
+[profile.dev]
+# Line-table-only debug info: drastically cuts link time and target/ size
+# (was ~25GB with full debuginfo)
+debug = 1
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev: GPUI apps feel sluggish otherwise.
+# First build is slower; acceptable trade-off.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# NOTE: no panic = "abort" — tests rely on unwinding.

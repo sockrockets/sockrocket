@@ -1,0 +1,9 @@
+# Project-level Cargo configuration
+
+# Windows (MSVC): the default link.exe is slow and memory-hungry on this
+# workspace. Stable Rust cannot switch to lld painlessly yet, so we reduce
+# link work via `debug = 1` in [profile.dev] (see root Cargo.toml).
+# On a NIGHTLY toolchain you can uncomment the block below to use rust-lld:
+#
+# [target.x86_64-pc-windows-msvc]
+# rustflags = ["-Zlinker-features=lld"]

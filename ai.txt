@@ -1,0 +1,8 @@
+# ai.txt — Spawning / Have I Been Trained style reservation
+# https://site.spawning.ai/spawning-ai-txt
+#
+# This project opts out of use as training data for machine-learning models.
+
+User-Agent: *
+Save-Data: no
+Train-AI: no

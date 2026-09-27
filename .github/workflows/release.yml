@@ -1,0 +1,435 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # Tag (minus the leading "v") must match BOTH [workspace.package].version in
+  # the root Cargo.toml and the contents of merlin/version — the three are
+  # released together and must never drift apart.
+  verify-version:
+    name: Verify version sync
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check tag against Cargo.toml and merlin/version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VER=$(grep -m1 -E '^version\s*=' Cargo.toml | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')
+          MERLIN_VER=$(tr -d '[:space:]' < merlin/version)
+          echo "tag=${TAG}  cargo=${CARGO_VER}  merlin=${MERLIN_VER}"
+          if [ -z "$CARGO_VER" ]; then
+            echo "::error::Could not parse version from root Cargo.toml"
+            exit 1
+          fi
+          if [ "$TAG" != "$CARGO_VER" ] || [ "$TAG" != "$MERLIN_VER" ]; then
+            echo "::error::Version mismatch: tag '${TAG}' vs Cargo.toml '${CARGO_VER}' vs merlin/version '${MERLIN_VER}'"
+            echo "Bump [workspace.package] version in Cargo.toml AND merlin/version to match the tag, then re-tag."
+            exit 1
+          fi
+          echo "Version sync OK: ${TAG}"
+
+  build-release:
+    name: Release (${{ matrix.cli_asset }})
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cli_artifact: sockrocket-cli
+            gui_artifact: sockrocket
+            cli_asset: sockrocket-cli-linux-x86_64
+            gui_asset: sockrocket-linux-x86_64.tar.gz
+            arch_label: x86_64
+            ext: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cli_artifact: sockrocket-cli
+            gui_artifact: sockrocket
+            cli_asset: sockrocket-cli-linux-aarch64
+            gui_asset: sockrocket-linux-aarch64.tar.gz
+            arch_label: aarch64
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cli_artifact: sockrocket-cli
+            gui_artifact: sockrocket
+            cli_asset: sockrocket-cli-macos-x86_64
+            gui_asset: sockrocket-macos-x86_64.dmg
+            arch_label: x86_64
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cli_artifact: sockrocket-cli
+            gui_artifact: sockrocket
+            cli_asset: sockrocket-cli-macos-aarch64
+            gui_asset: sockrocket-macos-aarch64.dmg
+            arch_label: aarch64
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cli_artifact: sockrocket-cli.exe
+            gui_artifact: sockrocket.exe
+            cli_asset: sockrocket-cli-windows-x86_64.exe
+            gui_asset: sockrocket-windows-x86_64.zip
+            arch_label: x86_64
+            ext: ".exe"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-release
+
+      # ── Linux system dependencies ──────────────────────────────────────────
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libvulkan-dev \
+            libgl1-mesa-dev \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            pkg-config \
+            clang
+
+      # ── macOS system dependencies ──────────────────────────────────────────
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config
+
+      # ── Windows: locate fxc.exe for GPUI HLSL shader compilation ───────────
+      - name: Set GPUI_FXC_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "fxc.exe" |
+            Where-Object { $_.FullName -match "x64" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $fxc) {
+            Write-Error "fxc.exe not found in Windows Kits"
+            exit 1
+          }
+          echo "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Found fxc.exe: $($fxc.FullName)"
+
+      # ── Build release binaries ─────────────────────────────────────────────
+      - name: Build release (CLI)
+        run: cargo build --package sockrocket-cli --release --target ${{ matrix.target }}
+
+      - name: Build release (GUI)
+        # GUI may not build headlessly on Linux; continue so CLI still uploads
+        continue-on-error: ${{ runner.os == 'Linux' }}
+        run: cargo build --package sockrocket-gui --release --target ${{ matrix.target }}
+
+      # ── Prepare artifacts (Unix) ───────────────────────────────────────────
+      - name: Prepare artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cp target/${{ matrix.target }}/release/${{ matrix.cli_artifact }} \
+             ${{ matrix.cli_asset }}
+          if [ ! -f "target/${{ matrix.target }}/release/${{ matrix.gui_artifact }}" ]; then
+            echo "GUI binary missing; skipping GUI asset"
+            exit 0
+          fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            chmod +x tools/macos_dmg.sh
+            ./tools/macos_dmg.sh \
+              "target/${{ matrix.target }}/release/${{ matrix.gui_artifact }}" \
+              "$VERSION" \
+              "${{ matrix.arch_label }}" \
+              "${{ matrix.gui_asset }}" \
+              "Sockrocket.app"
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            chmod +x tools/linux_package.sh
+            ./tools/linux_package.sh \
+              "target/${{ matrix.target }}/release/${{ matrix.gui_artifact }}" \
+              "$VERSION" \
+              "${{ matrix.arch_label }}" \
+              "${{ matrix.gui_asset }}"
+          else
+            cp "target/${{ matrix.target }}/release/${{ matrix.gui_artifact }}" \
+               "${{ matrix.gui_asset }}"
+          fi
+
+      - name: Prepare artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.cli_artifact }}" `
+                    "${{ matrix.cli_asset }}"
+          if (Test-Path "target\${{ matrix.target }}\release\${{ matrix.gui_artifact }}") {
+            & .\tools\windows_package.ps1 `
+              -Binary "target\${{ matrix.target }}\release\${{ matrix.gui_artifact }}" `
+              -Version $version `
+              -Out "${{ matrix.gui_asset }}"
+          }
+
+      # ── macOS Code Signing ─────────────────────────────────────────────────
+      # Required secrets:
+      #   MACOS_CERTIFICATE      – base64-encoded Developer ID .p12 certificate
+      #   MACOS_CERTIFICATE_PWD  – password for the .p12
+      #   MACOS_IDENTITY         – e.g. "Developer ID Application: Name (TEAMID)"
+      # Optional notarization secrets:
+      #   APPLE_ID               – your Apple ID email
+      #   APPLE_TEAM_ID          – 10-char team ID
+      #   APPLE_APP_PASSWORD     – app-specific password
+      - name: Sign binaries (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_IDENTITY: ${{ secrets.MACOS_IDENTITY }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD=$(openssl rand -hex 16)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          if [ -f "${{ matrix.cli_asset }}" ]; then
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_IDENTITY" "${{ matrix.cli_asset }}"
+          fi
+
+          if [ -d Sockrocket.app ]; then
+            codesign --force --deep --options runtime --timestamp \
+              --sign "$MACOS_IDENTITY" Sockrocket.app
+            codesign --verify --deep --strict Sockrocket.app
+
+            # Rebuild DMG from the Developer ID–signed app
+            VERSION="${GITHUB_REF_NAME#v}"
+            STAGE=$(mktemp -d)
+            cp -R Sockrocket.app "$STAGE/Sockrocket.app"
+            ln -s /Applications "$STAGE/Applications"
+            rm -f "${{ matrix.gui_asset }}"
+            hdiutil create \
+              -volname "Sockrocket ${VERSION}" \
+              -srcfolder "$STAGE" \
+              -ov -format UDZO -fs HFS+ \
+              "${{ matrix.gui_asset }}"
+            rm -rf "$STAGE"
+          fi
+
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          # Prefer notarizing the DMG (staple works on disk images).
+          if [ -f "${{ matrix.gui_asset }}" ]; then
+            xcrun notarytool submit "${{ matrix.gui_asset }}" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --wait
+            xcrun stapler staple "${{ matrix.gui_asset }}" || true
+          fi
+          if [ -f "${{ matrix.cli_asset }}" ]; then
+            zip "${{ matrix.cli_asset }}.zip" "${{ matrix.cli_asset }}"
+            xcrun notarytool submit "${{ matrix.cli_asset }}.zip" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --wait
+            rm -f "${{ matrix.cli_asset }}.zip"
+          fi
+
+      # ── Windows Code Signing ───────────────────────────────────────────────
+      # Required secrets:
+      #   WINDOWS_CERTIFICATE      – base64-encoded .pfx code-signing certificate
+      #   WINDOWS_CERTIFICATE_PWD  – password for the .pfx
+      - name: Sign binaries (Windows)
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PWD }}
+        shell: pwsh
+        run: |
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $certPath  = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+
+          $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe"
+          $guiBin = "target\${{ matrix.target }}\release\${{ matrix.gui_artifact }}"
+          foreach ($bin in @("${{ matrix.cli_asset }}", $guiBin)) {
+            if (Test-Path $bin) {
+              & $signtool sign `
+                /f  $certPath `
+                /p  $env:WINDOWS_CERTIFICATE_PWD `
+                /tr http://timestamp.sectigo.com `
+                /td sha256 `
+                /fd sha256 `
+                $bin
+            }
+          }
+          Remove-Item $certPath -Force
+
+          # Rebuild ZIP from the signed GUI exe
+          if (Test-Path $guiBin) {
+            $version = "${{ github.ref_name }}".TrimStart('v')
+            & .\tools\windows_package.ps1 `
+              -Binary $guiBin `
+              -Version $version `
+              -Out "${{ matrix.gui_asset }}"
+          }
+
+
+      # ── Checksums ──────────────────────────────────────────────────────────
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          SUMS="SHA256SUMS-${{ matrix.cli_asset }}.txt"
+          : > "$SUMS"
+          hash() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1"
+            else
+              shasum -a 256 "$1"
+            fi
+          }
+          for f in "${{ matrix.cli_asset }}" "${{ matrix.gui_asset }}"; do
+            [ -f "$f" ] && hash "$f" >> "$SUMS"
+          done
+          cat "$SUMS"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.cli_asset }}
+            ${{ matrix.gui_asset }}
+            SHA256SUMS-${{ matrix.cli_asset }}.txt
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+
+  # ── Merlin Router Plugin ───────────────────────────────────────────────────
+  # Cross-compile aarch64 + armv7 (hf/sf), then pack all koolcenter platforms
+  # (arm / hnd / hnd_v8 / qca / mtk / ipq32 / ipq64) via merlin/pack.sh.
+  merlin-binaries:
+    # Explicit name avoids GitHub appending the full Rust triple
+    # (…-unknown-linux-musl) into the Actions UI job title.
+    name: Merlin binaries (${{ matrix.name }})
+    needs: verify-version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64
+            target: aarch64-unknown-linux-musl
+          - name: armv7hf
+            target: armv7-unknown-linux-musleabihf
+          - name: armv7sf
+            target: armv7-unknown-linux-musleabi
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: merlin-${{ matrix.name }}-release
+
+      - name: Install cross-compilation toolchain
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cross-compile CLI (${{ matrix.name }})
+        run: cross build --package sockrocket-cli --release --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-merlin-bin-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/sockrocket-cli
+          retention-days: 7
+
+  merlin-package:
+    name: Merlin packages
+    needs: merlin-binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-merlin-bin-aarch64
+          path: target/aarch64-unknown-linux-musl/release
+
+      - name: Download armv7hf binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-merlin-bin-armv7hf
+          path: target/armv7-unknown-linux-musleabihf/release
+
+      - name: Download armv7sf binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-merlin-bin-armv7sf
+          path: target/armv7-unknown-linux-musleabi/release
+
+      - name: Make binaries executable
+        run: |
+          chmod +x target/aarch64-unknown-linux-musl/release/sockrocket-cli
+          chmod +x target/armv7-unknown-linux-musleabihf/release/sockrocket-cli
+          chmod +x target/armv7-unknown-linux-musleabi/release/sockrocket-cli
+
+      - name: Pack all platforms
+        run: ./merlin/pack.sh
+
+      - name: Upload Merlin packages to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/merlin/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+

@@ -1,0 +1,2 @@
+# Tools that honor .aiignore should skip this tree for indexing / training.
+*

@@ -1,0 +1,28 @@
+pub fn lookup(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "chrome.brand" => "Rocket",
+        "nav.dashboard" => "仪表盘",
+        "nav.nodes" => "节点",
+        "nav.groups" => "策略组",
+        "nav.connections" => "连接",
+        "nav.rules" => "规则",
+        "nav.logs" => "日志",
+        "nav.settings" => "设置",
+        "settings.title" => "设置",
+        "settings.section.proxy" => "代理",
+        "settings.listen_address" => "监听地址",
+        "settings.socks_port" => "SOCKS5 端口",
+        "settings.http_port" => "HTTP 端口",
+        "settings.apply" => "应用更改",
+        "settings.listeners_restart_hint" => "修改监听地址或端口会重启本地代理监听。",
+        "settings.section.system" => "系统",
+        "settings.system_proxy" => "系统代理",
+        "settings.theme" => "主题",
+        "settings.theme.dark" => "深色",
+        "settings.language" => "语言",
+        "settings.section.about" => "关于",
+        "settings.about.name" => "Sockrocket 代理客户端",
+        "settings.about.github" => "GitHub",
+        _ => return None,
+    })
+}

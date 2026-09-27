@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Sockrocket — Cross-Platform Proxy Client</title>
+  <meta name="description" content="Rust proxy client with native GUI, CLI, and AsusWRT-Merlin plugin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2."/>
+  <meta name="theme-color" content="#0B1628"/>
+  <meta property="og:title" content="Sockrocket"/>
+  <meta property="og:description" content="One Rust stack from laptop to LAN — GUI, CLI, Merlin."/>
+  <meta property="og:image" content="assets/logo.svg"/>
+  <link rel="icon" type="image/svg+xml" href="assets/logo-icon.svg"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=Sora:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --navy: #0B1628;
+      --ink: #06101C;
+      --panel: #12203A;
+      --line: rgba(255,255,255,.08);
+      --orange: #FF6A00;
+      --orange-hot: #FF8A33;
+      --cyan: #3EC8FF;
+      --text: #E8EEF7;
+      --muted: #8FA0B8;
+      --ok: #3DDB8A;
+      --font-display: "Syne", sans-serif;
+      --font: "Sora", sans-serif;
+      --mono: "JetBrains Mono", ui-monospace, monospace;
+    }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--ink);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--orange-hot); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Nav ── */
+    .nav {
+      position: fixed; inset: 0 0 auto; z-index: 50;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 1rem; padding: .9rem clamp(1rem, 4vw, 2.5rem);
+      background: rgba(6,16,28,.72);
+      backdrop-filter: blur(16px) saturate(1.2);
+      border-bottom: 1px solid transparent;
+      transition: border-color .3s, background .3s;
+    }
+    .nav.scrolled { border-bottom-color: var(--line); background: rgba(6,16,28,.9); }
+    .brand {
+      display: flex; align-items: center; gap: .65rem;
+      color: #fff; font-family: var(--font-display); font-weight: 800;
+      font-size: 1.15rem; letter-spacing: -.02em;
+    }
+    .brand img { width: 34px; height: 34px; border-radius: 8px; }
+    .nav-links { display: flex; gap: 1.6rem; align-items: center; }
+    .nav-links a {
+      color: var(--muted); font-size: .88rem; font-weight: 500;
+      transition: color .2s;
+    }
+    .nav-links a:hover { color: #fff; text-decoration: none; }
+    .lang-row { display: flex; gap: .3rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .lang-btn {
+      background: transparent; border: 1px solid var(--line);
+      color: var(--muted); padding: .28rem .55rem; border-radius: 6px;
+      font: 600 .72rem var(--font); cursor: pointer; transition: .2s;
+    }
+    .lang-btn:hover, .lang-btn.active {
+      border-color: var(--orange); color: var(--orange-hot);
+      background: rgba(255,106,0,.1);
+    }
+    .nav-cta {
+      background: var(--orange); color: #fff !important;
+      padding: .45rem 1rem; border-radius: 8px; font-weight: 600; font-size: .85rem;
+      box-shadow: 0 0 0 0 rgba(255,106,0,.4);
+      animation: pulse-glow 2.8s ease-in-out infinite;
+    }
+    .nav-cta:hover { background: var(--orange-hot); text-decoration: none; }
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,106,0,.35); }
+      50% { box-shadow: 0 0 22px 2px rgba(255,106,0,.35); }
+    }
+
+    /* ── Hero ── */
+    .hero {
+      position: relative;
+      min-height: 100svh;
+      display: grid;
+      align-items: center;
+      padding: 6.5rem clamp(1.2rem, 5vw, 4rem) 3.5rem;
+      overflow: hidden;
+    }
+    .hero-bg {
+      position: absolute; inset: 0; z-index: 0;
+      background:
+        radial-gradient(ellipse 80% 60% at 70% 20%, rgba(255,106,0,.18), transparent 55%),
+        radial-gradient(ellipse 50% 40% at 15% 80%, rgba(62,200,255,.12), transparent 50%),
+        linear-gradient(165deg, #0B1628 0%, #06101C 55%, #0A1A30 100%);
+    }
+    #trail {
+      position: absolute; inset: 0; z-index: 1;
+      width: 100%; height: 100%; pointer-events: none;
+    }
+    .hero-grid {
+      position: absolute; inset: 0; z-index: 1;
+      background-image:
+        linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+      background-size: 64px 64px;
+      mask-image: radial-gradient(ellipse 70% 60% at 50% 40%, #000 20%, transparent 75%);
+      animation: grid-drift 28s linear infinite;
+    }
+    @keyframes grid-drift {
+      from { background-position: 0 0; }
+      to { background-position: 64px 64px; }
+    }
+    .hero-inner {
+      position: relative; z-index: 2;
+      max-width: 1200px; width: 100%; margin: 0 auto;
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 2.5rem; align-items: center;
+    }
+    .hero-copy { max-width: 560px; }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: .5rem;
+      font-size: .78rem; font-weight: 600; letter-spacing: .08em;
+      text-transform: uppercase; color: var(--orange-hot);
+      margin-bottom: 1.1rem;
+      opacity: 0; animation: rise .7s .1s ease forwards;
+    }
+    .eyebrow::before {
+      content: ""; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--ok); box-shadow: 0 0 12px var(--ok);
+      animation: blink 1.6s ease-in-out infinite;
+    }
+    @keyframes blink { 50% { opacity: .35; } }
+    .hero h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2.8rem, 7vw, 5.2rem);
+      font-weight: 800; line-height: .95; letter-spacing: -.04em;
+      color: #fff; margin-bottom: 1.1rem;
+      opacity: 0; animation: rise .8s .2s ease forwards;
+    }
+    .hero h1 em {
+      font-style: normal;
+      background: linear-gradient(120deg, #fff 10%, var(--orange) 55%, var(--orange-hot) 100%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-lead {
+      color: var(--muted); font-size: 1.08rem; max-width: 42ch;
+      margin-bottom: 2rem;
+      opacity: 0; animation: rise .8s .35s ease forwards;
+    }
+    .cta-row {
+      display: flex; flex-wrap: wrap; gap: .8rem;
+      opacity: 0; animation: rise .8s .5s ease forwards;
+    }
+    .btn {
+      display: inline-flex; align-items: center; gap: .5rem;
+      padding: .85rem 1.4rem; border-radius: 10px;
+      font-weight: 600; font-size: .95rem;
+      transition: transform .18s, box-shadow .18s, background .18s;
+      border: 1px solid transparent;
+    }
+    .btn:hover { transform: translateY(-2px); text-decoration: none; }
+    .btn-primary {
+      background: var(--orange); color: #fff;
+      box-shadow: 0 10px 30px rgba(255,106,0,.35);
+    }
+    .btn-primary:hover { background: var(--orange-hot); }
+    .btn-ghost {
+      background: rgba(255,255,255,.04); color: var(--text);
+      border-color: var(--line);
+    }
+    .btn-ghost:hover { border-color: rgba(255,255,255,.22); color: #fff; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .hero-visual {
+      position: relative;
+      justify-self: end;
+      width: min(100%, 420px);
+      aspect-ratio: 1;
+      opacity: 0; animation: rise 1s .4s ease forwards, float 5s 1.2s ease-in-out infinite;
+    }
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-12px); }
+    }
+    .hero-visual .mark {
+      width: 100%; height: 100%;
+      border-radius: 28%;
+      box-shadow:
+        0 0 0 1px rgba(255,106,0,.25),
+        0 30px 80px rgba(0,0,0,.45),
+        0 0 60px rgba(255,106,0,.2);
+      animation: mark-spin 24s linear infinite;
+    }
+    @keyframes mark-spin {
+      from { filter: hue-rotate(0deg); }
+      to { filter: hue-rotate(8deg); }
+    }
+    .orbit {
+      position: absolute; inset: -8%;
+      border: 1px dashed rgba(62,200,255,.25);
+      border-radius: 50%;
+      animation: spin 18s linear infinite;
+    }
+    .orbit::after {
+      content: ""; position: absolute; top: 8%; left: 50%;
+      width: 10px; height: 10px; margin-left: -5px;
+      border-radius: 50%; background: var(--cyan);
+      box-shadow: 0 0 16px var(--cyan);
+    }
+    .orbit-2 {
+      inset: -18%;
+      border-color: rgba(255,106,0,.2);
+      animation-duration: 28s; animation-direction: reverse;
+    }
+    .orbit-2::after { background: var(--orange); box-shadow: 0 0 16px var(--orange); top: 70%; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Sections ── */
+    section {
+      position: relative;
+      padding: 5.5rem clamp(1.2rem, 5vw, 4rem);
+      max-width: 1200px; margin: 0 auto;
+    }
+    .kicker {
+      font-size: .75rem; font-weight: 700; letter-spacing: .12em;
+      text-transform: uppercase; color: var(--orange);
+      margin-bottom: .8rem;
+    }
+    h2 {
+      font-family: var(--font-display);
+      font-size: clamp(1.9rem, 4vw, 3rem);
+      font-weight: 800; letter-spacing: -.03em; line-height: 1.05;
+      color: #fff; margin-bottom: .8rem;
+    }
+    .lede { color: var(--muted); max-width: 48ch; font-size: 1.02rem; margin-bottom: 2.4rem; }
+
+    .strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      margin: 0 clamp(1.2rem, 5vw, 4rem) 0;
+      max-width: 1200px;
+      margin-left: auto; margin-right: auto;
+    }
+    .strip-item {
+      background: var(--navy);
+      padding: 1.6rem 1.2rem;
+      text-align: center;
+    }
+    .strip-num {
+      font-family: var(--font-display);
+      font-size: 2rem; font-weight: 800; color: #fff;
+    }
+    .strip-num span { color: var(--orange); }
+    .strip-label { color: var(--muted); font-size: .82rem; margin-top: .25rem; }
+
+    .features {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0;
+      border-top: 1px solid var(--line);
+    }
+    .feat {
+      padding: 1.8rem 1.4rem 1.8rem 0;
+      border-bottom: 1px solid var(--line);
+      display: grid; grid-template-columns: 48px 1fr; gap: 1rem;
+      transition: background .25s;
+    }
+    .feat:nth-child(odd) { padding-right: 1.8rem; border-right: 1px solid var(--line); }
+    .feat:nth-child(even) { padding-left: 1.8rem; }
+    .feat-ico {
+      width: 48px; height: 48px; border-radius: 12px;
+      display: grid; place-items: center;
+      background: rgba(255,106,0,.1);
+      color: var(--orange); font-size: 1.25rem;
+      border: 1px solid rgba(255,106,0,.2);
+    }
+    .feat h3 {
+      font-family: var(--font-display);
+      font-size: 1.1rem; font-weight: 700; color: #fff; margin-bottom: .35rem;
+    }
+    .feat p { color: var(--muted); font-size: .9rem; }
+
+    /* Merlin spotlight */
+    .merlin {
+      margin: 1rem clamp(1.2rem, 5vw, 4rem) 0;
+      max-width: 1200px; margin-left: auto; margin-right: auto;
+      border-radius: 24px;
+      padding: clamp(2rem, 4vw, 3.2rem);
+      position: relative; overflow: hidden;
+      background:
+        linear-gradient(135deg, rgba(255,106,0,.12), transparent 40%),
+        linear-gradient(225deg, rgba(62,200,255,.1), transparent 45%),
+        var(--panel);
+      border: 1px solid var(--line);
+    }
+    .merlin::before {
+      content: "";
+      position: absolute; right: -10%; top: -30%;
+      width: 420px; height: 420px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(255,106,0,.2), transparent 65%);
+      animation: drift 8s ease-in-out infinite alternate;
+    }
+    @keyframes drift {
+      from { transform: translate(0,0); }
+      to { transform: translate(-30px, 20px); }
+    }
+    .merlin-inner { position: relative; z-index: 1; max-width: 640px; }
+    .merlin .tag {
+      display: inline-block;
+      font-family: var(--mono); font-size: .72rem;
+      color: var(--cyan); border: 1px solid rgba(62,200,255,.35);
+      padding: .25rem .6rem; border-radius: 999px; margin-bottom: 1rem;
+    }
+    .merlin-points {
+      list-style: none; margin: 1.4rem 0 1.8rem;
+      display: grid; gap: .55rem;
+    }
+    .merlin-points li {
+      display: flex; gap: .7rem; align-items: flex-start;
+      color: var(--muted); font-size: .92rem;
+    }
+    .merlin-points li::before {
+      content: "→"; color: var(--orange); font-weight: 700; flex-shrink: 0;
+    }
+
+    /* Protocols */
+    .proto-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+    }
+    .proto {
+      padding: 1.3rem 1.2rem;
+      border-bottom: 2px solid var(--orange);
+      background: linear-gradient(180deg, rgba(255,255,255,.03), transparent);
+    }
+    .proto strong {
+      display: block; font-family: var(--font-display);
+      font-size: 1.15rem; color: #fff; margin-bottom: .35rem;
+    }
+    .proto span { color: var(--muted); font-size: .85rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .7rem; }
+    .chip {
+      font-family: var(--mono); font-size: .68rem;
+      padding: .2rem .45rem; border-radius: 4px;
+      background: rgba(62,200,255,.1); color: var(--cyan);
+    }
+    .chip.hot { background: rgba(255,106,0,.12); color: var(--orange-hot); }
+
+    /* Install */
+    .tabs { display: flex; gap: .4rem; margin-bottom: 1rem; }
+    .tab {
+      font: 600 .85rem var(--font);
+      padding: .45rem 1rem; border-radius: 8px; cursor: pointer;
+      background: transparent; border: 1px solid var(--line); color: var(--muted);
+    }
+    .tab.active { background: var(--orange); border-color: var(--orange); color: #fff; }
+    .code {
+      position: relative;
+      font-family: var(--mono); font-size: .88rem; line-height: 1.75;
+      background: var(--ink); border: 1px solid var(--line);
+      border-radius: 14px; padding: 1.3rem 1.4rem;
+      overflow-x: auto;
+    }
+    .code .c { color: #5A6A80; }
+    .code .n { color: var(--orange-hot); }
+    .code .k { color: var(--cyan); }
+    .copy-btn {
+      position: absolute; top: .8rem; right: .8rem;
+      font: 600 .72rem var(--font);
+      background: var(--panel); border: 1px solid var(--line);
+      color: var(--muted); padding: .3rem .65rem; border-radius: 6px; cursor: pointer;
+    }
+    .copy-btn:hover { color: #fff; border-color: var(--orange); }
+
+    .dl-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+    }
+    .dl {
+      padding: 1.4rem 0;
+      border-top: 1px solid var(--line);
+    }
+    .dl h3 {
+      font-family: var(--font-display); font-size: 1.05rem;
+      color: #fff; margin-bottom: .4rem;
+    }
+    .dl p { color: var(--muted); font-size: .82rem; margin-bottom: .9rem; min-height: 2.8em; }
+    .dl-links { display: flex; flex-wrap: wrap; gap: .4rem; }
+    .dl-links a {
+      font-size: .78rem; font-weight: 600;
+      color: var(--muted); border: 1px solid var(--line);
+      padding: .35rem .65rem; border-radius: 6px;
+      transition: .15s;
+    }
+    .dl-links a:hover {
+      color: var(--orange-hot); border-color: var(--orange);
+      text-decoration: none;
+    }
+
+    footer {
+      margin-top: 3rem;
+      padding: 2.5rem clamp(1.2rem, 5vw, 4rem) 3rem;
+      border-top: 1px solid var(--line);
+      text-align: center; color: var(--muted); font-size: .85rem;
+    }
+    .footer-brand {
+      display: inline-flex; align-items: center; gap: .5rem;
+      font-family: var(--font-display); font-weight: 800; color: #fff;
+      margin-bottom: 1rem;
+    }
+    .footer-brand img { width: 22px; height: 22px; border-radius: 5px; }
+    .footer-links {
+      display: flex; flex-wrap: wrap; gap: 1.2rem; justify-content: center;
+      margin-bottom: 1rem;
+    }
+    .footer-links a { color: var(--muted); }
+    .footer-links a:hover { color: #fff; text-decoration: none; }
+
+    @media (max-width: 900px) {
+      .hero-inner { grid-template-columns: 1fr; }
+      .hero-visual { justify-self: start; width: min(280px, 70vw); margin-bottom: .5rem; order: -1; }
+      .strip { grid-template-columns: repeat(2, 1fr); }
+      .features { grid-template-columns: 1fr; }
+      .feat:nth-child(odd), .feat:nth-child(even) {
+        padding: 1.4rem 0; border-right: none;
+      }
+      .proto-grid, .dl-row { grid-template-columns: 1fr 1fr; }
+      .nav-links { display: none; }
+    }
+    @media (max-width: 520px) {
+      .proto-grid, .dl-row { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<header class="nav" id="nav">
+  <a class="brand" href="#">
+    <img src="assets/logo.svg" alt=""/>
+    Sockrocket
+  </a>
+  <div class="nav-links">
+    <a href="#features" data-i18n="nav-features">Features</a>
+    <a href="#merlin" data-i18n="nav-merlin">Merlin</a>
+    <a href="#protocols" data-i18n="nav-protocols">Protocols</a>
+    <a href="#download" data-i18n="nav-download">Download</a>
+    <a href="#community" data-i18n="nav-community">Community</a>
+    <a href="https://github.com/sockrockets/sockrocket">GitHub</a>
+  </div>
+  <div class="lang-row">
+    <button type="button" class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
+    <button type="button" class="lang-btn" data-lang="vi" onclick="setLang('vi')">VI</button>
+    <button type="button" class="lang-btn" data-lang="ru" onclick="setLang('ru')">RU</button>
+    <button type="button" class="lang-btn" data-lang="zh" onclick="setLang('zh')">中文</button>
+    <a class="nav-cta" href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0" data-i18n="nav-cta">v0.1.0 ↓</a>
+  </div>
+</header>
+
+<main>
+  <section class="hero" aria-label="Hero">
+    <div class="hero-bg"></div>
+    <div class="hero-grid"></div>
+    <canvas id="trail" aria-hidden="true"></canvas>
+    <div class="hero-inner">
+      <div class="hero-copy">
+        <div class="eyebrow" data-i18n="eyebrow">v0.1.0 · Open source · Apache-2.0</div>
+        <h1 data-i18n="hero-h1">Sockrocket<em>.</em><br/>Proxy that ships.</h1>
+        <p class="hero-lead" data-i18n="hero-sub">Native GUI, CLI, and AsusWRT-Merlin — one Rust stack from your laptop to the whole LAN.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0" data-i18n="hero-btn-download">Download v0.1.0</a>
+          <a class="btn btn-ghost" href="https://github.com/sockrockets/sockrocket" data-i18n="hero-btn-github">View source</a>
+        </div>
+      </div>
+      <div class="hero-visual" aria-hidden="true">
+        <div class="orbit"></div>
+        <div class="orbit orbit-2"></div>
+        <img class="mark" src="assets/logo.svg" alt=""/>
+      </div>
+    </div>
+  </section>
+
+  <div class="strip">
+    <div class="strip-item"><div class="strip-num">6</div><div class="strip-label" data-i18n="stat-protocols">Protocols</div></div>
+    <div class="strip-item"><div class="strip-num">3</div><div class="strip-label" data-i18n="stat-surfaces">Surfaces</div></div>
+    <div class="strip-item"><div class="strip-num">5<span>+</span></div><div class="strip-label" data-i18n="stat-arch">Arch targets</div></div>
+    <div class="strip-item"><div class="strip-num">100<span>%</span></div><div class="strip-label" data-i18n="stat-rust">Rust</div></div>
+  </div>
+
+  <section id="features">
+    <div class="kicker" data-i18n="feat-label">Features</div>
+    <h2 data-i18n="feat-h2">Built for daily use,<br/>not demo day.</h2>
+    <p class="lede" data-i18n="feat-sub">Through-proxy latency, real routing, and a Merlin plugin that shares the same engine as the desktop client.</p>
+    <div class="features">
+      <article class="feat">
+        <div class="feat-ico">⚡</div>
+        <div>
+          <h3 data-i18n="fc1-title">Warm through-proxy tests</h3>
+          <p data-i18n="fc1-desc">Node ranking measures exit-side RTT on a warm path — what browsing feels like, not a fake TCP ping to server:port.</p>
+        </div>
+      </article>
+      <article class="feat">
+        <div class="feat-ico">🧭</div>
+        <div>
+          <h3 data-i18n="fc2-title">Smart routing</h3>
+          <p data-i18n="fc2-desc">Domain, GeoIP, and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy.</p>
+        </div>
+      </article>
+      <article class="feat">
+        <div class="feat-ico">🔏</div>
+        <div>
+          <h3 data-i18n="fc3-title">TLS fingerprint craft</h3>
+          <p data-i18n="fc3-desc">Patched rustls (craftls) with REALITY and browser-like ClientHello — built for hostile networks.</p>
+        </div>
+      </article>
+      <article class="feat">
+        <div class="feat-ico">📡</div>
+        <div>
+          <h3 data-i18n="fc4-title">Subscriptions</h3>
+          <p data-i18n="fc4-desc">Clash, V2Ray / VMess, SingBox URLs. Auto-detect, update, dedupe, batch test.</p>
+        </div>
+      </article>
+      <article class="feat">
+        <div class="feat-ico">🖥️</div>
+        <div>
+          <h3 data-i18n="fc5-title">GUI + CLI</h3>
+          <p data-i18n="fc5-desc">Native GPUI desktop app and a lean CLI for headless or scripted setups.</p>
+        </div>
+      </article>
+      <article class="feat">
+        <div class="feat-ico">🛰️</div>
+        <div>
+          <h3 data-i18n="fc6-title">LAN-wide Merlin</h3>
+          <p data-i18n="fc6-desc">Official AsusWRT-Merlin package: one musl binary, Web UI, iptables/DNS, hot-reload node switch.</p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <div class="merlin" id="merlin">
+    <div class="merlin-inner">
+      <span class="tag" data-i18n="merlin-tag">asuswrt-merlin · koolcenter</span>
+      <h2 data-i18n="merlin-h2">Same engine on the router.</h2>
+      <p class="lede" style="margin-bottom:0" data-i18n="merlin-sub">What works in the GUI works on Merlin — transparent proxy for every device on your LAN.</p>
+      <ul class="merlin-points">
+        <li data-i18n="merlin-p1">Platform packages: arm64 (hnd_v8), armv7 soft/hard float</li>
+        <li data-i18n="merlin-p2">Hot-reload set_node without tearing down listeners</li>
+        <li data-i18n="merlin-p3">Through-proxy probe concurrency capped for router stability</li>
+      </ul>
+      <a class="btn btn-primary" href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md" data-i18n="merlin-cta">Merlin guide →</a>
+    </div>
+  </div>
+
+  <section id="protocols">
+    <div class="kicker" data-i18n="proto-label">Protocols</div>
+    <h2 data-i18n="proto-h2">The ones that matter.</h2>
+    <p class="lede" data-i18n="proto-sub">Including QUIC next-gen transports and Reality obfuscation.</p>
+    <div class="proto-grid">
+      <div class="proto"><strong>Shadowsocks</strong><span data-i18n="uc-ss">Light, general purpose</span><div class="chips"><span class="chip">TCP</span><span class="chip">UDP</span><span class="chip">AEAD 2022</span></div></div>
+      <div class="proto"><strong>VMess</strong><span data-i18n="uc-vmess">CDN-friendly</span><div class="chips"><span class="chip">WS</span><span class="chip">TLS</span></div></div>
+      <div class="proto"><strong>VLess</strong><span data-i18n="uc-vless">Low overhead</span><div class="chips"><span class="chip hot">REALITY</span><span class="chip">WS</span></div></div>
+      <div class="proto"><strong>Trojan</strong><span data-i18n="uc-trojan">HTTPS camouflage</span><div class="chips"><span class="chip">TLS</span></div></div>
+      <div class="proto"><strong>TUIC v5</strong><span data-i18n="uc-tuic">0-RTT reconnect</span><div class="chips"><span class="chip hot">QUIC</span></div></div>
+      <div class="proto"><strong>Hysteria2</strong><span data-i18n="uc-hy2">Lossy networks</span><div class="chips"><span class="chip hot">QUIC</span></div></div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="kicker" data-i18n="install-label">Quick start</div>
+    <h2 data-i18n="install-h2">Up in under a minute.</h2>
+    <p class="lede" data-i18n="install-sub">Grab a release binary. Default SOCKS5 :1080 · HTTP :1087.</p>
+    <div class="tabs">
+      <button type="button" class="tab active" onclick="showTab('gui')">GUI</button>
+      <button type="button" class="tab" onclick="showTab('cli')">CLI</button>
+      <button type="button" class="tab" onclick="showTab('merlin')">Merlin</button>
+    </div>
+    <div id="tab-gui" class="code">
+      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+      <span class="c"># macOS — open DMG, drag Sockrocket to Applications</span><br/>
+      <span class="n">open</span> sockrocket-macos-aarch64.dmg<br/><br/>
+      <span class="c"># Linux — extract + install (icons / app menu)</span><br/>
+      <span class="n">tar</span> xzf sockrocket-linux-x86_64.tar.gz<br/>
+      <span class="n">./Sockrocket-*-linux-x86_64/install.sh</span><br/><br/>
+      <span class="c"># Windows — extract ZIP, run Sockrocket.exe</span>
+    </div>
+    <div id="tab-cli" class="code" style="display:none">
+      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+      <span class="n">sockrocket-cli</span> <span class="k">--init</span> config.yaml<br/>
+      <span class="c"># edit config.yaml, then:</span><br/>
+      <span class="n">sockrocket-cli</span> config.yaml
+    </div>
+    <div id="tab-merlin" class="code" style="display:none">
+      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+      <span class="c" data-i18n="merlin-step1"># 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from Releases</span><br/>
+      <span class="c" data-i18n="merlin-step2"># 2. Software Center → Offline install → upload the tar.gz</span><br/>
+      <span class="c" data-i18n="merlin-step3"># 3. Open Sockrocket tile · check uname -m (hnd vs hnd_v8)</span><br/>
+      <span class="n"># docs:</span> docs/merlin.md
+    </div>
+  </section>
+
+  <section id="community">
+    <div class="kicker" data-i18n="community-label">Community</div>
+    <h2 data-i18n="community-h2">Announcements and Q&amp;A.</h2>
+    <p class="lede" data-i18n="community-sub">Release notes on Telegram; questions on GitHub Discussions. Do not post subscription URLs, tokens, or personal identifiers.</p>
+    <div class="dl-row">
+      <div class="dl">
+        <h3>Telegram</h3>
+        <p data-i18n="community-tg">Channel for release announcements.</p>
+        <div class="dl-links">
+          <a href="https://t.me/sockrocket">t.me/sockrocket</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>Discussions</h3>
+        <p data-i18n="community-disc">Q&amp;A and feedback on GitHub.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/discussions">Open Discussions</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>Issues</h3>
+        <p data-i18n="community-issues">Bug reports and regressions.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/issues">Open Issues</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="download">
+    <div class="kicker" data-i18n="dl-label">Download</div>
+    <h2 data-i18n="dl-h2">Every platform we ship.</h2>
+    <p class="lede" data-i18n="dl-sub">Prebuilt GUI, CLI, and Merlin packages on GitHub Releases.</p>
+    <div class="dl-row">
+      <div class="dl">
+        <h3>Linux</h3>
+        <p data-i18n="dl-linux">x86_64 and aarch64 GUI + CLI.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Releases</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>macOS</h3>
+        <p data-i18n="dl-macos">Intel and Apple Silicon native.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Releases</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>Windows</h3>
+        <p data-i18n="dl-windows">x86_64 GUI + CLI .exe.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Releases</a>
+        </div>
+      </div>
+      <div class="dl">
+        <h3>Merlin</h3>
+        <p data-i18n="dl-merlin">arm64 / armv7 soft &amp; hard float packages.</p>
+        <div class="dl-links">
+          <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Packages</a>
+          <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">Docs</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="footer-brand">
+    <img src="assets/logo.svg" alt=""/>
+    Sockrocket
+  </div>
+  <div class="footer-links">
+    <a href="https://github.com/sockrockets/sockrocket">GitHub</a>
+    <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a>
+    <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">Merlin</a>
+    <a href="https://t.me/sockrocket">Telegram</a>
+    <a href="https://github.com/sockrockets/sockrocket/discussions">Discussions</a>
+    <a href="https://github.com/sockrockets/sockrocket/blob/main/LICENSE">Apache 2.0</a>
+  </div>
+  <p data-i18n="footer-copy">Built in Rust. © 2026 Sockrocket.</p>
+</footer>
+
+<script>
+const translations = {
+  en: {
+    'nav-features': 'Features', 'nav-merlin': 'Merlin', 'nav-protocols': 'Protocols',
+    'nav-download': 'Download', 'nav-community': 'Community', 'nav-cta': 'v0.1.0 ↓',
+    'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
+    'hero-h1': 'Sockrocket<em>.</em><br/>Proxy that ships.',
+    'hero-sub': 'Native GUI, CLI, and AsusWRT-Merlin — one Rust stack from your laptop to the whole LAN.',
+    'hero-btn-download': 'Download v0.1.0', 'hero-btn-github': 'View source',
+    'stat-protocols': 'Protocols', 'stat-surfaces': 'Surfaces', 'stat-arch': 'Arch targets', 'stat-rust': 'Rust',
+    'feat-label': 'Features', 'feat-h2': 'Built for daily use,<br/>not demo day.',
+    'feat-sub': 'Through-proxy latency, real routing, and a Merlin plugin that shares the same engine as the desktop client.',
+    'fc1-title': 'Warm through-proxy tests',
+    'fc1-desc': 'Node ranking measures exit-side RTT on a warm path — what browsing feels like, not a fake TCP ping to server:port.',
+    'fc2-title': 'Smart routing',
+    'fc2-desc': 'Domain, GeoIP, and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy.',
+    'fc3-title': 'TLS fingerprint craft',
+    'fc3-desc': 'Patched rustls (craftls) with REALITY and browser-like ClientHello — built for hostile networks.',
+    'fc4-title': 'Subscriptions',
+    'fc4-desc': 'Clash, V2Ray / VMess, SingBox URLs. Auto-detect, update, dedupe, batch test.',
+    'fc5-title': 'GUI + CLI',
+    'fc5-desc': 'Native GPUI desktop app and a lean CLI for headless or scripted setups.',
+    'fc6-title': 'LAN-wide Merlin',
+    'fc6-desc': 'Official AsusWRT-Merlin package: one musl binary, Web UI, iptables/DNS, hot-reload node switch.',
+    'merlin-tag': 'asuswrt-merlin · koolcenter',
+    'merlin-h2': 'Same engine on the router.',
+    'merlin-sub': 'What works in the GUI works on Merlin — transparent proxy for every device on your LAN.',
+    'merlin-p1': 'Platform packages: arm64 (hnd_v8), armv7 soft/hard float',
+    'merlin-p2': 'Hot-reload set_node without tearing down listeners',
+    'merlin-p3': 'Through-proxy probe concurrency capped for router stability',
+    'merlin-cta': 'Merlin guide →',
+    'proto-label': 'Protocols', 'proto-h2': 'The ones that matter.',
+    'proto-sub': 'Including QUIC next-gen transports and Reality obfuscation.',
+    'uc-ss': 'Light, general purpose', 'uc-vmess': 'CDN-friendly', 'uc-vless': 'Low overhead',
+    'uc-trojan': 'HTTPS camouflage', 'uc-tuic': '0-RTT reconnect', 'uc-hy2': 'Lossy networks',
+    'install-label': 'Quick start', 'install-h2': 'Up in under a minute.',
+    'install-sub': 'Grab a release binary. Default SOCKS5 :1080 · HTTP :1087.',
+    'dl-label': 'Download', 'dl-h2': 'Every platform we ship.',
+    'dl-sub': 'Prebuilt GUI, CLI, and Merlin packages on GitHub Releases.',
+    'dl-linux': 'x86_64 and aarch64 GUI + CLI.',
+    'dl-macos': 'Intel and Apple Silicon native.',
+    'dl-windows': 'x86_64 GUI + CLI .exe.',
+    'dl-merlin': 'arm64 / armv7 soft & hard float packages.',
+    'footer-copy': 'Built in Rust. © 2026 Sockrocket.',
+    'merlin-step1': '# 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from Releases',
+    'merlin-step2': '# 2. Software Center → Offline install → upload the tar.gz',
+    'merlin-step3': '# 3. Open Sockrocket tile · check uname -m (hnd vs hnd_v8)',
+    'community-label': 'Community',
+    'community-h2': 'Announcements and Q&amp;A.',
+    'community-sub': 'Release notes on Telegram; questions on GitHub Discussions. Do not post subscription URLs, tokens, or personal identifiers.',
+    'community-tg': 'Channel for release announcements.',
+    'community-disc': 'Q&amp;A and feedback on GitHub.',
+    'community-issues': 'Bug reports and regressions.',
+  },
+  vi: {
+    'nav-features': 'Tính năng', 'nav-merlin': 'Merlin', 'nav-protocols': 'Giao thức',
+    'nav-download': 'Tải xuống', 'nav-community': 'Cộng đồng', 'nav-cta': 'v0.1.0 ↓',
+    'eyebrow': 'v0.1.0 · Mã nguồn mở · Apache-2.0',
+    'hero-h1': 'Sockrocket<em>.</em><br/>Proxy sẵn sàng.',
+    'hero-sub': 'GUI gốc, CLI và AsusWRT-Merlin — một stack Rust từ laptop đến cả LAN.',
+    'hero-btn-download': 'Tải v0.1.0', 'hero-btn-github': 'Xem mã nguồn',
+    'stat-protocols': 'Giao thức', 'stat-surfaces': 'Giao diện', 'stat-arch': 'Kiến trúc', 'stat-rust': 'Rust',
+    'feat-label': 'Tính năng', 'feat-h2': 'Dùng mỗi ngày,<br/>không chỉ demo.',
+    'feat-sub': 'Đo latency qua proxy thật, định tuyến thực tế, plugin Merlin dùng chung engine với desktop.',
+    'fc1-title': 'Test ấm qua proxy',
+    'fc1-desc': 'Xếp hạng nút theo RTT phía exit trên warm path — đúng cảm giác duyệt web, không phải ping TCP giả.',
+    'fc2-title': 'Định tuyến thông minh',
+    'fc2-desc': 'Domain, GeoIP, CIDR. System proxy cho app thường; TUN khi app bỏ qua proxy OS.',
+    'fc3-title': 'TLS fingerprint',
+    'fc3-desc': 'rustls (craftls) với REALITY và ClientHello giống trình duyệt.',
+    'fc4-title': 'Subscription',
+    'fc4-desc': 'Clash, V2Ray/VMess, SingBox. Tự nhận dạng, cập nhật, dedupe, test hàng loạt.',
+    'fc5-title': 'GUI + CLI',
+    'fc5-desc': 'App GPUI native và CLI nhẹ cho headless / script.',
+    'fc6-title': 'Merlin toàn LAN',
+    'fc6-desc': 'Gói AsusWRT-Merlin chính thức: một binary musl, Web UI, iptables/DNS, hot-reload.',
+    'merlin-tag': 'asuswrt-merlin · koolcenter',
+    'merlin-h2': 'Cùng engine trên router.',
+    'merlin-sub': 'GUI chạy được thì Merlin chạy được — proxy trong suốt cho mọi thiết bị LAN.',
+    'merlin-p1': 'Gói: arm64 (hnd_v8), armv7 soft/hard float',
+    'merlin-p2': 'Hot-reload set_node không hạ listener',
+    'merlin-p3': 'Giới hạn concurrency probe để router ổn định',
+    'merlin-cta': 'Hướng dẫn Merlin →',
+    'proto-label': 'Giao thức', 'proto-h2': 'Những giao thức quan trọng.',
+    'proto-sub': 'Gồm QUIC thế hệ mới và Reality.',
+    'uc-ss': 'Nhẹ, đa năng', 'uc-vmess': 'Thân thiện CDN', 'uc-vless': 'Ít overhead',
+    'uc-trojan': 'Ngụy trang HTTPS', 'uc-tuic': 'Kết nối lại 0-RTT', 'uc-hy2': 'Mạng mất gói',
+    'install-label': 'Bắt đầu nhanh', 'install-h2': 'Chạy dưới một phút.',
+    'install-sub': 'Tải binary. Mặc định SOCKS5 :1080 · HTTP :1087.',
+    'dl-label': 'Tải xuống', 'dl-h2': 'Mọi nền tảng chúng tôi ship.',
+    'dl-sub': 'GUI, CLI và gói Merlin trên GitHub Releases.',
+    'dl-linux': 'GUI + CLI x86_64 và aarch64.',
+    'dl-macos': 'Native Intel và Apple Silicon.',
+    'dl-windows': 'GUI + CLI .exe x86_64.',
+    'dl-merlin': 'Gói arm64 / armv7 soft & hard float.',
+    'footer-copy': 'Viết bằng Rust. © 2026 Sockrocket.',
+    'merlin-step1': '# 1. Tải sockrocket-merlin-&lt;platform&gt;.tar.gz từ Releases',
+    'merlin-step2': '# 2. Software Center → Offline install → tải tar.gz lên',
+    'merlin-step3': '# 3. Mở ô Sockrocket · kiểm tra uname -m (hnd vs hnd_v8)',
+    'community-label': 'Cộng đồng',
+    'community-h2': 'Thông báo và hỏi đáp.',
+    'community-sub': 'Phát hành trên Telegram; hỏi đáp trên GitHub Discussions. Không đăng URL subscription, token hay thông tin cá nhân.',
+    'community-tg': 'Kênh thông báo phát hành.',
+    'community-disc': 'Hỏi đáp và góp ý trên GitHub.',
+    'community-issues': 'Báo lỗi và hồi quy.',
+  },
+  ru: {
+    'nav-features': 'Возможности', 'nav-merlin': 'Merlin', 'nav-protocols': 'Протоколы',
+    'nav-download': 'Скачать', 'nav-community': 'Сообщество', 'nav-cta': 'v0.1.0 ↓',
+    'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
+    'hero-h1': 'Sockrocket<em>.</em><br/>Прокси, который работает.',
+    'hero-sub': 'Нативный GUI, CLI и AsusWRT-Merlin — один стек на Rust от ноутбука до всей LAN.',
+    'hero-btn-download': 'Скачать v0.1.0', 'hero-btn-github': 'Исходники',
+    'stat-protocols': 'Протоколы', 'stat-surfaces': 'Интерфейсы', 'stat-arch': 'Архитектуры', 'stat-rust': 'Rust',
+    'feat-label': 'Возможности', 'feat-h2': 'Для ежедневной работы,<br/>не для демо.',
+    'feat-sub': 'Задержка через прокси, настоящая маршрутизация и плагин Merlin на том же движке, что и десктоп.',
+    'fc1-title': 'Прогретые тесты через прокси',
+    'fc1-desc': 'Ранжирование узлов по RTT на стороне выхода по тёплому пути — как в браузере, а не фейковый TCP ping до server:port.',
+    'fc2-title': 'Умная маршрутизация',
+    'fc2-desc': 'Правила Domain, GeoIP и CIDR. Системный прокси для обычных приложений; TUN, если программа его игнорирует.',
+    'fc3-title': 'TLS fingerprint',
+    'fc3-desc': 'Патченый rustls (craftls) с REALITY и ClientHello как у браузера — для враждебных сетей.',
+    'fc4-title': 'Подписки',
+    'fc4-desc': 'Clash, V2Ray / VMess, SingBox. Автоопределение, обновление, дедуп, пакетный тест.',
+    'fc5-title': 'GUI + CLI',
+    'fc5-desc': 'Нативное GPUI-приложение и лёгкий CLI для headless и скриптов.',
+    'fc6-title': 'Merlin на всю LAN',
+    'fc6-desc': 'Официальный пакет AsusWRT-Merlin: один musl-бинарник, Web UI, iptables/DNS, hot-reload узлов.',
+    'merlin-tag': 'asuswrt-merlin · koolcenter',
+    'merlin-h2': 'Тот же движок на роутере.',
+    'merlin-sub': 'Что работает в GUI — работает на Merlin: прозрачный прокси для всех устройств в LAN.',
+    'merlin-p1': 'Пакеты: arm64 (hnd_v8), armv7 soft/hard float',
+    'merlin-p2': 'Hot-reload set_node без сброса слушателей',
+    'merlin-p3': 'Ограниченная конкурентность probe для стабильности роутера',
+    'merlin-cta': 'Гид по Merlin →',
+    'proto-label': 'Протоколы', 'proto-h2': 'Те, что важны.',
+    'proto-sub': 'Включая QUIC-транспорты нового поколения и Reality.',
+    'uc-ss': 'Лёгкий, универсальный', 'uc-vmess': 'Дружит с CDN', 'uc-vless': 'Малый overhead',
+    'uc-trojan': 'Маскировка под HTTPS', 'uc-tuic': 'Реконнект 0-RTT', 'uc-hy2': 'Потери пакетов',
+    'install-label': 'Быстрый старт', 'install-h2': 'Меньше минуты.',
+    'install-sub': 'Скачайте релиз. По умолчанию SOCKS5 :1080 · HTTP :1087.',
+    'dl-label': 'Скачать', 'dl-h2': 'Все платформы, которые мы собираем.',
+    'dl-sub': 'Готовые GUI, CLI и пакеты Merlin на GitHub Releases.',
+    'dl-linux': 'GUI + CLI для x86_64 и aarch64.',
+    'dl-macos': 'Нативно для Intel и Apple Silicon.',
+    'dl-windows': 'GUI + CLI .exe для x86_64.',
+    'dl-merlin': 'Пакеты arm64 / armv7 soft & hard float.',
+    'footer-copy': 'Написано на Rust. © 2026 Sockrocket.',
+    'merlin-step1': '# 1. Скачайте sockrocket-merlin-&lt;platform&gt;.tar.gz из Releases',
+    'merlin-step2': '# 2. Software Center → Offline install → загрузите tar.gz',
+    'merlin-step3': '# 3. Откройте Sockrocket · проверьте uname -m (hnd vs hnd_v8)',
+    'community-label': 'Сообщество',
+    'community-h2': 'Анонсы и вопросы.',
+    'community-sub': 'Релизы в Telegram; вопросы в GitHub Discussions. Не публикуйте URL подписок, токены и личные данные.',
+    'community-tg': 'Канал анонсов релизов.',
+    'community-disc': 'Вопросы и отзывы на GitHub.',
+    'community-issues': 'Баги и регрессии.',
+  },
+  zh: {
+    'nav-features': '功能', 'nav-merlin': 'Merlin', 'nav-protocols': '协议',
+    'nav-download': '下载', 'nav-community': '社区', 'nav-cta': 'v0.1.0 ↓',
+    'eyebrow': 'v0.1.0 · 开源 · Apache-2.0',
+    'hero-h1': 'Sockrocket<em>.</em><br/>代理，开箱即用。',
+    'hero-sub': '原生 GUI、CLI 与华硕 Merlin 插件——同一套 Rust 栈，从笔记本到整网。',
+    'hero-btn-download': '下载 v0.1.0', 'hero-btn-github': '查看源码',
+    'stat-protocols': '协议', 'stat-surfaces': '界面形态', 'stat-arch': '架构目标', 'stat-rust': 'Rust',
+    'feat-label': '功能', 'feat-h2': '为日常而做，<br/>不是为演示。',
+    'feat-sub': '真实过代理测速、实用分流，以及与桌面端同源引擎的 Merlin 插件。',
+    'fc1-title': '暖路径过代理测速',
+    'fc1-desc': '节点排序测量出口侧暖路径 RTT——贴近浏览体感，不是对 server:port 的假 TCP ping。',
+    'fc2-title': '智能分流',
+    'fc2-desc': '域名 / GeoIP / CIDR。系统代理覆盖常见应用；TUN 兜底不走系统代理的程序。',
+    'fc3-title': 'TLS 指纹定制',
+    'fc3-desc': 'craftls（定制 rustls）支持 REALITY 与类浏览器 ClientHello。',
+    'fc4-title': '订阅管理',
+    'fc4-desc': 'Clash、V2Ray/VMess、SingBox。自动识别、更新、去重、批量测速。',
+    'fc5-title': 'GUI + CLI',
+    'fc5-desc': '原生 GPUI 桌面端，加上适合无头与脚本的轻量 CLI。',
+    'fc6-title': 'Merlin 全网代理',
+    'fc6-desc': '官方 AsusWRT-Merlin 包：单个 musl 二进制、Web UI、iptables/DNS、热重载切节点。',
+    'merlin-tag': 'asuswrt-merlin · koolcenter',
+    'merlin-h2': '路由器上同一引擎。',
+    'merlin-sub': 'GUI 能跑的，Merlin 也能跑——局域网设备透明代理。',
+    'merlin-p1': '平台包：arm64（hnd_v8）、armv7 软/硬浮点',
+    'merlin-p2': 'set_node 热重载，不拆监听',
+    'merlin-p3': '过代理探测限并发，照顾路由稳定性',
+    'merlin-cta': 'Merlin 指南 →',
+    'proto-label': '协议', 'proto-h2': '真正重要的那些。',
+    'proto-sub': '含 QUIC 下一代传输与 Reality 混淆。',
+    'uc-ss': '轻量通用', 'uc-vmess': '友好 CDN', 'uc-vless': '低开销',
+    'uc-trojan': 'HTTPS 伪装', 'uc-tuic': '0-RTT 重连', 'uc-hy2': '弱网高吞吐',
+    'install-label': '快速开始', 'install-h2': '一分钟内跑起来。',
+    'install-sub': '下载发布二进制。默认 SOCKS5 :1080 · HTTP :1087。',
+    'dl-label': '下载', 'dl-h2': '我们发布的全部平台。',
+    'dl-sub': 'GitHub Releases 上的 GUI、CLI 与 Merlin 包。',
+    'dl-linux': 'x86_64 / aarch64 GUI + CLI。',
+    'dl-macos': 'Intel 与 Apple Silicon 原生。',
+    'dl-windows': 'x86_64 GUI + CLI .exe。',
+    'dl-merlin': 'arm64 / armv7 软硬浮点包。',
+    'footer-copy': '用 Rust 打造。© 2026 Sockrocket。',
+    'merlin-step1': '# 1. 从 Releases 下载 sockrocket-merlin-&lt;platform&gt;.tar.gz',
+    'merlin-step2': '# 2. 软件中心 → 离线安装 → 上传该 tar.gz',
+    'merlin-step3': '# 3. 打开 Sockrocket · 核对 uname -m（注意 hnd 与 hnd_v8）',
+    'community-label': '社区',
+    'community-h2': '发布通知与问答。',
+    'community-sub': '发版看 Telegram；提问用 GitHub Discussions。请勿公开粘贴订阅链接、token 或个人信息。',
+    'community-tg': '发布通知频道。',
+    'community-disc': '在 GitHub 提问与反馈。',
+    'community-issues': '缺陷与回归报告。',
+  }
+};
+
+const langHtml = { en: 'en', vi: 'vi', ru: 'ru', zh: 'zh-CN' };
+const metaByLang = {
+  en: {
+    title: 'Sockrocket — Cross-Platform Proxy Client',
+    description: 'Rust proxy client with native GUI, CLI, and AsusWRT-Merlin plugin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+  },
+  vi: {
+    title: 'Sockrocket — Proxy đa nền tảng',
+    description: 'Client proxy Rust với GUI gốc, CLI và plugin AsusWRT-Merlin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+  },
+  ru: {
+    title: 'Sockrocket — кроссплатформенный прокси-клиент',
+    description: 'Прокси-клиент на Rust: нативный GUI, CLI и плагин AsusWRT-Merlin. Shadowsocks, VMess, VLess, Trojan, TUIC и Hysteria2.',
+  },
+  zh: {
+    title: 'Sockrocket — 跨平台代理客户端',
+    description: 'Rust 代理客户端：原生 GUI、CLI 与华硕 Merlin 插件。支持 Shadowsocks、VMess、VLess、Trojan、TUIC、Hysteria2。',
+  },
+};
+
+function detectLang() {
+  const saved = localStorage.getItem('sockrocket-lang');
+  if (saved && translations[saved]) return saved;
+  const nav = (navigator.languages && navigator.languages[0]) || navigator.language || '';
+  const low = String(nav).toLowerCase();
+  if (low.startsWith('zh')) return 'zh';
+  if (low.startsWith('vi')) return 'vi';
+  if (low.startsWith('ru')) return 'ru';
+  return 'en';
+}
+
+function applyLang(lang) {
+  const code = translations[lang] ? lang : 'en';
+  const t = translations[code];
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (t[key] !== undefined) el.innerHTML = t[key];
+  });
+  document.documentElement.lang = langHtml[code] || 'en';
+  document.querySelectorAll('.lang-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-lang') === code);
+  });
+  const meta = metaByLang[code] || metaByLang.en;
+  document.title = meta.title;
+  const desc = document.querySelector('meta[name="description"]');
+  if (desc) desc.setAttribute('content', meta.description);
+  const ogTitle = document.querySelector('meta[property="og:title"]');
+  if (ogTitle) ogTitle.setAttribute('content', 'Sockrocket');
+  const ogDesc = document.querySelector('meta[property="og:description"]');
+  if (ogDesc) ogDesc.setAttribute('content', meta.description);
+}
+function setLang(lang) {
+  localStorage.setItem('sockrocket-lang', lang);
+  applyLang(lang);
+}
+applyLang(detectLang());
+
+function showTab(name) {
+  ['gui', 'cli', 'merlin'].forEach(t => {
+    const el = document.getElementById('tab-' + t);
+    if (el) el.style.display = t === name ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tabs .tab').forEach((btn, i) => {
+    btn.classList.toggle('active', ['gui', 'cli', 'merlin'][i] === name);
+  });
+}
+
+function copyCode(btn) {
+  const block = btn.parentElement;
+  const text = block.innerText.replace(/^Copy\n?/, '').trim();
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = '✓';
+    setTimeout(() => btn.textContent = 'Copy', 1600);
+  });
+}
+
+window.addEventListener('scroll', () => {
+  document.getElementById('nav').classList.toggle('scrolled', window.scrollY > 20);
+}, { passive: true });
+
+/* Particle trail — rocket exhaust vibe */
+(function () {
+  const canvas = document.getElementById('trail');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  let w, h, particles, raf;
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function resize() {
+    w = canvas.width = canvas.offsetWidth * devicePixelRatio;
+    h = canvas.height = canvas.offsetHeight * devicePixelRatio;
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  }
+  function spawn() {
+    particles = Array.from({ length: 48 }, () => ({
+      x: Math.random() * canvas.offsetWidth,
+      y: Math.random() * canvas.offsetHeight,
+      vx: (Math.random() - 0.5) * 0.35,
+      vy: -0.2 - Math.random() * 0.55,
+      r: 0.6 + Math.random() * 1.8,
+      a: 0.15 + Math.random() * 0.45,
+      hue: Math.random() > 0.55 ? 24 : 195,
+    }));
+  }
+  function tick() {
+    ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
+    for (const p of particles) {
+      p.x += p.vx; p.y += p.vy;
+      if (p.y < -10) { p.y = canvas.offsetHeight + 10; p.x = Math.random() * canvas.offsetWidth; }
+      ctx.beginPath();
+      ctx.fillStyle = `hsla(${p.hue}, 100%, 60%, ${p.a})`;
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    raf = requestAnimationFrame(tick);
+  }
+  resize(); spawn();
+  if (!reduce) tick();
+  window.addEventListener('resize', () => { resize(); }, { passive: true });
+})();
+</script>
+</body>
+</html>
