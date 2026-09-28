@@ -229,6 +229,8 @@ do_start() {
 
     ip rule  add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
     ip route replace default dev "$TUN_DEV" table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
+    # Drop the TUN-off blackhole so Fake-IP traffic can be MARK'd into TUN again.
+    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
 
     # Return-path forwarding: replies sockrocket-cli injects into the TUN (src =
     # public internet IP, dst = LAN client) traverse the filter FORWARD
@@ -306,6 +308,12 @@ do_stop() {
     ip rule  del fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
     ip route flush table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
     ip rule  del fwmark "$TUN_MARK" table 100 2>/dev/null || true
+
+    # Stale Fake-IP (198.18/16) after TUN off: without a route clients hang
+    # until DNS TTL. Blackhole makes them fail fast and re-query (Clash docs
+    # also recommend flushing DNS after leaving fake-ip mode).
+    ip route replace blackhole 198.18.0.0/16 2>/dev/null \
+        || ip route add blackhole 198.18.0.0/16 2>/dev/null || true
 
     ok "iptables rules removed"
 }

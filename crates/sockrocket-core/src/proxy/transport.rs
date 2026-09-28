@@ -24,7 +24,9 @@ use super::pool::ConnFactory;
 /// Default timeout for TCP connect + TLS handshake.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Socket send/receive buffer size (256KB — improves throughput on high-BDP links).
-const SOCKET_BUF_SIZE: usize = 256 * 1024;
+// 64 KiB keeps throughput acceptable while capping kernel+userspace buffer
+// residency on memory-tight Merlin routers (was 256 KiB).
+const SOCKET_BUF_SIZE: usize = 64 * 1024;
 /// TCP keepalive interval (keeps connections alive through NATs/firewalls).
 const TCP_KEEPALIVE_SECS: u64 = 30;
 

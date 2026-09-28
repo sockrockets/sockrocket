@@ -18,11 +18,19 @@
 //!
 //! Domestic names never enter the pool: they are answered with real
 //! addresses so `geoip:CN → direct` routing keeps them off the proxy.
+//!
+//! Persistence (Clash Meta / sing-box style): the domain↔fake-IP map is
+//! optionally written to disk so a TUN restart reuses the same addresses.
+//! Clients that still hold a cached Fake-IP after a toggle then reverse-map
+//! correctly instead of waiting for DNS TTL expiry (~minutes on ISP DNS).
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
@@ -50,6 +58,10 @@ const MAX_ENTRIES: usize = 8192;
 /// geoip path — which is exactly the path this table exists to bypass.
 const DOMESTIC_MAX_ENTRIES: usize = 16384;
 
+/// Debounce disk writes on JFFS/flash: at most one persist every N seconds
+/// while allocating; shutdown always flushes.
+const PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Test whether an address belongs to the fake range. Cheap and pure, so
 /// hot paths (every TUN stream) can call it without touching the pool.
 pub fn is_fake_ip(ip: Ipv4Addr) -> bool {
@@ -63,6 +75,8 @@ pub fn is_fake_ip(ip: Ipv4Addr) -> bool {
 /// resolver is always resolvable by the stream handler.
 pub struct FakeIpPool {
     inner: Mutex<Inner>,
+    persist_path: Option<PathBuf>,
+    last_persist: Mutex<Option<Instant>>,
 }
 
 struct Inner {
@@ -74,16 +88,6 @@ struct Inner {
     order: VecDeque<String>,
     /// Real addresses (v4 and v6) recently answered for domestic-group
     /// (China) names, mapped to the name that produced them.
-    ///
-    /// Why this exists: geoip is the only signal the TUN layer has for
-    /// bare-IP traffic, and geoip databases routinely miss CDN ranges
-    /// (observed: a domestic site → CDN
-    /// a domestic CDN address not classified CN → forced through the proxy → the
-    /// unlock-model exit cannot dial the bare IP → site dead). The DNS
-    /// split already decided these names are domestic; remembering their
-    /// answers lets the TUN handler honor that decision and dial direct.
-    /// Keeping the domain alongside lets explicit user routing rules
-    /// (domain/domain-suffix/keyword) override the direct default.
     domestic: LruCache<IpAddr, String>,
 }
 
@@ -99,7 +103,132 @@ impl FakeIpPool {
                     NonZeroUsize::new(DOMESTIC_MAX_ENTRIES).expect("capacity is non-zero"),
                 ),
             }),
+            persist_path: None,
+            last_persist: Mutex::new(None),
         })
+    }
+
+    /// Load a previously persisted store (Clash Meta–style cache), or start
+    /// empty when the file is missing/corrupt. Always attaches `path` for
+    /// subsequent [`Self::persist`] / debounced writes from [`Self::allocate`].
+    pub fn load_or_new(path: impl Into<PathBuf>) -> Arc<Self> {
+        let path = path.into();
+        let pool = Arc::new(Self {
+            inner: Mutex::new(Inner {
+                next: FIRST_HOST_OFFSET,
+                by_domain: HashMap::new(),
+                by_ip: HashMap::new(),
+                order: VecDeque::new(),
+                domestic: LruCache::new(
+                    NonZeroUsize::new(DOMESTIC_MAX_ENTRIES).expect("capacity is non-zero"),
+                ),
+            }),
+            persist_path: Some(path.clone()),
+            last_persist: Mutex::new(None),
+        });
+        if let Err(e) = pool.load_from(&path) {
+            tracing::warn!(
+                "fake-IP store load from {}: {e:#} — starting empty",
+                path.display()
+            );
+        } else {
+            let n = pool
+                .inner
+                .lock()
+                .map(|g| g.by_domain.len())
+                .unwrap_or(0);
+            if n > 0 {
+                tracing::info!(
+                    "fake-IP store loaded {} mapping(s) from {}",
+                    n,
+                    path.display()
+                );
+            }
+        }
+        pool
+    }
+
+    fn load_from(&self, path: &Path) -> std::io::Result<()> {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut inner = self.inner.lock().expect("fake-ip pool poisoned");
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("next=") {
+                if let Ok(n) = rest.parse::<u32>() {
+                    inner.next = n.max(FIRST_HOST_OFFSET);
+                }
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let (Some(ip_s), Some(domain)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Ok(ip) = ip_s.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if !is_fake_ip(ip) {
+                continue;
+            }
+            let domain = domain.to_ascii_lowercase();
+            if inner.by_domain.len() >= MAX_ENTRIES {
+                break;
+            }
+            if inner.by_domain.contains_key(&domain) || inner.by_ip.contains_key(&ip) {
+                continue;
+            }
+            inner.by_domain.insert(domain.clone(), ip);
+            inner.by_ip.insert(ip, domain.clone());
+            inner.order.push_back(domain);
+        }
+        Ok(())
+    }
+
+    /// Flush the domain↔IP map to disk. No-op when persistence is disabled.
+    pub fn persist(&self) -> std::io::Result<()> {
+        let Some(path) = self.persist_path.as_ref() else {
+            return Ok(());
+        };
+        let (next, rows) = {
+            let inner = self.inner.lock().expect("fake-ip pool poisoned");
+            let rows: Vec<(Ipv4Addr, String)> = inner
+                .order
+                .iter()
+                .filter_map(|d| inner.by_domain.get(d).map(|ip| (*ip, d.clone())))
+                .collect();
+            (inner.next, rows)
+        };
+        let mut out = String::from("# sockrocket fake-ip store v1\n");
+        out.push_str(&format!("next={next}\n"));
+        for (ip, domain) in rows {
+            out.push_str(&format!("{ip} {domain}\n"));
+        }
+        let tmp = path.with_extension("store.tmp");
+        fs::write(&tmp, out)?;
+        fs::rename(&tmp, path)?;
+        if let Ok(mut last) = self.last_persist.lock() {
+            *last = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    fn maybe_persist(&self) {
+        let Ok(last) = self.last_persist.lock() else {
+            return;
+        };
+        if last.is_some_and(|t| t.elapsed() < PERSIST_MIN_INTERVAL) {
+            return;
+        }
+        drop(last);
+        if let Err(e) = self.persist() {
+            tracing::debug!("fake-IP persist skipped/failed: {e}");
+        }
     }
 
     /// Return the fake address for `domain`, allocating one on first use.
@@ -138,6 +267,8 @@ impl FakeIpPool {
         inner.by_domain.insert(domain.clone(), ip);
         inner.by_ip.insert(ip, domain.clone());
         inner.order.push_back(domain);
+        drop(inner);
+        self.maybe_persist();
         ip
     }
 
@@ -156,10 +287,7 @@ impl FakeIpPool {
     }
 
     /// Remember that `ip` was just answered for the domestic-group name
-    /// `domain` (see [`Inner::domestic`]). Called by the resolver on every
-    /// domestic-group A/AAAA answer, including cache hits — the repeated
-    /// `put` refreshes recency, which is what keeps a hot name's address
-    /// from being LRU-evicted by one-off CDN answers.
+    /// `domain` (see [`Inner::domestic`]).
     pub fn record_domestic(&self, ip: IpAddr, domain: &str) {
         self.inner
             .lock()
@@ -169,11 +297,7 @@ impl FakeIpPool {
     }
 
     /// The domestic-group name that most recently resolved to `ip`, if any.
-    /// Presence means "the DNS split considers this a domestic address" —
-    /// the TUN handler dials it direct unless a user rule says otherwise.
     pub fn lookup_domestic(&self, ip: IpAddr) -> Option<String> {
-        // peek (not get): lookups here must not promote recency — only a
-        // fresh DNS answer proves the address is still being handed out.
         self.inner
             .lock()
             .expect("fake-ip pool poisoned")
@@ -240,12 +364,10 @@ mod tests {
     fn lru_eviction_drops_oldest() {
         let pool = FakeIpPool::new();
         let first = pool.allocate("first.example.com");
-        // Fill the pool to capacity.
         for i in 1..MAX_ENTRIES {
             pool.allocate(&format!("d{i}.example.com"));
         }
         assert_eq!(pool.len(), MAX_ENTRIES);
-        // One more allocation evicts the oldest ("first.example.com").
         pool.allocate("overflow.example.com");
         assert_eq!(pool.len(), MAX_ENTRIES);
         assert_eq!(pool.lookup(first), None, "oldest mapping must be evicted");
@@ -258,14 +380,31 @@ mod tests {
         assert_eq!(pool.lookup_domestic(ip), None);
         pool.record_domestic(ip, "example.cn");
         assert_eq!(pool.lookup_domestic(ip).as_deref(), Some("example.cn"));
-        // Unrelated addresses stay unknown.
         assert_eq!(
             pool.lookup_domestic(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11))),
             None
         );
-        // IPv6 records work too (dual-stack clients may prefer v6).
         let v6 = IpAddr::V6("2001:db8::1".parse().unwrap());
         pool.record_domestic(v6, "example.cn");
         assert_eq!(pool.lookup_domestic(v6).as_deref(), Some("example.cn"));
+    }
+
+    #[test]
+    fn persist_roundtrip_reuses_same_ip() {
+        let dir = std::env::temp_dir().join(format!("sockrocket-fakeip-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("fakeip.store");
+        let _ = fs::remove_file(&path);
+
+        let pool = FakeIpPool::load_or_new(&path);
+        let ip = pool.allocate("www.google.com");
+        pool.persist().unwrap();
+
+        let pool2 = FakeIpPool::load_or_new(&path);
+        assert_eq!(pool2.lookup(ip).as_deref(), Some("www.google.com"));
+        assert_eq!(pool2.allocate("www.google.com"), ip);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
     }
 }

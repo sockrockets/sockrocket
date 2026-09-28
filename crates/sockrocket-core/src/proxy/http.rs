@@ -47,8 +47,8 @@ impl HttpProxyServer {
                     let (stream, peer) = result?;
                     stream.set_nodelay(true).ok();
                     let sock = SockRef::from(&stream);
-                    sock.set_send_buffer_size(256 * 1024).ok();
-                    sock.set_recv_buffer_size(256 * 1024).ok();
+                    sock.set_send_buffer_size(64 * 1024).ok();
+                    sock.set_recv_buffer_size(64 * 1024).ok();
                     let outbound = self.outbound.clone();
                     let stats = self.stats.clone();
                     tokio::spawn(async move {

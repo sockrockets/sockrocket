@@ -1285,7 +1285,7 @@ fn act_set_toggles(post: &J) -> J {
     let Ok(map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let (cur_proxy, cur_dns) = effective_toggles(&map);
+    let (cur_proxy, mut cur_dns) = effective_toggles(&map);
     let cur_cn = conf_bool(&map, "cn_ipset_direct", false);
 
     // Apply transparent_proxy first: dns_hijack verification depends on the
@@ -1305,6 +1305,13 @@ fn act_set_toggles(post: &J) -> J {
             return err_msg(&format!("Save failed: {e}"));
         }
         if new_proxy {
+            // Full transparent path: TUN + DNS hijack. Fake-IP only exists
+            // with --tun; without TUN, hijack still serves short-TTL real IPs
+            // (safe). TUN without hijack leaves clients on polluted ISP DNS.
+            map.insert(ykey("dns_hijack"), Y::Bool(true));
+            if let Err(e) = save_conf(&map) {
+                return err_msg(&format!("Save failed: {e}"));
+            }
             // restart brings up --tun + iptables + dnsmasq per the keys.
             // do_start rewrites `mode` on disk while we are in here.
             run_sh("restart");
@@ -1314,7 +1321,8 @@ fn act_set_toggles(post: &J) -> J {
             )
             .map(|o| o.contains("MARK"))
             .unwrap_or(false);
-            if !ok {
+            let dns_ok = dnsmasq_hijack_conf().exists();
+            if !ok || !dns_ok {
                 // Re-read before the rollback for the same reason: the disk
                 // state changed during run_sh.
                 let mut map = match load_conf() {
@@ -1322,14 +1330,20 @@ fn act_set_toggles(post: &J) -> J {
                     Err(e) => return err_msg(&format!("Failed to read config: {e}")),
                 };
                 map.insert(ykey("transparent_proxy"), Y::Bool(false));
+                // Keep DNS hijack on so LAN stays on short-TTL sockrocket DNS
+                // (no Fake-IP without --tun) instead of ISP long-TTL.
+                map.insert(ykey("dns_hijack"), Y::Bool(true));
                 let _ = save_conf(&map);
-                // Config now says off — make the router match: tear down any
-                // half-applied rules and restart a plain (non-tun) daemon,
-                // otherwise a --tun process lingers with no steering rules.
+                // Config now says TUN off — tear MARK rules and restart plain
+                // daemon; DNS hijack is re-applied by do_start when wanted.
                 run_sh("proxy-off");
-                return json!({"ok": false, "msg": "Failed to enable transparent proxy: TUN or iptables rules not ready (check the tun module)"});
+                return json!({"ok": false, "msg": "Failed to enable transparent proxy: TUN/iptables/DNS hijack not ready (check the tun module and logs)"});
             }
         } else {
+            // Turn TUN/iptables off but KEEP dns_hijack. Without --tun the
+            // daemon serves real IPs (no Fake-IP) with short TTL — LAN stays
+            // online, and re-enabling TUN recovers in seconds instead of
+            // waiting out ISP DNS TTLs (~60s+).
             run_sh("proxy-off");
             let still_on = run_cmd(
                 "iptables",
@@ -1344,14 +1358,24 @@ fn act_set_toggles(post: &J) -> J {
                 };
                 map.insert(ykey("transparent_proxy"), Y::Bool(true));
                 let _ = save_conf(&map);
-                return json!({"ok": false, "msg": "Failed to disable transparent proxy: iptables rules still present"});
+                return json!({"ok": false, "msg": "Failed to disable transparent proxy: iptables MARK still present"});
             }
+            // Refresh cur_dns from disk (proxy-off / do_start may leave it on).
+            if let Ok(m) = load_conf() {
+                let (_, d) = effective_toggles(&m);
+                cur_dns = d;
+            }
+        }
+        if new_proxy {
+            cur_dns = true;
         }
     }
 
     if let Some(new_dns) = want_dns
         && new_dns != cur_dns
     {
+        // DNS hijack without TUN is OK: Fake-IP is only enabled with --tun.
+        // SOCKS-mode hijack serves short-TTL real IPs (china-split).
         // Same re-read as the proxy block: a save after run_sh must start
         // from what is on disk NOW, not from the snapshot taken earlier.
         let mut map = match load_conf() {
@@ -1494,6 +1518,18 @@ fn act_stats() -> J {
     json!({"ok": true, "uptime": uptime, "pid": pid_val, "dns_active": dns_active, "fw_active": fw_active})
 }
 
+fn vm_rss_kb(pid: &str) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn act_sysinfo() -> J {
     let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let kb_of = |key: &str| -> u64 {
@@ -1526,11 +1562,21 @@ fn act_sysinfo() -> J {
     let wan_ip = run_cmd("nvram", &["get", "wan0_ipaddr"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    // Per-process RSS so the UI can show Sockrocket's own footprint vs
+    // system-wide MemAvailable pressure (often ~40–50% on Merlin even idle).
+    let daemon_rss_kb = fs::read_to_string(pid_path())
+        .ok()
+        .map(|p| vm_rss_kb(p.trim()))
+        .filter(|_| is_running())
+        .unwrap_or(0);
+    let api_rss_kb = vm_rss_kb(&std::process::id().to_string());
     json!({
         "ok": true,
         "mem_total_kb": mem_total,
         "mem_used_kb": mem_used,
         "mem_pct": mem_pct,
+        "daemon_rss_kb": daemon_rss_kb,
+        "api_rss_kb": api_rss_kb,
         "load": load,
         "uptime": format!("{}h {}m", uptime_s / 3600, (uptime_s % 3600) / 60),
         "wan_ip": wan_ip,

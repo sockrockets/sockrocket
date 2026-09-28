@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use etherparse::{Icmpv4Header, Icmpv6Header};
@@ -361,12 +361,15 @@ impl TunProxy {
         // long-lived push/heartbeat channels (chat clients, GCM :5228,
         // Apple Push :5223, QUIC-like :4430) routinely idle for longer and
         // were killed ("session timeout reached"), making the phone app show
-        // the PC as offline and delaying push delivery. 3600s matches the
-        // common NAT conntrack "established" timeout that home routers give
-        // these connections on a direct path.
-        tcp_config.timeout = std::time::Duration::from_secs(3600);
+        // the PC as offline and delaying push delivery. 1800s is still above
+        // typical push idle gaps while capping how long a dead session can
+        // hold ipstack memory on a memory-tight Merlin router.
+        tcp_config.timeout = std::time::Duration::from_secs(1800);
         tcp_config.options = Some(vec![TcpOptions::MaximumSegmentSize(tun_tcp_mss(TUN_MTU))]);
-        tcp_config.max_unacked_bytes = 256 * 1024;
+        // 64 KiB (was 256 KiB): each TUN TCP session buffers up to this many
+        // unacked bytes in userspace. Hundreds of phone/PC flows × 256 KiB
+        // was a major contributor to OOM / dropbear death on 1 GB routers.
+        tcp_config.max_unacked_bytes = 64 * 1024;
         ipstack_config.with_tcp_config(tcp_config);
         ipstack_config.udp_timeout(std::time::Duration::from_secs(30));
 
@@ -377,6 +380,19 @@ impl TunProxy {
 
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
+
+        // Cap concurrent stream tasks so a LAN scan / download burst cannot
+        // grow the JoinSet (and ipstack session table) without bound.
+        const MAX_TUN_STREAMS: usize = 512;
+        let active_streams = Arc::new(AtomicUsize::new(0));
+
+        /// Decrements the active-stream counter when a per-stream task ends.
+        struct StreamSlot(Arc<AtomicUsize>);
+        impl Drop for StreamSlot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
 
         let handle = tokio::spawn(async move {
             // Create DNS resolver for intercepting TUN DNS queries.
@@ -419,11 +435,23 @@ impl TunProxy {
                 };
                 match accepted {
                     Ok(stream) => {
+                        if active_streams.load(Ordering::Relaxed) >= MAX_TUN_STREAMS {
+                            // Drop the stream by letting it fall out of scope:
+                            // ipstack closes/RSTs; prefer this over unbounded
+                            // memory growth under a connection flood.
+                            tracing::debug!(
+                                "TUN stream cap ({MAX_TUN_STREAMS}) reached — dropping new session"
+                            );
+                            continue;
+                        }
                         let outbound = outbound.clone();
                         let resolver = dns_resolver.clone();
                         let fakeip = fakeip.clone();
                         let router = router.clone();
+                        let active = active_streams.clone();
+                        active.fetch_add(1, Ordering::Relaxed);
                         streams.spawn(async move {
+                            let _slot = StreamSlot(active);
                             if let Err(e) =
                                 handle_tun_stream(stream, outbound, resolver, fakeip, router).await
                             {

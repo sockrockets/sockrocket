@@ -801,6 +801,7 @@ function chipPending(id, on) {
 }
 function toggleDns() {
   var want = !S.status.dns_hijack;
+  // DNS hijack without TUN is OK (short-TTL real IPs, no Fake-IP).
   chipPending('chip-dns', true);
   api('set_toggles', { dns_hijack: want }, function (d) {
     chipPending('chip-dns', false);
@@ -820,13 +821,21 @@ function toggleCn() {
 function toggleProxy() {
   var want = !S.status.transparent_proxy;
   chipPending('chip-fw', true);
-  api('set_toggles', { transparent_proxy: want }, function (d) {
+  // Enabling TUN also ensures DNS hijack (Fake-IP needs it). Disabling TUN
+  // leaves DNS on so clients keep short-TTL answers and recover in seconds.
+  var body = want
+    ? { transparent_proxy: true, dns_hijack: true }
+    : { transparent_proxy: false };
+  if (want) chipPending('chip-dns', true);
+  api('set_toggles', body, function (d) {
     chipPending('chip-fw', false);
+    chipPending('chip-dns', false);
     toastResp(d);
-    // Turning the proxy on restarts the service (~10s before the TUN device
-    // and iptables rules are in place), so give it room before polling.
-    setTimeout(function () { refreshStatus(true); }, 1500);
-  }, function () { chipPending('chip-fw', false); });
+    setTimeout(function () { refreshStatus(true); }, want ? 3500 : 2000);
+  }, function () {
+    chipPending('chip-fw', false);
+    chipPending('chip-dns', false);
+  });
 }
 
 /* ══ Service control ═══════════════════════════════════════════════ */

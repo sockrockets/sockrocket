@@ -18,11 +18,10 @@ dns_direct_server: "114.114.114.114"   # DNS server for direct domains (China IS
 # system : set system proxy (for desktop clients; routers usually use tun)
 mode: "tun"
 
-# Independent toggles. DNS hijack defaults OFF so Softcenter / LAN DNS stay
-# usable until you have working nodes and explicitly enable it in the UI.
-# transparent_proxy may stay on in the template; sockrocket.sh still skips
-# both TUN and DNS when nodes: [] (no blackhole on fresh install).
-transparent_proxy: true
+# Independent toggles. Both default OFF so Softcenter / LAN stay usable until
+# you have working nodes and explicitly enable them in the UI. sockrocket.sh
+# also skips TUN and DNS when nodes: [] (no blackhole on fresh install).
+transparent_proxy: false
 dns_hijack: false
 
 # -- Active node ---------------------------------------------------------------
@@ -102,10 +101,15 @@ dns_direct_domains:
   - "vivo.com.cn"
 
 # -- Health check --------------------------------------------------------------
+# Probe the active node and auto-switch on failure so a dead exit does not
+# leave the LAN stuck on a blackholed proxy path.
 health_check:
-  url: "http://www.gstatic.com/generate_204"
-  interval: 300      # Check interval (seconds)
-  timeout: 10        # Timeout (seconds)
+  enabled: true
+  interval_secs: 60
+  # Switch on the first failed probe so a dead exit does not sit for a full
+  # interval before failover (TUN toggle / cold start feel seconds-fast).
+  failure_threshold: 1
+  auto_switch: true
 
 # -- Routing rules (matched in order) ------------------------------------------
 rules:

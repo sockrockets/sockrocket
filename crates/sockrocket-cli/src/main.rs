@@ -119,8 +119,16 @@ async fn async_main() -> Result<()> {
     // Fake-IP pool, shared by the DNS listener (hands out fake addresses for
     // international names) and the TUN proxy (maps them back to domains and
     // dials by name). TUN mode only: socks/http clients must keep receiving
-    // real addresses.
-    let fakeip_pool = enable_tun.then(sockrocket_core::FakeIpPool::new);
+    // real addresses. Persist like Clash Meta so TUN toggle/restart reuses
+    // the same 198.18.x.x → domain map (clients with cached Fake-IPs recover
+    // immediately instead of waiting on DNS TTL).
+    let fakeip_store = {
+        let p = std::path::Path::new(&config_path);
+        p.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("fakeip.store")
+    };
+    let fakeip_pool = enable_tun.then(|| sockrocket_core::FakeIpPool::load_or_new(&fakeip_store));
 
     // Proxy-server hostnames, shared with the DNS resolver so node servers
     // always resolve direct/real (never fake-IP). Repopulated on config
@@ -352,11 +360,25 @@ async fn async_main() -> Result<()> {
         None
     };
 
-    tracing::info!("Press Ctrl+C to stop");
+    tracing::info!("Press Ctrl+C / SIGTERM to stop");
+    // Merlin's sockrocket.sh stops us with SIGTERM. tokio::signal::ctrl_c only
+    // covers SIGINT — without SIGTERM the process ignored stop for the full
+    // graceful-wait window (~8s) before kill -9, dominating TUN toggle latency.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("register SIGTERM handler")?;
+    #[cfg(unix)]
+    let wait_term = async { sigterm.recv().await };
+    #[cfg(not(unix))]
+    let wait_term = std::future::pending::<Option<()>>();
+    tokio::pin!(wait_term);
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result?;
+                break;
+            }
+            _ = &mut wait_term => {
                 break;
             }
             event = config_watcher.next() => {
@@ -418,6 +440,13 @@ async fn async_main() -> Result<()> {
     }
     tracing::info!("Shutdown signal received");
     config_watcher.shutdown();
+
+    // Persist Fake-IP map before tearing down so the next --tun start reuses it.
+    if let Some(pool) = &fakeip_pool
+        && let Err(e) = pool.persist()
+    {
+        tracing::warn!("fake-IP store persist on shutdown failed: {e}");
+    }
 
     // Stop the DNS listener before the proxy/TUN so dnsmasq's forwarded
     // queries fail fast instead of hitting a half-torn-down resolver.
@@ -587,7 +616,21 @@ async fn load_config(path: &str) -> Result<AppConfig> {
     let parsed: AppConfig = serde_yaml::from_str(&content)?;
     let file_node_count = parsed.nodes.len();
     let has_subscriptions = !parsed.subscriptions.is_empty();
-    let config = resolve_config(parsed).await?;
+    // Fast path: nodes already persisted in config.yaml. Re-fetching every
+    // start/TUN toggle was ~8s of WAN I/O on Merlin (4 subs, one 404). Explicit
+    // refresh: `SOCKROCKET_REFRESH_SUBS=1` (update-subs / daily cron) or an
+    // empty nodes list (first install).
+    let refresh_subs = env::var_os("SOCKROCKET_REFRESH_SUBS").is_some();
+    let config = if file_node_count > 0 && !refresh_subs {
+        tracing::info!(
+            "Using {file_node_count} persisted node(s); skipping subscription fetch"
+        );
+        let mut config = parsed;
+        normalize_node_names(&mut config.nodes);
+        config
+    } else {
+        resolve_config(parsed).await?
+    };
     // Persist subscription-fetched nodes back into the config file so other
     // consumers that only read the file (e.g. the router Web UI's node list
     // and active-node index) stay consistent with what sockrocket-cli runs. The
@@ -688,8 +731,8 @@ async fn resolve_config(mut config: AppConfig) -> Result<AppConfig> {
 /// config editor) write `active_node` / toggles often; each write used to
 /// trigger a full subscription download + 178→89 dedup, saturating the
 /// router's WAN/CPU and briefly swapping the outbound mid-traffic.
-/// Subscription refresh stays explicit: process start (`load_config`) and
-/// `update-subs` / the daily cron.
+/// Subscription refresh stays explicit: `SOCKROCKET_REFRESH_SUBS=1` on start
+/// (`update-subs` / daily cron) or the Web UI `update_subs` action.
 async fn apply_reloaded_config(
     mut config: AppConfig,
 ) -> Result<(AppConfig, Option<usize>, SharedOutbound)> {

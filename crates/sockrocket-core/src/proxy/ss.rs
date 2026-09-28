@@ -62,8 +62,8 @@ impl Outbound for SsOutbound {
             // throughput on high-BDP links.
             let opts = ConnectOpts {
                 tcp: shadowsocks::net::TcpSocketOpts {
-                    send_buffer_size: Some(256 * 1024),
-                    recv_buffer_size: Some(256 * 1024),
+                    send_buffer_size: Some(64 * 1024),
+                    recv_buffer_size: Some(64 * 1024),
                     nodelay: true,
                     ..Default::default()
                 },

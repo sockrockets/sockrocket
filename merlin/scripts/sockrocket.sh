@@ -10,6 +10,12 @@ SOCKROCKET_SCRIPTS="$SOCKROCKET_DIR/scripts"
 SOCKROCKET_PID="$SOCKROCKET_DIR/sockrocket.pid"
 SOCKROCKET_LOG="$SOCKROCKET_DIR/sockrocket.log"
 SOCKROCKET_LOCK="$SOCKROCKET_DIR/sockrocket.lock"
+# Runtime fail-open marker: present ⇒ LAN uses direct DNS/routing; config
+# toggles still express user intent and are re-applied when the probe recovers.
+DEGRADED_FILE="$SOCKROCKET_DIR/.lan_degraded"
+WOUT_FAILS_FILE="$SOCKROCKET_DIR/.wout_fails"
+SUPERVISOR_PID="$SOCKROCKET_DIR/sockrocket-supervisor.pid"
+GUARD_PID_FILE="$SOCKROCKET_DIR/sockrocket-guard.pid"
 # Crash forensics ("black box"): text history on jffs (tiny). Optional core
 # dumps live on /tmp (tmpfs) and are OFF by default — unlimited cores plus a
 # system-wide core_pattern rewrite can fill router RAM and affect other
@@ -234,8 +240,9 @@ rotate_log() {
 setup_cron() {
     # Subscription auto-update daily at 04:00
     cru a SockrocketSubUpdate "0 4 * * * $SOCKROCKET_DIR/scripts/sockrocket.sh update-subs" 2>/dev/null || true
-    # Watchdog every 5 minutes
-    cru a SockrocketWatchdog "*/5 * * * * $SOCKROCKET_DIR/scripts/sockrocket.sh watchdog" 2>/dev/null || true
+    # Slow safety net only — second-scale recovery is the in-process
+    # supervisor + guard loop started by do_start.
+    cru a SockrocketWatchdog "*/1 * * * * $SOCKROCKET_DIR/scripts/sockrocket.sh watchdog" 2>/dev/null || true
 }
 
 remove_cron() {
@@ -261,13 +268,17 @@ count_section() {
 
 # Ensure the two toggle keys exist in config.yaml, deriving them from the
 # legacy `mode` key when absent. Idempotent; called from do_start.
+#
+# Fail-open defaults: missing keys must NOT enable DNS hijack. A missing
+# dns_hijack on an old config used to become true whenever mode=tun, which
+# blackholed Softcenter/LAN DNS on first boot before the user opted in.
 migrate_toggle_keys() {
     [ -f "$SOCKROCKET_CONF" ] || return 0
     [ -n "$(get_config_value transparent_proxy)" ] && [ -n "$(get_config_value dns_hijack)" ] && return 0
     local mode tp dh
     mode=$(get_config_value mode)
     case "${mode:-tun}" in
-        tun) tp=true;  dh=true  ;;
+        tun) tp=true;  dh=false ;;
         *)   tp=false; dh=false ;;
     esac
     local tmp="$SOCKROCKET_CONF.tmp"
@@ -491,7 +502,7 @@ do_start() {
     # Zero-config / not-ready guard: TUN + DNS hijack must not run until
     # there is at least one persisted node. A subscription URL alone is not
     # enough — fetch may still fail, and hijacking LAN DNS in that state
-    # makes Softcenter show "数据加载中，请稍候重试" and can blackhole SSH.
+    # freezes Softcenter ("loading data, retry later") and can blackhole SSH.
     local force_socks=0
     if [ "$(count_section nodes)" = "0" ]; then
         force_socks=1
@@ -504,7 +515,8 @@ do_start() {
     migrate_toggle_keys
     local want_proxy want_dns
     want_proxy=$(conf_bool transparent_proxy true)
-    want_dns=$(conf_bool dns_hijack true)
+    # Default OFF: match config.yaml.template and Softcenter-safe install.
+    want_dns=$(conf_bool dns_hijack false)
 
     if [ "$force_socks" = "1" ]; then
         if [ "$want_proxy" = "true" ]; then
@@ -517,10 +529,26 @@ do_start() {
         fi
     fi
 
+    # DNS hijack WITHOUT TUN is safe: Fake-IP is only enabled when the
+    # daemon is started with --tun. SOCKS-mode hijack serves short-TTL real
+    # IPs (china-split) so closing TUN does not push clients onto ISP DNS
+    # (long TTLs → ~1min bare-IP blackhole after re-enable).
+
+    # Fail-open marker: keep the daemon (SOCKS/HTTP) up for recovery probes,
+    # but do not re-hijack LAN until try_recover_lan_proxy clears the marker.
+    if [ -f "${SOCKROCKET_DIR}/.lan_degraded" ]; then
+        if [ "$want_proxy" = "true" ] || [ "$want_dns" = "true" ]; then
+            warn "LAN degraded ($(cat "${SOCKROCKET_DIR}/.lan_degraded" 2>/dev/null)) — starting without transparent proxy/DNS hijack"
+        fi
+        want_proxy=false
+        want_dns=false
+    fi
+
     # TUN must be up BEFORE handing --tun to sockrocket-cli.
     if [ "$want_proxy" = "true" ] && ! ensure_tun; then
         log_error "Failed to enable transparent proxy: TUN device unavailable (tried modprobe/insmod/mknod)"
         want_proxy=false
+        # Keep DNS hijack if wanted — SOCKS mode has no Fake-IP.
     fi
 
     # Core dumps must be enabled in THIS shell: the daemon inherits ulimit
@@ -528,19 +556,23 @@ do_start() {
     enable_core_dumps
 
     if [ "$want_proxy" = "true" ]; then
-        nice -n 3 "$SOCKROCKET_BIN" "$SOCKROCKET_CONF" --tun >> "$SOCKROCKET_LOG" 2>&1 &
+        start_daemon_supervised 1
         [ "$(get_config_value mode)" != "tun" ] && sed -i 's/^mode:.*/mode: "tun"/' "$SOCKROCKET_CONF" 2>/dev/null
     else
-        nice -n 3 "$SOCKROCKET_BIN" "$SOCKROCKET_CONF" >> "$SOCKROCKET_LOG" 2>&1 &
+        start_daemon_supervised 0
         [ "$(get_config_value mode)" != "socks" ] && sed -i 's/^mode:.*/mode: "socks"/' "$SOCKROCKET_CONF" 2>/dev/null
     fi
-    echo $! > "$SOCKROCKET_PID"
-    sleep 1
-
+    # Supervisor writes SOCKROCKET_PID; poll briefly instead of a fixed 1s sleep.
+    local ready=0
+    while [ "$ready" -lt 3 ]; do
+        is_running && break
+        sleep 1
+        ready=$((ready + 1))
+    done
     if is_running; then
         ok "Sockrocket started (PID $(cat "$SOCKROCKET_PID"))"
         # Softcenter offline install must not block 20–35s on TUN/DNS waits —
-        # that freezes the software-center UI ("数据加载中"). FAST_START
+        # that freezes the software-center UI ("loading data"). FAST_START
         # applies rules in the background; normal starts wait as before.
         if [ "${SOCKROCKET_FAST_START:-0}" = "1" ]; then
             (
@@ -587,12 +619,16 @@ do_start() {
             fi
         fi
         setup_cron
+        start_guard
+        try_recover_lan_proxy
     else
         log_error "Sockrocket failed to start. Last log lines:"
         tail -20 "$SOCKROCKET_LOG" 2>/dev/null | while IFS= read -r line; do
             log_error "  $line"
         done
         rm -f "$SOCKROCKET_PID"
+        # Daemon failed with possible leftover intent — don't leave LAN hijacked.
+        enter_lan_degraded "start failed"
         return 1
     fi
 }
@@ -706,6 +742,8 @@ restore_direct_network() {
         ip route flush table 5370 2>/dev/null || true
         ip rule  del fwmark 0x4765 table 100 2>/dev/null || true
     fi
+    # Full restore: drop Fake-IP blackhole too (TUN-off path keeps it for fail-fast).
+    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
 
     # dnsmasq hijack file + upstream pin
     update_dnsmasq stop
@@ -729,6 +767,39 @@ restore_direct_network() {
 
     # Drop TUN device left by --tun so no stale routes linger
     ip link del sockrocket-tun 2>/dev/null || true
+
+    # OOM under TUN/ipstack has been observed to kill dropbear and leave the
+    # router unreachable over SSH while HTTP still answers. Best-effort
+    # revive management access whenever we restore the direct path.
+    ensure_sshd
+}
+
+# Restart dropbear/sshd when the configured SSH port is not listening.
+# Safe no-op when SSH is intentionally disabled (nvram sshd_enable=0).
+ensure_sshd() {
+    local en port
+    en=$(nvram get sshd_enable 2>/dev/null || echo "")
+    [ "$en" = "0" ] && return 0
+    port=$(nvram get sshd_port 2>/dev/null || echo "")
+    port=${port:-22}
+    # Already listening?
+    if netstat -ln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" \
+        || netstat -ln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+        return 0
+    fi
+    log_warn "SSH port ${port} not listening — restarting dropbear/sshd"
+    if service restart_sshd >/dev/null 2>&1; then
+        sleep 1
+    elif which dropbear >/dev/null 2>&1; then
+        killall dropbear 2>/dev/null || true
+        dropbear -p "$port" >/dev/null 2>&1 || dropbear >/dev/null 2>&1 || true
+        sleep 1
+    fi
+    if netstat -ln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"; then
+        ok "SSH restored on port ${port}"
+    else
+        log_warn "SSH still down on port ${port} — reboot the router if management stays unreachable"
+    fi
 }
 
 do_stop() {
@@ -736,13 +807,22 @@ do_stop() {
     # sockrocket.pid) used to skip all cleanup, leaving the iptables MARK rules and
     # the dnsmasq hijack (catch-all → 127.0.0.1:5300) live with nothing
     # listening — a LAN-wide DNS blackhole the Web UI could not clear.
+    #
+    # Stamp stopped FIRST so the supervisor does not treat our kill as a crash
+    # and immediately respawn / fail-open race.
+    : > "$SOCKROCKET_DIR/stopped"
+    stop_guard
+    stop_supervisor
+
     if is_running; then
         info "Stopping Sockrocket (API bridge keeps running so the Web UI can start it again)..."
         local pid
         pid=$(cat "$SOCKROCKET_PID")
         kill "$pid" 2>/dev/null
+        # Daemon handles SIGTERM (and used to ignore it → full 8s wait every
+        # TUN toggle). Keep a short grace window then SIGKILL.
         local wait=0
-        while kill -0 "$pid" 2>/dev/null && [ "$wait" -lt 8 ]; do
+        while kill -0 "$pid" 2>/dev/null && [ "$wait" -lt 3 ]; do
             sleep 1; wait=$((wait + 1))
         done
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
@@ -757,10 +837,7 @@ do_stop() {
     remove_cron
     restore_core_pattern
     prune_core_dumps
-
-    # The config keys express user INTENT and are deliberately left alone by
-    # stop: restarting the service must restore the user's chosen toggles.
-    : > "$SOCKROCKET_DIR/stopped"
+    rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
 
     ok "Sockrocket stopped (direct LAN network restored)"
 }
@@ -780,28 +857,30 @@ do_dns_off() {
     [ ! -f "${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf" ]
 }
 
-# proxy-off: tear down ONLY the transparent-proxy rules. The daemon keeps
-# running so SOCKS/HTTP stay reachable.
+# proxy-off: tear down transparent-proxy (iptables/TUN) but KEEP DNS hijack
+# when dns_hijack=true.
 #
-# This is a low-level primitive and is NOT durable on its own: the config key
-# still says transparent_proxy=true, so the next watchdog pass would reapply
-# the rules. Callers must write the key to false FIRST (cgi.rs's set_toggles
-# does exactly that), after which the watchdog's key guard keeps it off.
-# dns-off needs no such pairing — the DNS watchdog can only remove a hijack.
+# Fake-IP only exists with --tun. Restarting without --tun makes the DNS
+# listener hand out short-TTL *real* IPs — LAN keeps working, and re-enabling
+# TUN recovers in seconds (no ISP long-TTL hang). Callers write
+# transparent_proxy=false FIRST; leave dns_hijack as-is unless the user
+# explicitly turned DNS off.
 do_proxy_off() {
     [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1
     local rc=0
     iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK" && rc=1
-    # A daemon started with --tun keeps its TUN stack up even after the
-    # steering rules are gone; restart it in plain mode so the running
-    # process matches the (now off) configuration.
+    # A daemon started with --tun keeps its TUN stack (and Fake-IP pool) up
+    # even after the steering rules are gone; restart in plain mode so Fake-IP
+    # stops and short-TTL real answers take over.
     local pid
     pid=$(cat "$SOCKROCKET_PID" 2>/dev/null)
     if [ -n "$pid" ] \
         && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- "--tun"; then
         do_stop
-        sleep 1
         do_start
+    elif [ "$(conf_bool dns_hijack false)" = "true" ]; then
+        # Already SOCKS-mode: just make sure hijack file is present.
+        wait_for_dns 10 && update_dnsmasq start
     fi
     return $rc
 }
@@ -836,13 +915,13 @@ do_status() {
 
 # ── Update subscriptions ──────────────────────────────────────────────────────
 do_update_subs() {
-    info "Updating subscriptions (restart to re-fetch)..."
+    info "Updating subscriptions (force re-fetch on next start)..."
     if is_running; then
         do_stop
-        sleep 1
-        do_start
+        # Persisted nodes normally skip WAN fetch on start; force refresh here.
+        SOCKROCKET_REFRESH_SUBS=1 do_start
     else
-        do_start
+        SOCKROCKET_REFRESH_SUBS=1 do_start
     fi
     ok "Subscription update triggered"
 }
@@ -1010,6 +1089,201 @@ collect_crash_dump() {
     fi
 }
 
+# ── Second-scale supervisor / guard ───────────────────────────────────────────
+# Cron (1 min) is only a safety net. Real recovery must be seconds:
+#   - supervisor waits on the daemon; on exit → immediate LAN fail-open + restart
+#   - guard polls every 5s for dead DNS port / recover-from-degraded
+
+stop_supervisor() {
+    local pid
+    pid=$(cat "$SUPERVISOR_PID" 2>/dev/null)
+    # The waiter masks TERM (`trap '' HUP INT TERM`); SIGKILL immediately.
+    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+    rm -f "$SUPERVISOR_PID"
+}
+
+stop_guard() {
+    local pid
+    pid=$(cat "$GUARD_PID_FILE" 2>/dev/null)
+    # Same as supervisor: the guard loop ignores TERM.
+    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+    rm -f "$GUARD_PID_FILE"
+}
+
+# Launch sockrocket-cli under a waiter that fail-opens the LAN the instant the
+# process exits (no waiting for cron), then respawns in a loop until stopped.
+start_daemon_supervised() {
+    local use_tun="$1"
+    stop_supervisor
+    (
+        trap '' HUP INT TERM
+        while [ ! -f "$SOCKROCKET_DIR/stopped" ]; do
+            if [ "$use_tun" = "1" ]; then
+                nice -n 3 "$SOCKROCKET_BIN" "$SOCKROCKET_CONF" --tun >> "$SOCKROCKET_LOG" 2>&1 &
+            else
+                nice -n 3 "$SOCKROCKET_BIN" "$SOCKROCKET_CONF" >> "$SOCKROCKET_LOG" 2>&1 &
+            fi
+            local dpid=$!
+            echo "$dpid" > "$SOCKROCKET_PID"
+            # Poll death every 1s. Only fail-open on "DNS port lost" after we
+            # have observed the port UP at least once — otherwise startup races
+            # (TUN/DNS bind takes a few seconds) false-trigger degrade.
+            local dns_seen_up=0
+            while kill -0 "$dpid" 2>/dev/null; do
+                if [ -f "$SOCKROCKET_DIR/stopped" ]; then
+                    wait "$dpid" 2>/dev/null
+                    exit 0
+                fi
+                if [ "$(conf_bool dns_hijack false)" = "true" ]; then
+                    local dns_port
+                    dns_port=$(get_config_value dns_port)
+                    dns_port=${dns_port:-5300}
+                    if netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
+                        dns_seen_up=1
+                    elif [ "$dns_seen_up" = "1" ] && [ ! -f "$DEGRADED_FILE" ]; then
+                        echo "daemon DNS port lost while pid $dpid still alive" > "$DEGRADED_FILE"
+                        sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
+                        log_error "LAN fail-open: DNS port lost during daemon teardown (pid $dpid)"
+                    fi
+                fi
+                sleep 1
+            done
+            wait "$dpid" 2>/dev/null
+            local rc=$?
+            if [ "$(cat "$SOCKROCKET_PID" 2>/dev/null)" = "$dpid" ]; then
+                rm -f "$SOCKROCKET_PID"
+            fi
+            if [ -f "$SOCKROCKET_DIR/stopped" ]; then
+                exit 0
+            fi
+            echo "daemon exited rc=$rc" > "$DEGRADED_FILE"
+            sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
+            log_error "Daemon exited (pid $dpid rc=$rc) — fail-open LAN immediately"
+            sleep 2
+        done
+    ) &
+    echo $! > "$SUPERVISOR_PID"
+}
+
+# 5-second poller: dead DNS listener while hijack is intended → fail-open;
+# degraded + healthy probe → re-arm proxy path.
+start_guard() {
+    stop_guard
+    (
+        trap '' HUP INT TERM
+        local dns_miss=0
+        while true; do
+            sleep 3
+            [ -f "$SOCKROCKET_DIR/stopped" ] && exit 0
+
+            if [ -f "$DEGRADED_FILE" ]; then
+                if is_running; then
+                    # Prefer script entry so recover works even if functions
+                    # were not inherited by this subshell.
+                    sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" recover >> "$SOCKROCKET_LOG" 2>&1 || true
+                fi
+                continue
+            fi
+
+            if ! is_running; then
+                echo "daemon not running (guard)" > "$DEGRADED_FILE"
+                sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
+                continue
+            fi
+
+            if [ "$(conf_bool dns_hijack false)" = "true" ]; then
+                local dns_port
+                dns_port=$(get_config_value dns_port)
+                dns_port=${dns_port:-5300}
+                if netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
+                    dns_miss=0
+                else
+                    dns_miss=$((dns_miss + 1))
+                    if [ "$dns_miss" -ge 2 ]; then
+                        echo "DNS port ${dns_port} dead (guard)" > "$DEGRADED_FILE"
+                        sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
+                        dns_miss=0
+                    fi
+                fi
+            else
+                dns_miss=0
+            fi
+        done
+    ) &
+    echo $! > "$GUARD_PID_FILE"
+}
+
+# ── LAN fail-open / recover ───────────────────────────────────────────────────
+# User toggles in config.yaml express INTENT and must survive failures.
+# Runtime degradation tears down DNS hijack + transparent rules so the LAN
+# returns to direct connectivity, then the watchdog/guard re-applies them once
+# the daemon and outbound probe are healthy again.
+
+enter_lan_degraded() {
+    local reason="$1"
+    # Idempotent stamp; always tear down so a second call still clears rules.
+    echo "$reason" > "$DEGRADED_FILE" 2>/dev/null
+    log_error "LAN fail-open: ${reason} — restoring direct DNS/routing (config intent kept)"
+    update_dnsmasq stop
+    [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
+        "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1
+    ensure_sshd
+}
+
+# True when SOCKS/HTTP can complete a basic outbound HTTP probe (node path alive).
+outbound_probe_ok() {
+    local http_port
+    http_port=$(get_config_value http_port)
+    http_port=${http_port:-1087}
+    if which curl >/dev/null 2>&1; then
+        curl -x "http://127.0.0.1:${http_port}" -sS -m 5 -o /dev/null \
+            "http://www.gstatic.com/generate_204" 2>/dev/null && return 0
+        return 1
+    fi
+    if which timeout >/dev/null 2>&1; then
+        timeout 2 sh -c "echo | nc -w1 127.0.0.1 $http_port >/dev/null 2>&1"
+    else
+        nc -w1 127.0.0.1 "$http_port" </dev/null >/dev/null 2>&1
+    fi
+}
+
+# Re-apply transparent proxy + DNS hijack from config after a fail-open, once
+# the daemon and outbound path look healthy again.
+try_recover_lan_proxy() {
+    [ -f "$DEGRADED_FILE" ] || return 0
+    is_running || return 0
+
+    local dns_port
+    dns_port=$(get_config_value dns_port)
+    dns_port=${dns_port:-5300}
+    # Only require DNS port when hijack is intended.
+    if [ "$(conf_bool dns_hijack false)" = "true" ]; then
+        if ! netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
+            return 0
+        fi
+    fi
+    outbound_probe_ok || return 0
+
+    local want_proxy want_dns
+    want_proxy=$(conf_bool transparent_proxy true)
+    want_dns=$(conf_bool dns_hijack false)
+
+    log_warn "LAN recovering — re-applying proxy path (was: $(cat "$DEGRADED_FILE" 2>/dev/null))"
+    if [ "$want_proxy" = "true" ]; then
+        ensure_tun || log_warn "Recover: TUN unavailable"
+        if ip link show sockrocket-tun >/dev/null 2>&1 \
+            || ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2"; then
+            [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
+                "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1
+        fi
+    fi
+    if [ "$want_dns" = "true" ]; then
+        update_dnsmasq start
+    fi
+    rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
+    ok "LAN proxy path restored after fail-open"
+}
+
 # ── Watchdog ──────────────────────────────────────────────────────────────────
 do_watchdog() {
     local issues=0
@@ -1027,23 +1301,41 @@ do_watchdog() {
         if ! api_is_running; then
             do_api_start >> "$SOCKROCKET_LOG" 2>&1
         fi
+        # Even while stopped, revive SSH if OOM killed dropbear earlier.
+        ensure_sshd
+        # Manual stop already tore rules down; clear any stale degrade marker.
+        rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
         return
+    fi
+
+    # Memory pressure: fail-open WITHOUT rewriting user toggles so we can
+    # recover automatically once memory recovers.
+    local mem_total mem_avail mem_pct=0
+    mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+    if [ -n "$mem_total" ] && [ "$mem_total" -gt 0 ] && [ -n "$mem_avail" ]; then
+        mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+    fi
+    if [ "$mem_pct" -ge 85 ]; then
+        enter_lan_degraded "memory pressure ${mem_pct}%"
+        issues=$((issues + 1))
     fi
 
     local healthy=1
     if ! is_running; then
         log_error "Watchdog: Sockrocket not running — restarting..."
-        # Grab the crash scene BEFORE the restart wipes it: dmesg registers,
-        # log tail, and any core the kernel wrote to /tmp. The restart itself
-        # clears /tmp? no — tmpfs persists until reboot — but a second crash
-        # would overwrite the core, and dmesg scrolls, so collect now.
         collect_crash_dump
+        # Fail-open for the restart window so LAN is not blackholed if start fails.
+        enter_lan_degraded "daemon not running"
         do_start >> "$SOCKROCKET_LOG" 2>&1
         issues=$((issues + 1))
-        healthy=0
-        # The restart can itself fail (e.g. tun.ko not loaded), so the
-        # fail-open check at the end still has to run — a hijack left over
-        # from the previous run must not stay installed against a dead port.
+        if is_running; then
+            healthy=1
+            # do_start respects .lan_degraded (SOCKS only). Recovery below
+            # re-applies hijack/TP once the outbound probe passes.
+        else
+            healthy=0
+        fi
     fi
 
     if [ "$healthy" = "1" ]; then
@@ -1070,10 +1362,32 @@ do_watchdog() {
             issues=$((issues + 1))
         fi
 
+        # Outbound liveness while hijack/TP are supposed to be on: consecutive
+        # probe failures → fail-open; success clears the counter and may recover.
+        if [ ! -f "$DEGRADED_FILE" ] \
+            && { [ "$(conf_bool transparent_proxy true)" = "true" ] \
+              || [ "$(conf_bool dns_hijack false)" = "true" ]; }; then
+            if outbound_probe_ok; then
+                rm -f "$WOUT_FAILS_FILE"
+            else
+                local ofails=0
+                [ -f "$WOUT_FAILS_FILE" ] && ofails=$(cat "$WOUT_FAILS_FILE" 2>/dev/null)
+                ofails=$((ofails + 1))
+                echo "$ofails" > "$WOUT_FAILS_FILE"
+                if [ "$ofails" -ge 3 ]; then
+                    enter_lan_degraded "outbound probe failed ${ofails}x"
+                    issues=$((issues + 1))
+                else
+                    log_warn "Watchdog: outbound probe failed (${ofails}/3)"
+                fi
+            fi
+        fi
+
         # Self-heal a rebooted router: tun.ko never auto-loads, so if the
         # user wants transparent proxying and the device is gone, reload it
-        # before reapplying the rules.
-        if [ "$(conf_bool transparent_proxy true)" = "true" ]; then
+        # before reapplying the rules — but NOT while degraded (LAN must stay
+        # on the direct path until probe recovers).
+        if [ ! -f "$DEGRADED_FILE" ] && [ "$(conf_bool transparent_proxy true)" = "true" ]; then
             ensure_tun || log_warn "Watchdog: TUN unavailable for transparent proxy"
             if { ip link show sockrocket-tun >/dev/null 2>&1 || \
                  ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2"; } \
@@ -1086,10 +1400,12 @@ do_watchdog() {
             # Symmetry with the DNS side: when the proxy is switched off a
             # stale MARK chain must not survive. Traffic marked into a TUN
             # device that may no longer exist blackholes the LAN.
-            if iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
-                log_warn "Watchdog: transparent proxy is off but stale rules exist — removing"
-                [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1
-                issues=$((issues + 1))
+            if [ "$(conf_bool transparent_proxy true)" != "true" ] || [ -f "$DEGRADED_FILE" ]; then
+                if iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
+                    log_warn "Watchdog: transparent proxy off/degraded but stale rules exist — removing"
+                    [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1
+                    issues=$((issues + 1))
+                fi
             fi
         fi
     fi
@@ -1113,19 +1429,12 @@ do_watchdog() {
     dns_port=$(get_config_value dns_port)
     dns_port=${dns_port:-5300}
     local want_dns
-    want_dns=$(conf_bool dns_hijack true)
+    want_dns=$(conf_bool dns_hijack false)
     local fail_file="$SOCKROCKET_DIR/.wdns_fails"
 
     if [ "$(count_section nodes)" = "0" ]; then
-        if [ -f "$dns_conf" ]; then
-            log_error "Watchdog: no nodes in config — removing DNS hijack (LAN/Softcenter restored)"
-            update_dnsmasq stop
-            issues=$((issues + 1))
-        fi
-        if iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
-            log_error "Watchdog: no nodes in config — removing transparent proxy rules"
-            [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
-                "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1
+        if [ -f "$dns_conf" ] || iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
+            enter_lan_degraded "no nodes in config"
             issues=$((issues + 1))
         fi
         rm -f "$fail_file"
@@ -1136,13 +1445,16 @@ do_watchdog() {
             issues=$((issues + 1))
         fi
         rm -f "$fail_file"
+    elif [ -f "$DEGRADED_FILE" ]; then
+        # Stay fail-open while degraded; recovery happens below.
+        if [ -f "$dns_conf" ]; then
+            update_dnsmasq stop
+        fi
+        rm -f "$fail_file"
     elif ! is_running; then
         # The restart attempt above already ran; still-dead means fail open.
-        if [ -f "$dns_conf" ]; then
-            log_error "Watchdog: Sockrocket daemon dead — removing DNS hijack (LAN DNS restored)"
-            update_dnsmasq stop
-            issues=$((issues + 1))
-        fi
+        enter_lan_degraded "daemon still dead after restart"
+        issues=$((issues + 1))
         rm -f "$fail_file"
     else
         local port_ok=0 i
@@ -1181,9 +1493,8 @@ do_watchdog() {
             [ -f "$fail_file" ] && fails=$(cat "$fail_file" 2>/dev/null)
             fails=$((fails + 1))
             echo "$fails" > "$fail_file"
-            if [ "$fails" -ge 3 ] && [ -f "$dns_conf" ]; then
-                log_error "Watchdog: DNS port $dns_port dead for $fails consecutive checks — failing open (LAN DNS restored)"
-                update_dnsmasq stop
+            if [ "$fails" -ge 3 ]; then
+                enter_lan_degraded "DNS port $dns_port dead for $fails consecutive checks"
                 rm -f "$fail_file"
                 issues=$((issues + 1))
             else
@@ -1191,6 +1502,9 @@ do_watchdog() {
             fi
         fi
     fi
+
+    # After any fail-open, try to put the proxy path back once healthy.
+    try_recover_lan_proxy
 
     [ "$issues" -gt 0 ] && log_warn "Watchdog: $issues issue(s) found and addressed"
 }
@@ -1211,13 +1525,19 @@ case "$1" in
         acquire_lock && { do_stop; release_lock; } || true
         ;;
     restart)
-        acquire_lock && { do_stop; sleep 1; do_start; release_lock; } || true
+        acquire_lock && {
+            do_stop
+            # Process already waited-out in do_stop; no fixed 1s pause.
+            do_start
+            release_lock
+        } || true
         ;;
     reload)
         acquire_lock || exit 1
         if is_running; then
             info "Reloading Sockrocket config..."
-            do_stop; sleep 1; do_start
+            do_stop
+            do_start
         else
             do_start
         fi
@@ -1258,9 +1578,13 @@ case "$1" in
         # running daemon. Guarantees direct LAN connectivity.
         acquire_lock && { restore_direct_network; ok "Direct network restored"; release_lock; } || true
         ;;
+    recover)
+        # Second-scale re-arm after fail-open (called by the guard loop).
+        acquire_lock 5 && { try_recover_lan_proxy; release_lock; } || true
+        ;;
     diagnose)  cmd_diagnose ;;
     *)
-        echo "Usage: $0 {start|stop|restart|reload|status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|dns-on|dns-off|pin-dns|proxy-off|network-restore}"
+        echo "Usage: $0 {start|stop|restart|reload|status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|dns-on|dns-off|pin-dns|proxy-off|network-restore|recover}"
         exit 1
         ;;
 esac

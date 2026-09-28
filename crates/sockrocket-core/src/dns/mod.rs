@@ -1210,20 +1210,18 @@ pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u
                         28 => addrs.into_iter().filter(|a| a.is_ipv6()).collect(),
                         _ => addrs,
                     };
-                    // Fake-IP answers get a short TTL: the address is only
-                    // valid while the pool mapping lives, and client/dnsmasq
-                    // caches must not outlive pool evictions or daemon
-                    // restarts. Domestic real answers get a medium TTL: the
-                    // domestic-IP table is process memory, so after a daemon
-                    // restart a longer-cached answer would point at an
-                    // address the new daemon no longer recognizes as
-                    // domestic (and geoip would then misroute it).
+                    // Fake-IP answers: TTL=5 so clients re-ask after pool
+                    // restart/eviction. Domestic with Fake-IP mode: TTL=30
+                    // (domestic-IP table is process memory). Without Fake-IP
+                    // (TUN off, SOCKS + DNS hijack): also TTL=5 — otherwise
+                    // international real IPs cache for minutes and re-enabling
+                    // TUN blackholes bare-IP dials through unlock exits.
                     let ttl = if filtered.iter().any(|a| resolver.is_fake(a)) {
                         5
                     } else if resolver.has_fakeip() {
                         30
                     } else {
-                        300
+                        5
                     };
                     match build_dns_response_with_ttl(query, &filtered, ttl) {
                         Ok(resp) => resp,
