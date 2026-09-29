@@ -249,9 +249,50 @@
     }
     .lede { color: var(--muted); max-width: 48ch; font-size: 1.02rem; margin-bottom: 2.4rem; }
 
+    /* Routing / GeoIP */
+    .route-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1rem;
+      margin-top: .5rem;
+    }
+    .route-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 1.35rem 1.4rem;
+    }
+    .route-card h3 {
+      font-family: var(--font-display);
+      font-size: 1.05rem; font-weight: 700; color: #fff;
+      margin-bottom: .55rem;
+    }
+    .route-card p, .route-card li {
+      color: var(--muted); font-size: .92rem; line-height: 1.55;
+    }
+    .route-card ul { margin: .5rem 0 0 1.1rem; }
+    .route-card li { margin: .25rem 0; }
+    .route-card code {
+      font-family: var(--mono); font-size: .82rem;
+      color: var(--cyan); background: rgba(62,200,255,.08);
+      padding: .1rem .35rem; border-radius: 4px;
+    }
+    .route-note {
+      margin-top: 1.4rem;
+      padding: 1rem 1.2rem;
+      border-left: 3px solid var(--orange);
+      background: rgba(255,106,0,.06);
+      border-radius: 0 10px 10px 0;
+      color: var(--muted); font-size: .9rem;
+    }
+    .route-note strong { color: #fff; }
+    @media (max-width: 720px) {
+      .route-grid { grid-template-columns: 1fr; }
+    }
+
     .strip {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 1px;
       background: var(--line);
       border: 1px solid var(--line);
@@ -393,6 +434,50 @@
     }
     .copy-btn:hover { color: #fff; border-color: var(--orange); }
 
+    .use-panel { display: none; }
+    .use-panel.active { display: block; }
+    .use-steps {
+      margin: 0 0 1.1rem;
+      padding: 0;
+      list-style: none;
+      counter-reset: use;
+    }
+    .use-steps li {
+      position: relative;
+      counter-increment: use;
+      padding: .75rem .9rem .75rem 3rem;
+      margin-bottom: .55rem;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      color: var(--muted);
+      font-size: .92rem;
+      line-height: 1.5;
+    }
+    .use-steps li::before {
+      content: counter(use);
+      position: absolute;
+      left: .85rem; top: .85rem;
+      width: 1.45rem; height: 1.45rem;
+      border-radius: 7px;
+      background: rgba(255,106,0,.15);
+      color: var(--orange-hot);
+      font: 700 .78rem var(--font-display);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .use-steps li strong { color: #fff; font-weight: 600; }
+    .use-steps li code {
+      font-family: var(--mono); font-size: .82rem;
+      color: var(--cyan); background: rgba(62,200,255,.08);
+      padding: .1rem .35rem; border-radius: 4px;
+    }
+    .use-hint {
+      margin: .85rem 0 0;
+      color: var(--muted);
+      font-size: .85rem;
+    }
+    .use-hint a { color: var(--orange-hot); }
+
     .dl-row {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -442,6 +527,7 @@
       .hero-inner { grid-template-columns: 1fr; }
       .hero-visual { justify-self: start; width: min(280px, 70vw); margin-bottom: .5rem; order: -1; }
       .strip { grid-template-columns: repeat(2, 1fr); }
+      .strip .strip-item:last-child { grid-column: 1 / -1; }
       .features { grid-template-columns: 1fr; }
       .feat:nth-child(odd), .feat:nth-child(even) {
         padding: 1.4rem 0; border-right: none;
@@ -470,6 +556,8 @@
   </a>
   <div class="nav-links">
     <a href="#features" data-i18n="nav-features">Features</a>
+    <a href="#routing" data-i18n="nav-routing">Routing</a>
+    <a href="#install" data-i18n="nav-setup">Setup</a>
     <a href="#merlin" data-i18n="nav-merlin">Merlin</a>
     <a href="#protocols" data-i18n="nav-protocols">Protocols</a>
     <a href="#download" data-i18n="nav-download">Download</a>
@@ -511,6 +599,7 @@
   <div class="strip">
     <div class="strip-item"><div class="strip-num">6</div><div class="strip-label" data-i18n="stat-protocols">Protocols</div></div>
     <div class="strip-item"><div class="strip-num">3</div><div class="strip-label" data-i18n="stat-surfaces">Surfaces</div></div>
+    <div class="strip-item"><div class="strip-num">741</div><div class="strip-label" data-i18n="stat-cidrs">CN CIDRs</div></div>
     <div class="strip-item"><div class="strip-num">5<span>+</span></div><div class="strip-label" data-i18n="stat-arch">Arch targets</div></div>
     <div class="strip-item"><div class="strip-num">100<span>%</span></div><div class="strip-label" data-i18n="stat-rust">Rust</div></div>
   </div>
@@ -531,7 +620,7 @@
         <div class="feat-ico">🧭</div>
         <div>
           <h3 data-i18n="fc2-title">Smart routing</h3>
-          <p data-i18n="fc2-desc">Domain, GeoIP, and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy.</p>
+          <p data-i18n="fc2-desc">Domain, GeoIP (built-in CN CIDRs), and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy. <a href="#routing">How GeoIP works →</a></p>
         </div>
       </article>
       <article class="feat">
@@ -565,6 +654,50 @@
     </div>
   </section>
 
+  <section id="routing">
+    <div class="kicker" data-i18n="route-label">Routing &amp; GeoIP</div>
+    <h2 data-i18n="route-h2">China direct without a fat MMDB.</h2>
+    <p class="lede" data-i18n="route-sub">geoip:CN is powered by a curated in-binary CIDR list — small enough for Merlin flash, accurate enough for domestic direct.</p>
+    <div class="route-grid">
+      <article class="route-card">
+        <h3 data-i18n="route-c1-title">What “GeoIP” means here</h3>
+        <p data-i18n="route-c1-body">Not MaxMind. Sockrocket ships a lightweight in-memory GeoIP database built from ~741 aggregated China IPv4 CIDRs (APNIC-oriented curated subset), plus private ranges. Rules like <code>geoip: CN → direct</code> hit this table.</p>
+      </article>
+      <article class="route-card">
+        <h3 data-i18n="route-c2-title">Rule types</h3>
+        <ul>
+          <li data-i18n="route-c2-li1"><code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code></li>
+          <li data-i18n="route-c2-li2"><code>ip-cidr</code> and <code>geoip</code> (country code)</li>
+          <li data-i18n="route-c2-li3"><code>final</code> catch-all → proxy or direct</li>
+          <li data-i18n="route-c2-li4">Actions: <code>direct</code> · <code>proxy</code> · <code>reject</code></li>
+        </ul>
+      </article>
+      <article class="route-card">
+        <h3 data-i18n="route-c3-title">Built-in China-direct set</h3>
+        <p data-i18n="route-c3-body">Out of the box: private/LAN CIDRs, common CN domain suffixes &amp; keywords, then the CN IP list, then match-all → proxy. Your custom rules prepend this set (first match wins).</p>
+      </article>
+      <article class="route-card">
+        <h3 data-i18n="route-c4-title">Merlin extras</h3>
+        <p data-i18n="route-c4-body">Same CIDR list can load into a kernel <code>ipset</code> for hardware-NAT direct (<code>cn_ipset_direct</code>). TUN Fake-IP keeps international names on the domain path; domestic answers stay real IPs so geoip/direct still works.</p>
+      </article>
+    </div>
+    <p class="route-note" data-i18n="route-note"><strong>Why not MaxMind GeoLite?</strong> A Country MMDB is typically several megabytes — painful on Merlin JFFS next to a ~10&nbsp;MB musl binary, plus license/update friction. The curated CN list keeps the router package lean; gaps are covered by domain rules and the TUN domestic-IP table.</p>
+    <p class="lede" style="margin:1.6rem 0 .7rem;font-size:.92rem" data-i18n="route-ex-label">Same YAML on desktop CLI and Merlin (<code>rules:</code> prepend the built-in set):</p>
+    <div class="code">
+      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+      <span class="n">rules</span>:<br/>
+      &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"domain-suffix"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">"google.com"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"proxy"</span><br/>
+      &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"geoip"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">"CN"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"direct"</span><br/>
+      &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"final"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">""</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"proxy"</span>
+    </div>
+  </section>
+
   <div class="merlin" id="merlin">
     <div class="merlin-inner">
       <span class="tag" data-i18n="merlin-tag">asuswrt-merlin · koolcenter</span>
@@ -594,35 +727,86 @@
   </section>
 
   <section id="install">
-    <div class="kicker" data-i18n="install-label">Quick start</div>
-    <h2 data-i18n="install-h2">Up in under a minute.</h2>
-    <p class="lede" data-i18n="install-sub">Grab a release binary. Default SOCKS5 :1080 · HTTP :1087.</p>
+    <div class="kicker" data-i18n="install-label">Setup &amp; config</div>
+    <h2 data-i18n="install-h2">Install once. Configure the same way.</h2>
+    <p class="lede" data-i18n="install-sub">GUI and Merlin share subscriptions, nodes, and routing rules. CLI uses the same <code>config.yaml</code> shape. Defaults: SOCKS5 <code>:1080</code> · HTTP <code>:1087</code>.</p>
     <div class="tabs">
-      <button type="button" class="tab active" onclick="showTab('gui')">GUI</button>
-      <button type="button" class="tab" onclick="showTab('cli')">CLI</button>
-      <button type="button" class="tab" onclick="showTab('merlin')">Merlin</button>
+      <button type="button" class="tab active" onclick="showTab('gui')" data-i18n="tab-gui">Desktop GUI</button>
+      <button type="button" class="tab" onclick="showTab('cli')" data-i18n="tab-cli">CLI</button>
+      <button type="button" class="tab" onclick="showTab('merlin')" data-i18n="tab-merlin">Merlin router</button>
     </div>
-    <div id="tab-gui" class="code">
-      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
-      <span class="c"># macOS — open DMG, drag Sockrocket to Applications</span><br/>
-      <span class="n">open</span> sockrocket-macos-aarch64.dmg<br/><br/>
-      <span class="c"># Linux — extract + install (icons / app menu)</span><br/>
-      <span class="n">tar</span> xzf sockrocket-linux-x86_64.tar.gz<br/>
-      <span class="n">./Sockrocket-*-linux-x86_64/install.sh</span><br/><br/>
-      <span class="c"># Windows — extract ZIP, run Sockrocket.exe</span>
+
+    <div id="tab-gui" class="use-panel active">
+      <ol class="use-steps">
+        <li data-i18n="gui-s1"><strong>Install</strong> — macOS: open the DMG and drag to Applications. Windows: unzip and run <code>Sockrocket.exe</code>. Linux: extract the tarball and run <code>install.sh</code> (or launch <code>./sockrocket</code>).</li>
+        <li data-i18n="gui-s2"><strong>Add a subscription</strong> — paste a Clash / V2Ray / SingBox URL → Update. Or add nodes manually.</li>
+        <li data-i18n="gui-s3"><strong>Pick a node</strong> — Test / Test all (warm through-proxy RTT), then select a node and connect.</li>
+        <li data-i18n="gui-s4"><strong>Traffic mode</strong> — enable <strong>System proxy</strong> for browsers and most apps; turn on <strong>TUN</strong> when an app ignores the OS proxy (admin / root required).</li>
+        <li data-i18n="gui-s5"><strong>Routing</strong> — built-in China-direct is on by default; add custom domain / GeoIP / CIDR rules in Settings (same model as YAML <code>rules:</code>). See <a href="#routing">Routing &amp; GeoIP</a>.</li>
+      </ol>
+      <div class="code">
+        <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+        <span class="c"># macOS — open DMG, drag Sockrocket to Applications</span><br/>
+        <span class="n">open</span> sockrocket-macos-aarch64.dmg<br/><br/>
+        <span class="c"># if Gatekeeper blocks (unsigned builds):</span><br/>
+        <span class="n">xattr</span> -cr /Applications/Sockrocket.app<br/><br/>
+        <span class="c"># Linux</span><br/>
+        <span class="n">tar</span> xzf sockrocket-linux-x86_64.tar.gz<br/>
+        <span class="n">./Sockrocket-*-linux-x86_64/install.sh</span><br/><br/>
+        <span class="c"># Windows — extract ZIP, run Sockrocket.exe</span>
+      </div>
+      <p class="use-hint" data-i18n="gui-hint">Language: status-bar cycle EN → VI → 中文 (saved). Do not paste subscription URLs into public chats.</p>
     </div>
-    <div id="tab-cli" class="code" style="display:none">
-      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
-      <span class="n">sockrocket-cli</span> <span class="k">--init</span> config.yaml<br/>
-      <span class="c"># edit config.yaml, then:</span><br/>
-      <span class="n">sockrocket-cli</span> config.yaml
+
+    <div id="tab-cli" class="use-panel">
+      <ol class="use-steps">
+        <li data-i18n="cli-s1"><strong>Init</strong> — generate a starter <code>config.yaml</code>, then edit listen ports, subscriptions, and rules.</li>
+        <li data-i18n="cli-s2"><strong>Subscriptions</strong> — under <code>subscriptions:</code> set <code>name</code>, <code>url</code>, <code>format: auto</code>. Nodes fill in on start (or when you refresh).</li>
+        <li data-i18n="cli-s3"><strong>Active node</strong> — <code>active_node: 0</code> selects the first node; <code>null</code> stays direct.</li>
+        <li data-i18n="cli-s4"><strong>Rules</strong> — same <code>rule_type</code> / <code>pattern</code> / <code>target</code> as GUI and Merlin. Custom rules prepend the built-in China-direct set.</li>
+        <li data-i18n="cli-s5"><strong>Run</strong> — point apps at local SOCKS/HTTP, or put a system-proxy / TUN front-end in front of the CLI.</li>
+      </ol>
+      <div class="code">
+        <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+        <span class="n">sockrocket-cli</span> <span class="k">--init</span> config.yaml<br/>
+        <span class="c"># edit subscriptions / rules / active_node, then:</span><br/>
+        <span class="n">sockrocket-cli</span> config.yaml<br/><br/>
+        <span class="c"># minimal shape</span><br/>
+        <span class="n">listen_addr</span>: <span class="k">"127.0.0.1"</span><br/>
+        <span class="n">socks_port</span>: <span class="k">1080</span><br/>
+        <span class="n">http_port</span>: <span class="k">1087</span><br/>
+        <span class="n">subscriptions</span>:<br/>
+        &nbsp;&nbsp;- <span class="n">name</span>: <span class="k">"My sub"</span><br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">url</span>: <span class="k">"https://example.com/sub"</span><br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">format</span>: <span class="k">"auto"</span><br/>
+        <span class="n">active_node</span>: <span class="k">0</span>
+      </div>
+      <p class="use-hint" data-i18n="cli-hint">Full field reference: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a> · example: <a href="https://github.com/sockrockets/sockrocket/blob/main/config.yaml.example">config.yaml.example</a>.</p>
     </div>
-    <div id="tab-merlin" class="code" style="display:none">
-      <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
-      <span class="c" data-i18n="merlin-step1"># 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from Releases</span><br/>
-      <span class="c" data-i18n="merlin-step2"># 2. Software Center → Offline install → upload the tar.gz</span><br/>
-      <span class="c" data-i18n="merlin-step3"># 3. Open Sockrocket tile · check uname -m (hnd vs hnd_v8)</span><br/>
-      <span class="n"># docs:</span> docs/merlin.md
+
+    <div id="tab-merlin" class="use-panel">
+      <ol class="use-steps">
+        <li data-i18n="mer-s1"><strong>Pick the package</strong> — from <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a> download <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>. Match <code>uname -m</code> / SoC: <code>hnd_v8</code> (aarch64 BCM490x) vs <code>hnd</code> (armv7 BCM675x) is the usual mistake.</li>
+        <li data-i18n="mer-s2"><strong>Software Center (recommended)</strong> — router Web UI → <strong>Software Center</strong> (koolcenter / softcenter) → <strong>Offline install</strong> → upload the matching <code>.tar.gz</code> → Install. Wrong platform <code>.valid</code> → reject or <em>Exec format error</em>.</li>
+        <li data-i18n="mer-s3"><strong>Open the plugin</strong> — Sockrocket tile in Software Center, or <code>http://&lt;router-lan-ip&gt;/ext/sockrocket/sockrocket.asp</code>.</li>
+        <li data-i18n="mer-s4"><strong>Configure</strong> — add subscription → Update → wait for nodes → select node → enable transparent proxy / TUN as needed. Same rules engine as desktop.</li>
+        <li data-i18n="mer-s5"><strong>Optional</strong> — SSH install if you prefer; edit <code>/jffs/addons/sockrocket/config.yaml</code> (listen <code>0.0.0.0</code> for LAN). Service: <code>sockrocket.sh start|stop|restart|status|update-subs</code>.</li>
+      </ol>
+      <div class="code">
+        <button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button>
+        <span class="c" data-i18n="mer-sc1"># —— Software Center plugin install (recommended) ——</span><br/>
+        <span class="c" data-i18n="mer-sc2"># 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from GitHub Releases</span><br/>
+        <span class="c" data-i18n="mer-sc3"># 2. Router Web UI → Software Center (koolcenter / softcenter)</span><br/>
+        <span class="c" data-i18n="mer-sc4"># 3. Offline install / upload package → select the .tar.gz → Install</span><br/>
+        <span class="c" data-i18n="mer-sc5"># 4. Open the Sockrocket tile (or /ext/sockrocket/sockrocket.asp)</span><br/><br/>
+        <span class="c" data-i18n="mer-ssh-label"># —— SSH install (optional) ——</span><br/>
+        <span class="n">uname</span> -m<br/>
+        <span class="n">scp</span> sockrocket-merlin-hnd_v8.tar.gz admin@192.168.50.1:/tmp/<br/>
+        <span class="n">ssh</span> admin@192.168.50.1<br/>
+        <span class="n">cd</span> /tmp &amp;&amp; <span class="n">tar</span> xzf sockrocket-merlin-hnd_v8.tar.gz<br/>
+        <span class="n">sh</span> sockrocket/install.sh hnd_v8
+      </div>
+      <p class="use-hint" data-i18n="mer-hint">Archive root is always <code>sockrocket/</code> (koolcenter module name). LAN devices need no client — traffic hits iptables/TUN on the router, then GeoIP/domain rules. Full guide: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>.</p>
     </div>
   </section>
 
@@ -699,6 +883,7 @@
     Sockrocket
   </div>
   <div class="footer-links">
+    <a href="#routing">Routing</a>
     <a href="https://github.com/sockrockets/sockrocket">GitHub</a>
     <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a>
     <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">Merlin</a>
@@ -712,19 +897,20 @@
 <script>
 const translations = {
   en: {
-    'nav-features': 'Features', 'nav-merlin': 'Merlin', 'nav-protocols': 'Protocols',
+    'nav-features': 'Features', 'nav-routing': 'Routing', 'nav-setup': 'Setup', 'nav-merlin': 'Merlin', 'nav-protocols': 'Protocols',
     'nav-download': 'Download', 'nav-community': 'Community', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>Proxy that ships.',
     'hero-sub': 'Native GUI, CLI, and AsusWRT-Merlin — one Rust stack from your laptop to the whole LAN.',
     'hero-btn-download': 'Download v0.1.0', 'hero-btn-github': 'View source',
-    'stat-protocols': 'Protocols', 'stat-surfaces': 'Surfaces', 'stat-arch': 'Arch targets', 'stat-rust': 'Rust',
+    'stat-protocols': 'Protocols', 'stat-surfaces': 'Surfaces', 'stat-cidrs': 'CN CIDRs',
+    'stat-arch': 'Arch targets', 'stat-rust': 'Rust',
     'feat-label': 'Features', 'feat-h2': 'Built for daily use,<br/>not demo day.',
     'feat-sub': 'Through-proxy latency, real routing, and a Merlin plugin that shares the same engine as the desktop client.',
     'fc1-title': 'Warm through-proxy tests',
     'fc1-desc': 'Node ranking measures exit-side RTT on a warm path — what browsing feels like, not a fake TCP ping to server:port.',
     'fc2-title': 'Smart routing',
-    'fc2-desc': 'Domain, GeoIP, and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy.',
+    'fc2-desc': 'Domain, GeoIP (built-in CN CIDRs), and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy. <a href="#routing">How GeoIP works →</a>',
     'fc3-title': 'TLS fingerprint craft',
     'fc3-desc': 'Patched rustls (craftls) with REALITY and browser-like ClientHello — built for hostile networks.',
     'fc4-title': 'Subscriptions',
@@ -733,6 +919,22 @@ const translations = {
     'fc5-desc': 'Native GPUI desktop app and a lean CLI for headless or scripted setups.',
     'fc6-title': 'LAN-wide Merlin',
     'fc6-desc': 'Official AsusWRT-Merlin package: one musl binary, Web UI, iptables/DNS, hot-reload node switch.',
+    'route-label': 'Routing &amp; GeoIP',
+    'route-h2': 'China direct without a fat MMDB.',
+    'route-sub': 'geoip:CN is powered by a curated in-binary CIDR list — small enough for Merlin flash, accurate enough for domestic direct.',
+    'route-c1-title': 'What “GeoIP” means here',
+    'route-c1-body': 'Not MaxMind. Sockrocket ships a lightweight in-memory GeoIP database built from ~741 aggregated China IPv4 CIDRs (APNIC-oriented curated subset), plus private ranges. Rules like <code>geoip: CN → direct</code> hit this table.',
+    'route-c2-title': 'Rule types',
+    'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
+    'route-c2-li2': '<code>ip-cidr</code> and <code>geoip</code> (country code)',
+    'route-c2-li3': '<code>final</code> catch-all → proxy or direct',
+    'route-c2-li4': 'Actions: <code>direct</code> · <code>proxy</code> · <code>reject</code>',
+    'route-c3-title': 'Built-in China-direct set',
+    'route-c3-body': 'Out of the box: private/LAN CIDRs, common CN domain suffixes &amp; keywords, then the CN IP list, then match-all → proxy. Your custom rules prepend this set (first match wins).',
+    'route-c4-title': 'Merlin extras',
+    'route-c4-body': 'Same CIDR list can load into a kernel <code>ipset</code> for hardware-NAT direct (<code>cn_ipset_direct</code>). TUN Fake-IP keeps international names on the domain path; domestic answers stay real IPs so geoip/direct still works.',
+    'route-note': '<strong>Why not MaxMind GeoLite?</strong> A Country MMDB is typically several megabytes — painful on Merlin JFFS next to a ~10&nbsp;MB musl binary, plus license/update friction. The curated CN list keeps the router package lean; gaps are covered by domain rules and the TUN domestic-IP table.',
+    'route-ex-label': 'Same YAML on desktop CLI and Merlin (<code>rules:</code> prepend the built-in set):',
     'merlin-tag': 'asuswrt-merlin · koolcenter',
     'merlin-h2': 'Same engine on the router.',
     'merlin-sub': 'What works in the GUI works on Merlin — transparent proxy for every device on your LAN.',
@@ -744,8 +946,33 @@ const translations = {
     'proto-sub': 'Including QUIC next-gen transports and Reality obfuscation.',
     'uc-ss': 'Light, general purpose', 'uc-vmess': 'CDN-friendly', 'uc-vless': 'Low overhead',
     'uc-trojan': 'HTTPS camouflage', 'uc-tuic': '0-RTT reconnect', 'uc-hy2': 'Lossy networks',
-    'install-label': 'Quick start', 'install-h2': 'Up in under a minute.',
-    'install-sub': 'Grab a release binary. Default SOCKS5 :1080 · HTTP :1087.',
+    'install-label': 'Setup &amp; config', 'install-h2': 'Install once. Configure the same way.',
+    'install-sub': 'GUI and Merlin share subscriptions, nodes, and routing rules. CLI uses the same <code>config.yaml</code> shape. Defaults: SOCKS5 <code>:1080</code> · HTTP <code>:1087</code>.',
+    'tab-gui': 'Desktop GUI', 'tab-cli': 'CLI', 'tab-merlin': 'Merlin router',
+    'gui-s1': '<strong>Install</strong> — macOS: open the DMG and drag to Applications. Windows: unzip and run <code>Sockrocket.exe</code>. Linux: extract the tarball and run <code>install.sh</code> (or launch <code>./sockrocket</code>).',
+    'gui-s2': '<strong>Add a subscription</strong> — paste a Clash / V2Ray / SingBox URL → Update. Or add nodes manually.',
+    'gui-s3': '<strong>Pick a node</strong> — Test / Test all (warm through-proxy RTT), then select a node and connect.',
+    'gui-s4': '<strong>Traffic mode</strong> — enable <strong>System proxy</strong> for browsers and most apps; turn on <strong>TUN</strong> when an app ignores the OS proxy (admin / root required).',
+    'gui-s5': '<strong>Routing</strong> — built-in China-direct is on by default; add custom domain / GeoIP / CIDR rules in Settings (same model as YAML <code>rules:</code>). See <a href="#routing">Routing &amp; GeoIP</a>.',
+    'gui-hint': 'Language: status-bar cycle EN → VI → 中文 (saved). Do not paste subscription URLs into public chats.',
+    'cli-s1': '<strong>Init</strong> — generate a starter <code>config.yaml</code>, then edit listen ports, subscriptions, and rules.',
+    'cli-s2': '<strong>Subscriptions</strong> — under <code>subscriptions:</code> set <code>name</code>, <code>url</code>, <code>format: auto</code>. Nodes fill in on start (or when you refresh).',
+    'cli-s3': '<strong>Active node</strong> — <code>active_node: 0</code> selects the first node; <code>null</code> stays direct.',
+    'cli-s4': '<strong>Rules</strong> — same <code>rule_type</code> / <code>pattern</code> / <code>target</code> as GUI and Merlin. Custom rules prepend the built-in China-direct set.',
+    'cli-s5': '<strong>Run</strong> — point apps at local SOCKS/HTTP, or put a system-proxy / TUN front-end in front of the CLI.',
+    'cli-hint': 'Full field reference: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a> · example: <a href="https://github.com/sockrockets/sockrocket/blob/main/config.yaml.example">config.yaml.example</a>.',
+    'mer-s1': '<strong>Pick the package</strong> — from <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a> download <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>. Match <code>uname -m</code> / SoC: <code>hnd_v8</code> (aarch64 BCM490x) vs <code>hnd</code> (armv7 BCM675x) is the usual mistake.',
+    'mer-s2': '<strong>Software Center (recommended)</strong> — router Web UI → <strong>Software Center</strong> (koolcenter / softcenter) → <strong>Offline install</strong> → upload the matching <code>.tar.gz</code> → Install. Wrong platform <code>.valid</code> → reject or <em>Exec format error</em>.',
+    'mer-s3': '<strong>Open the plugin</strong> — Sockrocket tile in Software Center, or <code>http://&lt;router-lan-ip&gt;/ext/sockrocket/sockrocket.asp</code>.',
+    'mer-s4': '<strong>Configure</strong> — add subscription → Update → wait for nodes → select node → enable transparent proxy / TUN as needed. Same rules engine as desktop.',
+    'mer-s5': '<strong>Optional</strong> — SSH install if you prefer; edit <code>/jffs/addons/sockrocket/config.yaml</code> (listen <code>0.0.0.0</code> for LAN). Service: <code>sockrocket.sh start|stop|restart|status|update-subs</code>.',
+    'mer-sc1': '# —— Software Center plugin install (recommended) ——',
+    'mer-sc2': '# 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from GitHub Releases',
+    'mer-sc3': '# 2. Router Web UI → Software Center (koolcenter / softcenter)',
+    'mer-sc4': '# 3. Offline install / upload package → select the .tar.gz → Install',
+    'mer-sc5': '# 4. Open the Sockrocket tile (or /ext/sockrocket/sockrocket.asp)',
+    'mer-ssh-label': '# —— SSH install (optional) ——',
+    'mer-hint': 'Archive root is always <code>sockrocket/</code> (koolcenter module name). LAN devices need no client — traffic hits iptables/TUN on the router, then GeoIP/domain rules. Full guide: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>.',
     'dl-label': 'Download', 'dl-h2': 'Every platform we ship.',
     'dl-sub': 'Prebuilt GUI, CLI, and Merlin packages on GitHub Releases.',
     'dl-linux': 'x86_64 and aarch64 GUI + CLI.',
@@ -753,9 +980,6 @@ const translations = {
     'dl-windows': 'x86_64 GUI + CLI .exe.',
     'dl-merlin': 'arm64 / armv7 soft & hard float packages.',
     'footer-copy': 'Built in Rust. © 2026 Sockrocket.',
-    'merlin-step1': '# 1. Download sockrocket-merlin-&lt;platform&gt;.tar.gz from Releases',
-    'merlin-step2': '# 2. Software Center → Offline install → upload the tar.gz',
-    'merlin-step3': '# 3. Open Sockrocket tile · check uname -m (hnd vs hnd_v8)',
     'community-label': 'Community',
     'community-h2': 'Announcements and Q&amp;A.',
     'community-sub': 'Release notes on Telegram; questions on GitHub Discussions. Do not post subscription URLs, tokens, or personal identifiers.',
@@ -764,19 +988,20 @@ const translations = {
     'community-issues': 'Bug reports and regressions.',
   },
   vi: {
-    'nav-features': 'Tính năng', 'nav-merlin': 'Merlin', 'nav-protocols': 'Giao thức',
+    'nav-features': 'Tính năng', 'nav-routing': 'Định tuyến', 'nav-setup': 'Cài đặt', 'nav-merlin': 'Merlin', 'nav-protocols': 'Giao thức',
     'nav-download': 'Tải xuống', 'nav-community': 'Cộng đồng', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · Mã nguồn mở · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>Proxy sẵn sàng.',
     'hero-sub': 'GUI gốc, CLI và AsusWRT-Merlin — một stack Rust từ laptop đến cả LAN.',
     'hero-btn-download': 'Tải v0.1.0', 'hero-btn-github': 'Xem mã nguồn',
-    'stat-protocols': 'Giao thức', 'stat-surfaces': 'Giao diện', 'stat-arch': 'Kiến trúc', 'stat-rust': 'Rust',
+    'stat-protocols': 'Giao thức', 'stat-surfaces': 'Giao diện', 'stat-cidrs': 'CN CIDR',
+    'stat-arch': 'Kiến trúc', 'stat-rust': 'Rust',
     'feat-label': 'Tính năng', 'feat-h2': 'Dùng mỗi ngày,<br/>không chỉ demo.',
     'feat-sub': 'Đo latency qua proxy thật, định tuyến thực tế, plugin Merlin dùng chung engine với desktop.',
     'fc1-title': 'Test ấm qua proxy',
     'fc1-desc': 'Xếp hạng nút theo RTT phía exit trên warm path — đúng cảm giác duyệt web, không phải ping TCP giả.',
     'fc2-title': 'Định tuyến thông minh',
-    'fc2-desc': 'Domain, GeoIP, CIDR. System proxy cho app thường; TUN khi app bỏ qua proxy OS.',
+    'fc2-desc': 'Domain, GeoIP (CIDR CN tích hợp), CIDR. System proxy cho app thường; TUN khi app bỏ qua proxy OS. <a href="#routing">GeoIP hoạt động thế nào →</a>',
     'fc3-title': 'TLS fingerprint',
     'fc3-desc': 'rustls (craftls) với REALITY và ClientHello giống trình duyệt.',
     'fc4-title': 'Subscription',
@@ -785,6 +1010,22 @@ const translations = {
     'fc5-desc': 'App GPUI native và CLI nhẹ cho headless / script.',
     'fc6-title': 'Merlin toàn LAN',
     'fc6-desc': 'Gói AsusWRT-Merlin chính thức: một binary musl, Web UI, iptables/DNS, hot-reload.',
+    'route-label': 'Định tuyến &amp; GeoIP',
+    'route-h2': 'Trung Quốc đi thẳng, không cần MMDB nặng.',
+    'route-sub': 'geoip:CN dựa trên danh sách CIDR gắn trong binary — đủ nhỏ cho flash Merlin, đủ chính xác cho direct nội địa.',
+    'route-c1-title': '“GeoIP” nghĩa là gì ở đây',
+    'route-c1-body': 'Không phải MaxMind. Sockrocket có GeoIP nhẹ trong bộ nhớ từ ~741 CIDR IPv4 Trung Quốc (tập hợp APNIC đã chọn lọc), cộng dải private. Luật kiểu <code>geoip: CN → direct</code> tra bảng này.',
+    'route-c2-title': 'Loại luật',
+    'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
+    'route-c2-li2': '<code>ip-cidr</code> và <code>geoip</code> (mã quốc gia)',
+    'route-c2-li3': '<code>final</code> bắt tất cả → proxy hoặc direct',
+    'route-c2-li4': 'Hành động: <code>direct</code> · <code>proxy</code> · <code>reject</code>',
+    'route-c3-title': 'Bộ China-direct sẵn có',
+    'route-c3-body': 'Mặc định: CIDR private/LAN, suffix &amp; keyword domain CN phổ biến, rồi danh sách IP CN, rồi match-all → proxy. Luật tùy chỉnh của bạn đứng trước (khớp đầu tiên thắng).',
+    'route-c4-title': 'Thêm trên Merlin',
+    'route-c4-body': 'Cùng danh sách CIDR có thể nạp vào <code>ipset</code> kernel cho hardware-NAT direct (<code>cn_ipset_direct</code>). TUN Fake-IP giữ tên quốc tế trên đường domain; câu trả lời nội địa vẫn là IP thật để geoip/direct vẫn đúng.',
+    'route-note': '<strong>Vì sao không MaxMind GeoLite?</strong> Country MMDB thường vài megabyte — nặng với Merlin JFFS bên cạnh binary musl ~10&nbsp;MB, thêm giấy phép/cập nhật. Danh sách CN chọn lọc giữ gói router gọn; thiếu sót bù bằng luật domain và bảng IP nội địa của TUN.',
+    'route-ex-label': 'Desktop CLI và Merlin cùng YAML (<code>rules:</code> đứng trước bộ sẵn có):',
     'merlin-tag': 'asuswrt-merlin · koolcenter',
     'merlin-h2': 'Cùng engine trên router.',
     'merlin-sub': 'GUI chạy được thì Merlin chạy được — proxy trong suốt cho mọi thiết bị LAN.',
@@ -796,8 +1037,33 @@ const translations = {
     'proto-sub': 'Gồm QUIC thế hệ mới và Reality.',
     'uc-ss': 'Nhẹ, đa năng', 'uc-vmess': 'Thân thiện CDN', 'uc-vless': 'Ít overhead',
     'uc-trojan': 'Ngụy trang HTTPS', 'uc-tuic': 'Kết nối lại 0-RTT', 'uc-hy2': 'Mạng mất gói',
-    'install-label': 'Bắt đầu nhanh', 'install-h2': 'Chạy dưới một phút.',
-    'install-sub': 'Tải binary. Mặc định SOCKS5 :1080 · HTTP :1087.',
+    'install-label': 'Cài đặt &amp; cấu hình', 'install-h2': 'Cài một lần. Cấu hình cùng một cách.',
+    'install-sub': 'GUI và Merlin dùng chung subscription, node và luật định tuyến. CLI dùng cùng dạng <code>config.yaml</code>. Mặc định: SOCKS5 <code>:1080</code> · HTTP <code>:1087</code>.',
+    'tab-gui': 'Desktop GUI', 'tab-cli': 'CLI', 'tab-merlin': 'Router Merlin',
+    'gui-s1': '<strong>Cài đặt</strong> — macOS: mở DMG kéo vào Applications. Windows: giải nén chạy <code>Sockrocket.exe</code>. Linux: giải nén tarball và chạy <code>install.sh</code> (hoặc <code>./sockrocket</code>).',
+    'gui-s2': '<strong>Thêm subscription</strong> — dán URL Clash / V2Ray / SingBox → Update. Hoặc thêm node thủ công.',
+    'gui-s3': '<strong>Chọn node</strong> — Test / Test all (RTT warm qua proxy), rồi chọn node và kết nối.',
+    'gui-s4': '<strong>Chế độ lưu lượng</strong> — bật <strong>System proxy</strong> cho trình duyệt và hầu hết app; bật <strong>TUN</strong> khi app bỏ qua proxy OS (cần admin / root).',
+    'gui-s5': '<strong>Định tuyến</strong> — China-direct sẵn có mặc định; thêm luật domain / GeoIP / CIDR trong Settings (cùng mô hình YAML <code>rules:</code>). Xem <a href="#routing">Routing &amp; GeoIP</a>.',
+    'gui-hint': 'Ngôn ngữ: thanh trạng thái EN → VI → 中文 (đã lưu). Đừng dán URL subscription vào chat công khai.',
+    'cli-s1': '<strong>Init</strong> — tạo <code>config.yaml</code> mẫu, rồi sửa cổng lắng nghe, subscription và luật.',
+    'cli-s2': '<strong>Subscriptions</strong> — trong <code>subscriptions:</code> đặt <code>name</code>, <code>url</code>, <code>format: auto</code>. Node được điền khi start (hoặc khi refresh).',
+    'cli-s3': '<strong>Active node</strong> — <code>active_node: 0</code> chọn node đầu; <code>null</code> giữ direct.',
+    'cli-s4': '<strong>Rules</strong> — cùng <code>rule_type</code> / <code>pattern</code> / <code>target</code> như GUI và Merlin. Luật tùy chỉnh đứng trước bộ China-direct sẵn có.',
+    'cli-s5': '<strong>Chạy</strong> — trỏ app tới SOCKS/HTTP local, hoặc đặt system-proxy / TUN phía trước CLI.',
+    'cli-hint': 'Tham chiếu đầy đủ: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a> · ví dụ: <a href="https://github.com/sockrockets/sockrocket/blob/main/config.yaml.example">config.yaml.example</a>.',
+    'mer-s1': '<strong>Chọn gói</strong> — tải <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code> từ <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a>. Khớp <code>uname -m</code> / SoC: <code>hnd_v8</code> (aarch64 BCM490x) vs <code>hnd</code> (armv7 BCM675x) là lỗi thường gặp.',
+    'mer-s2': '<strong>Software Center (khuyến nghị)</strong> — Web UI router → <strong>Software Center</strong> (koolcenter / softcenter) → <strong>Offline install</strong> → tải lên <code>.tar.gz</code> khớp → Install. Sai platform <code>.valid</code> → từ chối hoặc <em>Exec format error</em>.',
+    'mer-s3': '<strong>Mở plugin</strong> — ô Sockrocket trong Software Center, hoặc <code>http://&lt;router-lan-ip&gt;/ext/sockrocket/sockrocket.asp</code>.',
+    'mer-s4': '<strong>Cấu hình</strong> — thêm subscription → Update → đợi node → chọn node → bật transparent proxy / TUN nếu cần. Cùng engine luật với desktop.',
+    'mer-s5': '<strong>Tùy chọn</strong> — cài bằng SSH nếu muốn; sửa <code>/jffs/addons/sockrocket/config.yaml</code> (listen <code>0.0.0.0</code> cho LAN). Dịch vụ: <code>sockrocket.sh start|stop|restart|status|update-subs</code>.',
+    'mer-sc1': '# —— Cài plugin qua Software Center (khuyến nghị) ——',
+    'mer-sc2': '# 1. Tải sockrocket-merlin-&lt;platform&gt;.tar.gz từ GitHub Releases',
+    'mer-sc3': '# 2. Web UI router → Software Center (koolcenter / softcenter)',
+    'mer-sc4': '# 3. Offline install / upload → chọn .tar.gz → Install',
+    'mer-sc5': '# 4. Mở ô Sockrocket (hoặc /ext/sockrocket/sockrocket.asp)',
+    'mer-ssh-label': '# —— Cài SSH (tùy chọn) ——',
+    'mer-hint': 'Gốc archive luôn là <code>sockrocket/</code> (tên module koolcenter). Thiết bị LAN không cần client — lưu lượng vào iptables/TUN trên router, rồi luật GeoIP/domain. Hướng dẫn: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>.',
     'dl-label': 'Tải xuống', 'dl-h2': 'Mọi nền tảng chúng tôi ship.',
     'dl-sub': 'GUI, CLI và gói Merlin trên GitHub Releases.',
     'dl-linux': 'GUI + CLI x86_64 và aarch64.',
@@ -805,9 +1071,6 @@ const translations = {
     'dl-windows': 'GUI + CLI .exe x86_64.',
     'dl-merlin': 'Gói arm64 / armv7 soft & hard float.',
     'footer-copy': 'Viết bằng Rust. © 2026 Sockrocket.',
-    'merlin-step1': '# 1. Tải sockrocket-merlin-&lt;platform&gt;.tar.gz từ Releases',
-    'merlin-step2': '# 2. Software Center → Offline install → tải tar.gz lên',
-    'merlin-step3': '# 3. Mở ô Sockrocket · kiểm tra uname -m (hnd vs hnd_v8)',
     'community-label': 'Cộng đồng',
     'community-h2': 'Thông báo và hỏi đáp.',
     'community-sub': 'Phát hành trên Telegram; hỏi đáp trên GitHub Discussions. Không đăng URL subscription, token hay thông tin cá nhân.',
@@ -816,19 +1079,20 @@ const translations = {
     'community-issues': 'Báo lỗi và hồi quy.',
   },
   ru: {
-    'nav-features': 'Возможности', 'nav-merlin': 'Merlin', 'nav-protocols': 'Протоколы',
+    'nav-features': 'Возможности', 'nav-routing': 'Маршрутизация', 'nav-setup': 'Настройка', 'nav-merlin': 'Merlin', 'nav-protocols': 'Протоколы',
     'nav-download': 'Скачать', 'nav-community': 'Сообщество', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>Прокси, который работает.',
     'hero-sub': 'Нативный GUI, CLI и AsusWRT-Merlin — один стек на Rust от ноутбука до всей LAN.',
     'hero-btn-download': 'Скачать v0.1.0', 'hero-btn-github': 'Исходники',
-    'stat-protocols': 'Протоколы', 'stat-surfaces': 'Интерфейсы', 'stat-arch': 'Архитектуры', 'stat-rust': 'Rust',
+    'stat-protocols': 'Протоколы', 'stat-surfaces': 'Интерфейсы', 'stat-cidrs': 'CN CIDR',
+    'stat-arch': 'Архитектуры', 'stat-rust': 'Rust',
     'feat-label': 'Возможности', 'feat-h2': 'Для ежедневной работы,<br/>не для демо.',
     'feat-sub': 'Задержка через прокси, настоящая маршрутизация и плагин Merlin на том же движке, что и десктоп.',
     'fc1-title': 'Прогретые тесты через прокси',
     'fc1-desc': 'Ранжирование узлов по RTT на стороне выхода по тёплому пути — как в браузере, а не фейковый TCP ping до server:port.',
     'fc2-title': 'Умная маршрутизация',
-    'fc2-desc': 'Правила Domain, GeoIP и CIDR. Системный прокси для обычных приложений; TUN, если программа его игнорирует.',
+    'fc2-desc': 'Domain, GeoIP (встроенные CN CIDR) и CIDR. Системный прокси для обычных приложений; TUN, если программа его игнорирует. <a href="#routing">Как работает GeoIP →</a>',
     'fc3-title': 'TLS fingerprint',
     'fc3-desc': 'Патченый rustls (craftls) с REALITY и ClientHello как у браузера — для враждебных сетей.',
     'fc4-title': 'Подписки',
@@ -837,6 +1101,22 @@ const translations = {
     'fc5-desc': 'Нативное GPUI-приложение и лёгкий CLI для headless и скриптов.',
     'fc6-title': 'Merlin на всю LAN',
     'fc6-desc': 'Официальный пакет AsusWRT-Merlin: один musl-бинарник, Web UI, iptables/DNS, hot-reload узлов.',
+    'route-label': 'Маршрутизация и GeoIP',
+    'route-h2': 'Китай напрямую — без тяжёлого MMDB.',
+    'route-sub': 'geoip:CN опирается на курируемый список CIDR в бинарнике — достаточно мал для flash Merlin и достаточно точен для domestic direct.',
+    'route-c1-title': 'Что здесь значит «GeoIP»',
+    'route-c1-body': 'Не MaxMind. Лёгкая in-memory база из ~741 агрегированных китайских IPv4 CIDR (курируемый APNIC-поднабор) плюс private-диапазоны. Правила вроде <code>geoip: CN → direct</code> бьют по этой таблице.',
+    'route-c2-title': 'Типы правил',
+    'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
+    'route-c2-li2': '<code>ip-cidr</code> и <code>geoip</code> (код страны)',
+    'route-c2-li3': '<code>final</code> catch-all → proxy или direct',
+    'route-c2-li4': 'Действия: <code>direct</code> · <code>proxy</code> · <code>reject</code>',
+    'route-c3-title': 'Встроенный China-direct набор',
+    'route-c3-body': 'Из коробки: private/LAN CIDR, типичные CN domain-suffix и keyword, затем список CN IP, затем match-all → proxy. Ваши правила ставятся впереди (первое совпадение побеждает).',
+    'route-c4-title': 'Дополнительно на Merlin',
+    'route-c4-body': 'Тот же CIDR-список можно загрузить в kernel <code>ipset</code> для hardware-NAT direct (<code>cn_ipset_direct</code>). TUN Fake-IP держит международные имена на domain-пути; отечественные ответы остаются реальными IP, чтобы geoip/direct работал.',
+    'route-note': '<strong>Почему не MaxMind GeoLite?</strong> Country MMDB обычно несколько мегабайт — тяжело для Merlin JFFS рядом с ~10&nbsp;MB musl-бинарником, плюс лицензия и обновления. Курируемый CN-список держит пакет лёгким; пробелы закрывают domain-правила и domestic-IP таблица TUN.',
+    'route-ex-label': 'Тот же YAML на desktop CLI и Merlin (<code>rules:</code> перед встроенным набором):',
     'merlin-tag': 'asuswrt-merlin · koolcenter',
     'merlin-h2': 'Тот же движок на роутере.',
     'merlin-sub': 'Что работает в GUI — работает на Merlin: прозрачный прокси для всех устройств в LAN.',
@@ -848,8 +1128,33 @@ const translations = {
     'proto-sub': 'Включая QUIC-транспорты нового поколения и Reality.',
     'uc-ss': 'Лёгкий, универсальный', 'uc-vmess': 'Дружит с CDN', 'uc-vless': 'Малый overhead',
     'uc-trojan': 'Маскировка под HTTPS', 'uc-tuic': 'Реконнект 0-RTT', 'uc-hy2': 'Потери пакетов',
-    'install-label': 'Быстрый старт', 'install-h2': 'Меньше минуты.',
-    'install-sub': 'Скачайте релиз. По умолчанию SOCKS5 :1080 · HTTP :1087.',
+    'install-label': 'Установка и настройка', 'install-h2': 'Установите один раз. Настраивайте одинаково.',
+    'install-sub': 'GUI и Merlin делят подписки, узлы и правила. CLI использует ту же форму <code>config.yaml</code>. По умолчанию: SOCKS5 <code>:1080</code> · HTTP <code>:1087</code>.',
+    'tab-gui': 'Desktop GUI', 'tab-cli': 'CLI', 'tab-merlin': 'Router Merlin',
+    'gui-s1': '<strong>Установка</strong> — macOS: откройте DMG и перетащите в Applications. Windows: распакуйте и запустите <code>Sockrocket.exe</code>. Linux: распакуйте tarball и запустите <code>install.sh</code> (или <code>./sockrocket</code>).',
+    'gui-s2': '<strong>Подписка</strong> — вставьте URL Clash / V2Ray / SingBox → Update. Или добавьте узлы вручную.',
+    'gui-s3': '<strong>Выбор узла</strong> — Test / Test all (тёплый RTT через прокси), затем выберите узел и подключитесь.',
+    'gui-s4': '<strong>Режим трафика</strong> — включите <strong>System proxy</strong> для браузеров и большинства приложений; <strong>TUN</strong> — если приложение игнорирует системный прокси (нужны права admin / root).',
+    'gui-s5': '<strong>Маршрутизация</strong> — China-direct включён по умолчанию; свои domain / GeoIP / CIDR — в Settings (та же модель, что YAML <code>rules:</code>). См. <a href="#routing">Routing &amp; GeoIP</a>.',
+    'gui-hint': 'Язык: в статус-баре EN → VI → 中文 (сохраняется). Не публикуйте URL подписок в открытых чатах.',
+    'cli-s1': '<strong>Init</strong> — создайте стартовый <code>config.yaml</code>, затем правьте порты, подписки и правила.',
+    'cli-s2': '<strong>Subscriptions</strong> — в <code>subscriptions:</code> укажите <code>name</code>, <code>url</code>, <code>format: auto</code>. Узлы подтянутся при старте (или при refresh).',
+    'cli-s3': '<strong>Active node</strong> — <code>active_node: 0</code> выбирает первый узел; <code>null</code> — режим direct.',
+    'cli-s4': '<strong>Rules</strong> — те же <code>rule_type</code> / <code>pattern</code> / <code>target</code>, что у GUI и Merlin. Свои правила идут перед встроенным China-direct.',
+    'cli-s5': '<strong>Запуск</strong> — направьте приложения на локальный SOCKS/HTTP или поставьте system-proxy / TUN перед CLI.',
+    'cli-hint': 'Полный справочник: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a> · пример: <a href="https://github.com/sockrockets/sockrocket/blob/main/config.yaml.example">config.yaml.example</a>.',
+    'mer-s1': '<strong>Выбор пакета</strong> — скачайте <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code> с <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a>. По <code>uname -m</code> / SoC: <code>hnd_v8</code> (aarch64 BCM490x) vs <code>hnd</code> (armv7 BCM675x) — типичная ошибка.',
+    'mer-s2': '<strong>Software Center (рекомендуется)</strong> — Web UI роутера → <strong>Software Center</strong> (koolcenter / softcenter) → <strong>Offline install</strong> → загрузите нужный <code>.tar.gz</code> → Install. Неверный <code>.valid</code> → отказ или <em>Exec format error</em>.',
+    'mer-s3': '<strong>Откройте плагин</strong> — плитка Sockrocket в Software Center или <code>http://&lt;router-lan-ip&gt;/ext/sockrocket/sockrocket.asp</code>.',
+    'mer-s4': '<strong>Настройка</strong> — подписка → Update → дождаться узлов → выбрать узел → при необходимости transparent proxy / TUN. Тот же движок правил, что на десктопе.',
+    'mer-s5': '<strong>Опционально</strong> — установка по SSH; правка <code>/jffs/addons/sockrocket/config.yaml</code> (listen <code>0.0.0.0</code> для LAN). Сервис: <code>sockrocket.sh start|stop|restart|status|update-subs</code>.',
+    'mer-sc1': '# —— Установка плагина через Software Center (рекомендуется) ——',
+    'mer-sc2': '# 1. Скачайте sockrocket-merlin-&lt;platform&gt;.tar.gz с GitHub Releases',
+    'mer-sc3': '# 2. Web UI роутера → Software Center (koolcenter / softcenter)',
+    'mer-sc4': '# 3. Offline install / upload → выберите .tar.gz → Install',
+    'mer-sc5': '# 4. Откройте плитку Sockrocket (или /ext/sockrocket/sockrocket.asp)',
+    'mer-ssh-label': '# —— Установка по SSH (опционально) ——',
+    'mer-hint': 'Корень архива всегда <code>sockrocket/</code> (имя модуля koolcenter). Устройствам в LAN клиент не нужен — трафик идёт в iptables/TUN на роутере, затем GeoIP/domain. Гайд: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>.',
     'dl-label': 'Скачать', 'dl-h2': 'Все платформы, которые мы собираем.',
     'dl-sub': 'Готовые GUI, CLI и пакеты Merlin на GitHub Releases.',
     'dl-linux': 'GUI + CLI для x86_64 и aarch64.',
@@ -857,9 +1162,6 @@ const translations = {
     'dl-windows': 'GUI + CLI .exe для x86_64.',
     'dl-merlin': 'Пакеты arm64 / armv7 soft & hard float.',
     'footer-copy': 'Написано на Rust. © 2026 Sockrocket.',
-    'merlin-step1': '# 1. Скачайте sockrocket-merlin-&lt;platform&gt;.tar.gz из Releases',
-    'merlin-step2': '# 2. Software Center → Offline install → загрузите tar.gz',
-    'merlin-step3': '# 3. Откройте Sockrocket · проверьте uname -m (hnd vs hnd_v8)',
     'community-label': 'Сообщество',
     'community-h2': 'Анонсы и вопросы.',
     'community-sub': 'Релизы в Telegram; вопросы в GitHub Discussions. Не публикуйте URL подписок, токены и личные данные.',
@@ -868,19 +1170,20 @@ const translations = {
     'community-issues': 'Баги и регрессии.',
   },
   zh: {
-    'nav-features': '功能', 'nav-merlin': 'Merlin', 'nav-protocols': '协议',
+    'nav-features': '功能', 'nav-routing': '分流', 'nav-setup': '配置使用', 'nav-merlin': 'Merlin', 'nav-protocols': '协议',
     'nav-download': '下载', 'nav-community': '社区', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · 开源 · Apache-2.0',
     'hero-h1': 'Sockrocket<em>.</em><br/>代理，开箱即用。',
     'hero-sub': '原生 GUI、CLI 与华硕 Merlin 插件——同一套 Rust 栈，从笔记本到整网。',
     'hero-btn-download': '下载 v0.1.0', 'hero-btn-github': '查看源码',
-    'stat-protocols': '协议', 'stat-surfaces': '界面形态', 'stat-arch': '架构目标', 'stat-rust': 'Rust',
+    'stat-protocols': '协议', 'stat-surfaces': '界面形态', 'stat-cidrs': '国内 CIDR',
+    'stat-arch': '架构目标', 'stat-rust': 'Rust',
     'feat-label': '功能', 'feat-h2': '为日常而做，<br/>不是为演示。',
     'feat-sub': '真实过代理测速、实用分流，以及与桌面端同源引擎的 Merlin 插件。',
     'fc1-title': '暖路径过代理测速',
     'fc1-desc': '节点排序测量出口侧暖路径 RTT——贴近浏览体感，不是对 server:port 的假 TCP ping。',
     'fc2-title': '智能分流',
-    'fc2-desc': '域名 / GeoIP / CIDR。系统代理覆盖常见应用；TUN 兜底不走系统代理的程序。',
+    'fc2-desc': '域名 / GeoIP（内置国内 CIDR）/ CIDR。系统代理覆盖常见应用；TUN 兜底不走系统代理的程序。<a href="#routing">GeoIP 如何工作 →</a>',
     'fc3-title': 'TLS 指纹定制',
     'fc3-desc': 'craftls（定制 rustls）支持 REALITY 与类浏览器 ClientHello。',
     'fc4-title': '订阅管理',
@@ -889,6 +1192,22 @@ const translations = {
     'fc5-desc': '原生 GPUI 桌面端，加上适合无头与脚本的轻量 CLI。',
     'fc6-title': 'Merlin 全网代理',
     'fc6-desc': '官方 AsusWRT-Merlin 包：单个 musl 二进制、Web UI、iptables/DNS、热重载切节点。',
+    'route-label': '分流与 GeoIP',
+    'route-h2': '国内直连，不必塞进臃肿 MMDB。',
+    'route-sub': 'geoip:CN 由二进制内嵌的精选 CIDR 列表驱动——适合 Merlin 闪存体积，也够用国内直连精度。',
+    'route-c1-title': '这里的「GeoIP」指什么',
+    'route-c1-body': '不是 MaxMind。Sockrocket 内置轻量内存 GeoIP：约 741 条聚合后的中国 IPv4 CIDR（面向 APNIC 的精选集），外加私网段。形如 <code>geoip: CN → direct</code> 的规则查这张表。',
+    'route-c2-title': '规则类型',
+    'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
+    'route-c2-li2': '<code>ip-cidr</code> 与 <code>geoip</code>（国家代码）',
+    'route-c2-li3': '<code>final</code> 兜底 → proxy 或 direct',
+    'route-c2-li4': '动作：<code>direct</code> · <code>proxy</code> · <code>reject</code>',
+    'route-c3-title': '内置国内直连规则集',
+    'route-c3-body': '开箱即用：私网/局域网 CIDR、常见国内域名后缀与关键词、国内 IP 列表，最后 match-all → 代理。自定义规则插在前面（先匹配先生效）。',
+    'route-c4-title': 'Merlin 额外能力',
+    'route-c4-body': '同一 CIDR 列表可灌入内核 <code>ipset</code> 做硬件 NAT 直连（<code>cn_ipset_direct</code>）。TUN Fake-IP 让境外域名走域名规则路径；国内解析仍是真实 IP，geoip/直连继续生效。',
+    'route-note': '<strong>为何不用 MaxMind GeoLite？</strong> Country MMDB 通常数兆字节——紧挨着约 10&nbsp;MB 的 musl 二进制塞进 Merlin JFFS 很疼，还有授权与更新成本。精选国内列表让路由包保持轻量；缺口由域名规则和 TUN 国内 IP 表补齐。',
+    'route-ex-label': '桌面 CLI 与 Merlin 共用同一套 YAML（自定义 <code>rules:</code> 插在内置规则前）：',
     'merlin-tag': 'asuswrt-merlin · koolcenter',
     'merlin-h2': '路由器上同一引擎。',
     'merlin-sub': 'GUI 能跑的，Merlin 也能跑——局域网设备透明代理。',
@@ -900,8 +1219,33 @@ const translations = {
     'proto-sub': '含 QUIC 下一代传输与 Reality 混淆。',
     'uc-ss': '轻量通用', 'uc-vmess': '友好 CDN', 'uc-vless': '低开销',
     'uc-trojan': 'HTTPS 伪装', 'uc-tuic': '0-RTT 重连', 'uc-hy2': '弱网高吞吐',
-    'install-label': '快速开始', 'install-h2': '一分钟内跑起来。',
-    'install-sub': '下载发布二进制。默认 SOCKS5 :1080 · HTTP :1087。',
+    'install-label': '配置与使用', 'install-h2': '装一次，配置方式统一。',
+    'install-sub': 'GUI 与 Merlin 共用订阅、节点与分流规则；CLI 使用同一套 <code>config.yaml</code> 结构。默认：SOCKS5 <code>:1080</code> · HTTP <code>:1087</code>。',
+    'tab-gui': '桌面 GUI', 'tab-cli': 'CLI', 'tab-merlin': 'Merlin 路由',
+    'gui-s1': '<strong>安装</strong> — macOS：打开 DMG 拖到「应用程序」。Windows：解压运行 <code>Sockrocket.exe</code>。Linux：解压 tarball 后执行 <code>install.sh</code>（或直接 <code>./sockrocket</code>）。',
+    'gui-s2': '<strong>添加订阅</strong> — 粘贴 Clash / V2Ray / SingBox 链接 → 更新；也可手动加节点。',
+    'gui-s3': '<strong>选择节点</strong> — Test / Test all（暖路径过代理 RTT），再点选节点并连接。',
+    'gui-s4': '<strong>流量模式</strong> — 开启<strong>系统代理</strong>覆盖浏览器等常见应用；应用不认系统代理时再开 <strong>TUN</strong>（需管理员 / root）。',
+    'gui-s5': '<strong>分流</strong> — 默认已有国内直连；在设置里加域名 / GeoIP / CIDR（与 YAML <code>rules:</code> 同一模型）。详见 <a href="#routing">分流与 GeoIP</a>。',
+    'gui-hint': '语言：状态栏循环 EN → VI → 中文（会保存）。请勿在公开聊天粘贴订阅链接。',
+    'cli-s1': '<strong>初始化</strong> — 生成起步 <code>config.yaml</code>，再改监听端口、订阅与规则。',
+    'cli-s2': '<strong>订阅</strong> — 在 <code>subscriptions:</code> 填写 <code>name</code>、<code>url</code>、<code>format: auto</code>。启动（或刷新）后写入节点。',
+    'cli-s3': '<strong>活动节点</strong> — <code>active_node: 0</code> 选第一个节点；<code>null</code> 为直连。',
+    'cli-s4': '<strong>规则</strong> — 与 GUI、Merlin 相同的 <code>rule_type</code> / <code>pattern</code> / <code>target</code>。自定义规则插在内置国内直连之前。',
+    'cli-s5': '<strong>运行</strong> — 让应用走本地 SOCKS/HTTP，或在 CLI 前再挂系统代理 / TUN。',
+    'cli-hint': '字段说明：<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a> · 示例：<a href="https://github.com/sockrockets/sockrocket/blob/main/config.yaml.example">config.yaml.example</a>。',
+    'mer-s1': '<strong>选对平台包</strong> — 从 <a href="https://github.com/sockrockets/sockrocket/releases">Releases</a> 下载 <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>。对照 <code>uname -m</code> / SoC：常见踩坑是 <code>hnd_v8</code>（aarch64 BCM490x）与 <code>hnd</code>（armv7 BCM675x）。',
+    'mer-s2': '<strong>软件中心安装（推荐）</strong> — 路由器 Web UI → <strong>软件中心</strong>（koolcenter / softcenter）→ <strong>离线安装</strong> → 上传对应 <code>.tar.gz</code> → 安装。平台 <code>.valid</code> 不对会拒绝，或出现 <em>Exec format error</em>。',
+    'mer-s3': '<strong>打开插件</strong> — 软件中心里的 Sockrocket 磁贴，或 <code>http://&lt;路由器局域网IP&gt;/ext/sockrocket/sockrocket.asp</code>。',
+    'mer-s4': '<strong>配置</strong> — 加订阅 → 更新 → 等节点出现 → 选节点 → 按需开透明代理 / TUN。分流引擎与桌面端相同。',
+    'mer-s5': '<strong>可选</strong> — 也可用 SSH 安装；编辑 <code>/jffs/addons/sockrocket/config.yaml</code>（整网监听用 <code>0.0.0.0</code>）。服务：<code>sockrocket.sh start|stop|restart|status|update-subs</code>。',
+    'mer-sc1': '# —— 软件中心插件安装（推荐） ——',
+    'mer-sc2': '# 1. 从 GitHub Releases 下载 sockrocket-merlin-&lt;platform&gt;.tar.gz',
+    'mer-sc3': '# 2. 路由器 Web UI → 软件中心（koolcenter / softcenter）',
+    'mer-sc4': '# 3. 离线安装 / 上传插件 → 选择 .tar.gz → 安装',
+    'mer-sc5': '# 4. 打开 Sockrocket 磁贴（或 /ext/sockrocket/sockrocket.asp）',
+    'mer-ssh-label': '# —— SSH 安装（可选） ——',
+    'mer-hint': '压缩包根目录固定为 <code>sockrocket/</code>（koolcenter 模块名）。局域网设备无需装客户端——流量进路由上的 iptables/TUN，再走 GeoIP/域名规则。完整指南：<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>。',
     'dl-label': '下载', 'dl-h2': '我们发布的全部平台。',
     'dl-sub': 'GitHub Releases 上的 GUI、CLI 与 Merlin 包。',
     'dl-linux': 'x86_64 / aarch64 GUI + CLI。',
@@ -909,9 +1253,6 @@ const translations = {
     'dl-windows': 'x86_64 GUI + CLI .exe。',
     'dl-merlin': 'arm64 / armv7 软硬浮点包。',
     'footer-copy': '用 Rust 打造。© 2026 Sockrocket。',
-    'merlin-step1': '# 1. 从 Releases 下载 sockrocket-merlin-&lt;platform&gt;.tar.gz',
-    'merlin-step2': '# 2. 软件中心 → 离线安装 → 上传该 tar.gz',
-    'merlin-step3': '# 3. 打开 Sockrocket · 核对 uname -m（注意 hnd 与 hnd_v8）',
     'community-label': '社区',
     'community-h2': '发布通知与问答。',
     'community-sub': '发版看 Telegram；提问用 GitHub Discussions。请勿公开粘贴订阅链接、token 或个人信息。',
@@ -925,19 +1266,19 @@ const langHtml = { en: 'en', vi: 'vi', ru: 'ru', zh: 'zh-CN' };
 const metaByLang = {
   en: {
     title: 'Sockrocket — Cross-Platform Proxy Client',
-    description: 'Rust proxy client with native GUI, CLI, and AsusWRT-Merlin plugin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+    description: 'Rust proxy with GUI, CLI, and AsusWRT-Merlin. Built-in GeoIP (741 CN CIDRs), smart routing, Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
   },
   vi: {
     title: 'Sockrocket — Proxy đa nền tảng',
-    description: 'Client proxy Rust với GUI gốc, CLI và plugin AsusWRT-Merlin. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+    description: 'Proxy Rust với GUI, CLI và Merlin. GeoIP tích hợp (741 CN CIDR), định tuyến thông minh. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
   },
   ru: {
     title: 'Sockrocket — кроссплатформенный прокси-клиент',
-    description: 'Прокси-клиент на Rust: нативный GUI, CLI и плагин AsusWRT-Merlin. Shadowsocks, VMess, VLess, Trojan, TUIC и Hysteria2.',
+    description: 'Прокси на Rust: GUI, CLI и Merlin. Встроенный GeoIP (741 CN CIDR), умная маршрутизация. Shadowsocks, VMess, VLess, Trojan, TUIC и Hysteria2.',
   },
   zh: {
     title: 'Sockrocket — 跨平台代理客户端',
-    description: 'Rust 代理客户端：原生 GUI、CLI 与华硕 Merlin 插件。支持 Shadowsocks、VMess、VLess、Trojan、TUIC、Hysteria2。',
+    description: 'Rust 代理：原生 GUI、CLI 与 Merlin 插件。内置 GeoIP（741 条国内 CIDR）与智能分流。支持 Shadowsocks、VMess、VLess、Trojan、TUIC、Hysteria2。',
   },
 };
 
@@ -981,7 +1322,7 @@ applyLang(detectLang());
 function showTab(name) {
   ['gui', 'cli', 'merlin'].forEach(t => {
     const el = document.getElementById('tab-' + t);
-    if (el) el.style.display = t === name ? 'block' : 'none';
+    if (el) el.classList.toggle('active', t === name);
   });
   document.querySelectorAll('.tabs .tab').forEach((btn, i) => {
     btn.classList.toggle('active', ['gui', 'cli', 'merlin'][i] === name);

@@ -660,6 +660,30 @@ function toastResp(d, fallback) {
   if (d.ok === false) showMsg(d.msg || 'Operation failed', 'err');
   else showMsg(d.msg || fallback || 'Done', 'ok');
 }
+/** Copy plain text to the clipboard (Clipboard API + textarea fallback for older WebUI browsers). */
+function copyText(text, okMsg) {
+  if (!text) { showMsg('Nothing to copy', 'err'); return; }
+  function ok() { showMsg(okMsg || 'Copied', 'ok'); }
+  function fail() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    var worked = false;
+    try { worked = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    if (worked) ok();
+    else showMsg('Copy failed — select the URL manually', 'err');
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(ok, fail);
+  } else {
+    fail();
+  }
+}
 
 /* ══ State ═════════════════════════════════════════════════════════ */
 var S = {
@@ -667,6 +691,7 @@ var S = {
   status: {},        // status action result
   stats: {},         // stats action result
   nodes: [],         // node_details
+  subs: [],          // subscriptions (for copy-url by index)
   activeNode: 0,
   lat: {},           // index -> ms (-1 = timeout)
   testingAll: false,
@@ -1029,15 +1054,27 @@ function loadSubs() {
   api('subscriptions', null, function (d) {
     var el = document.getElementById('sub-list');
     var subs = d.subs || [];
+    S.subs = subs;
     if (!subs.length) { el.innerHTML = '<div class="hint">No subscriptions yet.</div>'; return; }
     el.innerHTML = subs.map(function (s) {
       return '<div class="row">' +
         '<span class="badge acc">' + esc(s.format || 'auto') + '</span>' +
         '<span class="r-name">' + esc(s.name) + '<div class="r-sub">' + esc(s.url) + '</div></span>' +
+        '<button class="btn btn-sm" onclick="event.stopPropagation();copySubUrl(' + s.index + ')" title="Copy subscription URL">Copy</button>' +
         '<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();delSub(' + s.index + ')">Delete</button>' +
         '</div>';
     }).join('');
   });
+}
+function copySubUrl(i) {
+  var subs = S.subs || [];
+  var s = null;
+  for (var k = 0; k < subs.length; k++) {
+    if (subs[k].index === i) { s = subs[k]; break; }
+  }
+  if (!s) s = subs[i];
+  if (!s || !s.url) { showMsg('No subscription URL', 'err'); return; }
+  copyText(s.url, 'Subscription URL copied');
 }
 function addSub() {
   var data = {

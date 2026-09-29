@@ -1371,6 +1371,7 @@ impl AppState {
             for (i, sub) in self.subscriptions.iter().enumerate() {
                 let last_updated = Self::format_last_updated(sub.last_updated);
                 let name = sub.name.clone();
+                let sub_url = sub.url.clone();
                 let sub_nodes = self
                     .nodes
                     .iter()
@@ -1412,6 +1413,19 @@ impl AppState {
                                         .text_color(rgb(TEXT_MUTED))
                                         .child(format!("{} nodes · {}", sub_nodes, last_updated)),
                                 ),
+                        )
+                        .child(
+                            Button::new(("subs-bar-copy", i))
+                                .xsmall()
+                                .label("Copy".to_string())
+                                .tooltip("Copy subscription URL to the clipboard")
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(sub_url.clone()));
+                                    this.import_status =
+                                        "✓ Subscription URL copied to clipboard".to_string();
+                                    cx.notify();
+                                })),
                         )
                         .child(
                             Button::new(("subs-bar-refresh", i))
@@ -1478,6 +1492,7 @@ impl AppState {
                 sub.url.clone()
             };
             let name = sub.name.clone();
+            let sub_url = sub.url.clone();
             let node_count = self
                 .nodes
                 .iter()
@@ -1567,6 +1582,19 @@ impl AppState {
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.cycle_refresh_interval(i, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(("copy-sub-url-btn", i))
+                                .xsmall()
+                                .label("Copy".to_string())
+                                .tooltip("Copy subscription URL to the clipboard")
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(sub_url.clone()));
+                                    this.import_status =
+                                        "✓ Subscription URL copied to clipboard".to_string();
+                                    cx.notify();
                                 })),
                         )
                         .child(
