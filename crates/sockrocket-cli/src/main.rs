@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
-    OutboundFactory, ProxyProtocol, ProxyService, Router, RoutingOutbound, RoutingRule, RuleSet,
+    OutboundFactory, ProxyProtocol, ProxyService, Router, RoutingOutbound, RoutingRule,
     SharedOutbound, SwappableOutbound, TunProxy, create_outbound, fetch_subscription,
     normalize_node_names, resolve_to_ips, setup_tun_routes, tun_requirements, tun_supported,
 };
@@ -777,16 +777,16 @@ fn build_outbound(
     Ok(wrap_with_rules(base_outbound, router))
 }
 
-/// Build the routing router once per process (None when no rules are
-/// configured). Shared by the routing outbound and — in TUN mode — the
-/// stream handler, which consults domain rules for bare-IP traffic whose
-/// originating name is known from recent DNS answers.
+/// Build the routing router once per process. Shared by the routing outbound
+/// and — in TUN mode — the stream handler.
+///
+/// Uses the same assembly as the desktop GUI Rule mode: user rules (by
+/// priority) first, then the built-in China-direct set, with the expanded
+/// in-binary GeoIP DB attached. Empty `rules` still yields China-direct so
+/// Merlin / CLI match GUI behaviour.
 fn build_router(rules: &[RoutingRule]) -> Option<Arc<Router>> {
-    if rules.is_empty() {
-        return None;
-    }
     Some(Arc::new(
-        Router::new(RuleSet::from_config(rules))
+        Router::new(sockrocket_core::rule_mode_ruleset(rules))
             .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
     ))
 }

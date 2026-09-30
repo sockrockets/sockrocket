@@ -46,13 +46,26 @@ rules:
   - rule_type: domain-suffix
     pattern: "google.com"
     target: proxy
+    priority: 10          # higher runs first (default 0)
+  - rule_type: dst-port
+    pattern: "443"        # or "1000-2000"
+    target: direct
   - rule_type: ip-cidr
     pattern: "192.168.0.0/16"
     target: direct
   - rule_type: geoip
-    pattern: CN
+    pattern: CN           # built-in ~7456 China IPv4 CIDRs (+ private)
     target: direct
+  - rule_type: final      # alias: match
+    pattern: "*"
+    target: proxy
 ```
+
+Rule types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `dst-port` (alias `port`), `final`/`match`.
+
+Evaluation: enabled rules sorted by **priority descending**, then list order. First match wins.
+
+Refresh the CN CIDR database with `scripts/update-china-cidrs.sh` (source: 17mon/china_ip_list).
 
 ---
 

@@ -379,7 +379,8 @@ fn default_format() -> String {
 /// Routing rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
-    /// Rule type: "domain", "domain-suffix", "ip-cidr", "geoip"
+    /// Rule type: "domain", "domain-suffix", "domain-keyword", "ip-cidr",
+    /// "geoip", "dst-port", "match"/"final"
     pub rule_type: String,
     /// Match pattern
     pub pattern: String,
@@ -388,6 +389,10 @@ pub struct RoutingRule {
     /// Whether this rule is active (defaults to true)
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Evaluation priority. Higher values are tried first. Rules with equal
+    /// priority keep their list order (stable). Default `0`.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 fn default_true() -> bool {

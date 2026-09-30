@@ -119,7 +119,7 @@ do_ipset_start() {
     # (as spawned by the API bridge) lacks the `command` builtin, so the
     # usual `command -v ipset` guard fails with 127 even when ipset exists.
     ipset list >/dev/null 2>&1 || { err "ipset not available"; return 1; }
-    ipset create "$IPSET_NAME" hash:net maxelem 4096 -exist 2>/dev/null || true
+    ipset create "$IPSET_NAME" hash:net maxelem 16384 -exist 2>/dev/null || true
     # One atomic restore instead of ~800 individual `ipset add` forks.
     if ! "$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null \
         | awk '{print "add '"$IPSET_NAME"' " $1}' \

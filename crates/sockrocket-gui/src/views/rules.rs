@@ -95,23 +95,32 @@ fn status_alert_kind(message: &str) -> AlertKind {
 }
 
 /// Client-side approximation of router matching for the rule tester.
-/// Returns `(rule_index, target)` of the first *enabled* rule matching `host`.
-/// `geoip` rules need a database and are not evaluated client-side.
+/// Returns `(rule_index, target)` of the first *enabled* rule matching `host`,
+/// using the same priority-then-index order as the engine. `geoip` / `dst-port`
+/// are not evaluated client-side (need GeoIP DB / a destination port).
 fn match_rule(rules: &[RoutingRule], host: &str) -> Option<(usize, String)> {
     let host = host.trim().trim_end_matches('.').to_lowercase();
     if host.is_empty() {
         return None;
     }
-    for (i, r) in rules.iter().enumerate() {
-        if !r.enabled {
-            continue;
-        }
+    let mut indexed: Vec<(usize, &RoutingRule)> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.enabled)
+        .collect();
+    indexed.sort_by(|a, b| {
+        b.1.priority
+            .cmp(&a.1.priority)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    for (i, r) in indexed {
         let p = r.pattern.trim().to_lowercase();
         let hit = match r.rule_type.as_str() {
             "domain" | "domain-suffix" => host == p || host.ends_with(&format!(".{}", p)),
             "domain-keyword" => !p.is_empty() && host.contains(&p),
             "ip-cidr" => ip_in_cidr(&host, &p),
-            "match" => true,
+            "match" | "final" => true,
+            "geoip" | "dst-port" | "port" => false,
             _ => false,
         };
         if hit {
@@ -272,6 +281,7 @@ impl AppState {
             "domain-keyword" => "e.g. youtube",
             "ip-cidr" => "e.g. 192.168.0.0/24",
             "geoip" => "e.g. CN",
+            "dst-port" => "e.g. 443 or 1000-2000",
             "match" => "no pattern needed — matches all",
             _ => "",
         };
@@ -400,6 +410,7 @@ impl AppState {
                                             ("domain-keyword", "Keyword"),
                                             ("ip-cidr", "IP CIDR"),
                                             ("geoip", "GeoIP"),
+                                            ("dst-port", "Port"),
                                             ("match", "Match All"),
                                         ];
                                         let mut row = div().flex().flex_row().gap_1().flex_wrap();
@@ -445,6 +456,27 @@ impl AppState {
                                                 .child(pattern_hint),
                                         )
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .w(px(72.0))
+                                    .child(field_label("Priority"))
+                                    .child(
+                                        gpui_component::input::Input::new(
+                                            &self.rule_priority_input,
+                                        )
+                                        .xsmall()
+                                        .w_full(),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(TINY))
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child("higher first"),
+                                    ),
                             )
                             .child(
                                 div()
@@ -561,7 +593,7 @@ impl AppState {
                             }),
                     )
                     .child(div().text_size(px(TINY)).text_color(rgb(TEXT_MUTED)).child(
-                        "First enabled match wins · geoip rules are not evaluated client-side",
+                        "Higher priority first · equal priority uses list order (↑↓) · geoip not evaluated client-side",
                     )),
             );
 
@@ -691,7 +723,8 @@ impl AppState {
             "domain-keyword" => "DOMAIN-KEYWORD".to_string(),
             "ip-cidr" => "IP-CIDR".to_string(),
             "geoip" => "GEOIP".to_string(),
-            "match" => "MATCH".to_string(),
+            "dst-port" | "port" => "PORT".to_string(),
+            "match" | "final" => "MATCH".to_string(),
             other => other.to_uppercase(),
         };
         let type_chip = mini_badge(type_label, PURPLE);
@@ -743,7 +776,15 @@ impl AppState {
                     .text_size(px(TINY))
                     .font_family(MONO_FONT)
                     .text_color(rgb(TEXT_MUTED))
-                    .child(format!("{}", index + 1)),
+                    .child(format!(
+                        "{}{}",
+                        index + 1,
+                        if rule.priority != 0 {
+                            format!("·P{}", rule.priority)
+                        } else {
+                            String::new()
+                        }
+                    )),
             )
             // ENABLE switch (always visible)
             .child(div().w(px(32.0)).flex_shrink_0().child(

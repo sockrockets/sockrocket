@@ -535,6 +535,7 @@ fn dispatch(action: &str, post: &J) -> J {
         "get_rules" => act_get_rules(),
         "add_rule" => act_add_rule(post),
         "del_rule" => act_del_rule(post),
+        "move_rule" => act_move_rule(post),
         "diagnose" => act_diagnose(),
         _ => json!({"error": "Unknown action"}),
     }
@@ -1690,6 +1691,7 @@ const RULE_TYPES: &[&str] = &[
     "domain-keyword",
     "ip-cidr",
     "geoip",
+    "dst-port",
     "final",
 ];
 /// Rule targets accepted from the UI.
@@ -1740,6 +1742,29 @@ fn valid_rule_pattern(rule_type: &str, pattern: &str) -> std::result::Result<Str
                 Err("Invalid GeoIP country code (e.g. CN, US)".into())
             }
         }
+        "dst-port" => {
+            let (min, max) = if let Some((a, b)) = p.split_once('-') {
+                (
+                    a.trim()
+                        .parse::<u16>()
+                        .map_err(|_| "Invalid port range (e.g. 443 or 1000-2000)")?,
+                    b.trim()
+                        .parse::<u16>()
+                        .map_err(|_| "Invalid port range (e.g. 443 or 1000-2000)")?,
+                )
+            } else {
+                let port = p
+                    .parse::<u16>()
+                    .map_err(|_| "Invalid port (e.g. 443 or 1000-2000)")?;
+                (port, port)
+            };
+            let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+            Ok(if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            })
+        }
         "final" => Ok("*".to_string()),
         _ => Err(format!("Unknown rule type: {rule_type}")),
     }
@@ -1760,6 +1785,8 @@ fn act_get_rules() -> J {
                         "rule_type": r.get(ykey("rule_type")).and_then(|v| v.as_str()).unwrap_or(""),
                         "pattern": r.get(ykey("pattern")).and_then(|v| v.as_str()).unwrap_or(""),
                         "target": r.get(ykey("target")).and_then(|v| v.as_str()).unwrap_or("proxy"),
+                        "priority": r.get(ykey("priority")).and_then(|v| v.as_i64()).unwrap_or(0),
+                        "enabled": r.get(ykey("enabled")).and_then(|v| v.as_bool()).unwrap_or(true),
                     })
                 })
                 .collect()
@@ -1808,7 +1835,24 @@ fn act_add_rule(post: &J) -> J {
     entry.insert(ykey("rule_type"), Y::String(rule_type.to_string()));
     entry.insert(ykey("pattern"), Y::String(pattern.clone()));
     entry.insert(ykey("target"), Y::String(target.to_string()));
-    seq.insert(0, Y::Mapping(entry));
+    let priority = post
+        .get("priority")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    entry.insert(ykey("priority"), Y::Number(priority.into()));
+    entry.insert(ykey("enabled"), Y::Bool(true));
+    // Higher priority first: insert at front of equal-priority group so UI
+    // "new rule" stays ahead of older same-priority rules (list order tie-break).
+    let insert_at = seq
+        .iter()
+        .position(|r| {
+            r.get(ykey("priority"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32
+                <= priority
+        })
+        .unwrap_or(seq.len());
+    seq.insert(insert_at, Y::Mapping(entry));
     map.insert(ykey("rules"), Y::Sequence(seq));
 
     match save_conf(&map) {
@@ -1850,6 +1894,54 @@ fn act_del_rule(post: &J) -> J {
                 spawn_sh("restart");
             }
             json!({"ok": true, "msg": "Deleted (takes effect after service restart)"})
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+/// Swap a rule with its neighbour (`dir`: -1 = up / higher in list, +1 = down).
+/// List order is the tie-breaker for equal `priority` values.
+fn act_move_rule(post: &J) -> J {
+    let Some(index) = post
+        .get("index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+    else {
+        return err_msg("Invalid parameters");
+    };
+    let dir = post.get("dir").and_then(|v| v.as_i64()).unwrap_or(0);
+    if dir != -1 && dir != 1 {
+        return err_msg("dir must be -1 (up) or 1 (down)");
+    }
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut seq = match map.remove(ykey("rules")) {
+        Some(Y::Sequence(s)) => s,
+        _ => Vec::new(),
+    };
+    if index >= seq.len() {
+        return err_msg("Rule index out of range");
+    }
+    let other = index as isize + dir as isize;
+    if other < 0 || other as usize >= seq.len() {
+        return err_msg("Already at edge");
+    }
+    seq.swap(index, other as usize);
+    // Keep YAML priority aligned with list order (same as desktop GUI).
+    let n = seq.len() as i64;
+    for (i, item) in seq.iter_mut().enumerate() {
+        if let Y::Mapping(m) = item {
+            m.insert(ykey("priority"), Y::Number((n - i as i64).into()));
+        }
+    }
+    map.insert(ykey("rules"), Y::Sequence(seq));
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running() {
+                spawn_sh("restart");
+            }
+            json!({"ok": true, "msg": "Order updated (takes effect after service restart)"})
         }
         Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
     }

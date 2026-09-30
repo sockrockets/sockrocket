@@ -116,6 +116,9 @@ impl GeoIpDb {
         // Link-local
         db.add_entry("169.254.0.0/16", "PRIVATE");
 
+        // Carrier-grade NAT (RFC 6598)
+        db.add_entry("100.64.0.0/10", "PRIVATE");
+
         // Private IPv6
         db.add_entry("::1/128", "PRIVATE");
         db.add_entry("fc00::/7", "PRIVATE");

@@ -180,12 +180,25 @@ rules:
   - rule_type: "ip-cidr"
     pattern: "192.168.0.0/16"
     target: "direct"
+    priority: 50
   - rule_type: "geoip"
-    pattern: "CN"
+    pattern: "CN"          # ~7456 built-in China IPv4 CIDRs
     target: "direct"
+    priority: 40
+  - rule_type: "dst-port"  # optional
+    pattern: "443"
+    target: "direct"
+    priority: 30
+  - rule_type: "final"
+    pattern: "*"
+    target: "proxy"
+    priority: 0
 ```
 
-Or use the Web UI: `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`
+Higher `priority` wins first; equal values keep list order. Or use the Web UI
+(`Routing rules` page): set priority, ↑↓ reorder, types including `dst-port`.
+
+Web UI: `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`
 
 ---
 

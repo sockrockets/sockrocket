@@ -599,7 +599,7 @@
   <div class="strip">
     <div class="strip-item"><div class="strip-num">6</div><div class="strip-label" data-i18n="stat-protocols">Protocols</div></div>
     <div class="strip-item"><div class="strip-num">3</div><div class="strip-label" data-i18n="stat-surfaces">Surfaces</div></div>
-    <div class="strip-item"><div class="strip-num">741</div><div class="strip-label" data-i18n="stat-cidrs">CN CIDRs</div></div>
+    <div class="strip-item"><div class="strip-num">7.4k</div><div class="strip-label" data-i18n="stat-cidrs">CN CIDRs</div></div>
     <div class="strip-item"><div class="strip-num">5<span>+</span></div><div class="strip-label" data-i18n="stat-arch">Arch targets</div></div>
     <div class="strip-item"><div class="strip-num">100<span>%</span></div><div class="strip-label" data-i18n="stat-rust">Rust</div></div>
   </div>
@@ -661,13 +661,13 @@
     <div class="route-grid">
       <article class="route-card">
         <h3 data-i18n="route-c1-title">What “GeoIP” means here</h3>
-        <p data-i18n="route-c1-body">Not MaxMind. Sockrocket ships a lightweight in-memory GeoIP database built from ~741 aggregated China IPv4 CIDRs (APNIC-oriented curated subset), plus private ranges. Rules like <code>geoip: CN → direct</code> hit this table.</p>
+        <p data-i18n="route-c1-body">Not MaxMind. Sockrocket ships a lightweight in-memory GeoIP database built from ~7456 aggregated China IPv4 CIDRs (from 17mon/china_ip_list; refresh via scripts/update-china-cidrs.sh), plus private ranges. Rules like <code>geoip: CN → direct</code> hit this table.</p>
       </article>
       <article class="route-card">
         <h3 data-i18n="route-c2-title">Rule types</h3>
         <ul>
           <li data-i18n="route-c2-li1"><code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code></li>
-          <li data-i18n="route-c2-li2"><code>ip-cidr</code> and <code>geoip</code> (country code)</li>
+          <li data-i18n="route-c2-li2"><code>ip-cidr</code>, <code>geoip</code>, <code>dst-port</code> (priority + list order)</li>
           <li data-i18n="route-c2-li3"><code>final</code> catch-all → proxy or direct</li>
           <li data-i18n="route-c2-li4">Actions: <code>direct</code> · <code>proxy</code> · <code>reject</code></li>
         </ul>
@@ -689,6 +689,10 @@
       &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"domain-suffix"</span><br/>
       &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">"google.com"</span><br/>
       &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"proxy"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">priority</span>: <span class="k">10</span><br/>
+      &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"dst-port"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">"443"</span><br/>
+      &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"direct"</span><br/>
       &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"geoip"</span><br/>
       &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">"CN"</span><br/>
       &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"direct"</span><br/>
@@ -923,10 +927,10 @@ const translations = {
     'route-h2': 'China direct without a fat MMDB.',
     'route-sub': 'geoip:CN is powered by a curated in-binary CIDR list — small enough for Merlin flash, accurate enough for domestic direct.',
     'route-c1-title': 'What “GeoIP” means here',
-    'route-c1-body': 'Not MaxMind. Sockrocket ships a lightweight in-memory GeoIP database built from ~741 aggregated China IPv4 CIDRs (APNIC-oriented curated subset), plus private ranges. Rules like <code>geoip: CN → direct</code> hit this table.',
+    'route-c1-body': 'Not MaxMind. Sockrocket ships a lightweight in-memory GeoIP database built from ~7456 aggregated China IPv4 CIDRs (from 17mon/china_ip_list; refresh via scripts/update-china-cidrs.sh), plus private ranges. Rules like <code>geoip: CN → direct</code> hit this table.',
     'route-c2-title': 'Rule types',
     'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
-    'route-c2-li2': '<code>ip-cidr</code> and <code>geoip</code> (country code)',
+    'route-c2-li2': '<code>ip-cidr</code>, <code>geoip</code>, <code>dst-port</code> (priority + list order)',
     'route-c2-li3': '<code>final</code> catch-all → proxy or direct',
     'route-c2-li4': 'Actions: <code>direct</code> · <code>proxy</code> · <code>reject</code>',
     'route-c3-title': 'Built-in China-direct set',
@@ -1014,10 +1018,10 @@ const translations = {
     'route-h2': 'Trung Quốc đi thẳng, không cần MMDB nặng.',
     'route-sub': 'geoip:CN dựa trên danh sách CIDR gắn trong binary — đủ nhỏ cho flash Merlin, đủ chính xác cho direct nội địa.',
     'route-c1-title': '“GeoIP” nghĩa là gì ở đây',
-    'route-c1-body': 'Không phải MaxMind. Sockrocket có GeoIP nhẹ trong bộ nhớ từ ~741 CIDR IPv4 Trung Quốc (tập hợp APNIC đã chọn lọc), cộng dải private. Luật kiểu <code>geoip: CN → direct</code> tra bảng này.',
+    'route-c1-body': 'Không phải MaxMind. Sockrocket có GeoIP nhẹ trong bộ nhớ từ ~7456 CIDR IPv4 Trung Quốc (17mon/china_ip_list; cập nhật bằng scripts/update-china-cidrs.sh), cộng dải private. Luật kiểu <code>geoip: CN → direct</code> tra bảng này.',
     'route-c2-title': 'Loại luật',
     'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
-    'route-c2-li2': '<code>ip-cidr</code> và <code>geoip</code> (mã quốc gia)',
+    'route-c2-li2': '<code>ip-cidr</code>, <code>geoip</code>, <code>dst-port</code> (ưu tiên + thứ tự)',
     'route-c2-li3': '<code>final</code> bắt tất cả → proxy hoặc direct',
     'route-c2-li4': 'Hành động: <code>direct</code> · <code>proxy</code> · <code>reject</code>',
     'route-c3-title': 'Bộ China-direct sẵn có',
@@ -1105,10 +1109,10 @@ const translations = {
     'route-h2': 'Китай напрямую — без тяжёлого MMDB.',
     'route-sub': 'geoip:CN опирается на курируемый список CIDR в бинарнике — достаточно мал для flash Merlin и достаточно точен для domestic direct.',
     'route-c1-title': 'Что здесь значит «GeoIP»',
-    'route-c1-body': 'Не MaxMind. Лёгкая in-memory база из ~741 агрегированных китайских IPv4 CIDR (курируемый APNIC-поднабор) плюс private-диапазоны. Правила вроде <code>geoip: CN → direct</code> бьют по этой таблице.',
+    'route-c1-body': 'Не MaxMind. Лёгкая in-memory база из ~7456 агрегированных китайских IPv4 CIDR (17mon/china_ip_list; обновление: scripts/update-china-cidrs.sh) плюс private-диапазоны. Правила вроде <code>geoip: CN → direct</code> бьют по этой таблице.',
     'route-c2-title': 'Типы правил',
     'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
-    'route-c2-li2': '<code>ip-cidr</code> и <code>geoip</code> (код страны)',
+    'route-c2-li2': '<code>ip-cidr</code>, <code>geoip</code>, <code>dst-port</code> (приоритет + порядок)',
     'route-c2-li3': '<code>final</code> catch-all → proxy или direct',
     'route-c2-li4': 'Действия: <code>direct</code> · <code>proxy</code> · <code>reject</code>',
     'route-c3-title': 'Встроенный China-direct набор',
@@ -1196,10 +1200,10 @@ const translations = {
     'route-h2': '国内直连，不必塞进臃肿 MMDB。',
     'route-sub': 'geoip:CN 由二进制内嵌的精选 CIDR 列表驱动——适合 Merlin 闪存体积，也够用国内直连精度。',
     'route-c1-title': '这里的「GeoIP」指什么',
-    'route-c1-body': '不是 MaxMind。Sockrocket 内置轻量内存 GeoIP：约 741 条聚合后的中国 IPv4 CIDR（面向 APNIC 的精选集），外加私网段。形如 <code>geoip: CN → direct</code> 的规则查这张表。',
+    'route-c1-body': '不是 MaxMind。Sockrocket 内置轻量内存 GeoIP：约 7456 条聚合后的中国 IPv4 CIDR（来自 17mon/china_ip_list；可用 scripts/update-china-cidrs.sh 更新），外加私网段。形如 <code>geoip: CN → direct</code> 的规则查这张表。',
     'route-c2-title': '规则类型',
     'route-c2-li1': '<code>domain</code> / <code>domain-suffix</code> / <code>domain-keyword</code>',
-    'route-c2-li2': '<code>ip-cidr</code> 与 <code>geoip</code>（国家代码）',
+    'route-c2-li2': '<code>ip-cidr</code>、<code>geoip</code>、<code>dst-port</code>（priority + 列表顺序）',
     'route-c2-li3': '<code>final</code> 兜底 → proxy 或 direct',
     'route-c2-li4': '动作：<code>direct</code> · <code>proxy</code> · <code>reject</code>',
     'route-c3-title': '内置国内直连规则集',
@@ -1266,19 +1270,19 @@ const langHtml = { en: 'en', vi: 'vi', ru: 'ru', zh: 'zh-CN' };
 const metaByLang = {
   en: {
     title: 'Sockrocket — Cross-Platform Proxy Client',
-    description: 'Rust proxy with GUI, CLI, and AsusWRT-Merlin. Built-in GeoIP (741 CN CIDRs), smart routing, Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+    description: 'Rust proxy with GUI, CLI, and AsusWRT-Merlin. Built-in GeoIP (7456 CN CIDRs), smart routing, Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
   },
   vi: {
     title: 'Sockrocket — Proxy đa nền tảng',
-    description: 'Proxy Rust với GUI, CLI và Merlin. GeoIP tích hợp (741 CN CIDR), định tuyến thông minh. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
+    description: 'Proxy Rust với GUI, CLI và Merlin. GeoIP tích hợp (7456 CN CIDR), định tuyến thông minh. Shadowsocks, VMess, VLess, Trojan, TUIC & Hysteria2.',
   },
   ru: {
     title: 'Sockrocket — кроссплатформенный прокси-клиент',
-    description: 'Прокси на Rust: GUI, CLI и Merlin. Встроенный GeoIP (741 CN CIDR), умная маршрутизация. Shadowsocks, VMess, VLess, Trojan, TUIC и Hysteria2.',
+    description: 'Прокси на Rust: GUI, CLI и Merlin. Встроенный GeoIP (7456 CN CIDR), умная маршрутизация. Shadowsocks, VMess, VLess, Trojan, TUIC и Hysteria2.',
   },
   zh: {
     title: 'Sockrocket — 跨平台代理客户端',
-    description: 'Rust 代理：原生 GUI、CLI 与 Merlin 插件。内置 GeoIP（741 条国内 CIDR）与智能分流。支持 Shadowsocks、VMess、VLess、Trojan、TUIC、Hysteria2。',
+    description: 'Rust 代理：原生 GUI、CLI 与 Merlin 插件。内置 GeoIP（7456 条国内 CIDR）与智能分流。支持 Shadowsocks、VMess、VLess、Trojan、TUIC、Hysteria2。',
   },
 };
 

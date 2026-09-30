@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
@@ -35,6 +34,8 @@ pub enum MatchRule {
     IpCidr { addr: IpAddr, prefix_len: u8 },
     /// GeoIP country code (e.g., "CN", "US")
     GeoIp(String),
+    /// Destination port or inclusive range (e.g. pattern `443` or `1000-2000`)
+    DstPort { min: u16, max: u16 },
     /// Match all (catch-all rule)
     MatchAll,
 }
@@ -72,12 +73,23 @@ impl RuleSet {
     }
 
     /// Build from config RoutingRules. Disabled rules are skipped.
+    ///
+    /// Rules are ordered by **priority descending**, then original list
+    /// index (stable). Higher `priority` wins when patterns overlap.
     pub fn from_config(rules: &[RoutingRule]) -> Self {
         let mut set = Self::new();
-        for r in rules {
-            if !r.enabled {
-                continue;
-            }
+        let mut indexed: Vec<(usize, &RoutingRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.enabled)
+            .collect();
+        indexed.sort_by(|a, b| {
+            b.1.priority
+                .cmp(&a.1.priority)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        for (_, r) in indexed {
             let action = match r.target.to_lowercase().as_str() {
                 "direct" => RouteAction::Direct,
                 "reject" | "block" => RouteAction::Reject,
@@ -103,6 +115,13 @@ impl RuleSet {
                     }
                 },
                 "geoip" => MatchRule::GeoIp(r.pattern.to_uppercase()),
+                "dst-port" | "port" => match parse_port_range(&r.pattern) {
+                    Some((min, max)) => MatchRule::DstPort { min, max },
+                    None => {
+                        tracing::warn!("Invalid dst-port pattern: {}", r.pattern);
+                        continue;
+                    }
+                },
                 "match" | "final" => MatchRule::MatchAll,
                 _ => {
                     tracing::warn!("Unknown rule type: {}", r.rule_type);
@@ -128,15 +147,16 @@ impl Default for RuleSet {
 
 /// Cache key for route lookups: rule evaluation lowercases the host
 /// before matching, so the cache must be keyed by the lowercased host too
-/// (otherwise "EXAMPLE.com" and "example.com" are two entries). Borrows
-/// when the host is already lowercase ASCII — the common case — avoiding
-/// an allocation on the hit fast path.
-fn cache_key(host: &str) -> Cow<'_, str> {
-    if host.is_ascii() && !host.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Borrowed(host)
+/// (otherwise "EXAMPLE.com" and "example.com" are two entries). Destination
+/// port is included because `dst-port` rules can diverge by port for the
+/// same host.
+fn cache_key(host: &str, port: u16) -> String {
+    let host_part = if host.is_ascii() && !host.bytes().any(|b| b.is_ascii_uppercase()) {
+        host.to_string()
     } else {
-        Cow::Owned(host.to_lowercase())
-    }
+        host.to_lowercase()
+    };
+    format!("{host_part}:{port}")
 }
 
 /// Router evaluates rules against connection targets.
@@ -165,13 +185,13 @@ impl Router {
     /// Evaluate routing rules for a given destination.
     /// `host` can be a domain name or IP address string.
     pub fn route(&self, host: &str, port: u16) -> RouteAction {
-        let key = cache_key(host);
+        let key = cache_key(host, port);
         // get() (not peek()) so a hit promotes the entry in LRU order —
         // without promotion a hot route stays evictable under cache churn.
         // This needs the write lock, but it is a std RwLock held only for
         // the lookup, so it is cheap.
         if let Ok(mut cache) = self.cache.write()
-            && let Some(action) = cache.get(key.as_ref())
+            && let Some(action) = cache.get(&key)
         {
             return action.clone();
         }
@@ -180,7 +200,7 @@ impl Router {
 
         // Store in cache — LruCache::put auto-evicts the LRU entry when full
         if let Ok(mut cache) = self.cache.write() {
-            cache.put(key.into_owned(), action.clone());
+            cache.put(key, action.clone());
         }
 
         action
@@ -192,7 +212,7 @@ impl Router {
         let ip: Option<IpAddr> = host.parse().ok();
 
         for entry in &self.rules.rules {
-            if self.rule_matches(&entry.rule, &host_lower, ip) {
+            if self.rule_matches(&entry.rule, &host_lower, ip, port) {
                 tracing::debug!(
                     "Route match: {}:{} -> {:?} (rule: {:?})",
                     host,
@@ -222,7 +242,7 @@ impl Router {
         for entry in &self.rules.rules {
             let matched = match &entry.rule {
                 MatchRule::Domain(_) | MatchRule::DomainSuffix(_) | MatchRule::DomainKeyword(_) => {
-                    self.rule_matches(&entry.rule, &host_lower, None)
+                    self.rule_matches(&entry.rule, &host_lower, None, 0)
                 }
                 _ => false,
             };
@@ -243,9 +263,9 @@ impl Router {
     pub async fn route_resolving(&self, host: &str, port: u16) -> RouteAction {
         // Fast path: same cache as `route` (same lowercased keying, same
         // LRU promotion on hit).
-        let key = cache_key(host);
+        let key = cache_key(host, port);
         if let Ok(mut cache) = self.cache.write()
-            && let Some(action) = cache.get(key.as_ref())
+            && let Some(action) = cache.get(&key)
         {
             return action.clone();
         }
@@ -253,7 +273,7 @@ impl Router {
         let action = self.route_uncached_resolving(host, port).await;
 
         if let Ok(mut cache) = self.cache.write() {
-            cache.put(key.into_owned(), action.clone());
+            cache.put(key, action.clone());
         }
 
         action
@@ -274,7 +294,7 @@ impl Router {
                 ip = resolve_host(&host_lower).await;
             }
 
-            if self.rule_matches(&entry.rule, &host_lower, ip) {
+            if self.rule_matches(&entry.rule, &host_lower, ip, port) {
                 tracing::debug!(
                     "Route match: {}:{} -> {:?} (rule: {:?})",
                     host,
@@ -289,7 +309,13 @@ impl Router {
         self.rules.default_action.clone()
     }
 
-    fn rule_matches(&self, rule: &MatchRule, host_lower: &str, ip: Option<IpAddr>) -> bool {
+    fn rule_matches(
+        &self,
+        rule: &MatchRule,
+        host_lower: &str,
+        ip: Option<IpAddr>,
+        port: u16,
+    ) -> bool {
         match rule {
             MatchRule::Domain(domain) => host_lower == domain,
 
@@ -314,6 +340,8 @@ impl Router {
                 }
             }
 
+            MatchRule::DstPort { min, max } => port >= *min && port <= *max,
+
             MatchRule::MatchAll => true,
         }
     }
@@ -337,6 +365,25 @@ async fn resolve_host(host: &str) -> Option<IpAddr> {
 }
 
 /// Parse a CIDR string like "192.168.0.0/16" or "::1/128".
+fn parse_port_range(pattern: &str) -> Option<(u16, u16)> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = p.split_once('-') {
+        let min: u16 = a.trim().parse().ok()?;
+        let max: u16 = b.trim().parse().ok()?;
+        if min <= max {
+            Some((min, max))
+        } else {
+            Some((max, min))
+        }
+    } else {
+        let port: u16 = p.parse().ok()?;
+        Some((port, port))
+    }
+}
+
 fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
     let parts: Vec<&str> = cidr.splitn(2, '/').collect();
     if parts.len() != 2 {
@@ -417,13 +464,15 @@ mod tests {
                 rule_type: "domain-suffix".into(),
                 pattern: "example.com".into(),
                 target: "direct".into(),
-                enabled: false, // disabled — must not apply
+                enabled: false,
+                priority: 0, // disabled — must not apply
             },
             RoutingRule {
                 rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "proxy".into(),
                 enabled: true,
+                priority: 0,
             },
         ];
         let router = Router::new(RuleSet::from_config(&rules));
@@ -549,24 +598,28 @@ mod tests {
                 pattern: "cn".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "ip-cidr".into(),
                 pattern: "192.168.0.0/16".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-keyword".into(),
                 pattern: "google".into(),
                 target: "proxy".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "match".into(),
                 pattern: "".into(),
                 target: "proxy".into(),
                 enabled: true,
+                priority: 0,
             },
         ];
 
@@ -630,10 +683,10 @@ mod tests {
 
         assert_eq!(router.route("EXAMPLE.COM", 80), RouteAction::Direct);
 
-        // Cached under the lowercased host only — matching lowercases too.
+        // Cached under lowercased host:port.
         let cache = router.cache.read().unwrap();
-        assert!(cache.peek("example.com").is_some());
-        assert!(cache.peek("EXAMPLE.COM").is_none());
+        assert!(cache.peek("example.com:80").is_some());
+        assert!(cache.peek("EXAMPLE.COM:80").is_none());
         assert_eq!(cache.len(), 1);
     }
 
@@ -656,9 +709,65 @@ mod tests {
             RouteAction::Direct
         );
 
-        // All case variants map to a single cache entry.
+        // All case variants map to a single cache entry (same port).
         let cache = router.cache.read().unwrap();
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.peek("www.example.com"), Some(&RouteAction::Direct));
+        assert_eq!(
+            cache.peek("www.example.com:443"),
+            Some(&RouteAction::Direct)
+        );
+    }
+
+    #[test]
+    fn test_priority_orders_before_list_index() {
+        let rules = vec![
+            RoutingRule {
+                rule_type: "domain-suffix".into(),
+                pattern: "example.com".into(),
+                target: "direct".into(),
+                enabled: true,
+                priority: 1,
+            },
+            RoutingRule {
+                rule_type: "domain-suffix".into(),
+                pattern: "example.com".into(),
+                target: "reject".into(),
+                enabled: true,
+                priority: 100,
+            },
+        ];
+        let router = Router::new(RuleSet::from_config(&rules));
+        assert_eq!(router.route("a.example.com", 443), RouteAction::Reject);
+    }
+
+    #[test]
+    fn test_dst_port_rule() {
+        let rules = vec![
+            RoutingRule {
+                rule_type: "dst-port".into(),
+                pattern: "443".into(),
+                target: "direct".into(),
+                enabled: true,
+                priority: 0,
+            },
+            RoutingRule {
+                rule_type: "dst-port".into(),
+                pattern: "1000-2000".into(),
+                target: "reject".into(),
+                enabled: true,
+                priority: 0,
+            },
+            RoutingRule {
+                rule_type: "match".into(),
+                pattern: "*".into(),
+                target: "proxy".into(),
+                enabled: true,
+                priority: 0,
+            },
+        ];
+        let router = Router::new(RuleSet::from_config(&rules));
+        assert_eq!(router.route("example.com", 443), RouteAction::Direct);
+        assert_eq!(router.route("example.com", 1500), RouteAction::Reject);
+        assert_eq!(router.route("example.com", 80), RouteAction::Proxy);
     }
 }

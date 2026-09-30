@@ -21,11 +21,15 @@ nodes: []
 #     format: "auto"
 subscriptions: []
 
-# Routing rules
+# Routing rules (higher priority first; equal priority keeps list order)
 # Examples:
 #   - rule_type: "domain-suffix"
 #     pattern: "google.com"
 #     target: "proxy"
+#     priority: 10
+#   - rule_type: "dst-port"
+#     pattern: "443"
+#     target: "direct"
 #   - rule_type: "geoip"
 #     pattern: "CN"
 #     target: "direct"

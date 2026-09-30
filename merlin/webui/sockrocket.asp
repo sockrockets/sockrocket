@@ -418,7 +418,7 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
         <div class="page-title">Routing rules</div>
         <div class="card">
           <h3>Add rule</h3>
-          <div class="form-grid" style="grid-template-columns: 150px 1fr 110px auto">
+          <div class="form-grid" style="grid-template-columns: 150px 1fr 90px 110px auto">
             <div class="fg"><label>Type</label>
               <select id="rule-type" onchange="ruleTypeChanged()">
                 <option value="domain-suffix">Domain suffix</option>
@@ -426,10 +426,12 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
                 <option value="domain-keyword">Domain keyword</option>
                 <option value="ip-cidr">IP CIDR</option>
                 <option value="geoip">GeoIP country</option>
+                <option value="dst-port">Dest port</option>
                 <option value="final">Final (match all)</option>
               </select>
             </div>
             <div class="fg"><label>Pattern</label><input type="text" id="rule-pattern" placeholder="example.com"></div>
+            <div class="fg"><label>Priority</label><input type="number" id="rule-priority" value="0" step="1" title="Higher runs first"></div>
             <div class="fg"><label>Action</label>
               <select id="rule-target">
                 <option value="direct">Direct</option>
@@ -439,7 +441,7 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
             </div>
             <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" onclick="addRule()">Add</button></div>
           </div>
-          <div class="hint">Rules are matched top-down, first match wins; new rules are inserted at the top. Changes take effect after an automatic service restart. China domains are direct by default (decided by DNS split) — no rule needed.</div>
+          <div class="hint">Higher <strong>priority</strong> wins first; equal priority keeps list order (use ↑↓). New rules insert ahead of same-priority peers. Changes restart the service. China CIDRs are covered by built-in geoip:CN (~7k ranges) — no rule needed for typical domestic direct.</div>
         </div>
         <div class="card">
           <h3>Rule list</h3>
@@ -1117,11 +1119,11 @@ function updateSubs() {
 }
 
 /* ══ Routing rules ═════════════════════════════════════════════════ */
-var RULE_TYPE_LABEL = { 'domain': 'Domain', 'domain-suffix': 'Suffix', 'domain-keyword': 'Keyword', 'ip-cidr': 'IP CIDR', 'geoip': 'GeoIP', 'final': 'Final', 'match': 'Final' };
+var RULE_TYPE_LABEL = { 'domain': 'Domain', 'domain-suffix': 'Suffix', 'domain-keyword': 'Keyword', 'ip-cidr': 'IP CIDR', 'geoip': 'GeoIP', 'dst-port': 'Port', 'final': 'Final', 'match': 'Final' };
 var RULE_TARGET_LABEL = { 'direct': 'Direct', 'proxy': 'Proxy', 'reject': 'Reject' };
 var RULE_PATTERN_HINT = {
   'domain': 'www.example.com', 'domain-suffix': 'example.com', 'domain-keyword': 'google',
-  'ip-cidr': '10.0.0.0/8', 'geoip': 'CN', 'final': '(not required)'
+  'ip-cidr': '10.0.0.0/8', 'geoip': 'CN', 'dst-port': '443 or 1000-2000', 'final': '(not required)'
 };
 function ruleTypeChanged() {
   var t = document.getElementById('rule-type').value;
@@ -1135,10 +1137,14 @@ function loadRules() {
     var el = document.getElementById('rule-list');
     var rules = d.rules || [];
     if (!rules.length) { el.innerHTML = '<div class="hint">No rules yet (default: private and CN traffic direct, everything else proxied).</div>'; return; }
-    el.innerHTML = rules.map(function (r) {
-      return '<div class="row"><span class="r-name" style="font-family:var(--mono)">' +
+    el.innerHTML = rules.map(function (r, i) {
+      var pri = (typeof r.priority === 'number') ? r.priority : 0;
+      return '<div class="row"><span class="badge acc" title="priority">P' + pri + '</span>' +
+        '<span class="r-name" style="font-family:var(--mono)">' +
         esc(RULE_TYPE_LABEL[r.rule_type] || r.rule_type) + '　' + esc(r.pattern) +
         '　→ ' + esc(RULE_TARGET_LABEL[r.target] || r.target) + '</span>' +
+        '<button class="btn btn-sm" onclick="event.stopPropagation();moveRule(' + r.index + ',-1)" title="Move up">↑</button>' +
+        '<button class="btn btn-sm" onclick="event.stopPropagation();moveRule(' + r.index + ',1)" title="Move down">↓</button>' +
         '<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();delRule(' + r.index + ')">Delete</button></div>';
     }).join('');
   });
@@ -1147,10 +1153,18 @@ function addRule() {
   var t = document.getElementById('rule-type').value;
   var p = document.getElementById('rule-pattern').value.trim();
   var g = document.getElementById('rule-target').value;
+  var pri = parseInt(document.getElementById('rule-priority').value, 10);
+  if (isNaN(pri)) pri = 0;
   if (t !== 'final' && !p) { showMsg('Please enter a pattern', 'err'); return; }
-  api('add_rule', { rule_type: t, pattern: p, target: g }, function (d) {
+  api('add_rule', { rule_type: t, pattern: p, target: g, priority: pri }, function (d) {
     toastResp(d);
     if (d.ok !== false) { document.getElementById('rule-pattern').value = ''; loadRules(); }
+  });
+}
+function moveRule(i, dir) {
+  api('move_rule', { index: i, dir: dir }, function (d) {
+    toastResp(d);
+    if (d.ok !== false) loadRules();
   });
 }
 function delRule(i) {

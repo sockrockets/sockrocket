@@ -136,6 +136,7 @@ pub struct AppState {
     // Rules management
     pub(crate) rules: Vec<RoutingRule>,
     pub(crate) rule_pattern_input: Entity<InputState>,
+    pub(crate) rule_priority_input: Entity<InputState>,
     // Selected values for type/target button groups
     pub(crate) rule_type_sel: String,
     pub(crate) rule_target_sel: String,
@@ -461,6 +462,8 @@ impl AppState {
         });
         let (system_proxy_enabled, system_proxy_status) = current_system_proxy_state();
         let rule_pattern_input = cx.new(|cx| InputState::new(window, cx).placeholder("google.com"));
+        let rule_priority_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("0").default_value("0"));
         let node_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search nodes..."));
         let node_tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add tag..."));
@@ -551,6 +554,7 @@ impl AppState {
             tun_stop_tx: None,
             rules: persisted.rules.clone(),
             rule_pattern_input,
+            rule_priority_input,
             rule_type_sel: "domain-suffix".to_string(),
             rule_target_sel: "proxy".to_string(),
             node_filter: String::new(),
@@ -3683,14 +3687,33 @@ impl AppState {
 
 // === Rule actions (Rules page business logic) ===
 
+/// Assign descending priorities from list order so evaluation matches the
+/// on-screen ranking after ↑↓ moves (higher list = higher priority).
+fn normalize_rule_priorities(rules: &mut [RoutingRule]) {
+    let n = rules.len() as i32;
+    for (i, r) in rules.iter_mut().enumerate() {
+        r.priority = n - i as i32;
+    }
+}
+
 impl AppState {
     pub(crate) fn add_rule(&mut self, cx: &mut Context<Self>) {
         let rule_type = self.rule_type_sel.clone();
         let pattern = self.rule_pattern_input.read(cx).value().to_string();
         let target = self.rule_target_sel.clone();
+        let priority = self
+            .rule_priority_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(0);
 
-        if pattern.trim().is_empty() {
-            self.rules_status = "â  Pattern is required".to_string();
+        if pattern.trim().is_empty()
+            && rule_type != "match"
+            && rule_type != "final"
+        {
+            self.rules_status = "⚠ Pattern is required".to_string();
             cx.notify();
             return;
         }
@@ -3700,19 +3723,26 @@ impl AppState {
             pattern: pattern.trim().to_string(),
             target: target.trim().to_string(),
             enabled: true,
+            priority,
         };
 
         let action_msg = if let Some(edit_idx) = self.editing_rule_index.take() {
             if edit_idx < self.rules.len() {
                 self.rules[edit_idx] = new_rule;
-                "â Rule updated"
+                "✓ Rule updated"
             } else {
                 self.rules.push(new_rule);
-                "â Rule added"
+                "✓ Rule added"
             }
         } else {
-            self.rules.push(new_rule);
-            "â Rule added"
+            // Insert ahead of equal-or-lower priority peers (same as Merlin).
+            let insert_at = self
+                .rules
+                .iter()
+                .position(|r| r.priority <= priority)
+                .unwrap_or(self.rules.len());
+            self.rules.insert(insert_at, new_rule);
+            "✓ Rule added"
         };
 
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
@@ -3742,6 +3772,10 @@ impl AppState {
         self.rule_target_sel = rule.target.clone();
         self.rule_pattern_input.update(cx, |state, cx| {
             state.set_value(rule.pattern, window, cx);
+        });
+        let pri = rule.priority.to_string();
+        self.rule_priority_input.update(cx, |state, cx| {
+            state.set_value(pri, window, cx);
         });
         self.editing_rule_index = Some(index);
         self.rules_status = format!("Editing rule #{}", index + 1);
@@ -3773,10 +3807,11 @@ impl AppState {
     pub(crate) fn move_rule_up(&mut self, index: usize, cx: &mut Context<Self>) {
         if index > 0 && index < self.rules.len() {
             self.rules.swap(index, index - 1);
+            normalize_rule_priorities(&mut self.rules);
             self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                "â Rule order updated. Restarting Rule mode to apply changes.".to_string()
+                "✓ Rule order updated. Restarting Rule mode to apply changes.".to_string()
             } else {
-                "â Rule moved".to_string()
+                "✓ Rule moved".to_string()
             };
             self.schedule_persist(cx);
             if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
@@ -3789,10 +3824,11 @@ impl AppState {
     pub(crate) fn move_rule_down(&mut self, index: usize, cx: &mut Context<Self>) {
         if index + 1 < self.rules.len() {
             self.rules.swap(index, index + 1);
+            normalize_rule_priorities(&mut self.rules);
             self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                "â Rule order updated. Restarting Rule mode to apply changes.".to_string()
+                "✓ Rule order updated. Restarting Rule mode to apply changes.".to_string()
             } else {
-                "â Rule moved".to_string()
+                "✓ Rule moved".to_string()
             };
             self.schedule_persist(cx);
             if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
@@ -3810,91 +3846,106 @@ impl AppState {
                 pattern: "CN".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "cn".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "baidu.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "qq.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "taobao.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "aliyun.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "jd.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "163.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "bilibili.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "domain-suffix".into(),
                 pattern: "zhihu.com".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "ip-cidr".into(),
                 pattern: "10.0.0.0/8".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "ip-cidr".into(),
                 pattern: "172.16.0.0/12".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "ip-cidr".into(),
                 pattern: "192.168.0.0/16".into(),
                 target: "direct".into(),
                 enabled: true,
+                priority: 0,
             },
             RoutingRule {
                 rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "proxy".into(),
                 enabled: true,
+                priority: 0,
             },
         ];
         self.rules = china_rules;
+        normalize_rule_priorities(&mut self.rules);
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-            "â China Direct preset loaded. Restarting Rule mode to apply changes.".to_string()
+            "✓ China Direct preset loaded. Restarting Rule mode to apply changes.".to_string()
         } else {
-            "â China Direct preset loaded".to_string()
+            "✓ China Direct preset loaded (geoip:CN uses ~7456 built-in CIDRs)".to_string()
         };
         self.schedule_persist(cx);
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
@@ -3906,9 +3957,9 @@ impl AppState {
     pub(crate) fn clear_rules(&mut self, cx: &mut Context<Self>) {
         self.rules.clear();
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-            "â Custom rules cleared. Falling back to built-in China Direct rules.".to_string()
+            "✓ Custom rules cleared. Falling back to built-in China Direct rules.".to_string()
         } else {
-            "â Custom rules cleared".to_string()
+            "✓ Custom rules cleared".to_string()
         };
         self.schedule_persist(cx);
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {

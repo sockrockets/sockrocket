@@ -111,28 +111,47 @@ health_check:
   failure_threshold: 1
   auto_switch: true
 
-# -- Routing rules (matched in order) ------------------------------------------
+# -- Routing rules -------------------------------------------------------------
+# Evaluation: higher `priority` first; equal priority keeps list order.
+# Types: domain | domain-suffix | domain-keyword | ip-cidr | geoip | dst-port | final
+# Built-in geoip:CN covers ~7456 China IPv4 CIDRs (refresh: scripts/update-china-cidrs.sh).
+# User rules are evaluated before the built-in China-direct domain set.
 rules:
   # Private addresses direct
   - rule_type: "ip-cidr"
     pattern: "10.0.0.0/8"
     target: "direct"
+    priority: 50
   - rule_type: "ip-cidr"
     pattern: "172.16.0.0/12"
     target: "direct"
+    priority: 50
   - rule_type: "ip-cidr"
     pattern: "192.168.0.0/16"
     target: "direct"
+    priority: 50
   - rule_type: "ip-cidr"
     pattern: "100.64.0.0/10"
     target: "direct"
+    priority: 50
 
-  # Mainland China IPs direct
+  # Mainland China IPs direct (expanded built-in GeoIP DB)
   - rule_type: "geoip"
     pattern: "CN"
     target: "direct"
+    priority: 40
 
-  # All other traffic goes through the proxy (default behavior, no explicit rule needed)
+  # Example: force HTTPS direct for a lab host (uncomment to use)
+  # - rule_type: "dst-port"
+  #   pattern: "443"
+  #   target: "direct"
+  #   priority: 30
+
+  # Catch-all → proxy (optional; omitted rules default to proxy)
+  - rule_type: "final"
+    pattern: "*"
+    target: "proxy"
+    priority: 0
 
 # -- Logging -------------------------------------------------------------------
 # log_level: "info"   # error | warn | info | debug
