@@ -8,7 +8,6 @@
 //
 // v2 elements intentionally omitted (unsupported by this app, no fakes):
 //   - "Auto-start on login" / "Minimize to tray" toggles
-//   - "Check Updates" button (no updater)
 //   - Keyboard Shortcuts card (shortcuts live in tooltips)
 //   - Theme picker (app is fixed dark) — shown as a static ghost label
 
@@ -296,27 +295,90 @@ impl AppState {
                     )
                     .child(hairline())
                     .child(
-                        div().flex().flex_row().gap_2().child(
-                            // v2 ghost button: hairline border, hover fill
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("about-github")
+                                    .flex()
+                                    .flex_row()
+                                    .px_3()
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(rgba(with_alpha(BORDER, 0x99)))
+                                    .text_size(px(SMALL))
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .child(sockrocket_gui::i18n::t("settings.about.github"))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.open_url("https://github.com/sockrockets/sockrocket");
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("about-check-update")
+                                    .flex()
+                                    .flex_row()
+                                    .px_3()
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(rgba(with_alpha(BORDER, 0x99)))
+                                    .text_size(px(SMALL))
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .child(sockrocket_gui::i18n::t("settings.about.check_update"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.check_for_updates(cx);
+                                    })),
+                            )
+                            .children(self.update_download_url.as_ref().map(|_| {
+                                div()
+                                    .id("about-open-download")
+                                    .flex()
+                                    .flex_row()
+                                    .px_3()
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .bg(rgba(with_alpha(ACCENT, 0x22)))
+                                    .border_1()
+                                    .border_color(rgba(with_alpha(ACCENT, 0x66)))
+                                    .text_size(px(SMALL))
+                                    .text_color(rgb(TEXT_ACCENT))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
+                                    .child(sockrocket_gui::i18n::t("settings.about.open_download"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_update_download(cx);
+                                    }))
+                            })),
+                    )
+                    .children(if !self.settings_status.is_empty() {
+                        Some(
                             div()
-                                .id("about-github")
-                                .flex()
-                                .flex_row()
-                                .px_3()
-                                .py(px(6.0))
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(rgba(with_alpha(BORDER, 0x99)))
-                                .text_size(px(SMALL))
-                                .text_color(rgb(TEXT_SECONDARY))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER)))
-                                .child(sockrocket_gui::i18n::t("settings.about.github"))
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.open_url("https://github.com/sockrockets/sockrocket");
-                                })),
-                        ),
-                    ),
+                                .mt_2()
+                                .text_size(px(TINY))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(self.settings_status.clone()),
+                        )
+                    } else {
+                        None
+                    })
+                    .children(self.update_download_url.as_ref().map(|_| {
+                        div()
+                            .mt_1()
+                            .text_size(px(TINY))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t(
+                                "settings.about.update_keep_config",
+                            ))
+                    })),
             )
     }
 

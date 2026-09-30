@@ -75,6 +75,8 @@ pub struct AppState {
     // Import status
     pub(crate) import_status: String,
     pub(crate) settings_status: String,
+    /// Direct download URL from the last successful update check (if any).
+    pub(crate) update_download_url: Option<String>,
     pub(crate) rules_status: String,
 
     // Settings (applied values)
@@ -527,6 +529,7 @@ impl AppState {
                 format!("â Loaded {} saved nodes", persisted.nodes.len())
             },
             settings_status: String::new(),
+            update_download_url: None,
             rules_status: String::new(),
             listen_addr: persisted.listen_addr,
             socks_port: persisted.socks_port,
@@ -2163,6 +2166,86 @@ impl AppState {
     }
 
     // === Settings ===
+
+    /// Query GitHub Releases and surface an update affordance in Settings → About.
+    pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.settings_status = "Checking for updates…".to_string();
+        self.update_download_url = None;
+        cx.notify();
+
+        let handle = self.tokio_handle.clone();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let prefer = sockrocket_core::preferred_gui_asset().map(|s| s.to_string());
+
+        cx.spawn(async move |weak, cx| {
+            let result = handle
+                .spawn(async move {
+                    sockrocket_core::check_for_update(&current, prefer.as_deref()).await
+                })
+                .await;
+            weak.update(cx, |this, cx| {
+                match result {
+                    Ok(Ok(check)) => {
+                        use sockrocket_core::UpdateAvailability;
+                        match check.availability {
+                            UpdateAvailability::UpToDate => {
+                                this.update_download_url = None;
+                                this.settings_status = format!(
+                                    "✓ Up to date (v{})",
+                                    check.current
+                                );
+                            }
+                            UpdateAvailability::Available => {
+                                let url = check
+                                    .asset_url
+                                    .clone()
+                                    .unwrap_or_else(|| check.html_url.clone());
+                                this.update_download_url = Some(url);
+                                let asset = check
+                                    .asset_name
+                                    .as_deref()
+                                    .unwrap_or("release page");
+                                this.settings_status = format!(
+                                    "✓ Update available: v{} → v{} ({}). Settings are kept — only the app is replaced.",
+                                    check.current, check.latest, asset
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        this.update_download_url = None;
+                        this.settings_status = format!("✗ Update check failed: {e}");
+                    }
+                    Err(e) => {
+                        this.update_download_url = None;
+                        this.settings_status = format!("✗ Update check task failed: {e}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Flush `gui-state.yaml` (nodes, subs, rules, settings), then open the
+    /// installer download. Never overwrites user data — config lives outside
+    /// the app bundle (Application Support / APPDATA / XDG_CONFIG_HOME).
+    pub(crate) fn open_update_download(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = self.update_download_url.clone() else {
+            self.settings_status = "⚠ No update download ready — check for updates first".to_string();
+            cx.notify();
+            return;
+        };
+        // Persist latest in-memory state before the user quits to install.
+        self.schedule_persist(cx);
+        self.settings_status = format!(
+            "✓ Opening download. {}",
+            sockrocket_gui::i18n::t("settings.about.update_keep_config")
+        );
+        cx.notify();
+        cx.open_url(&url);
+    }
 
     pub(crate) fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let addr = self.listen_addr_input.read(cx).value().trim().to_string();

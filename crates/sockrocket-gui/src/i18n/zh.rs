@@ -23,6 +23,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.section.about" => "关于",
         "settings.about.name" => "Sockrocket 代理客户端",
         "settings.about.github" => "GitHub",
+        "settings.about.check_update" => "检查更新",
+        "settings.about.open_download" => "下载更新",
+        "settings.about.update_keep_config" => "设置、节点、订阅与分流规则保存在用户数据目录，更新只替换程序本身，不会清空配置。",
         _ => return None,
     })
 }

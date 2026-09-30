@@ -25,6 +25,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.section.about" => "About",
         "settings.about.name" => "Sockrocket Proxy Client",
         "settings.about.github" => "GitHub",
+        "settings.about.check_update" => "Check for Updates",
+        "settings.about.open_download" => "Download Update",
+        "settings.about.update_keep_config" => "Your settings, nodes, subscriptions, and rules stay in the user data folder — only the app binary is replaced.",
         _ => return None,
     })
 }

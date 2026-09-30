@@ -458,6 +458,15 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
           <span class="hint">Saving runs sockrocket-cli validate automatically; a failed validation never overwrites the current config</span>
         </div>
         <textarea id="config-text" spellcheck="false"></textarea>
+        <div class="card" style="margin-top:12px">
+          <h3>Software update</h3>
+          <div class="toolbar">
+            <button class="btn btn-sm" onclick="checkUpdate()">Check for updates</button>
+            <button class="btn btn-success btn-sm" id="btn-apply-update" style="display:none" onclick="applyUpdate()">Download &amp; install</button>
+            <a class="btn btn-sm" id="btn-update-link" href="https://github.com/sockrockets/sockrocket/releases" target="_blank" rel="noopener">Releases</a>
+          </div>
+          <div class="hint" id="update-status">Checks GitHub Releases. Install replaces the musl binary only — <strong>config.yaml</strong>, subscriptions, nodes, and rules are kept.</div>
+        </div>
       </div>
 
       <!-- ── Page: Logs ────────────────────────────────────────────── -->
@@ -1187,6 +1196,51 @@ function saveConfig() {
     setTimeout(refreshStatus, 800);
   });
 }
+
+var pendingUpdateAsset = null;
+function checkUpdate() {
+  var st = document.getElementById('update-status');
+  var btn = document.getElementById('btn-apply-update');
+  st.textContent = 'Checking GitHub Releases…';
+  btn.style.display = 'none';
+  pendingUpdateAsset = null;
+  api('check_update', null, function (d) {
+    if (d.ok === false) {
+      st.textContent = d.msg || 'Check failed';
+      showMsg(d.msg || 'Check failed', 'err');
+      return;
+    }
+    st.textContent = d.msg || '';
+    var link = document.getElementById('btn-update-link');
+    if (d.html_url) link.href = d.html_url;
+    if (d.available) {
+      pendingUpdateAsset = d.asset_url || null;
+      btn.style.display = pendingUpdateAsset ? '' : 'none';
+      showMsg(d.msg || 'Update available', 'ok');
+    } else {
+      showMsg(d.msg || 'Up to date', 'ok');
+    }
+  }, function () {
+    st.textContent = 'Update check failed (timeout or network)';
+    showMsg('Update check failed', 'err');
+  }, 30000);
+}
+function applyUpdate() {
+  var st = document.getElementById('update-status');
+  if (!confirm('Download and install the latest sockrocket-cli binary?\n\nYour config.yaml, subscriptions, nodes, and routing rules will be kept. Only the program binary is replaced; the service will restart.')) return;
+  st.textContent = 'Downloading and installing… (may take a minute)';
+  document.getElementById('btn-apply-update').style.display = 'none';
+  api('apply_update', null, function (d) {
+    toastResp(d);
+    st.textContent = d.msg || '';
+    setTimeout(refreshStatus, 1500);
+  }, function () {
+    st.textContent = 'Install failed (timeout or network)';
+    showMsg('Install failed', 'err');
+  }, 180000);
+}
+
+/* ══ Logs ══════════════════════════════════════════════════════════ */
 
 /* ══ Logs ══════════════════════════════════════════════════════════ */
 var logAutoTimer = null;

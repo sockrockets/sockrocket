@@ -536,6 +536,8 @@ fn dispatch(action: &str, post: &J) -> J {
         "add_rule" => act_add_rule(post),
         "del_rule" => act_del_rule(post),
         "move_rule" => act_move_rule(post),
+        "check_update" => act_check_update(),
+        "apply_update" => act_apply_update(),
         "diagnose" => act_diagnose(),
         _ => json!({"error": "Unknown action"}),
     }
@@ -1945,6 +1947,123 @@ fn act_move_rule(post: &J) -> J {
         }
         Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
     }
+}
+
+fn act_check_update() -> J {
+    let current = env!("CARGO_PKG_VERSION");
+    let prefer = sockrocket_core::preferred_merlin_cli_asset().map(|s| s.to_string());
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return err_msg(&format!("Runtime error: {e}")),
+    };
+    let result = rt.block_on(async {
+        sockrocket_core::check_for_update(current, prefer.as_deref()).await
+    });
+    match result {
+        Ok(check) => {
+            let available =
+                check.availability == sockrocket_core::UpdateAvailability::Available;
+            json!({
+                "ok": true,
+                "current": check.current,
+                "latest": check.latest,
+                "available": available,
+                "html_url": check.html_url,
+                "asset_url": check.asset_url,
+                "asset_name": check.asset_name,
+                "msg": if available {
+                    format!("Update available: v{} → v{}", check.current, check.latest)
+                } else {
+                    format!("Up to date (v{})", check.current)
+                }
+            })
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Update check failed: {e}")}),
+    }
+}
+
+/// Download the matching musl CLI binary from GitHub Releases and replace the
+/// installed binary (config preserved). Restarts the service when it was running.
+fn act_apply_update() -> J {
+    let current = env!("CARGO_PKG_VERSION");
+    let Some(asset) = sockrocket_core::preferred_merlin_cli_asset() else {
+        return err_msg("Unsupported architecture for auto-update");
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => return err_msg(&format!("Runtime error: {e}")),
+    };
+    let check = match rt.block_on(async {
+        sockrocket_core::check_for_update(current, Some(asset)).await
+    }) {
+        Ok(c) => c,
+        Err(e) => return err_msg(&format!("Update check failed: {e}")),
+    };
+    if check.availability != sockrocket_core::UpdateAvailability::Available {
+        return json!({"ok": true, "msg": format!("Already up to date (v{})", check.current)});
+    }
+    let Some(url) = check.asset_url.clone() else {
+        return err_msg(&format!(
+            "Latest v{} has no asset `{asset}` — open {}",
+            check.latest, check.html_url
+        ));
+    };
+
+    let dest = std::env::temp_dir().join(format!("sockrocket-cli-update-{}", check.latest));
+    if let Err(e) = rt.block_on(async { sockrocket_core::download_file(&url, &dest).await }) {
+        return err_msg(&format!("Download failed: {e}"));
+    }
+
+    let bin = sockrocket_dir().join("sockrocket-cli");
+    let was_running = is_running();
+    if was_running {
+        run_sh("stop");
+    }
+    // Preserve mode bits when possible.
+    let mode = fs::metadata(&bin).ok().map(|m| m.permissions());
+    if let Err(e) = fs::copy(&dest, &bin) {
+        let _ = fs::remove_file(&dest);
+        if was_running {
+            spawn_sh("start");
+        }
+        return err_msg(&format!("Failed to replace binary: {e}"));
+    }
+    let _ = fs::remove_file(&dest);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = mode.unwrap_or_else(|| fs::Permissions::from_mode(0o755));
+        let mut p = perms;
+        p.set_mode(p.mode() | 0o111);
+        let _ = fs::set_permissions(&bin, p);
+    }
+    // Record package version for the Web UI.
+    let _ = fs::write(sockrocket_dir().join("version"), format!("{}\n", check.latest));
+    if was_running {
+        spawn_sh("start");
+    }
+    // Restart API after the HTTP response is flushed — killing ourselves
+    // mid-write drops the WebUI reply.
+    let api_sh = sockrocket_sh();
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sleep 2; sh '{}' api-restart >/dev/null 2>&1",
+            api_sh.display()
+        ))
+        .spawn();
+    json!({
+        "ok": true,
+        "msg": format!("Updated to v{} — service restarted (API reloads in ~2s)", check.latest),
+        "latest": check.latest,
+        "current": check.latest
+    })
 }
 
 fn act_diagnose() -> J {

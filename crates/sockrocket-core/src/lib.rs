@@ -5,6 +5,7 @@ pub mod qr;
 pub mod router;
 pub mod share_server;
 pub mod system_proxy;
+pub mod update;
 
 pub use config::clash::parse_clash_config;
 pub use config::dedup::{dedup_nodes, node_fingerprint, uniquify_node_names};
@@ -76,4 +77,8 @@ pub use share_server::{
 pub use system_proxy::{
     DEFAULT_BYPASS, SystemProxyConfig, clear_system_proxy, get_system_proxy, set_system_proxy,
     set_system_proxy_with_bypass, system_proxy_supported,
+};
+pub use update::{
+    UpdateAvailability, UpdateCheck, check_for_update, compare_versions, download_file,
+    merlin_package_asset, preferred_gui_asset, preferred_merlin_cli_asset,
 };

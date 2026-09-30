@@ -25,6 +25,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.section.about" => "Giới thiệu",
         "settings.about.name" => "Ứng dụng proxy Sockrocket",
         "settings.about.github" => "GitHub",
+        "settings.about.check_update" => "Kiểm tra cập nhật",
+        "settings.about.open_download" => "Tải bản cập nhật",
+        "settings.about.update_keep_config" => "Cài đặt, node, subscription và rule nằm trong thư mục dữ liệu người dùng — cập nhật chỉ thay binary, không xóa cấu hình.",
         _ => return None,
     })
 }
