@@ -442,22 +442,26 @@ do_start() {
         fi
     fi
 
-    # Same story for the Web UI page on standard Merlin: if /www was
-    # rebuilt on reboot, /www/ext/sockrocket is gone — restore page + api.js.
-    if [ ! -f /www/ext/sockrocket/sockrocket.asp ] && [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+    # Web UI page on standard Merlin: /www may be tmpfs and wiped on reboot.
+    # Always refresh from the durable copy so deploys are not left stale.
+    if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
         if mkdir -p /www/ext/sockrocket 2>/dev/null; then
             cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /www/ext/sockrocket/sockrocket.asp 2>/dev/null || true
         fi
+        mkdir -p /tmp/var/wwwext/sockrocket 2>/dev/null || true
+        cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /tmp/var/wwwext/sockrocket/sockrocket.asp 2>/dev/null || true
     fi
     write_api_js "$(api_port)"
 
-    # koolcenter self-heal: the offline installer's sandbox can miss the
-    # web page / API bridge / dbus registration; reinstall them here from
-    # the normal runtime environment on every start.
+    # koolcenter self-heal: Softcenter menu opens Module_sockrocket.asp.
+    # Always overwrite from the durable webui so UI updates are not stuck
+    # on the first-install copy (deploy used to miss this path).
     if [ -d /koolshare/scripts ] && [ -f /koolshare/scripts/base.sh ]; then
         local KS_WEBS="/koolshare/webs"
-        if [ ! -f "$KS_WEBS/Module_sockrocket.asp" ] && [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+        if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+            mkdir -p "$KS_WEBS" /jffs/.koolshare/webs 2>/dev/null || true
             cp "$SOCKROCKET_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp" 2>/dev/null || true
+            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /jffs/.koolshare/webs/Module_sockrocket.asp 2>/dev/null || true
         fi
         if [ ! -f /koolshare/res/icon-sockrocket.png ]; then
             if [ -f "$SOCKROCKET_DIR/res/icon-sockrocket.png" ]; then
@@ -878,10 +882,18 @@ do_proxy_off() {
         && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- "--tun"; then
         do_stop
         do_start
-    elif [ "$(conf_bool dns_hijack false)" = "true" ]; then
-        # Already SOCKS-mode: just make sure hijack file is present.
-        wait_for_dns 10 && update_dnsmasq start
     fi
+    # DNS hijack is independent of TUN. do_stop tears the hijack down; put it
+    # back whenever the key is still on so LAN never falls through to ISP DNS.
+    if [ "$(conf_bool dns_hijack false)" = "true" ]; then
+        if wait_for_dns 10; then
+            update_dnsmasq start || rc=1
+        else
+            log_warn "proxy-off: DNS port not listening — hijack left off"
+            rc=1
+        fi
+    fi
+    ensure_sshd
     return $rc
 }
 
@@ -1093,6 +1105,22 @@ collect_crash_dump() {
 # Cron (1 min) is only a safety net. Real recovery must be seconds:
 #   - supervisor waits on the daemon; on exit → immediate LAN fail-open + restart
 #   - guard polls every 5s for dead DNS port / recover-from-degraded
+#   - half-dead (pid alive, DNS gone) → kill daemon so supervisor respawns
+#     (fail-open alone left LAN on direct path while a zombie process sat idle)
+
+# Kill a still-alive daemon without writing the manual-stop marker, so the
+# supervised waiter respawns a fresh process. Used when DNS/:5300 (or TUN
+# via the CLI's own fatal exit) dies while the PID file still looks healthy.
+kill_half_dead_daemon() {
+    local reason="$1" pid
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    pid=$(cat "$SOCKROCKET_PID" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    log_error "Half-dead daemon (pid $pid): ${reason} — killing for supervised restart"
+    kill "$pid" 2>/dev/null || true
+}
 
 stop_supervisor() {
     local pid
@@ -1143,7 +1171,12 @@ start_daemon_supervised() {
                     elif [ "$dns_seen_up" = "1" ] && [ ! -f "$DEGRADED_FILE" ]; then
                         echo "daemon DNS port lost while pid $dpid still alive" > "$DEGRADED_FILE"
                         sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
-                        log_error "LAN fail-open: DNS port lost during daemon teardown (pid $dpid)"
+                        log_error "LAN fail-open: DNS port lost while pid $dpid still alive"
+                        # Fail-open alone is not enough: the process can keep
+                        # SOCKS up with a dead DNS/TUN stack. Kill so this
+                        # wait loop ends and the outer supervisor respawns.
+                        log_error "Half-dead daemon (pid $dpid): DNS port lost — killing for supervised restart"
+                        kill "$dpid" 2>/dev/null || true
                     fi
                 fi
                 sleep 1
@@ -1202,6 +1235,7 @@ start_guard() {
                     if [ "$dns_miss" -ge 2 ]; then
                         echo "DNS port ${dns_port} dead (guard)" > "$DEGRADED_FILE"
                         sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
+                        sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" kill-half-dead "DNS port ${dns_port} dead (guard)" >> "$SOCKROCKET_LOG" 2>&1 || true
                         dns_miss=0
                     fi
                 fi
@@ -1495,6 +1529,7 @@ do_watchdog() {
             echo "$fails" > "$fail_file"
             if [ "$fails" -ge 3 ]; then
                 enter_lan_degraded "DNS port $dns_port dead for $fails consecutive checks"
+                kill_half_dead_daemon "DNS port $dns_port dead for $fails consecutive checks"
                 rm -f "$fail_file"
                 issues=$((issues + 1))
             else
@@ -1573,6 +1608,9 @@ case "$1" in
     proxy-off)
         acquire_lock && { do_proxy_off && log_ok "Transparent proxy disabled" || log_error "Failed to disable transparent proxy"; release_lock; } || true
         ;;
+    ensure-sshd)
+        ensure_sshd
+        ;;
     network-restore)
         # Emergency / uninstall helper: tear down proxy+DNS without needing a
         # running daemon. Guarantees direct LAN connectivity.
@@ -1582,9 +1620,14 @@ case "$1" in
         # Second-scale re-arm after fail-open (called by the guard loop).
         acquire_lock 5 && { try_recover_lan_proxy; release_lock; } || true
         ;;
+    kill-half-dead)
+        # Called by the guard subshell (cannot inherit functions). Optional
+        # reason is $2; does not write the manual-stop marker.
+        kill_half_dead_daemon "${2:-half-dead}"
+        ;;
     diagnose)  cmd_diagnose ;;
     *)
-        echo "Usage: $0 {start|stop|restart|reload|status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|dns-on|dns-off|pin-dns|proxy-off|network-restore|recover}"
+        echo "Usage: $0 {start|stop|restart|reload|status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|ensure-sshd|dns-on|dns-off|pin-dns|proxy-off|network-restore|recover|kill-half-dead}"
         exit 1
         ;;
 esac

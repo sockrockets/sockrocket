@@ -1,35 +1,22 @@
-// === Rules View (v2) ===
-// Layout per ui-prototype-v2 §page-rules: icon page header + "Add Rule" action,
-// "Custom Rules" glass card (type/pattern/target add row + live rule tester),
-// bordered rule table (type/target badges, hover-revealed row actions,
-// enable switches), bottom hint card. There is no ruleset-subscription data
-// source in this app, so the v2 "Ruleset Subscriptions" panel is omitted and
-// its two real actions (Load China Direct / Clear All) live on the Custom
-// Rules card header instead. All behavior (add/delete/reorder/edit state
-// machine, China Direct ruleset, rule tester, Rule-mode restart) unchanged.
+//! Rules view — compact Clash/Surge-style layout: add/batch → list → optional templates.
 
 use crate::app::*;
 use crate::theme::*;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, Sizable as _};
-use sockrocket_core::{ProxyMode, RoutingRule};
+use sockrocket_core::{ProxyMode, RoutingRule, builtin_rule_scenes};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Two-click destructive confirm window, milliseconds (design-system §5.2).
 const CONFIRM_WINDOW_MS: u64 = 3000;
-
-/// Sentinel for "no rule row hovered / no delete confirm armed".
 const NO_RULE: usize = usize::MAX;
 
-/// Row index currently hovered; drives the hover-revealed row actions.
 static HOVERED_RULE: AtomicUsize = AtomicUsize::new(NO_RULE);
-/// Armed "Clear All" confirm timestamp (millis since epoch, 0 = disarmed).
 static CLEAR_CONFIRM_AT: AtomicU64 = AtomicU64::new(0);
-/// Armed single-rule delete confirm: rule index + timestamp.
 static DELETE_CONFIRM_INDEX: AtomicUsize = AtomicUsize::new(NO_RULE);
 static DELETE_CONFIRM_AT: AtomicU64 = AtomicU64::new(0);
+static GROUP_DEL_AT: AtomicU64 = AtomicU64::new(0);
+static GROUP_DEL_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -58,17 +45,28 @@ fn delete_confirm_armed(index: usize) -> bool {
     DELETE_CONFIRM_INDEX.load(Ordering::Relaxed) == index && confirm_slot_armed(&DELETE_CONFIRM_AT)
 }
 
+fn group_delete_armed(key: &str) -> bool {
+    let Ok(guard) = GROUP_DEL_KEY.lock() else {
+        return false;
+    };
+    *guard == key && confirm_slot_armed(&GROUP_DEL_AT)
+}
+
+fn arm_group_delete(key: &str) {
+    if let Ok(mut guard) = GROUP_DEL_KEY.lock() {
+        *guard = key.to_string();
+    }
+    GROUP_DEL_AT.store(now_millis(), Ordering::Relaxed);
+}
+
 fn disarm_delete_confirm() {
     DELETE_CONFIRM_INDEX.store(NO_RULE, Ordering::Relaxed);
     DELETE_CONFIRM_AT.store(0, Ordering::Relaxed);
 }
 
-/// Re-render once the confirm window lapses so armed buttons revert (§5.2 timeout reset).
 fn schedule_confirm_reset(this: &AppState, cx: &mut Context<AppState>) {
     let handle = this.tokio_handle.clone();
     cx.spawn(async move |weak, cx| {
-        // Must run inside the tokio runtime (via handle.spawn) because
-        // gpui's own executor does not provide a tokio reactor.
         handle
             .spawn(async {
                 tokio::time::sleep(std::time::Duration::from_millis(CONFIRM_WINDOW_MS + 50)).await;
@@ -80,230 +78,96 @@ fn schedule_confirm_reset(this: &AppState, cx: &mut Context<AppState>) {
     .detach();
 }
 
-/// Map a legacy ✓/✗/⚠-prefixed status message to an alert severity so all
-/// operation feedback renders through `alert_strip` (design-system §5.3).
-fn status_alert_kind(message: &str) -> AlertKind {
-    if message.starts_with('✓') || message.starts_with('✅') {
-        AlertKind::Success
-    } else if message.starts_with('✗') || message.starts_with('❌') {
-        AlertKind::Danger
-    } else if message.starts_with('⚠') {
-        AlertKind::Warning
-    } else {
-        AlertKind::Info
+fn rule_matches_query(rule: &RoutingRule, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
     }
+    rule.pattern.to_lowercase().contains(&q)
+        || rule.rule_type.to_lowercase().contains(&q)
+        || rule.target.to_lowercase().contains(&q)
+        || rule.group.to_lowercase().contains(&q)
 }
 
-/// Client-side approximation of router matching for the rule tester.
-/// Returns `(rule_index, target)` of the first *enabled* rule matching `host`,
-/// using the same priority-then-index order as the engine. `geoip` / `dst-port`
-/// are not evaluated client-side (need GeoIP DB / a destination port).
-fn match_rule(rules: &[RoutingRule], host: &str) -> Option<(usize, String)> {
-    let host = host.trim().trim_end_matches('.').to_lowercase();
-    if host.is_empty() {
-        return None;
-    }
-    let mut indexed: Vec<(usize, &RoutingRule)> = rules
+const TYPE_OPTIONS: &[(&str, &str)] = &[
+    ("domain-suffix", "rules.kind.domain-suffix"),
+    ("domain", "rules.kind.domain"),
+    ("domain-keyword", "rules.kind.domain-keyword"),
+    ("ip-cidr", "rules.kind.ip-cidr"),
+    ("geoip", "rules.kind.geoip"),
+    ("dst-port", "rules.kind.dst-port"),
+    ("match", "rules.kind.match"),
+];
+
+const TARGET_OPTIONS: &[(&str, &str)] = &[
+    ("proxy", "rules.act.proxy"),
+    ("direct", "rules.act.direct"),
+    ("reject", "rules.act.reject"),
+];
+
+fn short_type(rule_type: &str) -> &'static str {
+    let key = TYPE_OPTIONS
         .iter()
-        .enumerate()
-        .filter(|(_, r)| r.enabled)
-        .collect();
-    indexed.sort_by(|a, b| {
-        b.1.priority
-            .cmp(&a.1.priority)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    for (i, r) in indexed {
-        let p = r.pattern.trim().to_lowercase();
-        let hit = match r.rule_type.as_str() {
-            "domain" | "domain-suffix" => host == p || host.ends_with(&format!(".{}", p)),
-            "domain-keyword" => !p.is_empty() && host.contains(&p),
-            "ip-cidr" => ip_in_cidr(&host, &p),
-            "match" | "final" => true,
-            "geoip" | "dst-port" | "port" => false,
-            _ => false,
-        };
-        if hit {
-            return Some((i, r.target.clone()));
-        }
-    }
-    None
+        .find(|(value, _)| {
+            *value == rule_type
+                || (*value == "dst-port" && rule_type == "port")
+                || (*value == "match" && rule_type == "final")
+        })
+        .map(|(_, key)| *key)
+        .unwrap_or("rules.kind.domain-suffix");
+    sockrocket_gui::i18n::t(key)
 }
 
-/// IPv4 `addr` inside `cidr` ("a.b.c.d/bits")?
-fn ip_in_cidr(addr: &str, cidr: &str) -> bool {
-    let (net, bits) = cidr.split_once('/').unwrap_or((cidr, "32"));
-    let (Ok(ip), Ok(net)) = (
-        addr.parse::<std::net::Ipv4Addr>(),
-        net.trim().parse::<std::net::Ipv4Addr>(),
-    ) else {
-        return false;
-    };
-    let bits: u32 = bits.trim().parse().unwrap_or(32).min(32);
-    let mask = if bits == 0 {
-        0
+fn short_target(target: &str) -> &'static str {
+    let key = TARGET_OPTIONS
+        .iter()
+        .find(|(value, _)| *value == target)
+        .map(|(_, key)| *key)
+        .unwrap_or("rules.act.proxy");
+    sockrocket_gui::i18n::t(key)
+}
+
+/// `on` = all enabled, `partial` = mixed (border only).
+fn quiet_mark(id: impl Into<ElementId>, on: bool, partial: bool) -> Stateful<Div> {
+    let border = if on || partial { ACCENT } else { TEXT_MUTED };
+    let fill = if on {
+        rgb(ACCENT)
+    } else if partial {
+        rgba(with_alpha(ACCENT, 0x55))
     } else {
-        u32::MAX << (32 - bits)
+        rgba(0x00000000)
     };
-    (u32::from(ip) & mask) == (u32::from(net) & mask)
-}
-
-/// Color for a rule-target label (proxy/direct/reject).
-fn target_label_color(target: &str) -> u32 {
-    match target {
-        "proxy" => ACCENT,
-        "direct" => SUCCESS,
-        "reject" => DANGER,
-        _ => TEXT_SECONDARY,
-    }
-}
-
-/// v2 select chip: px-2.5 py-1 rounded-md border; active = ACCENT tint,
-/// inactive = BORDER border + muted text. `Stateful` for `.on_click`.
-fn rule_chip(id: impl Into<ElementId>, label: &str, active: bool) -> Stateful<Div> {
-    let chip = div()
+    div()
         .id(id)
-        .px_2p5()
-        .py_1()
-        .rounded(px(6.0))
-        .border_1()
-        .cursor_pointer()
-        .text_size(px(SMALL))
-        .font_weight(FontWeight::MEDIUM)
-        .child(label.to_string());
-    if active {
-        chip.bg(rgba(with_alpha(ACCENT, 0x1a)))
-            .border_color(rgba(with_alpha(ACCENT, 0x33)))
-            .text_color(rgb(ACCENT))
-    } else {
-        chip.border_color(rgba(with_alpha(BORDER, 0x99)))
-            .text_color(rgb(TEXT_MUTED))
-            .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
-    }
-}
-
-/// v2 cyan-tint action button (bg ACCENT/10 + border ACCENT/20, SMALL cyan).
-fn tint_btn(id: impl Into<ElementId>, label: &str, icon_path: Option<&str>) -> Stateful<Div> {
-    let mut btn = div()
-        .id(id)
-        .px_3()
-        .py_1p5()
-        .rounded(px(8.0))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1p5()
-        .cursor_pointer()
-        .bg(rgba(with_alpha(ACCENT, 0x1a)))
-        .border_1()
-        .border_color(rgba(with_alpha(ACCENT, 0x33)))
-        .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
-        .text_size(px(SMALL))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(ACCENT))
-        .child(label.to_string());
-    if let Some(path) = icon_path {
-        btn = btn.child(
-            Icon::empty()
-                .path(SharedString::from(path.to_string()))
-                .with_size(gpui_component::Size::Size(px(14.0)))
-                .text_color(rgb(ACCENT)),
-        );
-    }
-    btn
-}
-
-/// 20px hoverable row-action square; `hovered` tints the background.
-fn action_btn(
-    id: impl Into<ElementId>,
-    child: impl IntoElement,
-    hovered: bool,
-    armed: bool,
-) -> Stateful<Div> {
-    let btn = div()
-        .id(id)
-        .w(px(20.0))
-        .h(px(20.0))
-        .rounded(px(4.0))
-        .flex()
-        .items_center()
-        .justify_center()
+        .w(px(10.0))
+        .h(px(10.0))
+        .rounded_full()
         .flex_shrink_0()
-        .cursor_pointer();
-    let btn = if armed {
-        btn.bg(rgba(with_alpha(DANGER, 0x14)))
-    } else if hovered {
-        btn.bg(rgba(with_alpha(BG_HOVER, 0x4d)))
+        .cursor_pointer()
+        .border_1()
+        .border_color(rgb(border))
+        .bg(fill)
+}
+
+fn display_pattern(rule: &RoutingRule) -> String {
+    if matches!(rule.rule_type.as_str(), "match" | "final") {
+        sockrocket_gui::i18n::t("rules.match.label").to_string()
     } else {
-        btn
-    };
-    btn.child(child)
-}
-
-/// 1px hairline divider between in-card sections.
-fn hairline() -> Div {
-    div()
-        .h(px(1.0))
-        .w_full()
-        .flex_shrink_0()
-        .bg(rgba(with_alpha(BORDER, 0x99)))
-}
-
-/// TINY muted field label above a form control (v2 "Type"/"Pattern"/"Target").
-fn field_label(text: &str) -> Div {
-    div()
-        .text_size(px(TINY))
-        .text_color(rgb(TEXT_MUTED))
-        .child(text.to_string())
-}
-
-/// TINY muted mono table header cell.
-fn head_cell(text: &str) -> Div {
-    div()
-        .text_size(px(TINY))
-        .font_family(MONO_FONT)
-        .text_color(rgb(TEXT_MUTED))
-        .child(text.to_string())
+        rule.pattern.clone()
+    }
 }
 
 impl AppState {
     pub(crate) fn render_rules(&mut self, cx: &mut Context<Self>) -> Div {
         let rule_count = self.rules.len();
         let rules_status = self.rules_status.clone();
-        let rule_pattern_input = self.rule_pattern_input.clone();
-        let cur_type = self.rule_type_sel.clone();
-        let cur_target = self.rule_target_sel.clone();
-        let editing = self.editing_rule_index.is_some();
-
-        let pattern_hint: &'static str = match cur_type.as_str() {
-            "domain" => "e.g. google.com",
-            "domain-suffix" => "e.g. google.com (matches *.google.com too)",
-            "domain-keyword" => "e.g. youtube",
-            "ip-cidr" => "e.g. 192.168.0.0/24",
-            "geoip" => "e.g. CN",
-            "dst-port" => "e.g. 443 or 1000-2000",
-            "match" => "no pattern needed — matches all",
-            _ => "",
-        };
-
         let clear_armed = confirm_slot_armed(&CLEAR_CONFIRM_AT);
-
-        // Hoist the tester match so the matched rule row can be highlighted.
-        let tester_value_pre = self.rule_tester_input.read(cx).value().to_string();
-        let tester_match: Option<usize> = if tester_value_pre.trim().is_empty() {
-            None
-        } else {
-            match_rule(&self.rules, tester_value_pre.trim()).map(|(i, _)| i)
-        };
-
-        // (Both "Add Rule" entry points — header + empty state — focus the
-        // pattern input via their own `cx.listener` below.)
+        let batch_group = self.batch_edit_group.clone();
 
         let mut content = div()
             .flex()
             .flex_col()
-            .gap_4()
-            // === Page header (v2): icon block + title/subtitle | Add Rule ===
+            .gap_2p5()
             .child(
                 div()
                     .flex()
@@ -314,453 +178,758 @@ impl AppState {
                     .child(self.page_header_v3(
                         "icons/nav-rules.svg",
                         ACCENT,
-                        "Rules",
-                        "Routing & filtering rules",
+                        sockrocket_gui::i18n::t("rules.title"),
+                        sockrocket_gui::i18n::t("rules.subtitle"),
                     ))
-                    .child(
-                        tint_btn("rules-add-btn", "Add Rule", Some("icons/plus.svg")).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.rule_pattern_input.update(cx, |state, cx| {
-                                    state.focus(window, cx);
-                                });
-                            }),
-                        ),
-                    ),
-            )
-            // === Custom Rules card (v2): header actions + add row + tester ===
-            .child(
-                card()
-                    // Card header: section label | Load China Direct · Clear All
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .justify_between()
                             .gap_2()
-                            .child(section_label("Custom Rules"))
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .id("load-china-rules")
-                                            .px_1()
-                                            .py_0p5()
-                                            .rounded(px(4.0))
-                                            .cursor_pointer()
-                                            .text_size(px(MICRO))
-                                            .text_color(rgb(ACCENT))
-                                            .hover(|s| {
-                                                s.bg(rgba(with_alpha(ACCENT, 0x14)))
-                                                    .text_color(rgb(TEXT_ACCENT))
-                                            })
-                                            .child("Load China Direct")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.load_china_rules(cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("clear-rules")
-                                            .xsmall()
-                                            .label(if clear_armed {
-                                                "Confirm?".to_string()
-                                            } else {
-                                                "Clear All".to_string()
-                                            })
-                                            .tooltip("Remove all routing rules")
-                                            .when(clear_armed, |b| b.danger())
-                                            .when(!clear_armed, |b| b.ghost())
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
-                                                    CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
-                                                    this.clear_rules(cx);
-                                                } else {
-                                                    CLEAR_CONFIRM_AT
-                                                        .store(now_millis(), Ordering::Relaxed);
-                                                    schedule_confirm_reset(this, cx);
-                                                    cx.notify();
-                                                }
-                                            })),
-                                    ),
+                                    .id("rules-export")
+                                    .cursor_pointer()
+                                    .text_size(px(TINY))
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                    .child(sockrocket_gui::i18n::t("rules.export").to_string())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_rules_to_clipboard(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("clear-rules")
+                                    .cursor_pointer()
+                                    .text_size(px(TINY))
+                                    .text_color(rgb(if clear_armed {
+                                        DANGER
+                                    } else {
+                                        TEXT_MUTED
+                                    }))
+                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                    .child(if clear_armed {
+                                        sockrocket_gui::i18n::t("rules.clear_confirm").to_string()
+                                    } else {
+                                        sockrocket_gui::i18n::t("rules.clear").to_string()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
+                                            CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
+                                            this.clear_rules(cx);
+                                        } else {
+                                            CLEAR_CONFIRM_AT
+                                                .store(now_millis(), Ordering::Relaxed);
+                                            schedule_confirm_reset(this, cx);
+                                            cx.notify();
+                                        }
+                                    })),
                             ),
+                    ),
+            );
+        let filter_q = self
+            .rule_filter_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let rule_filter_input = self.rule_filter_input.clone();
+        let new_group_open = self.rules_new_group_open;
+        content = content.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div().flex_1().min_w(px(120.0)).child(
+                        gpui_component::input::Input::new(&rule_filter_input)
+                            .xsmall()
+                            .w_full(),
+                    ),
+                )
+                .when(!new_group_open, |d| {
+                    d.child(
+                        div()
+                            .id("open-new-rule-group")
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .text_color(rgb(TEXT_MUTED))
+                            .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                            .child(sockrocket_gui::i18n::t("rules.group.new").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.rules_new_group_open = true;
+                                this.rule_group_input.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                    state.focus(window, cx);
+                                });
+                                cx.notify();
+                            })),
                     )
-                    // Add row (v2): labeled Type chips + Pattern input + Target chips + Add
+                }),
+        );
+        if new_group_open {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(px(6.0))
+                    .bg(rgba(with_alpha(BG_HOVER, 0x66)))
+                    .child(
+                        div().flex_1().min_w(px(100.0)).child(
+                            gpui_component::input::Input::new(&self.rule_group_input)
+                                .xsmall()
+                                .w_full(),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("confirm-new-rule-group")
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .text_color(rgb(ACCENT))
+                            .child(sockrocket_gui::i18n::t("rules.group.new").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let name = this
+                                    .rule_group_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .to_string();
+                                if name.is_empty() {
+                                    this.rules_status =
+                                        sockrocket_gui::i18n::t("rules.status.group_name").into();
+                                    cx.notify();
+                                } else {
+                                    this.begin_add_in_group(&name, window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("cancel-new-rule-group")
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t("rules.cancel").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.rules_new_group_open = false;
+                                this.rule_group_input.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        content = content.children(if rules_status.is_empty() {
+            None
+        } else {
+            Some(
+                div()
+                    .text_size(px(TINY))
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(rules_status),
+            )
+        });
+
+        let show_empty = rule_count == 0 && batch_group.is_none();
+        if show_empty {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .pt_4()
+                    .child(empty_state(
+                        sockrocket_gui::i18n::t("rules.empty"),
+                        Some(
+                            div()
+                                .id("empty-new-group")
+                                .cursor_pointer()
+                                .text_size(px(SMALL))
+                                .text_color(rgb(TEXT_ACCENT))
+                                .child(sockrocket_gui::i18n::t("rules.empty.cta").to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.rules_new_group_open = true;
+                                    this.rule_group_input.update(cx, |state, cx| {
+                                        state.set_value("", window, cx);
+                                        state.focus(window, cx);
+                                    });
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        ),
+                    ))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .flex_wrap()
-                            .items_end()
-                            .gap_2()
+                            .items_center()
+                            .gap_3()
+                            .justify_center()
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(field_label("Type"))
-                                    .child({
-                                        let t = cur_type.clone();
-                                        let types: &[(&str, &str)] = &[
-                                            ("domain", "Domain"),
-                                            ("domain-suffix", "Suffix"),
-                                            ("domain-keyword", "Keyword"),
-                                            ("ip-cidr", "IP CIDR"),
-                                            ("geoip", "GeoIP"),
-                                            ("dst-port", "Port"),
-                                            ("match", "Match All"),
-                                        ];
-                                        let mut row = div().flex().flex_row().gap_1().flex_wrap();
-                                        for &(val, label) in types {
-                                            let active = t == val;
-                                            row = row.child(
-                                                rule_chip(
-                                                    SharedString::from(format!(
-                                                        "rule-type-{}",
-                                                        val
-                                                    )),
-                                                    label,
-                                                    active,
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.rule_type_sel = val.to_string();
-                                                    cx.notify();
-                                                })),
-                                            );
-                                        }
-                                        row
-                                    }),
+                                    .text_size(px(TINY))
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(sockrocket_gui::i18n::t("rules.scenes.title")),
                             )
-                            .child(
+                            .children(builtin_rule_scenes().iter().map(|scene| {
+                                let id = scene.id;
                                 div()
-                                    .flex_1()
-                                    .min_w(px(200.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(field_label("Pattern"))
-                                    .child(
-                                        gpui_component::input::Input::new(&rule_pattern_input)
-                                            .xsmall()
-                                            .w_full(),
-                                    )
-                                    .when(!pattern_hint.is_empty(), |d| {
-                                        d.child(
-                                            div()
-                                                .text_size(px(TINY))
-                                                .font_family(MONO_FONT)
-                                                .text_color(rgb(TEXT_MUTED))
-                                                .child(pattern_hint),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .w(px(72.0))
-                                    .child(field_label("Priority"))
-                                    .child(
-                                        gpui_component::input::Input::new(
-                                            &self.rule_priority_input,
-                                        )
-                                        .xsmall()
-                                        .w_full(),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(TINY))
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .child("higher first"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(field_label("Target"))
-                                    .child({
-                                        let mut row = div().flex().flex_row().gap_1().flex_wrap();
-                                        for &(val, label) in &[
-                                            ("direct", "Direct"),
-                                            ("proxy", "Proxy"),
-                                            ("reject", "Block"),
-                                        ] {
-                                            let active = cur_target == val;
-                                            row = row.child(
-                                                rule_chip(
-                                                    SharedString::from(format!(
-                                                        "rule-target-{}",
-                                                        val
-                                                    )),
-                                                    label,
-                                                    active,
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.rule_target_sel = val.to_string();
-                                                    cx.notify();
-                                                })),
-                                            );
-                                        }
-                                        row
-                                    }),
-                            )
-                            .child(
-                                tint_btn(
-                                    "add-rule-btn",
-                                    if editing { "Save" } else { "Add" },
-                                    if editing {
-                                        None
-                                    } else {
-                                        Some("icons/plus.svg")
-                                    },
-                                )
-                                .px_4()
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.add_rule(cx);
-                                    },
-                                )),
-                            )
-                            .children(if editing {
-                                Some(
-                                    Button::new("cancel-edit-btn")
-                                        .xsmall()
-                                        .label("Cancel".to_string())
-                                        .tooltip("Discard changes and stop editing")
-                                        .ghost()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_edit_rule(cx);
-                                        })),
-                                )
-                            } else {
-                                None
-                            }),
-                    )
-                    .children(if !rules_status.is_empty() {
-                        Some(alert_strip(status_alert_kind(&rules_status), rules_status))
-                    } else {
-                        None
+                                    .id(SharedString::from(format!("scene-empty-{id}")))
+                                    .cursor_pointer()
+                                    .text_size(px(TINY))
+                                    .text_color(rgb(TEXT_SECONDARY))
+                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                    .child(sockrocket_gui::i18n::t(scene.title_key).to_string())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.apply_rule_scene(id, cx);
+                                    }))
+                            })),
+                    ),
+            );
+        } else {
+            let groups = sockrocket_core::group_rules_for_display(&self.rules);
+            let mut list = div().flex().flex_col().gap_3();
+            let mut any_shown = false;
+            for bucket in groups {
+                let gkey = bucket.name.clone();
+                let collapsed = self.rules_collapsed_groups.contains(&gkey);
+                let title = if gkey.is_empty() {
+                    sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
+                } else {
+                    gkey.clone()
+                };
+                let count = bucket.indices.len();
+                let enabled_n = bucket
+                    .indices
+                    .iter()
+                    .filter(|&&i| self.rules.get(i).map(|r| r.enabled).unwrap_or(false))
+                    .count();
+                let gkey_toggle = gkey.clone();
+                let gkey_switch = gkey.clone();
+                let gkey_edit = gkey.clone();
+                let gkey_del = gkey.clone();
+                let del_armed = group_delete_armed(&gkey);
+                let all_on = count > 0 && enabled_n == count;
+                let partial = enabled_n > 0 && enabled_n < count;
+
+                let shown: Vec<usize> = bucket
+                    .indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        filter_q.is_empty()
+                            || self
+                                .rules
+                                .get(i)
+                                .is_some_and(|r| rule_matches_query(r, &filter_q))
                     })
-                    // === Rule tester (v2): one labeled input row, live first match ===
-                    .child(hairline())
+                    .collect();
+                if !filter_q.is_empty() && shown.is_empty() {
+                    continue;
+                }
+                any_shown = true;
+
+                let count_label = if !filter_q.is_empty() && shown.len() != count {
+                    format!("{} / {count}", shown.len())
+                } else {
+                    format!("{count}")
+                };
+
+                let header_group = SharedString::from(format!("grp-hover-{gkey}"));
+                let batch_here = batch_group.as_deref() == Some(gkey.as_str());
+                let mut section = div()
+                    .group(header_group.clone())
+                    .flex()
+                    .flex_col()
+                    .when(batch_here, |d| {
+                        d.pl_2()
+                            .border_l_2()
+                            .border_color(rgba(with_alpha(ACCENT, 0x55)))
+                    })
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(div().w(px(28.0)).flex_shrink_0().child(field_label("Test")))
+                            .py_1()
                             .child(
-                                div().flex_1().min_w_0().child(
-                                    gpui_component::input::Input::new(&self.rule_tester_input)
-                                        .xsmall()
-                                        .w_full(),
-                                ),
+                                div()
+                                    .id(SharedString::from(format!("grp-toggle-{gkey}")))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_rule_group_collapsed(&gkey_toggle, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(TINY))
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(if collapsed { "▸" } else { "▾" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(BODY))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(TINY))
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(count_label),
+                                    ),
                             )
-                            .when(!tester_value_pre.trim().is_empty(), |d| {
-                                match match_rule(&self.rules, tester_value_pre.trim()) {
-                                    Some((i, target)) => d
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_size(px(SMALL))
-                                                .font_family(MONO_FONT)
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(ACCENT))
-                                                .child(format!("#{}", i + 1)),
-                                        )
-                                        .child(mini_badge(
-                                            target.clone(),
-                                            target_label_color(&target),
-                                        )),
-                                    None => d
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .text_size(px(SMALL))
-                                                .font_family(MONO_FONT)
-                                                .text_color(rgb(TEXT_MUTED))
-                                                .child("no match →"),
-                                        )
-                                        .child(mini_badge("FINAL", WARNING)),
-                                }
-                            }),
-                    )
-                    .child(div().text_size(px(TINY)).text_color(rgb(TEXT_MUTED)).child(
-                        "Higher priority first · equal priority uses list order (↑↓) · geoip not evaluated client-side",
-                    )),
-            );
+                            .child(
+                                quiet_mark(
+                                    SharedString::from(format!("grp-switch-{gkey}")),
+                                    all_on,
+                                    partial,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_rule_group_enabled(&gkey_switch, !all_on, cx);
+                                })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("grp-edit-{gkey}")))
+                                    .cursor_pointer()
+                                    .text_size(px(TINY))
+                                    .text_color(rgb(if batch_here {
+                                        TEXT_ACCENT
+                                    } else {
+                                        TEXT_MUTED
+                                    }))
+                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                    .child(sockrocket_gui::i18n::t("rules.batch.mode").to_string())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if this.batch_edit_group.as_deref() == Some(gkey_edit.as_str())
+                                        {
+                                            this.cancel_edit_rule(window, cx);
+                                        } else {
+                                            this.begin_batch_edit_group(&gkey_edit, window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("grp-del-{gkey}")))
+                                    .cursor_pointer()
+                                    .text_size(px(TINY))
+                                    .text_color(rgb(if del_armed { DANGER } else { TEXT_MUTED }))
+                                    .when(!del_armed, |d| {
+                                        d.invisible().group_hover(header_group, |s| s.visible())
+                                    })
+                                    .child(if del_armed {
+                                        sockrocket_gui::i18n::t("rules.clear_confirm").to_string()
+                                    } else {
+                                        "×".to_string()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if group_delete_armed(&gkey_del) {
+                                            GROUP_DEL_AT.store(0, Ordering::Relaxed);
+                                            this.delete_rule_group(&gkey_del, cx);
+                                        } else {
+                                            arm_group_delete(&gkey_del);
+                                            schedule_confirm_reset(this, cx);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    );
 
-        // === Rule table (v2): bordered container, tinted header, hover rows ===
-        if rule_count == 0 {
-            let add_action = Button::new("empty-add-rule")
-                .xsmall()
-                .label("Add Rule".to_string())
-                .tooltip("Add your first routing rule")
-                .primary()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.rule_pattern_input.update(cx, |state, cx| {
-                        state.focus(window, cx);
-                    });
-                }));
-            content = content.child(empty_state(
-                "No rules yet",
-                Some(add_action.into_any_element()),
-            ));
-        } else {
-            let mut list = div().flex().flex_col();
-            // Header: # 32px + toggle spacer 32px | TYPE | PATTERN | TARGET | ACTIONS
-            let head = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .bg(rgba(with_alpha(BG_HOVER, 0x4d)))
-                .border_b_1()
-                .border_color(rgba(with_alpha(BORDER, 0x99)))
-                .child(div().w(px(32.0)).flex_shrink_0().child(head_cell("#")))
-                .child(div().w(px(32.0)).flex_shrink_0())
-                .child(div().w(px(112.0)).flex_shrink_0().child(head_cell("TYPE")))
-                .child(div().flex_1().min_w_0().child(head_cell("PATTERN")))
-                .child(div().w(px(72.0)).flex_shrink_0().child(head_cell("TARGET")))
-                .child(
-                    div().flex_1().min_w_0().flex().justify_end().child(
-                        div()
-                            .w(px(48.0))
-                            .flex_shrink_0()
-                            .flex()
-                            .justify_center()
-                            .child(head_cell("ACTIONS")),
-                    ),
-                );
-            list = list.child(head);
-            for i in 0..rule_count {
-                list = list.child(self.render_rule_item(
-                    i,
-                    tester_match == Some(i),
-                    i == rule_count - 1,
-                    cx,
-                ));
+                if batch_here {
+                    section = section.child(self.render_batch_editor(cx));
+                } else if !collapsed || !filter_q.is_empty() {
+                    let last = *shown.last().unwrap_or(&0);
+                    for (pos, &i) in shown.iter().enumerate() {
+                        section = section.child(self.render_rule_item(
+                            i,
+                            i == last || pos + 1 == shown.len(),
+                            cx,
+                        ));
+                    }
+                }
+                list = list.child(section);
             }
-            content = content.child(
-                div()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(rgba(with_alpha(BORDER, 0x99)))
-                    .overflow_hidden()
-                    .child(list),
-            );
-        }
+            if let Some(name) = batch_group.clone() {
+                let exists = sockrocket_core::group_rules_for_display(&self.rules)
+                    .iter()
+                    .any(|b| b.name == name);
+                if !exists {
+                    any_shown = true;
+                    let title = if name.is_empty() {
+                        sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
+                    } else {
+                        name
+                    };
+                    list = list.child(
+                        div()
+                            .pl_2()
+                            .border_l_2()
+                            .border_color(rgba(with_alpha(ACCENT, 0x55)))
+                            .child(
+                                div()
+                                    .py_1()
+                                    .text_size(px(BODY))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(title),
+                            )
+                            .child(self.render_batch_editor(cx)),
+                    );
+                }
+            }
+            if !any_shown && !filter_q.is_empty() {
+                list = list.child(
+                    div()
+                        .pl_4()
+                        .py_2()
+                        .text_size(px(TINY))
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(sockrocket_gui::i18n::t("rules.filter.empty")),
+                );
+            }
+            content = content.child(list);
 
-        // === Info card (v2): cyan info icon + hint with highlighted rule types ===
-        content = content.child(
-            card()
-                .p_4()
-                .flex()
-                .flex_row()
-                .items_start()
-                .gap_3()
-                .child(
-                    div().mt(px(1.0)).child(
-                        Icon::empty()
-                            .path("icons/info.svg")
-                            .with_size(gpui_component::Size::Size(px(16.0)))
-                            .text_color(rgb(ACCENT)),
-                    ),
-                )
-                .child(
+            if rule_count > 0 {
+                content = content.child(
                     div()
                         .flex()
                         .flex_row()
                         .flex_wrap()
-                        .gap_1()
-                        .text_size(px(SMALL))
-                        .text_color(rgb(TEXT_SECONDARY))
-                        .child("Rules are evaluated top-down. First match wins. Use ")
+                        .items_center()
+                        .gap_3()
+                        .pt_1()
                         .child(
                             div()
-                                .font_family(MONO_FONT)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(ACCENT))
-                                .child("DOMAIN-SUFFIX"),
+                                .text_size(px(TINY))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(sockrocket_gui::i18n::t("rules.scenes.title")),
                         )
-                        .child(" for whole domains, ")
-                        .child(
+                        .children(builtin_rule_scenes().iter().map(|scene| {
+                            let id = scene.id;
                             div()
-                                .font_family(MONO_FONT)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(ACCENT))
-                                .child("IP-CIDR"),
-                        )
-                        .child(" for network ranges."),
-                ),
-        );
+                                .id(SharedString::from(format!("scene-{id}")))
+                                .cursor_pointer()
+                                .text_size(px(TINY))
+                                .text_color(rgb(TEXT_SECONDARY))
+                                .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                .child(sockrocket_gui::i18n::t(scene.title_key).to_string())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.apply_rule_scene(id, cx);
+                                }))
+                        })),
+                );
+            }
+        }
 
         content
+    }
+
+    fn render_rule_menu(&mut self, menu: RuleMenu, cx: &mut Context<Self>) -> Div {
+        let open = self.rule_menu == Some(menu);
+        let (id, current, options): (&'static str, String, &'static [(&str, &str)]) = match menu {
+            RuleMenu::Type => (
+                "rule-dd-type",
+                short_type(&self.rule_type_sel).to_string(),
+                TYPE_OPTIONS,
+            ),
+            RuleMenu::Target => (
+                "rule-dd-target",
+                short_target(&self.rule_target_sel).to_string(),
+                TARGET_OPTIONS,
+            ),
+        };
+        let selected = match menu {
+            RuleMenu::Type => self.rule_type_sel.clone(),
+            RuleMenu::Target => self.rule_target_sel.clone(),
+        };
+        let mut panel = div()
+            .mt_1()
+            .py_1()
+            .min_w(px(100.0))
+            .rounded(px(6.0))
+            .bg(rgb(BG_PANEL))
+            .border_1()
+            .border_color(rgba(with_alpha(BORDER, 0xaa)))
+            .shadow_md()
+            .occlude();
+        for (value, key) in options {
+            let value = *value;
+            let active = selected == value
+                || (menu == RuleMenu::Type && selected == "final" && value == "match")
+                || (menu == RuleMenu::Type && selected == "port" && value == "dst-port");
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!("{id}-{value}")))
+                    .px_2p5()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_size(px(SMALL))
+                    .text_color(rgb(if active { TEXT_ACCENT } else { TEXT_SECONDARY }))
+                    .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                    .child(sockrocket_gui::i18n::t(key).to_string())
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            match menu {
+                                RuleMenu::Type => this.select_rule_type(value, window, cx),
+                                RuleMenu::Target => {
+                                    this.rule_target_sel = value.to_string();
+                                }
+                            }
+                            this.rule_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        div()
+            .relative()
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this.rule_menu == Some(menu) {
+                    this.rule_menu = None;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .id(id)
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(TINY))
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                    .child(format!("{current} ▾"))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.rule_menu = if this.rule_menu == Some(menu) {
+                                None
+                            } else {
+                                Some(menu)
+                            };
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .when(open, |d| {
+                d.child(deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(panel),
+                ))
+            })
+    }
+
+    /// Batch mode: edit the whole group as one-line-per-rule text.
+    fn render_batch_editor(&mut self, cx: &mut Context<Self>) -> Div {
+        let batch_input = self.rule_batch_input.clone();
+        div()
+            .ml_2()
+            .mr_1()
+            .mb_1()
+            .mt_0p5()
+            .px_2p5()
+            .py_2()
+            .rounded(px(6.0))
+            .bg(rgba(with_alpha(BG_HOVER, 0x55)))
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_size(px(TINY))
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(sockrocket_gui::i18n::t("rules.batch.hint").to_string()),
+            )
+            .child(
+                div().w_full().child(
+                    gpui_component::input::Input::new(&batch_input)
+                        .xsmall()
+                        .w_full(),
+                ),
+            )
+            .child({
+                let row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_rule_menu(RuleMenu::Target, cx));
+                row.child(div().flex_1())
+                    .child(
+                        div()
+                            .id("batch-cancel")
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .text_color(rgb(TEXT_MUTED))
+                            .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                            .child(sockrocket_gui::i18n::t("rules.cancel").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_edit_rule(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("batch-save")
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(rgba(with_alpha(ACCENT, 0x22)))
+                            .text_color(rgb(TEXT_ACCENT))
+                            .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
+                            .child(sockrocket_gui::i18n::t("rules.batch.save").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.rule_menu = None;
+                                this.save_batch_edit_group(window, cx);
+                            })),
+                    )
+            })
+    }
+
+    fn render_inline_editor(
+        &mut self,
+        index: usize,
+        is_last: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let cur_type = self.rule_type_sel.clone();
+        let pattern_input = self.rule_pattern_input.clone();
+        let is_final = matches!(cur_type.as_str(), "match" | "final");
+        let is_geoip = cur_type == "geoip";
+        div()
+            .ml_2()
+            .mr_1()
+            .my_0p5()
+            .px_2p5()
+            .py_1p5()
+            .rounded(px(6.0))
+            .bg(rgba(with_alpha(ACCENT, 0x10)))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(is_geoip, |d| {
+                d.child(
+                    div()
+                        .text_size(px(TINY))
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(sockrocket_gui::i18n::t("rules.hint.geoip").to_string()),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .when(!is_last, |d| d)
+                    .child(if is_final {
+                        div()
+                            .flex_1()
+                            .text_size(px(SMALL))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t("rules.hint.match"))
+                            .into_any_element()
+                    } else {
+                        div().flex_1().min_w(px(80.0)).child(
+                            gpui_component::input::Input::new(&pattern_input)
+                                .xsmall()
+                                .w_full(),
+                        ).into_any_element()
+                    })
+                    .child(self.render_rule_menu(RuleMenu::Type, cx))
+                    .child(self.render_rule_menu(RuleMenu::Target, cx))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("inline-cancel-{index}")))
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t("rules.cancel").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_edit_rule(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("inline-save-{index}")))
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_size(px(TINY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(rgba(with_alpha(ACCENT, 0x22)))
+                            .text_color(rgb(TEXT_ACCENT))
+                            .child(sockrocket_gui::i18n::t("rules.save").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_rule(window, cx);
+                            })),
+                    ),
+            )
     }
 
     pub(crate) fn render_rule_item(
         &mut self,
         index: usize,
-        tester_hit: bool,
         is_last: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        if self.editing_rule_index == Some(index) {
+            return self.render_inline_editor(index, is_last, cx).into_any_element();
+        }
         let rule = &self.rules[index];
         let is_enabled = rule.enabled;
-        // Type column: purple mini_badge, uppercase (v2).
-        let type_label: String = match rule.rule_type.as_str() {
-            "domain" => "DOMAIN".to_string(),
-            "domain-suffix" => "DOMAIN-SUFFIX".to_string(),
-            "domain-keyword" => "DOMAIN-KEYWORD".to_string(),
-            "ip-cidr" => "IP-CIDR".to_string(),
-            "geoip" => "GEOIP".to_string(),
-            "dst-port" | "port" => "PORT".to_string(),
-            "match" | "final" => "MATCH".to_string(),
-            other => other.to_uppercase(),
-        };
-        let type_chip = mini_badge(type_label, PURPLE);
-        let target_color = if !is_enabled {
-            TEXT_MUTED
-        } else {
-            match rule.target.as_str() {
-                "proxy" => ACCENT,
-                "direct" => SUCCESS,
-                "reject" => DANGER,
-                _ => TEXT_SECONDARY,
-            }
-        };
-        let pattern = rule.pattern.clone();
-        let target = rule.target.clone();
+        let pattern = display_pattern(rule);
+        let meta = format!(
+            "{} · {}",
+            short_type(&rule.rule_type),
+            short_target(&rule.target)
+        );
         let pattern_color = if is_enabled { TEXT_PRIMARY } else { TEXT_MUTED };
-
-        let hovered = hovered_rule() == Some(index);
         let del_armed = delete_confirm_armed(index);
-
         let weak = cx.entity().downgrade();
+        let row_group = SharedString::from(format!("rule-row-{index}"));
 
         div()
-            .id(SharedString::from(format!("rule-{}", index)))
+            .id(SharedString::from(format!("rule-{index}")))
+            .group(row_group.clone())
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .px_3()
-            .py_2()
+            .pl_4()
+            .pr_1()
+            .py_1()
+            .rounded(px(4.0))
             .when(!is_last, |d| {
-                d.border_b_1().border_color(rgba(with_alpha(BORDER, 0x66)))
+                d.border_b_1().border_color(rgba(with_alpha(BORDER, 0x18)))
             })
-            .when(tester_hit, |d| d.bg(rgba(with_alpha(ACCENT, 0x0d))))
-            .when(!is_enabled, |d| d.opacity(0.5))
-            .hover(|s| s.bg(rgba(with_alpha(BG_HOVER, 0x4d))))
+            .when(!is_enabled, |d| d.opacity(0.4))
+            .hover(|s| s.bg(rgba(with_alpha(BG_HOVER, 0x40))))
             .on_hover(move |is_hovered, _window, cx| {
                 let next = if *is_hovered { Some(index) } else { None };
                 if hovered_rule() != next {
@@ -768,27 +937,31 @@ impl AppState {
                     weak.update(cx, |_, cx| cx.notify()).ok();
                 }
             })
-            // # (1-based rule ordinal)
             .child(
                 div()
-                    .w(px(32.0))
-                    .flex_shrink_0()
-                    .text_size(px(TINY))
+                    .id(SharedString::from(format!("rule-pat-{index}")))
+                    .flex_1()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .text_size(px(SMALL))
                     .font_family(MONO_FONT)
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(format!(
-                        "{}{}",
-                        index + 1,
-                        if rule.priority != 0 {
-                            format!("·P{}", rule.priority)
-                        } else {
-                            String::new()
-                        }
-                    )),
+                    .text_color(rgb(pattern_color))
+                    .overflow_x_hidden()
+                    .child(pattern)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_edit_rule(index, window, cx);
+                    })),
             )
-            // ENABLE switch (always visible)
-            .child(div().w(px(32.0)).flex_shrink_0().child(
-                toggle_switch(("rule-switch", index), is_enabled).on_click(cx.listener(
+            .child(
+                div()
+                    .text_size(px(TINY))
+                    .text_color(rgb(TEXT_MUTED))
+                    .invisible()
+                    .group_hover(row_group.clone(), |s| s.visible())
+                    .child(meta),
+            )
+            .child(
+                quiet_mark(("rule-switch", index), is_enabled, false).on_click(cx.listener(
                     move |this, _, _, cx| {
                         if let Some(rule) = this.rules.get_mut(index) {
                             rule.enabled = !rule.enabled;
@@ -800,128 +973,48 @@ impl AppState {
                         cx.notify();
                     },
                 )),
-            ))
-            // TYPE (purple badge)
-            .child(div().w(px(112.0)).flex_shrink_0().child(type_chip))
-            // PATTERN (mono, primary)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(SMALL))
-                    .font_family(MONO_FONT)
-                    .text_color(rgb(pattern_color))
-                    .overflow_x_hidden()
-                    .child(pattern),
             )
-            // TARGET (colored badge)
-            .child(
+            .child(if del_armed {
                 div()
-                    .w(px(72.0))
-                    .flex_shrink_0()
-                    .child(mini_badge(target.to_uppercase(), target_color)),
-            )
-            // ACTIONS (up/down/edit icons + destructive delete, two-step confirm)
-            .child(
+                    .id(("rule-del-confirm", index))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(TINY))
+                    .text_color(rgb(DANGER))
+                    .child(sockrocket_gui::i18n::t("rules.clear_confirm").to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        disarm_delete_confirm();
+                        this.delete_rule(index, cx);
+                    }))
+                    .into_any_element()
+            } else {
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .id(("rule-del", index))
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(4.0))
                     .flex()
-                    .flex_row()
                     .items_center()
-                    .justify_end()
-                    .gap_0p5()
+                    .justify_center()
+                    .cursor_pointer()
+                    .invisible()
+                    .group_hover(row_group, |s| s.visible())
+                    .hover(|s| s.bg(rgba(with_alpha(DANGER, 0x18))))
                     .child(
-                        action_btn(
-                            ("rule-up", index),
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(rgb(if hovered { TEXT_PRIMARY } else { TEXT_MUTED }))
-                                .child("↑"),
-                            hovered,
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.move_rule_up(index, cx);
-                        }))
-                        .tooltip(|window, cx| {
-                            gpui_component::tooltip::Tooltip::new("Move rule up (higher priority)")
-                                .build(window, cx)
-                        }),
+                        Icon::empty()
+                            .path("icons/trash-2.svg")
+                            .with_size(gpui_component::Size::Size(px(11.0)))
+                            .text_color(rgb(TEXT_MUTED)),
                     )
-                    .child(
-                        action_btn(
-                            ("rule-down", index),
-                            Icon::empty()
-                                .path("icons/chevron-down.svg")
-                                .with_size(gpui_component::Size::Size(px(12.0)))
-                                .text_color(rgb(if hovered { TEXT_PRIMARY } else { TEXT_MUTED })),
-                            hovered,
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.move_rule_down(index, cx);
-                        }))
-                        .tooltip(|window, cx| {
-                            gpui_component::tooltip::Tooltip::new("Move rule down (lower priority)")
-                                .build(window, cx)
-                        }),
-                    )
-                    .child(
-                        action_btn(
-                            ("rule-edit", index),
-                            Icon::empty()
-                                .path("icons/edit.svg")
-                                .with_size(gpui_component::Size::Size(px(12.0)))
-                                .text_color(rgb(if hovered { TEXT_PRIMARY } else { TEXT_MUTED })),
-                            hovered,
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.start_edit_rule(index, window, cx);
-                        }))
-                        .tooltip(|window, cx| {
-                            gpui_component::tooltip::Tooltip::new("Edit this rule")
-                                .build(window, cx)
-                        }),
-                    )
-                    .child(
-                        action_btn(
-                            ("rule-del", index),
-                            Icon::empty()
-                                .path("icons/trash-2.svg")
-                                .with_size(gpui_component::Size::Size(px(12.0)))
-                                .text_color(rgb(if del_armed {
-                                    DANGER
-                                } else if hovered {
-                                    TEXT_PRIMARY
-                                } else {
-                                    TEXT_MUTED
-                                })),
-                            hovered,
-                            del_armed,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if delete_confirm_armed(index) {
-                                disarm_delete_confirm();
-                                this.delete_rule(index, cx);
-                            } else {
-                                DELETE_CONFIRM_INDEX.store(index, Ordering::Relaxed);
-                                DELETE_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
-                                set_hovered_rule(Some(index));
-                                schedule_confirm_reset(this, cx);
-                                cx.notify();
-                            }
-                        }))
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(if delete_confirm_armed(index) {
-                                "Click again to confirm deletion"
-                            } else {
-                                "Delete this rule"
-                            })
-                            .build(window, cx)
-                        }),
-                    ),
-            )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        DELETE_CONFIRM_INDEX.store(index, Ordering::Relaxed);
+                        DELETE_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
+                        set_hovered_rule(Some(index));
+                        schedule_confirm_reset(this, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .into_any_element()
     }
 }

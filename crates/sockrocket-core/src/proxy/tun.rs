@@ -271,6 +271,11 @@ pub struct TunProxy {
     /// `Some` when the TUN device was successfully assigned its IPv6 ULA
     /// address; `None` means IPv4-only mode.
     ipv6_gateway: Option<Ipv6Addr>,
+    /// Completes when the accept loop exits while still marked running
+    /// (device/stack failure). Intentional [`Self::stop`] clears `running`
+    /// first, so this stays pending. Callers (CLI under supervisor) should
+    /// exit on completion so a fresh process can rebuild TUN+DNS.
+    unexpected_exit_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// Information needed to set up system routes for TUN mode.
@@ -380,6 +385,7 @@ impl TunProxy {
 
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
+        let (unexpected_exit_tx, unexpected_exit_rx) = tokio::sync::oneshot::channel();
 
         // Cap concurrent stream tasks so a LAN scan / download burst cannot
         // grow the JoinSet (and ipstack session table) without bound.
@@ -475,7 +481,18 @@ impl TunProxy {
             streams.abort_all();
             while streams.join_next().await.is_some() {}
 
-            tracing::info!("TUN accept loop exited");
+            if running_clone.load(Ordering::Relaxed) {
+                // Still marked running ⇒ stop()/Drop did not initiate this.
+                // Transparent proxy is dead while SOCKS/DNS may still look
+                // alive — tell the supervisor-facing CLI to exit so a fresh
+                // process rebuilds the stack instead of sitting half-dead.
+                tracing::error!(
+                    "TUN accept loop exited unexpectedly — signalling fatal for supervised restart"
+                );
+                let _ = unexpected_exit_tx.send(());
+            } else {
+                tracing::info!("TUN accept loop exited");
+            }
         });
 
         Ok(TunProxy {
@@ -484,7 +501,16 @@ impl TunProxy {
             tun_name,
             shutdown,
             ipv6_gateway,
+            unexpected_exit_rx: Some(unexpected_exit_rx),
         })
+    }
+
+    /// Take the oneshot that fires when the accept loop dies unexpectedly.
+    ///
+    /// Intended for the Merlin CLI: await this alongside Ctrl+C/SIGTERM and
+    /// exit the process so `sockrocket.sh`'s supervisor can respawn.
+    pub fn take_unexpected_exit(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.unexpected_exit_rx.take()
     }
 
     /// Get the TUN device name.

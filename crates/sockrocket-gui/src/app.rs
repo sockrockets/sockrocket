@@ -44,11 +44,19 @@ use sockrocket_core::{
     create_outbound, dedup_nodes, fallback_pick, fetch_subscription, generate_token,
     get_system_proxy as get_os_proxy, local_lan_ip, new_shared_state, node_fingerprint,
     normalize_node_names, parse_proxy_uri, resolve_members, resolve_to_ips, rule_mode_ruleset,
-    set_system_proxy as set_os_proxy, setup_tun_routes, start_share_server, system_proxy_supported,
-    uniquify_node_names, url_test_pick,
+    rule_scene_by_id, set_system_proxy as set_os_proxy, setup_tun_routes, start_share_server,
+    system_proxy_supported, uniquify_node_names, url_test_pick, BatchConflict, format_rules_export,
+    format_rule_clash_line, group_member_indices, merge_batch_rules, make_typed_rule,
+    parse_batch_rules_in_group, replace_rule_group, same_rule_group,
 };
 
 /// Main application state
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleMenu {
+    Type,
+    Target,
+}
+
 pub struct AppState {
     pub(crate) active_view: ActiveView,
 
@@ -137,8 +145,30 @@ pub struct AppState {
 
     // Rules management
     pub(crate) rules: Vec<RoutingRule>,
+    pub(crate) rule_group_input: Entity<InputState>,
     pub(crate) rule_pattern_input: Entity<InputState>,
     pub(crate) rule_priority_input: Entity<InputState>,
+    /// Multi-line paste buffer for bulk rule types (domain / CIDR).
+    pub(crate) rule_batch_input: Entity<InputState>,
+    /// When true, show the optional bulk-paste panel.
+    pub(crate) rules_show_batch: bool,
+    /// Bulk duplicate policy: false = skip, true = replace.
+    pub(crate) rule_batch_replace: bool,
+    /// Collapsed group names in the Rules list (empty string = ungrouped).
+    pub(crate) rules_collapsed_groups: std::collections::HashSet<String>,
+    /// Filters rules shown inside groups (pattern / type / target / group).
+    pub(crate) rule_filter_input: Entity<InputState>,
+    /// Group whose inline add row is open. `None` hides it.
+    pub(crate) adding_rule_group: Option<String>,
+    /// Which rule dropdown is open in the add/edit row.
+    pub(crate) rule_menu: Option<RuleMenu>,
+    /// Toolbar expands the new-group name field.
+    pub(crate) rules_new_group_open: bool,
+    /// Group currently open in batch text edit (one rule per line).
+    pub(crate) batch_edit_group: Option<String>,
+    /// Group / pattern field focus — drives “committed” tint when blurred with text.
+    pub(crate) rule_group_focused: bool,
+    pub(crate) rule_pattern_focused: bool,
     // Selected values for type/target button groups
     pub(crate) rule_type_sel: String,
     pub(crate) rule_target_sel: String,
@@ -192,8 +222,10 @@ pub struct AppState {
     pub(crate) node_rename_input: Entity<InputState>,
     pub(crate) editing_node_index: Option<usize>,
 
-    // Rule editing
+    // Rule editing. `editing_group` is the original group name while the form
+    // replaces that whole group (empty string = the ungrouped bucket).
     pub(crate) editing_rule_index: Option<usize>,
+    pub(crate) editing_group: Option<String>,
 
     // Export & LAN share panel (Nodes page)
     pub(crate) show_share_panel: bool,
@@ -463,9 +495,24 @@ impl AppState {
                 .default_value(persisted.http_port.to_string())
         });
         let (system_proxy_enabled, system_proxy_status) = current_system_proxy_state();
-        let rule_pattern_input = cx.new(|cx| InputState::new(window, cx).placeholder("google.com"));
+        let rule_batch_input =
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .auto_grow(3, 20)
+                    .placeholder(sockrocket_gui::i18n::t("rules.ph.bulk.clash").to_string())
+            });
+        let rule_group_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("新分组"));
+        let rule_pattern_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(sockrocket_gui::i18n::t("rules.ph.domain-suffix").to_string())
+        });
         let rule_priority_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("0").default_value("0"));
+        let rule_filter_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(sockrocket_gui::i18n::t("rules.filter").to_string())
+        });
         let node_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search nodes..."));
         let node_tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add tag..."));
@@ -498,6 +545,80 @@ impl AppState {
         });
         // Rule tester re-evaluates live as the user types.
         let tester_sub = cx.subscribe(&rule_tester_input, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        // New-group field: Enter creates the group and opens its add row.
+        let group_sub = cx.subscribe_in(
+            &rule_group_input,
+            window,
+            |this, input, event, window, cx| match event {
+                InputEvent::Focus => {
+                    this.rule_group_focused = true;
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.rule_group_focused = false;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.rule_group_focused = false;
+                    if !this.rules_new_group_open {
+                        return;
+                    }
+                    let name = input.read(cx).value().trim().to_string();
+                    if name.is_empty() {
+                        this.rules_status =
+                            sockrocket_gui::i18n::t("rules.status.group_name").into();
+                        cx.notify();
+                    } else {
+                        this.begin_add_in_group(&name, window, cx);
+                    }
+                }
+                InputEvent::Change => {
+                    let _ = input;
+                    cx.notify();
+                }
+            },
+        );
+        // Pattern (edit row): Enter saves.
+        let pattern_sub = cx.subscribe_in(
+            &rule_pattern_input,
+            window,
+            |this, _, event, window, cx| match event {
+                InputEvent::Focus => {
+                    this.rule_pattern_focused = true;
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.rule_pattern_focused = false;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.rule_pattern_focused = false;
+                    this.add_rule(window, cx);
+                }
+                InputEvent::Change => cx.notify(),
+            },
+        );
+        // Batch/add box: live filter of empty state; Cmd/Ctrl+Enter submits.
+        let batch_sub = cx.subscribe_in(
+            &rule_batch_input,
+            window,
+            |this, _, event, window, cx| match event {
+                InputEvent::PressEnter { secondary: true } => {
+                    if this.batch_edit_group.is_some() {
+                        this.save_batch_edit_group(window, cx);
+                    } else {
+                        this.add_rule(window, cx);
+                    }
+                }
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            },
+        );
+        let filter_sub = cx.subscribe(&rule_filter_input, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
@@ -556,8 +677,20 @@ impl AppState {
             tun_status: "Disabled".to_string(),
             tun_stop_tx: None,
             rules: persisted.rules.clone(),
+            rule_group_input,
             rule_pattern_input,
             rule_priority_input,
+            rule_batch_input,
+            rules_show_batch: false,
+            rule_batch_replace: false,
+            rules_collapsed_groups: std::collections::HashSet::new(),
+            rule_filter_input,
+            adding_rule_group: None,
+            rule_menu: None,
+            rules_new_group_open: false,
+            batch_edit_group: None,
+            rule_group_focused: false,
+            rule_pattern_focused: false,
             rule_type_sel: "domain-suffix".to_string(),
             rule_target_sel: "proxy".to_string(),
             node_filter: String::new(),
@@ -581,6 +714,7 @@ impl AppState {
             node_rename_input,
             editing_node_index: None,
             editing_rule_index: None,
+            editing_group: None,
             show_share_panel: false,
             export_format: SubscriptionFormat::V2ray,
             export_status: String::new(),
@@ -604,7 +738,14 @@ impl AppState {
             palette_open: false,
             palette_input,
             palette_index: 0,
-            _subscriptions: vec![palette_sub, tester_sub],
+            _subscriptions: vec![
+                palette_sub,
+                tester_sub,
+                group_sub,
+                pattern_sub,
+                batch_sub,
+                filter_sub,
+            ],
             groups: persisted.groups.clone(),
             group_name_input,
             group_type_sel: GroupType::UrlTest,
@@ -3779,10 +3920,109 @@ fn normalize_rule_priorities(rules: &mut [RoutingRule]) {
     }
 }
 
+/// Dump a group as Clash `TYPE,pattern,TARGET` lines for the batch editor.
+/// Returns `(text, preferred_type, preferred_target)`.
+fn format_group_batch_lines(
+    rules: &[RoutingRule],
+    group: &str,
+) -> (String, String, String) {
+    let members: Vec<&RoutingRule> = rules
+        .iter()
+        .filter(|r| same_rule_group(&r.group, group))
+        .collect();
+    if members.is_empty() {
+        return (
+            String::new(),
+            "domain-suffix".into(),
+            "proxy".into(),
+        );
+    }
+    let first = members[0];
+    let text = members
+        .iter()
+        .map(|r| format_rule_clash_line(r))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (
+        text,
+        first.rule_type.clone(),
+        first.target.clone(),
+    )
+}
+
+fn lines_look_clash_typed(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .take(3)
+        .any(|l| {
+            let head = l.split([',', ' ', ':']).next().unwrap_or("");
+            matches!(
+                head.to_ascii_uppercase().as_str(),
+                "DOMAIN"
+                    | "DOMAIN-SUFFIX"
+                    | "DOMAIN-KEYWORD"
+                    | "IP-CIDR"
+                    | "GEOIP"
+                    | "DST-PORT"
+                    | "PORT"
+                    | "MATCH"
+                    | "FINAL"
+            )
+        })
+}
+
+fn apply_group_rules(
+    rules: &mut Vec<RoutingRule>,
+    group: &str,
+    incoming: Vec<RoutingRule>,
+) -> Result<(), String> {
+    if group_member_indices(rules, group).is_empty() {
+        rules.extend(incoming);
+        Ok(())
+    } else {
+        replace_rule_group(rules, group, incoming).map(|_| ())
+    }
+}
+
+pub(crate) fn rule_type_placeholder_key(rule_type: &str, bulk: bool) -> &'static str {
+    if bulk {
+        return "rules.ph.bulk.clash";
+    }
+    match rule_type {
+        "domain" => "rules.ph.domain",
+        "domain-keyword" => "rules.ph.domain-keyword",
+        "ip-cidr" => "rules.ph.ip-cidr",
+        "geoip" => "rules.ph.geoip",
+        "dst-port" | "port" => "rules.ph.dst-port",
+        "match" | "final" => "rules.ph.match",
+        _ => "rules.ph.domain-suffix",
+    }
+}
+
 impl AppState {
-    pub(crate) fn add_rule(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn select_rule_type(
+        &mut self,
+        rule_type: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rule_type_sel = rule_type.to_string();
+        let single_ph =
+            sockrocket_gui::i18n::t(rule_type_placeholder_key(rule_type, false)).to_string();
+        self.rule_pattern_input.update(cx, |state, cx| {
+            state.set_placeholder(single_ph, window, cx);
+        });
+        let bulk_ph = sockrocket_gui::i18n::t("rules.ph.bulk.clash").to_string();
+        self.rule_batch_input.update(cx, |state, cx| {
+            state.set_placeholder(bulk_ph, window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn add_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rule_type = self.rule_type_sel.clone();
-        let pattern = self.rule_pattern_input.read(cx).value().to_string();
+        let group = self.rule_group_input.read(cx).value().trim().to_string();
         let target = self.rule_target_sel.clone();
         let priority = self
             .rule_priority_input
@@ -3792,52 +4032,259 @@ impl AppState {
             .parse::<i32>()
             .unwrap_or(0);
 
-        if pattern.trim().is_empty()
-            && rule_type != "match"
-            && rule_type != "final"
-        {
-            self.rules_status = "⚠ Pattern is required".to_string();
+        // Update one rule inside its group.
+        if let Some(edit_idx) = self.editing_rule_index.take() {
+            let pattern_raw = self.rule_pattern_input.read(cx).value();
+            if pattern_raw.trim().is_empty() && !matches!(rule_type.as_str(), "match" | "final") {
+                self.editing_rule_index = Some(edit_idx);
+                self.rules_status = "⚠ 请填写规则内容".to_string();
+                cx.notify();
+                return;
+            }
+            let pattern = pattern_raw.trim().to_string();
+            let group = self
+                .rules
+                .get(edit_idx)
+                .map(|r| r.group.trim().to_string())
+                .unwrap_or(group);
+            let enabled = self
+                .rules
+                .get(edit_idx)
+                .map(|r| r.enabled)
+                .unwrap_or(true);
+            let pattern_for_build = if matches!(rule_type.as_str(), "match" | "final") {
+                "*"
+            } else {
+                pattern.as_str()
+            };
+            let typ = if matches!(rule_type.as_str(), "final") {
+                "match"
+            } else {
+                rule_type.as_str()
+            };
+            let mut new_rule = match make_typed_rule(typ, pattern_for_build, &target, &group) {
+                Ok(rule) => rule,
+                Err(msg) => {
+                    self.editing_rule_index = Some(edit_idx);
+                    self.rules_status = format!("✗ {msg}");
+                    cx.notify();
+                    return;
+                }
+            };
+            new_rule.enabled = enabled;
+            new_rule.priority = priority;
+            if edit_idx < self.rules.len() {
+                self.rules[edit_idx] = new_rule;
+            } else {
+                self.rules.push(new_rule);
+            }
+            self.clear_rule_pattern_fields(window, cx);
+            self.rules_collapsed_groups.remove(&group);
+            self.finish_rule_mutation(
+                sockrocket_gui::i18n::t("rules.status.saved"),
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let group = if let Some(g) = self.adding_rule_group.clone() {
+            g
+        } else {
+            group
+        };
+        if group.is_empty() && self.adding_rule_group.is_none() {
+            self.rules_status = "⚠ 请先选择或填写分组，再添加规则".into();
             cx.notify();
             return;
         }
 
-        let new_rule = RoutingRule {
-            rule_type: rule_type.trim().to_string(),
-            pattern: pattern.trim().to_string(),
-            target: target.trim().to_string(),
-            enabled: true,
-            priority,
-        };
+        let batch_text = self.rule_batch_input.read(cx).value().to_string();
+        let line_count = batch_text
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .count();
 
-        let action_msg = if let Some(edit_idx) = self.editing_rule_index.take() {
-            if edit_idx < self.rules.len() {
-                self.rules[edit_idx] = new_rule;
-                "✓ Rule updated"
-            } else {
-                self.rules.push(new_rule);
-                "✓ Rule added"
-            }
-        } else {
-            // Insert ahead of equal-or-lower priority peers (same as Merlin).
-            let insert_at = self
+        // FINAL catch-all
+        if matches!(rule_type.as_str(), "match" | "final") {
+            if self
                 .rules
                 .iter()
-                .position(|r| r.priority <= priority)
-                .unwrap_or(self.rules.len());
-            self.rules.insert(insert_at, new_rule);
-            "✓ Rule added"
-        };
+                .any(|r| matches!(r.rule_type.as_str(), "match" | "final"))
+            {
+                self.rules_status = "⚠ FINAL 规则已存在".into();
+                cx.notify();
+                return;
+            }
+            self.rules.push(RoutingRule {
+                name: String::new(),
+                group: group.clone(),
+                rule_type: "match".into(),
+                pattern: "*".into(),
+                target: target.trim().to_string(),
+                enabled: true,
+                priority,
+            });
+            self.rules_collapsed_groups.remove(&group);
+            self.finish_rule_mutation(
+                sockrocket_gui::i18n::t("rules.status.added_match"),
+                window,
+                cx,
+            );
+            return;
+        }
 
-        self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-            format!("{}. Restarting Rule mode to apply changes.", action_msg)
-        } else {
-            action_msg.to_string()
+        // Multi-line paste, or Clash `TYPE,pattern,TARGET` — unified parser.
+        if line_count > 1 || lines_look_clash_typed(&batch_text) {
+            let parsed = parse_batch_rules_in_group(&batch_text, &target, &group);
+            if parsed.rules.is_empty() {
+                let msg = parsed
+                    .errors
+                    .first()
+                    .map(|e| format!("✗ 第 {} 行: {}", e.line, e.message))
+                    .unwrap_or_else(|| "✗ 没有有效规则".into());
+                self.rules_status = msg;
+                cx.notify();
+                return;
+            }
+            let mut incoming = parsed.rules;
+            for r in &mut incoming {
+                r.priority = priority;
+                if r.group.is_empty() {
+                    r.group = group.clone();
+                }
+            }
+            let err_n = parsed.errors.len();
+            let conflict = if self.rule_batch_replace {
+                BatchConflict::Replace
+            } else {
+                BatchConflict::Skip
+            };
+            let stats = merge_batch_rules(&mut self.rules, incoming, conflict);
+            self.rules_collapsed_groups.remove(&group);
+            self.rule_batch_input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+            let msg = if err_n > 0 {
+                format!(
+                    "✓ 已添加 {} 条，跳过重复 {}，{} 行无效",
+                    stats.added, stats.skipped, err_n
+                )
+            } else {
+                format!("✓ 已添加 {} 条，跳过重复 {}", stats.added, stats.skipped)
+            };
+            self.finish_rule_mutation(&msg, window, cx);
+            return;
+        }
+
+        let pattern = batch_text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or("")
+            .to_string();
+        if pattern.is_empty() {
+            self.rules_status = "⚠ 填写规则，格式 TYPE,内容,动作".into();
+            cx.notify();
+            return;
+        }
+
+        let mut new_rule = match make_typed_rule(&rule_type, &pattern, &target, &group) {
+            Ok(r) => r,
+            Err(msg) => {
+                self.rules_status = format!("✗ {msg}");
+                cx.notify();
+                return;
+            }
         };
-        self.schedule_persist(cx);
+        new_rule.priority = priority;
+
+        if let Some(existing) = self
+            .rules
+            .iter()
+            .find(|r| r.rule_type == new_rule.rule_type && r.pattern == new_rule.pattern)
+        {
+            self.rules_status = format!(
+                "⚠ 已存在：{} {} → {}",
+                existing.rule_type, existing.pattern, existing.target
+            );
+            cx.notify();
+            return;
+        }
+
+        let shown = format!("{} → {}", new_rule.pattern, new_rule.target);
+        let insert_at = self
+            .rules
+            .iter()
+            .position(|r| r.priority <= priority)
+            .unwrap_or(self.rules.len());
+        self.rules.insert(insert_at, new_rule);
+        self.rules_collapsed_groups.remove(&group);
+        self.rule_batch_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.finish_rule_mutation(&format!("✓ 已添加 {shown}"), window, cx);
+    }
+
+    fn finish_rule_mutation(
+        &mut self,
+        msg: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            format!(
+                "{}{}",
+                msg,
+                sockrocket_gui::i18n::t("rules.status.restarted")
+            )
+        } else {
+            msg.to_string()
+        };
+        // Persist immediately so a rule add is never lost to debounce.
+        self.pending_persist = false;
+        self.persist_gui_state();
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             self.restart_proxy_with_current_state(cx);
         }
+        self.schedule_rules_status_clear(cx);
         cx.notify();
+    }
+
+    fn schedule_rules_status_clear(&mut self, cx: &mut Context<Self>) {
+        let handle = self.tokio_handle.clone();
+        let expected = self.rules_status.clone();
+        cx.spawn(async move |weak, cx| {
+            handle
+                .spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(2800)).await;
+                })
+                .await
+                .ok();
+            weak.update(cx, |this, cx| {
+                if this.rules_status == expected {
+                    this.rules_status.clear();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn clear_rule_pattern_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rule_pattern_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.rule_batch_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.rules_show_batch = false;
     }
 
     pub(crate) fn start_edit_rule(
@@ -3850,173 +4297,275 @@ impl AppState {
             return;
         }
         let rule = self.rules[index].clone();
-        // Set button-group selectors
-        self.rule_type_sel = rule.rule_type.clone();
         self.rule_target_sel = rule.target.clone();
+        self.rule_group_input.update(cx, |state, cx| {
+            state.set_value(rule.group.clone(), window, cx);
+        });
         self.rule_pattern_input.update(cx, |state, cx| {
-            state.set_value(rule.pattern, window, cx);
+            state.set_value(rule.pattern.clone(), window, cx);
+        });
+        // Editing always uses the single-line field.
+        self.rule_batch_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
         });
         let pri = rule.priority.to_string();
         self.rule_priority_input.update(cx, |state, cx| {
             state.set_value(pri, window, cx);
         });
         self.editing_rule_index = Some(index);
-        self.rules_status = format!("Editing rule #{}", index + 1);
+        self.editing_group = None;
+        self.adding_rule_group = None;
+        self.batch_edit_group = None;
+        self.rule_menu = None;
+        self.rules_show_batch = false;
+        self.rules_collapsed_groups.remove(&rule.group);
+        self.select_rule_type(&rule.rule_type, window, cx);
+        self.rule_pattern_input.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        let label = if rule.group.trim().is_empty() {
+            sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
+        } else {
+            rule.group.trim().to_string()
+        };
+        let shown = if matches!(rule.rule_type.as_str(), "match" | "final") {
+            sockrocket_gui::i18n::t("rules.kind.match").to_string()
+        } else {
+            rule.pattern.clone()
+        };
+        self.rules_status = format!(
+            "{}「{label}」· {shown}",
+            sockrocket_gui::i18n::t("rules.status.editing")
+        );
         cx.notify();
     }
 
-    pub(crate) fn cancel_edit_rule(&mut self, cx: &mut Context<Self>) {
+    /// Open a group for writing — same as batch edit (one rule per line).
+    pub(crate) fn begin_add_in_group(
+        &mut self,
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_batch_edit_group(group, window, cx);
+    }
+
+    pub(crate) fn cancel_edit_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_rule_index = None;
+        self.editing_group = None;
+        self.adding_rule_group = None;
+        self.batch_edit_group = None;
+        self.rule_menu = None;
         self.rules_status = String::new();
+        self.clear_rule_pattern_fields(window, cx);
+        let t = self.rule_type_sel.clone();
+        self.select_rule_type(&t, window, cx);
+    }
+
+    /// Open a group's rules as one-per-line text for batch write / edit.
+    pub(crate) fn begin_batch_edit_group(
+        &mut self,
+        group: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing_rule_index = None;
+        self.editing_group = None;
+        self.adding_rule_group = None;
+        self.rules_new_group_open = false;
+        self.rule_menu = None;
+        self.rules_collapsed_groups.remove(group);
+
+        let (text, typ, target) = format_group_batch_lines(&self.rules, group);
+        self.batch_edit_group = Some(group.to_string());
+        self.rule_target_sel = target;
+        self.select_rule_type(&typ, window, cx);
+        self.rule_batch_input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.focus(window, cx);
+        });
+        let label = if group.is_empty() {
+            sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
+        } else {
+            group.to_string()
+        };
+        self.rules_status = format!(
+            "{}「{label}」· {}",
+            sockrocket_gui::i18n::t("rules.status.batch"),
+            sockrocket_gui::i18n::t("rules.batch.hint")
+        );
         cx.notify();
+    }
+
+    /// Parse the batch text box and replace the whole group.
+    pub(crate) fn save_batch_edit_group(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.batch_edit_group.clone() else {
+            self.add_rule(window, cx);
+            return;
+        };
+        let text = self.rule_batch_input.read(cx).value().to_string();
+        let target = self.rule_target_sel.clone();
+        let parsed = parse_batch_rules_in_group(&text, &target, &group);
+        if parsed.rules.is_empty() {
+            let msg = parsed
+                .errors
+                .first()
+                .map(|e| format!("✗ 第 {} 行: {}", e.line, e.message))
+                .unwrap_or_else(|| {
+                    sockrocket_gui::i18n::t("rules.status.batch_empty").into()
+                });
+            self.rules_status = msg;
+            cx.notify();
+            return;
+        }
+        let mut incoming = parsed.rules;
+        for r in &mut incoming {
+            r.group = group.clone();
+        }
+        let has_match = incoming
+            .iter()
+            .any(|r| matches!(r.rule_type.as_str(), "match" | "final"));
+        if has_match
+            && self.rules.iter().any(|r| {
+                !same_rule_group(&r.group, &group)
+                    && matches!(r.rule_type.as_str(), "match" | "final")
+            })
+        {
+            self.rules_status = "⚠ FINAL 规则已存在".into();
+            cx.notify();
+            return;
+        }
+        let n = incoming.len();
+        let err_n = parsed.errors.len();
+        if let Err(msg) = apply_group_rules(&mut self.rules, &group, incoming) {
+            self.rules_status = format!("✗ {msg}");
+            cx.notify();
+            return;
+        }
+        self.batch_edit_group = None;
+        self.clear_rule_pattern_fields(window, cx);
+        let msg = if err_n > 0 {
+            format!("✓ 已保存 {n} 条，{err_n} 行无效")
+        } else {
+            format!("✓ 已保存 {n} 条")
+        };
+        self.finish_rule_mutation(&msg, window, cx);
     }
 
     pub(crate) fn delete_rule(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.rules.len() {
-            self.rules.remove(index);
-            self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                "â Rule removed. Restarting Rule mode to apply changes.".to_string()
-            } else {
-                "â Rule removed".to_string()
-            };
-            self.schedule_persist(cx);
-            if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                self.restart_proxy_with_current_state(cx);
-            }
-            cx.notify();
+        if index >= self.rules.len() {
+            return;
         }
+        if self.editing_rule_index == Some(index) {
+            self.editing_rule_index = None;
+        } else if let Some(edit) = self.editing_rule_index {
+            if edit > index {
+                self.editing_rule_index = Some(edit - 1);
+            }
+        }
+        self.rules.remove(index);
+        self.rules_status = sockrocket_gui::i18n::t("rules.status.removed").to_string();
+        if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            self.rules_status
+                .push_str(sockrocket_gui::i18n::t("rules.status.restarted"));
+            self.restart_proxy_with_current_state(cx);
+        }
+        self.pending_persist = false;
+        self.persist_gui_state();
+        self.schedule_rules_status_clear(cx);
+        cx.notify();
     }
 
-    pub(crate) fn move_rule_up(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index > 0 && index < self.rules.len() {
-            self.rules.swap(index, index - 1);
-            normalize_rule_priorities(&mut self.rules);
-            self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                "✓ Rule order updated. Restarting Rule mode to apply changes.".to_string()
-            } else {
-                "✓ Rule moved".to_string()
-            };
-            self.schedule_persist(cx);
-            if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                self.restart_proxy_with_current_state(cx);
-            }
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn move_rule_down(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index + 1 < self.rules.len() {
-            self.rules.swap(index, index + 1);
-            normalize_rule_priorities(&mut self.rules);
-            self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                "✓ Rule order updated. Restarting Rule mode to apply changes.".to_string()
-            } else {
-                "✓ Rule moved".to_string()
-            };
-            self.schedule_persist(cx);
-            if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-                self.restart_proxy_with_current_state(cx);
-            }
-            cx.notify();
-        }
-    }
-
+    /// Kept for callers / palette; China Direct is now the automatic system
+    /// layer after exceptions, so this replaces the list with an explicit copy
+    /// of common CN rules (legacy shortcut).
+    #[allow(dead_code)]
     pub(crate) fn load_china_rules(&mut self, cx: &mut Context<Self>) {
         // Add the built-in China direct ruleset as explicit rules
         let china_rules = vec![
-            RoutingRule {
-                rule_type: "geoip".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "geoip".into(),
                 pattern: "CN".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "cn".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "baidu.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "qq.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "taobao.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "aliyun.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "jd.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "163.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "bilibili.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "zhihu.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "ip-cidr".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
                 pattern: "10.0.0.0/8".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "ip-cidr".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
                 pattern: "172.16.0.0/12".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "ip-cidr".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
                 pattern: "192.168.0.0/16".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "match".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "proxy".into(),
                 enabled: true,
@@ -4028,7 +4577,7 @@ impl AppState {
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             "✓ China Direct preset loaded. Restarting Rule mode to apply changes.".to_string()
         } else {
-            "✓ China Direct preset loaded (geoip:CN uses ~7456 built-in CIDRs)".to_string()
+            "✓ China Direct preset loaded (geoip:CN uses built-in mainland CIDRs)".to_string()
         };
         self.schedule_persist(cx);
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
@@ -4039,15 +4588,157 @@ impl AppState {
 
     pub(crate) fn clear_rules(&mut self, cx: &mut Context<Self>) {
         self.rules.clear();
-        self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
-            "✓ Custom rules cleared. Falling back to built-in China Direct rules.".to_string()
-        } else {
-            "✓ Custom rules cleared".to_string()
+        self.adding_rule_group = None;
+        self.editing_rule_index = None;
+        self.rules_status = sockrocket_gui::i18n::t("rules.status.cleared").to_string();
+        if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            self.rules_status
+                .push_str(sockrocket_gui::i18n::t("rules.status.restarted"));
+            self.restart_proxy_with_current_state(cx);
+        }
+        self.pending_persist = false;
+        self.persist_gui_state();
+        self.schedule_rules_status_clear(cx);
+        cx.notify();
+    }
+
+    /// Copy current custom rules to the clipboard in re-importable form.
+    pub(crate) fn export_rules_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.rules.is_empty() {
+            self.rules_status = sockrocket_gui::i18n::t("rules.status.export_empty").into();
+            cx.notify();
+            return;
+        }
+        let text = format_rules_export(&self.rules);
+        let n = self.rules.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.rules_status = format!(
+            "{} {n}",
+            sockrocket_gui::i18n::t("rules.status.exported")
+        );
+        self.schedule_rules_status_clear(cx);
+        cx.notify();
+    }
+
+    /// Apply a built-in scene template into the exception list (skip duplicates).
+    pub(crate) fn apply_rule_scene(&mut self, scene_id: &str, cx: &mut Context<Self>) {
+        let Some(scene) = rule_scene_by_id(scene_id) else {
+            self.rules_status = format!("✗ Unknown scene '{scene_id}'");
+            cx.notify();
+            return;
         };
-        self.schedule_persist(cx);
+        let group_label = sockrocket_gui::i18n::t(scene.title_key).to_string();
+        let incoming = scene.rules_in_group(&group_label);
+        let n = incoming.len();
+        let stats = merge_batch_rules(&mut self.rules, incoming, BatchConflict::Skip);
+        self.rules_collapsed_groups.remove(&group_label);
+        let base = format!(
+            "✓ 「{group_label}」+{} / {n}（跳过 {}）",
+            stats.added, stats.skipped
+        );
+        self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            format!(
+                "{base}{}",
+                sockrocket_gui::i18n::t("rules.status.restarted")
+            )
+        } else {
+            base
+        };
+        self.pending_persist = false;
+        self.persist_gui_state();
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             self.restart_proxy_with_current_state(cx);
         }
+        self.schedule_rules_status_clear(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_rule_group_collapsed(&mut self, group: &str, cx: &mut Context<Self>) {
+        let key = group.to_string();
+        if !self.rules_collapsed_groups.insert(key.clone()) {
+            self.rules_collapsed_groups.remove(&key);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_rule_group_enabled(
+        &mut self,
+        group: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let g = group.trim();
+        for r in &mut self.rules {
+            let same = if g.is_empty() {
+                r.group.trim().is_empty()
+            } else {
+                r.group.trim() == g
+            };
+            if same {
+                r.enabled = enabled;
+            }
+        }
+        let label = if g.is_empty() {
+            sockrocket_gui::i18n::t("rules.group.ungrouped")
+        } else {
+            g
+        };
+        self.rules_status = format!(
+            "✓ {}「{label}」",
+            if enabled {
+                sockrocket_gui::i18n::t("rules.status.group_on")
+            } else {
+                sockrocket_gui::i18n::t("rules.status.group_off")
+            }
+        );
+        if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            self.rules_status
+                .push_str(sockrocket_gui::i18n::t("rules.status.restarted"));
+            self.restart_proxy_with_current_state(cx);
+        }
+        self.pending_persist = false;
+        self.persist_gui_state();
+        self.schedule_rules_status_clear(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn delete_rule_group(&mut self, group: &str, cx: &mut Context<Self>) {
+        let g = group.trim().to_string();
+        let before = self.rules.len();
+        self.rules.retain(|r| {
+            if g.is_empty() {
+                !r.group.trim().is_empty()
+            } else {
+                r.group.trim() != g
+            }
+        });
+        let removed = before - self.rules.len();
+        if self
+            .editing_group
+            .as_deref()
+            .is_some_and(|editing| editing.trim() == g)
+        {
+            self.editing_group = None;
+        }
+        if self.adding_rule_group.as_deref() == Some(g.as_str()) {
+            self.adding_rule_group = None;
+        }
+        if self.batch_edit_group.as_deref() == Some(g.as_str()) {
+            self.batch_edit_group = None;
+        }
+        self.rules_collapsed_groups.remove(&g);
+        self.rules_status = format!(
+            "{} {removed}",
+            sockrocket_gui::i18n::t("rules.status.group_removed")
+        );
+        if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            self.rules_status
+                .push_str(sockrocket_gui::i18n::t("rules.status.restarted"));
+            self.restart_proxy_with_current_state(cx);
+        }
+        self.pending_persist = false;
+        self.persist_gui_state();
+        self.schedule_rules_status_clear(cx);
         cx.notify();
     }
 }

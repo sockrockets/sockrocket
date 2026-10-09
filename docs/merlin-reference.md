@@ -93,7 +93,7 @@ DoT via proxy for primary; transaction ID check; node domains via bootstrap UDP 
 
 ## 4. Rules (`router/`)
 
-Types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `final`. Actions: `direct`, `proxy`, `reject`. User rules prepend built-in China-direct set. Rule changes on router may require daemon restart (API may auto-restart). Reject shows as timeout to clients.
+Types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `final`. Actions: `direct`, `proxy`, `reject`. User non-final rules first, then built-in China-direct (`geoip:CN`), then `final`. Rule changes on router may require daemon restart (API may auto-restart). Reject shows as timeout to clients.
 
 ---
 
@@ -101,11 +101,29 @@ Types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `final`.
 
 `health_check:` — `enabled`, `interval_secs` (≥5), `failure_threshold`, `auto_switch`. Probes `www.gstatic.com/generate_204` through current node; on failure switches to best latency node and persists `active_node` in `config.yaml`. State: `/tmp/sockrocket_health.json`.
 
+On start the monitor runs two probes about 3s apart, then settles into `interval_secs`. Merlin template uses `failure_threshold: 1` so a dead exit fails over on the first miss instead of waiting a full interval.
+
+### TUN / DNS toggles
+
+`transparent_proxy` and `dns_hijack` are independent. Fake-IP exists only while the daemon is started with `--tun`.
+
+| State | TUN | DNS hijack | Answers |
+|-------|-----|------------|---------|
+| Proxy on | on | forced on | Fake-IP, TTL 5s |
+| Proxy off | off | stays on | Real IPs, short TTL, no Fake-IP |
+| DNS off | either | off | ISP DNS (long TTL) |
+
+Turning transparent proxy off does not clear `dns_hijack` and does not pull subscriptions. `proxy-off` drops iptables, restarts without `--tun` when needed, then reinstalls the dnsmasq hijack if `dns_hijack` is still true. Subscription fetch runs only for `update-subs` / the daily cron (`SOCKROCKET_REFRESH_SUBS=1`).
+
+Router check (restores TUN+DNS on exit): `scripts/verify_tun_toggle.sh`.
+
 ---
 
 ## 6. CN ipset direct (optional)
 
-`cn_ipset_direct: false` by default. When on, `sockrocket_cn` hash:net (from `--dump-cn-cidrs`) lets domestic IPs skip TUN for hardware NAT. **Side effect:** per-domain rules for CN-resolved IPs do not apply on that path. Toggle via API / `iptables.sh ipset-on|off`.
+`proxy_mode` (`rule` | `global` | `direct`, default `rule` when omitted): same routing modes as the Mac client. Web UI shows a Rule / Global / Direct control. `set_proxy_mode` restarts the daemon; Global also clears `cn_ipset_direct`.
+
+`cn_ipset_direct: false` by default. When on, `sockrocket_cn` hash:net (from `--dump-cn-cidrs`) lets domestic IPs skip TUN for hardware NAT. **Side effect:** per-domain rules for CN-resolved IPs do not apply on that path. Advanced / API only (`iptables.sh ipset-on|off`); not shown as the primary toolbar control.
 
 ---
 
@@ -123,7 +141,7 @@ Types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `final`.
 
 Ports: DNS **5300** (localhost), SOCKS **1080**, HTTP **1087**, API **18188**.
 
-Router-only keys (read from YAML in CLI): `dns_port`, `transparent_proxy`, `dns_hijack`, `cn_ipset_direct`, legacy `mode: tun`.
+Router-only keys (read from YAML in CLI): `dns_port`, `transparent_proxy`, `dns_hijack`, `cn_ipset_direct`, legacy `mode: tun`. Shared with desktop: `proxy_mode`.
 
 ---
 
@@ -132,6 +150,18 @@ Router-only keys (read from YAML in CLI): `dns_port`, `transparent_proxy`, `dns_
 Prefer a package from [GitHub Releases](https://github.com/sockrockets/sockrocket/releases)
 (`sockrocket-merlin-<platform>.tar.gz`). To replace only the binary on an
 already-installed router:
+
+Preferred path (uploads binary + WebUI, including Softcenter
+`Module_sockrocket.asp`, then restarts safely):
+
+```bash
+# shellcheck source=/dev/null
+. .local/router.env
+./tools/merlin_deploy.sh
+# FORCE_RESTART=1 ./tools/merlin_deploy.sh   # when binary md5 matches but daemon must reload
+```
+
+Manual binary-only swap:
 
 ```bash
 # shellcheck source=/dev/null
@@ -147,7 +177,10 @@ ssh -p "$ROUTER_PORT" "${ROUTER_USER}@${ROUTER_HOST}" '
 '
 ```
 
-SSH password helper: `tools/ssh_askpass.sh` with `.local.example/`. Convert scripts to LF before scp (`tr -d '\r'`). Free JFFS space — remove stale `.new` files.
+SSH password helper: `tools/ssh_askpass.sh` with `.local.example/` (askpass +
+`PreferredAuthentications=password`). Convert scripts to LF before scp
+(`tr -d '\r'`). Free JFFS space — remove stale `.new` files. After deploy,
+confirm `sockrocket.sh status` shows running.
 
 Debug: `RUST_LOG=debug` to `/tmp/sockrocket-debug.log`; restore with `sockrocket.sh start`. Verify: `sh scripts/iptables.sh verify`.
 

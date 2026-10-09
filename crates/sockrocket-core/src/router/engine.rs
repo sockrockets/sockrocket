@@ -460,15 +460,13 @@ mod tests {
     #[test]
     fn test_from_config_skips_disabled_rules() {
         let rules = vec![
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "example.com".into(),
                 target: "direct".into(),
                 enabled: false,
                 priority: 0, // disabled — must not apply
             },
-            RoutingRule {
-                rule_type: "match".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "proxy".into(),
                 enabled: true,
@@ -593,29 +591,25 @@ mod tests {
     #[test]
     fn test_from_config() {
         let rules = vec![
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "cn".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "ip-cidr".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
                 pattern: "192.168.0.0/16".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "domain-keyword".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-keyword".into(),
                 pattern: "google".into(),
                 target: "proxy".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "match".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".into(),
                 pattern: "".into(),
                 target: "proxy".into(),
                 enabled: true,
@@ -721,15 +715,13 @@ mod tests {
     #[test]
     fn test_priority_orders_before_list_index() {
         let rules = vec![
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "example.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 1,
             },
-            RoutingRule {
-                rule_type: "domain-suffix".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
                 pattern: "example.com".into(),
                 target: "reject".into(),
                 enabled: true,
@@ -743,22 +735,19 @@ mod tests {
     #[test]
     fn test_dst_port_rule() {
         let rules = vec![
-            RoutingRule {
-                rule_type: "dst-port".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "dst-port".into(),
                 pattern: "443".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "dst-port".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "dst-port".into(),
                 pattern: "1000-2000".into(),
                 target: "reject".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule {
-                rule_type: "match".into(),
+            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "proxy".into(),
                 enabled: true,

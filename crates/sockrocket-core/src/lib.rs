@@ -16,6 +16,16 @@ pub use config::model::{
     RoutingRule, ShadowTlsConfig, Subscription, TransportConfig, TransportType,
     decode_display_name, normalize_node_names,
 };
+pub use config::rule_groups::{
+    RuleGroupSnapshot, RuleGroupView, existing_rule_groups, group_member_indices,
+    group_rules_for_display, replace_rule_group, same_rule_group, snapshot_rule_group,
+};
+pub use config::rule_scenes::{RuleScene, builtin_rule_scenes, rule_scene_by_id};
+pub use config::rules_batch::{
+    BatchConflict, BatchLineError, BatchMergeStats, BatchParseResult, format_rule_clash_line,
+    format_rules_export, make_typed_rule, merge_batch_rules, parse_batch_rules,
+    parse_batch_rules_in_group, parse_typed_patterns, rule_type_supports_bulk,
+};
 pub use config::singbox::{parse_singbox_config, parse_singbox_outbound};
 pub use config::subscription::{
     SUB_FETCH_TIMEOUT_SECS, detect_format, fetch_subscription, parse_subscription_content,

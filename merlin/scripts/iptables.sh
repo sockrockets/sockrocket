@@ -119,27 +119,42 @@ do_ipset_start() {
     # (as spawned by the API bridge) lacks the `command` builtin, so the
     # usual `command -v ipset` guard fails with 127 even when ipset exists.
     ipset list >/dev/null 2>&1 || { err "ipset not available"; return 1; }
-    ipset create "$IPSET_NAME" hash:net maxelem 16384 -exist 2>/dev/null || true
-    # One atomic restore instead of ~800 individual `ipset add` forks.
-    if ! "$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null \
-        | awk '{print "add '"$IPSET_NAME"' " $1}' \
-        | ipset restore -exist 2>/dev/null; then
-        err "failed to populate $IPSET_NAME"
+    # ALWAYS recreate. `ipset create -exist` keeps the previous maxelem; an
+    # older 4096-cap set silently truncated the expanded CN list (~6k+) and
+    # CN destinations fell through to MARK → proxy.
+    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    if ! ipset create "$IPSET_NAME" hash:net family inet hashsize 4096 maxelem 32768 2>/dev/null; then
+        err "failed to create $IPSET_NAME"
         return 1
     fi
-    if ! iptables -t mangle -C "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null; then
-        local mark_line
-        mark_line=$(iptables -t mangle -L "$MANGLE_CHAIN" --line-numbers -n 2>/dev/null \
-            | awk '/MARK/{print $1; exit}')
-        if [ -n "$mark_line" ]; then
-            iptables -t mangle -I "$MANGLE_CHAIN" "$mark_line" \
-                -m set --match-set "$IPSET_NAME" dst -j RETURN
-        else
-            iptables -t mangle -A "$MANGLE_CHAIN" \
-                -m set --match-set "$IPSET_NAME" dst -j RETURN
-        fi
+    # One atomic restore instead of thousands of individual `ipset add` forks.
+    if ! "$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null \
+        | awk '{print "add '"$IPSET_NAME"' " $1}' \
+        | ipset restore 2>/dev/null; then
+        err "failed to populate $IPSET_NAME"
+        ipset destroy "$IPSET_NAME" 2>/dev/null || true
+        return 1
     fi
-    ok "CN ipset direct applied ($IPSET_NAME, $(ipset list "$IPSET_NAME" 2>/dev/null | grep -c '^[0-9]') ranges)"
+    local loaded want
+    loaded=$(ipset list "$IPSET_NAME" 2>/dev/null | grep -c '^[0-9]')
+    want=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null | wc -l)
+    want=$(echo "$want" | tr -d ' ')
+    if [ -n "$want" ] && [ "$want" -gt 0 ] && [ "$loaded" -lt "$want" ]; then
+        err "CN ipset truncated ($loaded/$want) — check maxelem"
+        return 1
+    fi
+    local mark_line
+    mark_line=$(iptables -t mangle -L "$MANGLE_CHAIN" --line-numbers -n 2>/dev/null \
+        | awk '/MARK/{print $1; exit}')
+    if [ -n "$mark_line" ]; then
+        iptables -t mangle -I "$MANGLE_CHAIN" "$mark_line" \
+            -m set --match-set "$IPSET_NAME" dst -j RETURN
+    else
+        iptables -t mangle -A "$MANGLE_CHAIN" \
+            -m set --match-set "$IPSET_NAME" dst -j RETURN
+    fi
+    ok "CN ipset direct applied ($IPSET_NAME, $loaded ranges)"
 }
 
 do_ipset_stop() {

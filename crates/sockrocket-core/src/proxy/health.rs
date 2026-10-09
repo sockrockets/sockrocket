@@ -7,6 +7,11 @@
 //! candidate nodes concurrently and swaps the shared outbound to the best
 //! one — the local listeners keep running untouched.
 //!
+//! On start it runs a short **startup burst** (two probes a few seconds
+//! apart) before settling into `interval_secs`, so a dead active node after
+//! boot or TUN re-enable fails over within seconds instead of waiting a
+//! full interval.
+//!
 //! The whole mechanism is opt-in via `health_check.enabled` (default off).
 
 use std::sync::Arc;
@@ -23,6 +28,12 @@ use crate::proxy::speedtest::http_latency_test;
 const PROBE_TIMEOUT_SECS: u64 = 5;
 /// Timeout for testing one candidate node during failover.
 const CANDIDATE_TIMEOUT_SECS: u64 = 5;
+/// How many probes to run back-to-back at monitor start (boot / restart /
+/// TUN re-enable) before settling into `interval_secs`.
+const STARTUP_BURST: u32 = 2;
+/// Gap between startup-burst probes (seconds). Short enough that a dead
+/// active node fails over within a few seconds of start.
+const STARTUP_GAP_SECS: u64 = 3;
 
 /// Builds the full outbound for a node, applying the caller's routing/mode
 /// policy (rule routing, direct mode, …). Returns `None` when the outbound
@@ -140,26 +151,139 @@ impl Drop for HealthMonitor {
     }
 }
 
+/// Run one probe (+ optional failover). Returns `false` when shutdown was
+/// signalled mid-probe so the outer loop can exit cleanly.
+async fn probe_once(
+    setup: &HealthCheckSetup,
+    config: &HealthCheckConfig,
+    tracker: &mut FailureTracker,
+    probe_outbound: &SharedOutbound,
+    events_tx: &watch::Sender<Option<HealthEvent>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let probe = tokio::select! {
+        result = http_latency_test(probe_outbound, PROBE_TIMEOUT_SECS) => result,
+        _ = shutdown_rx.changed() => return false,
+    };
+
+    match probe {
+        Ok(ms) => {
+            tracker.record_success();
+            let _ = events_tx.send(Some(HealthEvent::ProbeOk { latency_ms: ms }));
+        }
+        Err(e) => {
+            let should_switch = tracker.record_failure();
+            let consecutive = tracker.consecutive;
+            tracing::warn!(
+                "health probe failed ({}/{}): {:#}",
+                consecutive,
+                tracker.threshold,
+                e
+            );
+            let _ = events_tx.send(Some(HealthEvent::ProbeFailed {
+                consecutive_failures: consecutive,
+                error: format!("{:#}", e),
+            }));
+
+            if !(should_switch && config.auto_switch) {
+                return true;
+            }
+            // Reset so a failed failover does not re-trigger on every tick.
+            tracker.reset();
+
+            let best = tokio::select! {
+                best = find_best_node(&setup.nodes) => best,
+                _ = shutdown_rx.changed() => return false,
+            };
+            match best {
+                Some((index, ms)) => {
+                    let node = &setup.nodes[index];
+                    match (setup.outbound_factory)(node) {
+                        Some(outbound) => {
+                            setup.swappable.set(outbound);
+                            tracing::info!(
+                                "health check: auto-switched to '{}' ({} ms)",
+                                node.name,
+                                ms
+                            );
+                            let _ = events_tx.send(Some(HealthEvent::AutoSwitched {
+                                node_index: index,
+                                node_name: node.name.clone(),
+                                latency_ms: ms,
+                            }));
+                        }
+                        None => {
+                            let _ = events_tx.send(Some(HealthEvent::SwitchFailed {
+                                reason: format!("failed to build outbound for '{}'", node.name),
+                            }));
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("health check: failover found no reachable node");
+                    let _ = events_tx.send(Some(HealthEvent::SwitchFailed {
+                        reason: "no reachable node among candidates".to_string(),
+                    }));
+                }
+            }
+        }
+    }
+    true
+}
+
 async fn run(
     setup: HealthCheckSetup,
     mut shutdown_rx: watch::Receiver<bool>,
     events_tx: watch::Sender<Option<HealthEvent>>,
 ) {
-    let config = setup.config;
+    let config = setup.config.clone();
     let interval_secs = config.interval_secs.clamp(5, 3600);
-    let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut tracker = FailureTracker::new(config.failure_threshold);
     // Probing through the swappable always exercises the *current* node.
     let probe_outbound = SharedOutbound(setup.swappable.clone());
 
     tracing::info!(
-        "health check started: every {}s, {} consecutive failure(s) trigger failover (auto_switch={})",
+        "health check started: startup burst {}×{}s then every {}s, {} consecutive failure(s) trigger failover (auto_switch={})",
+        STARTUP_BURST,
+        STARTUP_GAP_SECS,
         interval_secs,
         tracker.threshold,
         config.auto_switch
     );
+
+    // Startup burst: probe immediately, then once more after a short gap.
+    // Catches a dead active_node within seconds of boot / TUN re-enable
+    // instead of waiting a full interval_secs for the second sample.
+    for i in 0..STARTUP_BURST {
+        if i > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(STARTUP_GAP_SECS)) => {}
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("health check stopped");
+                    return;
+                }
+            }
+        }
+        if !probe_once(
+            &setup,
+            &config,
+            &mut tracker,
+            &probe_outbound,
+            &events_tx,
+            &mut shutdown_rx,
+        )
+        .await
+        {
+            tracing::info!("health check stopped");
+            return;
+        }
+    }
+
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick — the burst already covered "now".
+    timer.tick().await;
 
     loop {
         tokio::select! {
@@ -167,72 +291,17 @@ async fn run(
             _ = shutdown_rx.changed() => break,
         }
 
-        let probe = tokio::select! {
-            result = http_latency_test(&probe_outbound, PROBE_TIMEOUT_SECS) => result,
-            _ = shutdown_rx.changed() => break,
-        };
-
-        match probe {
-            Ok(ms) => {
-                tracker.record_success();
-                let _ = events_tx.send(Some(HealthEvent::ProbeOk { latency_ms: ms }));
-            }
-            Err(e) => {
-                let should_switch = tracker.record_failure();
-                let consecutive = tracker.consecutive;
-                tracing::warn!(
-                    "health probe failed ({}/{}): {:#}",
-                    consecutive,
-                    tracker.threshold,
-                    e
-                );
-                let _ = events_tx.send(Some(HealthEvent::ProbeFailed {
-                    consecutive_failures: consecutive,
-                    error: format!("{:#}", e),
-                }));
-
-                if !(should_switch && config.auto_switch) {
-                    continue;
-                }
-                // Reset so a failed failover does not re-trigger on every tick.
-                tracker.reset();
-
-                let best = tokio::select! {
-                    best = find_best_node(&setup.nodes) => best,
-                    _ = shutdown_rx.changed() => break,
-                };
-                match best {
-                    Some((index, ms)) => {
-                        let node = &setup.nodes[index];
-                        match (setup.outbound_factory)(node) {
-                            Some(outbound) => {
-                                setup.swappable.set(outbound);
-                                tracing::info!(
-                                    "health check: auto-switched to '{}' ({} ms)",
-                                    node.name,
-                                    ms
-                                );
-                                let _ = events_tx.send(Some(HealthEvent::AutoSwitched {
-                                    node_index: index,
-                                    node_name: node.name.clone(),
-                                    latency_ms: ms,
-                                }));
-                            }
-                            None => {
-                                let _ = events_tx.send(Some(HealthEvent::SwitchFailed {
-                                    reason: format!("failed to build outbound for '{}'", node.name),
-                                }));
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::warn!("health check: failover found no reachable node");
-                        let _ = events_tx.send(Some(HealthEvent::SwitchFailed {
-                            reason: "no reachable node among candidates".to_string(),
-                        }));
-                    }
-                }
-            }
+        if !probe_once(
+            &setup,
+            &config,
+            &mut tracker,
+            &probe_outbound,
+            &events_tx,
+            &mut shutdown_rx,
+        )
+        .await
+        {
+            break;
         }
     }
 

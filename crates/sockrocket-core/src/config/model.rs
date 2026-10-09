@@ -6,9 +6,9 @@ use std::collections::HashMap;
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
     /// All traffic goes through the proxy node
-    #[default]
     Global,
-    /// China-direct / overseas-proxy based on built-in rules
+    /// User rules + built-in China-direct, then final
+    #[default]
     Rule,
     /// All traffic connects directly (no proxy)
     Direct,
@@ -103,6 +103,19 @@ impl Default for AppConfig {
             groups: Vec::new(),
             locale: default_locale(),
         }
+    }
+}
+
+impl AppConfig {
+    /// Parse YAML config. Missing `proxy_mode` defaults to [`ProxyMode::Rule`]
+    /// (Merlin installs historically omitted the key).
+    pub fn from_yaml_str(content: &str) -> Result<Self, serde_yaml::Error> {
+        let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
+        let mut cfg: Self = serde_yaml::from_value(raw.clone())?;
+        if raw.get("proxy_mode").is_none() {
+            cfg.proxy_mode = ProxyMode::Rule;
+        }
+        Ok(cfg)
     }
 }
 
@@ -379,6 +392,13 @@ fn default_format() -> String {
 /// Routing rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
+    /// Optional display name (e.g. app or purpose). Empty when unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Display group (e.g. "跨境", "国内直连"). Empty = ungrouped.
+    /// Matching order is still global by priority/list — group is UI only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     /// Rule type: "domain", "domain-suffix", "domain-keyword", "ip-cidr",
     /// "geoip", "dst-port", "match"/"final"
     pub rule_type: String,

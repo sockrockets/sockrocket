@@ -18,11 +18,21 @@ dns_direct_server: "114.114.114.114"   # DNS server for direct domains (China IS
 # system : set system proxy (for desktop clients; routers usually use tun)
 mode: "tun"
 
+# Routing mode (same as Mac client titlebar):
+#   rule   — custom rules, then built-in China-direct (geoip:CN), then Final
+#   global — all traffic via the active node
+#   direct — no proxy
+proxy_mode: "rule"
+
 # Independent toggles. Both default OFF so Softcenter / LAN stay usable until
 # you have working nodes and explicitly enable them in the UI. sockrocket.sh
 # also skips TUN and DNS when nodes: [] (no blackhole on fresh install).
 transparent_proxy: false
 dns_hijack: false
+
+# Optional: divert China CIDRs around TUN via kernel ipset (hardware NAT).
+# Off by default; Global mode forces this off so domestic traffic still proxies.
+# cn_ipset_direct: false
 
 # -- Active node ---------------------------------------------------------------
 # Active node index (0 = first node), null = direct mode
@@ -102,7 +112,9 @@ dns_direct_domains:
 
 # -- Health check --------------------------------------------------------------
 # Probe the active node and auto-switch on failure so a dead exit does not
-# leave the LAN stuck on a blackholed proxy path.
+# leave the LAN stuck on a blackholed proxy path. At start the monitor runs two
+# quick probes (~3s apart) before settling into interval_secs, so a dead exit
+# after boot / TUN re-enable fails over within seconds.
 health_check:
   enabled: true
   interval_secs: 60
@@ -114,8 +126,8 @@ health_check:
 # -- Routing rules -------------------------------------------------------------
 # Evaluation: higher `priority` first; equal priority keeps list order.
 # Types: domain | domain-suffix | domain-keyword | ip-cidr | geoip | dst-port | final
-# Built-in geoip:CN covers ~7456 China IPv4 CIDRs (refresh: scripts/update-china-cidrs.sh).
-# User rules are evaluated before the built-in China-direct domain set.
+# Built-in geoip:CN covers mainland China IPv4 CIDRs (refresh: scripts/update-china-cidrs.sh).
+# User non-final rules first, then built-in China-direct, then final → proxy.
 rules:
   # Private addresses direct
   - rule_type: "ip-cidr"
