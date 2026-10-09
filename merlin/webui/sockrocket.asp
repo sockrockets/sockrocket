@@ -167,6 +167,21 @@ body {
 .chip.toggle:hover { border-color: var(--accent); background: var(--bg-hover); }
 .chip.toggle.pending { opacity: .6; pointer-events: none; }
 .chip.toggle.pending b::after { content: ' …'; }
+.mode-seg {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 2px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg-hover);
+}
+.mode-seg button {
+  border: 0; background: transparent; color: var(--text-muted);
+  font: 11px var(--sans); padding: 4px 10px; border-radius: 6px; cursor: pointer;
+}
+.mode-seg button:hover { color: var(--text-primary); }
+.mode-seg button.on {
+  background: var(--accent-dim, rgba(99,140,255,.18));
+  color: var(--accent); font-weight: 600;
+}
+.mode-seg.pending { opacity: .6; pointer-events: none; }
 
 /* ── Tables / rows ─────────────────────────────────────────────────── */
 .rows { display: flex; flex-direction: column; }
@@ -182,6 +197,17 @@ body {
 }
 .row .r-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .row .r-sub { font: 10px var(--mono); color: var(--text-muted); flex-shrink: 0; }
+.rule-group { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; background: var(--bg-panel, var(--bg-sidebar)); }
+.rule-group-hd {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  background: var(--bg-hover); border-bottom: 1px solid var(--border); cursor: pointer;
+}
+.rule-group-hd .rg-title { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.rule-group-hd .rg-count { font: 10px var(--mono); color: var(--text-muted); }
+.rule-group-hd .rg-actions { margin-left: auto; display: flex; gap: 4px; }
+.rule-group-body .row { border-radius: 0; }
+.rule-group.collapsed .rule-group-body { display: none; }
+.rule-group.collapsed .rule-group-hd { border-bottom: none; }
 .badge {
   font-size: 9px; padding: 1px 6px; border-radius: 4px; font-weight: 700;
   background: var(--bg-hover); color: var(--text-secondary); flex-shrink: 0;
@@ -231,6 +257,47 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
 .collapsible { display: none; }
 .collapsible.open { display: block; }
 .hint { font-size: 10px; color: var(--text-muted); margin-top: 6px; }
+.pipeline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 12px; }
+.step-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--bg-hover);
+}
+.step-pill .n {
+  width: 16px; height: 16px; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; font: 9px/1 var(--mono); font-weight: 700;
+}
+.step-pill.exc { border-color: rgba(34,211,238,.28); background: rgba(34,211,238,.08); }
+.step-pill.exc .n { background: rgba(34,211,238,.22); color: var(--accent); }
+.step-pill.sys { border-color: rgba(167,139,250,.28); background: rgba(167,139,250,.08); }
+.step-pill.sys .n { background: rgba(167,139,250,.22); color: #a78bfa; }
+.pipeline .arrow { color: var(--text-muted); font-size: 11px; }
+.tabs { display: flex; gap: 14px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.tab {
+  padding: 4px 2px 6px; cursor: pointer; font-size: 12px; color: var(--text-muted);
+  border-bottom: 2px solid transparent; background: none; border-top: 0; border-left: 0; border-right: 0;
+}
+.tab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+#rule-batch { height: 140px; margin-top: 4px; }
+.scene-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.scene-card {
+  display: flex; gap: 0; overflow: hidden; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--bg-app);
+}
+.scene-card .accent { width: 3px; flex-shrink: 0; background: var(--accent); }
+.scene-card .accent.green { background: var(--success); }
+.scene-card .body { flex: 1; padding: 12px 14px; min-width: 0; }
+.scene-card .title { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.scene-card .desc { font-size: 11px; color: var(--text-secondary); margin-bottom: 10px; line-height: 1.4; }
+.sys-note {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px; border-radius: 10px; margin-bottom: 12px;
+  border: 1px solid rgba(167,139,250,.28); background: rgba(167,139,250,.08);
+  font-size: 11px; color: var(--text-secondary); line-height: 1.45;
+}
+.sys-note strong { color: var(--text-primary); display: block; margin-bottom: 2px; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -297,14 +364,16 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
         </div>
 
         <div class="toolbar">
-          <div class="chip toggle" id="chip-dns" onclick="toggleDns()" title="Click to toggle DNS hijack">
+          <div class="chip toggle" id="chip-dns" onclick="toggleDns()" title="DNS hijack. Off sends LAN to ISP DNS (long TTL). On without transparent proxy serves short-TTL real IPs (no Fake-IP).">
             <span class="dot" id="dns-dot"></span>DNS hijack <b id="dns-state">—</b>
           </div>
-          <div class="chip toggle" id="chip-fw" onclick="toggleProxy()" title="Click to toggle transparent proxy">
+          <div class="chip toggle" id="chip-fw" onclick="toggleProxy()" title="Transparent proxy (TUN). Turning this off keeps DNS hijack on.">
             <span class="dot" id="fw-dot"></span>Transparent proxy <b id="fw-state">—</b>
           </div>
-          <div class="chip toggle" id="chip-cn" onclick="toggleCn()" title="China traffic bypasses TUN via hardware NAT (custom rules for China domains are ignored while enabled)">
-            <span class="dot" id="cn-dot"></span>CN direct <b id="cn-state">—</b>
+          <div class="mode-seg" id="mode-seg" title="Routing mode (same as Mac client)">
+            <button type="button" id="mode-rule" onclick="setProxyMode('rule')">Rule</button>
+            <button type="button" id="mode-global" onclick="setProxyMode('global')">Global</button>
+            <button type="button" id="mode-direct" onclick="setProxyMode('direct')">Direct</button>
           </div>
           <div class="chip"><span class="dot acc"></span>Egress IP <b id="wan-ip">—</b></div>
         </div>
@@ -417,35 +486,59 @@ textarea { width: 100%; height: 380px; font: 11px var(--mono); resize: vertical;
       <div class="page" id="page-dns">
         <div class="page-title">Routing rules</div>
         <div class="card">
-          <h3>Add rule</h3>
-          <div class="form-grid" style="grid-template-columns: 150px 1fr 90px 110px auto">
+          <datalist id="rule-group-list"></datalist>
+          <div class="form-grid" style="grid-template-columns: 140px 140px 100px auto">
+            <div class="fg"><label>Group</label><input type="text" id="rule-group" placeholder="e.g. Cross-border" list="rule-group-list"></div>
             <div class="fg"><label>Type</label>
               <select id="rule-type" onchange="ruleTypeChanged()">
-                <option value="domain-suffix">Domain suffix</option>
-                <option value="domain">Domain (exact)</option>
-                <option value="domain-keyword">Domain keyword</option>
+                <option value="domain-suffix">Suffix</option>
+                <option value="domain">Domain</option>
+                <option value="domain-keyword">Keyword</option>
                 <option value="ip-cidr">IP CIDR</option>
-                <option value="geoip">GeoIP country</option>
-                <option value="dst-port">Dest port</option>
-                <option value="final">Final (match all)</option>
+                <option value="geoip">GeoIP</option>
+                <option value="dst-port">Port</option>
+                <option value="final">Final</option>
               </select>
             </div>
-            <div class="fg"><label>Pattern</label><input type="text" id="rule-pattern" placeholder="example.com"></div>
-            <div class="fg"><label>Priority</label><input type="number" id="rule-priority" value="0" step="1" title="Higher runs first"></div>
             <div class="fg"><label>Action</label>
               <select id="rule-target">
-                <option value="direct">Direct</option>
                 <option value="proxy">Proxy</option>
+                <option value="direct">Direct</option>
                 <option value="reject">Reject</option>
               </select>
             </div>
-            <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" onclick="addRule()">Add</button></div>
+            <div class="fg"><label>Dup</label>
+              <select id="rule-dup">
+                <option value="skip">Skip</option>
+                <option value="replace">Replace</option>
+              </select>
+            </div>
           </div>
-          <div class="hint">Higher <strong>priority</strong> wins first; equal priority keeps list order (use ↑↓). New rules insert ahead of same-priority peers. Changes restart the service. China CIDRs are covered by built-in geoip:CN (~7k ranges) — no rule needed for typical domestic direct.</div>
+          <div class="hint" id="rule-input-hint" style="margin-bottom:6px">Domain + subdomains — one per line (e.g. google.com)</div>
+          <div id="rule-single-wrap" style="display:none">
+            <div class="form-grid" style="grid-template-columns: 1fr auto">
+              <div class="fg"><label>Pattern</label><input type="text" id="rule-pattern" placeholder="google.com"></div>
+              <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" onclick="addRule()">Add</button></div>
+            </div>
+          </div>
+          <div id="rule-bulk-wrap">
+            <textarea id="rule-batch" rows="5" spellcheck="false" placeholder="DOMAIN-SUFFIX,google.com,PROXY&#10;GEOIP,CN,DIRECT&#10;MATCH,PROXY"></textarea>
+            <div class="toolbar" style="margin-top:8px">
+              <div class="spacer"></div>
+              <button class="btn btn-sm" onclick="exportRules()">Export</button>
+              <button class="btn btn-success btn-sm" onclick="addRule()">Import</button>
+            </div>
+          </div>
         </div>
         <div class="card">
-          <h3>Rule list</h3>
+          <div class="toolbar">
+            <h3 style="margin:0">Rules</h3>
+            <div class="spacer"></div>
+            <button class="btn btn-sm" onclick="applyRuleScene('cross_border')">Preset: Cross-border</button>
+            <button class="btn btn-sm" onclick="applyRuleScene('domestic_direct')">Preset: Domestic</button>
+          </div>
           <div class="rows" id="rule-list"><div class="hint">Loading…</div></div>
+          <div class="hint">Custom rules, then built-in China Direct (geoip:CN), then Final.</div>
         </div>
       </div>
 
@@ -720,7 +813,7 @@ function showPage(p) {
     PAGE_LOADED[p] = true;
     if (p === 'nodes') loadNodes();
     if (p === 'subs') loadSubs();
-    if (p === 'dns') loadRules();
+    if (p === 'dns') { loadRules(); ruleTypeChanged(); }
     if (p === 'config') loadConfig();
     if (p === 'logs') loadLog();
   } else {
@@ -811,7 +904,21 @@ function renderChrome() {
   // stop), unlike the runtime stats which go inactive with the daemon.
   setChip('dns', st.dns_hijack);
   setChip('fw', st.transparent_proxy);
-  setChip('cn', st.cn_ipset_direct);
+  setProxyModeUi(st.proxy_mode || 'rule');
+  var dnsChip = document.getElementById('chip-dns');
+  var fwChip = document.getElementById('chip-fw');
+  if (dnsChip) {
+    dnsChip.title = st.dns_hijack
+      ? (st.transparent_proxy
+          ? 'DNS hijack on with TUN: Fake-IP (TTL 5s)'
+          : 'DNS hijack on without TUN: real IPs, short TTL, no Fake-IP')
+      : 'DNS hijack off: LAN uses ISP DNS (long TTL)';
+  }
+  if (fwChip) {
+    fwChip.title = st.transparent_proxy
+      ? 'Transparent proxy on (TUN + Fake-IP). Turning off keeps DNS hijack.'
+      : 'Transparent proxy off. DNS hijack stays unless you turn that chip off.';
+  }
   document.getElementById('wan-ip').textContent = si.wan_ip || '—';
 
   // stat cards
@@ -845,14 +952,33 @@ function toggleDns() {
     refreshStatus(true);
   }, function () { chipPending('chip-dns', false); });
 }
-function toggleCn() {
-  var want = !S.status.cn_ipset_direct;
-  chipPending('chip-cn', true);
-  api('set_toggles', { cn_ipset_direct: want }, function (d) {
-    chipPending('chip-cn', false);
+function setProxyModeUi(mode) {
+  var m = (mode || 'rule').toLowerCase();
+  ['rule', 'global', 'direct'].forEach(function (k) {
+    var el = document.getElementById('mode-' + k);
+    if (el) el.classList.toggle('on', k === m);
+  });
+  var seg = document.getElementById('mode-seg');
+  if (seg) {
+    seg.title = m === 'global'
+      ? 'Global: all traffic via active node'
+      : (m === 'direct'
+          ? 'Direct: no proxy'
+          : 'Rule: load custom rules, then built-in China-direct, then Final');
+  }
+}
+function setProxyMode(mode) {
+  var cur = (S.status.proxy_mode || 'rule').toLowerCase();
+  if (cur === mode) return;
+  var seg = document.getElementById('mode-seg');
+  if (seg) seg.classList.add('pending');
+  api('set_proxy_mode', { proxy_mode: mode }, function (d) {
+    if (seg) seg.classList.remove('pending');
     toastResp(d);
     refreshStatus(true);
-  }, function () { chipPending('chip-cn', false); });
+  }, function () {
+    if (seg) seg.classList.remove('pending');
+  });
 }
 function toggleProxy() {
   var want = !S.status.transparent_proxy;
@@ -1131,43 +1257,228 @@ function updateSubs() {
 var RULE_TYPE_LABEL = { 'domain': 'Domain', 'domain-suffix': 'Suffix', 'domain-keyword': 'Keyword', 'ip-cidr': 'IP CIDR', 'geoip': 'GeoIP', 'dst-port': 'Port', 'final': 'Final', 'match': 'Final' };
 var RULE_TARGET_LABEL = { 'direct': 'Direct', 'proxy': 'Proxy', 'reject': 'Reject' };
 var RULE_PATTERN_HINT = {
-  'domain': 'www.example.com', 'domain-suffix': 'example.com', 'domain-keyword': 'google',
-  'ip-cidr': '10.0.0.0/8', 'geoip': 'CN', 'dst-port': '443 or 1000-2000', 'final': '(not required)'
+  'domain': 'www.google.com',
+  'domain-suffix': 'google.com',
+  'domain-keyword': 'google',
+  'ip-cidr': '10.0.0.0/8',
+  'geoip': 'CN (also HK TW US JP KR SG…)',
+  'dst-port': '443 or 1000-2000',
+  'final': '(not required)'
 };
+var RULE_GEOIP_HINT = 'ISO region code — e.g. CN China · HK Hong Kong · TW Taiwan · US · JP · KR · SG (built-in DB covers CN)';
+var RULE_BULK_HINT = {
+  'domain': 'Clash format — one per line: DOMAIN,host,ACTION',
+  'domain-suffix': 'Clash format — one per line: DOMAIN-SUFFIX,domain,ACTION',
+  'domain-keyword': 'Clash format — one per line: DOMAIN-KEYWORD,word,ACTION',
+  'ip-cidr': 'Clash format — one per line: IP-CIDR,cidr,ACTION',
+  'geoip': 'Clash format — one per line: GEOIP,CC,ACTION (e.g. GEOIP,CN,DIRECT)'
+};
+var RULE_BULK_PLACEHOLDER = {
+  'domain': 'DOMAIN,www.google.com,PROXY\nDOMAIN,api.openai.com,PROXY',
+  'domain-suffix': 'DOMAIN-SUFFIX,google.com,PROXY\nDOMAIN-SUFFIX,youtube.com,PROXY\nDOMAIN-SUFFIX,github.com,PROXY',
+  'domain-keyword': 'DOMAIN-KEYWORD,google,PROXY\nDOMAIN-KEYWORD,openai,PROXY',
+  'ip-cidr': 'IP-CIDR,10.0.0.0/8,DIRECT\nIP-CIDR,192.168.0.0/16,DIRECT',
+  'geoip': 'GEOIP,CN,DIRECT\nGEOIP,HK,DIRECT\nGEOIP,US,PROXY'
+};
+var RULE_BULK_TYPES = { 'domain': 1, 'domain-suffix': 1, 'domain-keyword': 1, 'ip-cidr': 1, 'geoip': 1 };
+function ruleTypeSupportsBulk(t) { return !!RULE_BULK_TYPES[t]; }
 function ruleTypeChanged() {
   var t = document.getElementById('rule-type').value;
+  var bulk = ruleTypeSupportsBulk(t);
+  document.getElementById('rule-bulk-wrap').style.display = bulk ? '' : 'none';
+  document.getElementById('rule-single-wrap').style.display = bulk ? 'none' : '';
   var p = document.getElementById('rule-pattern');
   p.placeholder = RULE_PATTERN_HINT[t] || '';
   p.disabled = (t === 'final');
   if (t === 'final') p.value = '';
+  var ta = document.getElementById('rule-batch');
+  if (ta) ta.placeholder = RULE_BULK_PLACEHOLDER[t] || '';
+  var hint = document.getElementById('rule-input-hint');
+  if (hint) {
+    hint.textContent = bulk
+      ? (RULE_BULK_HINT[t] || '')
+      : (t === 'final'
+          ? 'Catch-all for remaining traffic (no pattern needed)'
+          : (t === 'geoip'
+              ? RULE_GEOIP_HINT
+              : (RULE_PATTERN_HINT[t] ? ('Example: ' + RULE_PATTERN_HINT[t]) : '')));
+  }
+  var dup = document.getElementById('rule-dup');
+  if (dup && dup.parentElement) dup.parentElement.style.display = bulk ? '' : 'none';
+}
+var RULE_COLLAPSED = {};
+function groupRulesForDisplay(rules) {
+  var named = [];
+  var ungrouped = [];
+  var order = [];
+  rules.forEach(function (r, i) {
+    var g = (r.group || '').trim();
+    if (!g) { ungrouped.push(i); return; }
+    if (order.indexOf(g) < 0) {
+      order.push(g);
+      named.push({ name: g, indices: [i] });
+    } else {
+      named[order.indexOf(g)].indices.push(i);
+    }
+  });
+  if (ungrouped.length) named.push({ name: '', indices: ungrouped });
+  return named;
+}
+function refreshRuleGroupList(rules) {
+  var dl = document.getElementById('rule-group-list');
+  if (!dl) return;
+  var seen = {};
+  var opts = [];
+  (rules || []).forEach(function (r) {
+    var g = (r.group || '').trim();
+    if (g && !seen[g]) { seen[g] = 1; opts.push('<option value="' + esc(g) + '">'); }
+  });
+  dl.innerHTML = opts.join('');
+}
+function ruleRowHtml(r) {
+  var dim = r.enabled === false ? ' style="opacity:.45"' : '';
+  return '<div class="row"' + dim + '>' +
+    '<span class="badge acc">' + esc(RULE_TYPE_LABEL[r.rule_type] || r.rule_type) + '</span>' +
+    '<span class="r-name" style="font-family:var(--mono)">' + esc(r.pattern) +
+    '　→ ' + esc(RULE_TARGET_LABEL[r.target] || r.target) + '</span>' +
+    '<button class="btn btn-sm" onclick="event.stopPropagation();moveRule(' + r.index + ',-1)" title="Move up">↑</button>' +
+    '<button class="btn btn-sm" onclick="event.stopPropagation();moveRule(' + r.index + ',1)" title="Move down">↓</button>' +
+    '<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();delRule(' + r.index + ')">Delete</button></div>';
 }
 function loadRules() {
   api('get_rules', null, function (d) {
     var el = document.getElementById('rule-list');
     var rules = d.rules || [];
-    if (!rules.length) { el.innerHTML = '<div class="hint">No rules yet (default: private and CN traffic direct, everything else proxied).</div>'; return; }
-    el.innerHTML = rules.map(function (r, i) {
-      var pri = (typeof r.priority === 'number') ? r.priority : 0;
-      return '<div class="row"><span class="badge acc" title="priority">P' + pri + '</span>' +
-        '<span class="r-name" style="font-family:var(--mono)">' +
-        esc(RULE_TYPE_LABEL[r.rule_type] || r.rule_type) + '　' + esc(r.pattern) +
-        '　→ ' + esc(RULE_TARGET_LABEL[r.target] || r.target) + '</span>' +
-        '<button class="btn btn-sm" onclick="event.stopPropagation();moveRule(' + r.index + ',-1)" title="Move up">↑</button>' +
-        '<button class="btn btn-sm" onclick="event.stopPropagation();moveRule(' + r.index + ',1)" title="Move down">↓</button>' +
-        '<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();delRule(' + r.index + ')">Delete</button></div>';
+    S.ruleRows = rules;
+    refreshRuleGroupList(rules);
+    if (!rules.length) {
+      el.innerHTML = '<div class="hint">No exceptions yet — China Direct already handles domestic traffic. Add rules to a group, or apply a template.</div>';
+      return;
+    }
+    var buckets = groupRulesForDisplay(rules);
+    el.innerHTML = buckets.map(function (b) {
+      var key = b.name;
+      var title = key || 'Ungrouped';
+      var collapsed = !!RULE_COLLAPSED[key];
+      var enabledN = b.indices.filter(function (i) { return rules[i].enabled !== false; }).length;
+      var body = b.indices.map(function (i) { return ruleRowHtml(rules[i]); }).join('');
+      var gEnc = encodeURIComponent(key);
+      return '<div class="rule-group' + (collapsed ? ' collapsed' : '') + '">' +
+        '<div class="rule-group-hd" onclick="toggleRuleGroup(\'' + gEnc + '\')">' +
+          '<span>' + (collapsed ? '▸' : '▾') + '</span>' +
+          '<span class="rg-title">' + esc(title) + '</span>' +
+          '<span class="rg-count">' + enabledN + '/' + b.indices.length + '</span>' +
+          '<span class="rg-actions" onclick="event.stopPropagation()">' +
+            '<button class="btn btn-sm" onclick="useRuleGroup(\'' + gEnc + '\')">Use</button>' +
+            '<button class="btn btn-sm" onclick="editRuleGroup(\'' + gEnc + '\')">Edit</button>' +
+            '<button class="btn btn-sm" onclick="setRuleGroupEnabled(\'' + gEnc + '\',true)">On</button>' +
+            '<button class="btn btn-sm" onclick="setRuleGroupEnabled(\'' + gEnc + '\',false)">Off</button>' +
+            '<button class="btn btn-danger btn-sm" onclick="deleteRuleGroup(\'' + gEnc + '\')">Del</button>' +
+          '</span>' +
+        '</div>' +
+        '<div class="rule-group-body">' + body + '</div></div>';
     }).join('');
   });
 }
+function useRuleGroup(enc) {
+  document.getElementById('rule-group').value = decodeURIComponent(enc);
+}
+function toggleRuleGroup(enc) {
+  var key = decodeURIComponent(enc);
+  RULE_COLLAPSED[key] = !RULE_COLLAPSED[key];
+  loadRules();
+}
+function setRuleGroupEnabled(enc, enabled) {
+  api('set_rule_group_enabled', { group: decodeURIComponent(enc), enabled: !!enabled }, function (d) {
+    toastResp(d);
+    if (d.ok !== false) loadRules();
+  });
+}
+function deleteRuleGroup(enc) {
+  var name = decodeURIComponent(enc) || 'Ungrouped';
+  if (!confirm('Delete all rules in group 「' + name + '」?')) return;
+  api('delete_rule_group', { group: decodeURIComponent(enc) }, function (d) {
+    toastResp(d);
+    if (d.ok !== false) loadRules();
+  });
+}
+var RULE_EDIT_GROUP = null;
+function editRuleGroup(enc) {
+  var key = decodeURIComponent(enc);
+  var members = (S.ruleRows || []).filter(function (r) {
+    return (r.group || '').trim() === key;
+  });
+  if (!members.length) return;
+  RULE_EDIT_GROUP = key;
+  document.getElementById('rule-group').value = key;
+  var typ = members[0].rule_type === 'match' ? 'final' : members[0].rule_type;
+  document.getElementById('rule-type').value = typ;
+  document.getElementById('rule-target').value = members[0].target;
+  function clashLine(r) {
+    var T = {
+      'domain': 'DOMAIN', 'domain-suffix': 'DOMAIN-SUFFIX', 'domain-keyword': 'DOMAIN-KEYWORD',
+      'ip-cidr': 'IP-CIDR', 'geoip': 'GEOIP', 'dst-port': 'DST-PORT', 'port': 'DST-PORT',
+      'match': 'MATCH', 'final': 'MATCH'
+    };
+    var act = (r.target || 'proxy').toUpperCase();
+    if (r.rule_type === 'match' || r.rule_type === 'final') return 'MATCH,' + act;
+    return (T[r.rule_type] || r.rule_type.toUpperCase()) + ',' + r.pattern + ',' + act;
+  }
+  var text = members.map(clashLine).join('\n');
+  ruleTypeChanged();
+  document.getElementById('rule-bulk-wrap').style.display = '';
+  document.getElementById('rule-single-wrap').style.display = 'none';
+  document.getElementById('rule-batch').value = text;
+  document.getElementById('rule-pattern').value = '';
+  var hint = document.getElementById('rule-input-hint');
+  if (hint) hint.textContent = 'Editing group 「' + (key || 'Ungrouped') + '」 — TYPE,pattern,ACTION · Import replaces the whole group';
+}
 function addRule() {
   var t = document.getElementById('rule-type').value;
-  var p = document.getElementById('rule-pattern').value.trim();
+  var grp = document.getElementById('rule-group').value.trim();
   var g = document.getElementById('rule-target').value;
-  var pri = parseInt(document.getElementById('rule-priority').value, 10);
-  if (isNaN(pri)) pri = 0;
+  var replace = document.getElementById('rule-dup').value === 'replace';
+  if (RULE_EDIT_GROUP !== null) {
+    if (!grp && RULE_EDIT_GROUP) { showMsg('Group name is required', 'err'); return; }
+    var editText = document.getElementById('rule-batch').value.trim()
+      || document.getElementById('rule-pattern').value.trim();
+    if (t !== 'final' && !editText) { showMsg('Paste the group patterns first', 'err'); return; }
+    var oldGroup = RULE_EDIT_GROUP;
+    api('replace_rule_group', {
+      group: oldGroup, new_group: grp, rule_type: t, target: g, text: editText
+    }, function (d) {
+      toastResp(d);
+      if (d.ok !== false) {
+        RULE_EDIT_GROUP = null;
+        document.getElementById('rule-batch').value = '';
+        document.getElementById('rule-pattern').value = '';
+        ruleTypeChanged();
+        loadRules();
+      }
+    });
+    return;
+  }
+  if (!grp) { showMsg('Enter a group name — rules are maintained by group', 'err'); return; }
+  if (ruleTypeSupportsBulk(t)) {
+    var text = document.getElementById('rule-batch').value;
+    if (!text.trim()) { showMsg('Paste one or more patterns first', 'err'); return; }
+    api('batch_add_rules', { text: text, target: g, group: grp, rule_type: t, replace: replace }, function (d) {
+      toastResp(d);
+      if (d.ok !== false) {
+        document.getElementById('rule-batch').value = '';
+        loadRules();
+      }
+    });
+    return;
+  }
+  var p = document.getElementById('rule-pattern').value.trim();
   if (t !== 'final' && !p) { showMsg('Please enter a pattern', 'err'); return; }
-  api('add_rule', { rule_type: t, pattern: p, target: g, priority: pri }, function (d) {
+  api('add_rule', { group: grp, rule_type: t, pattern: p, target: g, priority: 0 }, function (d) {
     toastResp(d);
-    if (d.ok !== false) { document.getElementById('rule-pattern').value = ''; loadRules(); }
+    if (d.ok !== false) {
+      document.getElementById('rule-pattern').value = '';
+      loadRules();
+    }
   });
 }
 function moveRule(i, dir) {
@@ -1180,6 +1491,23 @@ function delRule(i) {
   api('del_rule', { index: i }, function (d) {
     toastResp(d);
     if (d.ok !== false) loadRules();
+  });
+}
+function applyRuleScene(id) {
+  api('apply_rule_scene', { scene: id }, function (d) {
+    toastResp(d);
+    if (d.ok !== false) loadRules();
+  });
+}
+function exportRules() {
+  api('export_rules', null, function (d) {
+    if (d.ok === false) { toastResp(d); return; }
+    var text = d.text || '';
+    var ta = document.getElementById('rule-batch');
+    if (ta) ta.value = text;
+    document.getElementById('rule-type').value = 'domain-suffix';
+    ruleTypeChanged();
+    showMsg('Exported ' + (d.count || 0) + ' rule(s) — copy as needed', 'ok');
   });
 }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
-    OutboundFactory, ProxyProtocol, ProxyService, Router, RoutingOutbound, RoutingRule,
+    OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
     SharedOutbound, SwappableOutbound, TunProxy, create_outbound, fetch_subscription,
     normalize_node_names, resolve_to_ips, setup_tun_routes, tun_requirements, tun_supported,
 };
@@ -101,8 +101,16 @@ async fn async_main() -> Result<()> {
         .with_context(|| format!("failed to load config from {}", config_path))?;
 
     let active_index = resolve_active_index(&config)?;
-    let router = build_router(&config.rules);
+    let router = router_for_mode(&config);
     let outbound = build_outbound(&config, active_index, router.as_ref())?;
+    tracing::info!(
+        "Proxy mode: {}",
+        match config.proxy_mode {
+            ProxyMode::Global => "Global (all via proxy)",
+            ProxyMode::Rule => "Rule (user rules + China-direct)",
+            ProxyMode::Direct => "Direct (no proxy)",
+        }
+    );
     let selected = active_index.and_then(|index| config.nodes.get(index));
 
     // Swappable wrapper: health-check failover and config hot-reload replace
@@ -303,7 +311,7 @@ async fn async_main() -> Result<()> {
     );
 
     // Optionally start TUN proxy
-    let tun_proxy = if enable_tun {
+    let mut tun_proxy = if enable_tun {
         if !tun_supported() {
             tracing::warn!(
                 "TUN mode not supported on this system: {}",
@@ -360,6 +368,13 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    // When TUN dies unexpectedly the process must exit: SOCKS/DNS can still
+    // look healthy while transparent proxy is gone, and Merlin's supervisor
+    // only respawns on process exit (not on "pid alive, stack dead").
+    let mut tun_unexpected_exit = tun_proxy
+        .as_mut()
+        .and_then(|tun| tun.take_unexpected_exit());
+
     tracing::info!("Press Ctrl+C / SIGTERM to stop");
     // Merlin's sockrocket.sh stops us with SIGTERM. tokio::signal::ctrl_c only
     // covers SIGINT — without SIGTERM the process ignored stop for the full
@@ -372,6 +387,19 @@ async fn async_main() -> Result<()> {
     #[cfg(not(unix))]
     let wait_term = std::future::pending::<Option<()>>();
     tokio::pin!(wait_term);
+    let tun_fatal = async {
+        match &mut tun_unexpected_exit {
+            Some(rx) => {
+                let _ = rx.await;
+                true
+            }
+            None => {
+                std::future::pending::<()>().await;
+                false
+            }
+        }
+    };
+    tokio::pin!(tun_fatal);
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
@@ -379,6 +407,14 @@ async fn async_main() -> Result<()> {
                 break;
             }
             _ = &mut wait_term => {
+                break;
+            }
+            fatal = &mut tun_fatal => {
+                if fatal {
+                    tracing::error!(
+                        "TUN accept loop died unexpectedly — exiting so supervisor can restart"
+                    );
+                }
                 break;
             }
             event = config_watcher.next() => {
@@ -408,7 +444,8 @@ async fn async_main() -> Result<()> {
                                 if let Ok(mut set) = server_domains.write() {
                                     *set = collect_server_domains(&new_config.nodes);
                                 }
-                                outbound_factory = make_outbound_factory(build_router(&new_config.rules));
+                                outbound_factory =
+                                    make_outbound_factory(router_for_mode(&new_config));
                                 if new_config.health_check.enabled {
                                     service
                                         .restart_health_check(HealthCheckSetup {
@@ -613,7 +650,8 @@ fn init_config(path: &str) -> Result<()> {
 
 async fn load_config(path: &str) -> Result<AppConfig> {
     let content = fs::read_to_string(path)?;
-    let parsed: AppConfig = serde_yaml::from_str(&content)?;
+    let parsed = AppConfig::from_yaml_str(&content)
+        .with_context(|| format!("parse config {}", path))?;
     let file_node_count = parsed.nodes.len();
     let has_subscriptions = !parsed.subscriptions.is_empty();
     // Fast path: nodes already persisted in config.yaml. Re-fetching every
@@ -741,7 +779,7 @@ async fn apply_reloaded_config(
     // NOTE: the TUN-side domain-rule override keeps the router built at
     // process start; reloaded rules apply to the routing outbound only
     // until the next restart.
-    let outbound = build_outbound(&config, index, build_router(&config.rules).as_ref())?;
+    let outbound = build_outbound(&config, index, router_for_mode(&config).as_ref())?;
     Ok((config, index, outbound))
 }
 
@@ -769,6 +807,9 @@ fn build_outbound(
     active_index: Option<usize>,
     router: Option<&Arc<Router>>,
 ) -> Result<SharedOutbound> {
+    if config.proxy_mode == ProxyMode::Direct {
+        return Ok(SharedOutbound::direct());
+    }
     let base_outbound = match active_index {
         Some(index) => create_outbound(&config.nodes[index])?,
         None => SharedOutbound::direct(),
@@ -777,18 +818,20 @@ fn build_outbound(
     Ok(wrap_with_rules(base_outbound, router))
 }
 
-/// Build the routing router once per process. Shared by the routing outbound
-/// and — in TUN mode — the stream handler.
+/// Router for the configured [`ProxyMode`].
 ///
-/// Uses the same assembly as the desktop GUI Rule mode: user rules (by
-/// priority) first, then the built-in China-direct set, with the expanded
-/// in-binary GeoIP DB attached. Empty `rules` still yields China-direct so
-/// Merlin / CLI match GUI behaviour.
-fn build_router(rules: &[RoutingRule]) -> Option<Arc<Router>> {
-    Some(Arc::new(
-        Router::new(sockrocket_core::rule_mode_ruleset(rules))
-            .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
-    ))
+/// - **Rule**: user rules (by priority), then built-in China-direct, with the
+///   in-binary GeoIP DB. Empty `rules` still yields China-direct.
+/// - **Global** / **Direct**: no router (Global dials the active node; Direct
+///   uses a direct outbound in [`build_outbound`]).
+fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
+    match config.proxy_mode {
+        ProxyMode::Rule => Some(Arc::new(
+            Router::new(sockrocket_core::rule_mode_ruleset(&config.rules))
+                .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
+        )),
+        ProxyMode::Global | ProxyMode::Direct => None,
+    }
 }
 
 /// Wrap a node outbound with rule-based routing when a router exists.

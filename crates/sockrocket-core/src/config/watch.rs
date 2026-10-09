@@ -141,7 +141,7 @@ impl ConfigWatcher {
                     }
                 }
 
-                match serde_yaml::from_str::<AppConfig>(&content) {
+                match AppConfig::from_yaml_str(&content) {
                     Ok(config) => {
                         let requires_restart = {
                             let mut state = task_state.lock().unwrap();

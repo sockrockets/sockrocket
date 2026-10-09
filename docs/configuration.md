@@ -65,7 +65,7 @@ Rule types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `ds
 
 Evaluation: enabled rules sorted by **priority descending**, then list order. First match wins.
 
-Refresh the CN CIDR database with `scripts/update-china-cidrs.sh` (source: 17mon/china_ip_list).
+Refresh the CN CIDR database with `scripts/update-china-cidrs.sh` (merged from chnroutes2, Loyalsoldier, and china-operator-ip).
 
 ---
 

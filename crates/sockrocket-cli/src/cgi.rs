@@ -520,6 +520,7 @@ fn dispatch(action: &str, post: &J) -> J {
         "speedtest" => act_speedtest(),
         "stats" => act_stats(),
         "set_mode" => act_set_mode(post),
+        "set_proxy_mode" => act_set_proxy_mode(post),
         "set_toggles" => act_set_toggles(post),
         "logs_clear" => act_logs_clear(),
         "ip_check" => act_ip_check(),
@@ -534,8 +535,14 @@ fn dispatch(action: &str, post: &J) -> J {
         "set_direct_server" => act_set_direct_server(post),
         "get_rules" => act_get_rules(),
         "add_rule" => act_add_rule(post),
+        "batch_add_rules" => act_batch_add_rules(post),
+        "apply_rule_scene" => act_apply_rule_scene(post),
+        "export_rules" => act_export_rules(),
         "del_rule" => act_del_rule(post),
         "move_rule" => act_move_rule(post),
+        "set_rule_group_enabled" => act_set_rule_group_enabled(post),
+        "delete_rule_group" => act_delete_rule_group(post),
+        "replace_rule_group" => act_replace_rule_group(post),
         "check_update" => act_check_update(),
         "apply_update" => act_apply_update(),
         "diagnose" => act_diagnose(),
@@ -571,6 +578,9 @@ fn act_status() -> J {
         "node_count": node_count(&map),
         "sub_count": conf_seq(&map, "subscriptions").len(),
         "mode": conf_str(&map, "mode").unwrap_or_else(|| "tun".into()),
+        "proxy_mode": conf_str(&map, "proxy_mode")
+            .unwrap_or_else(|| "rule".into())
+            .to_ascii_lowercase(),
         "transparent_proxy": transparent_proxy,
         "dns_hijack": dns_hijack,
         "cn_ipset_direct": conf_bool(&map, "cn_ipset_direct", false),
@@ -1263,6 +1273,62 @@ fn act_set_mode(post: &J) -> J {
     }
 }
 
+/// Set routing mode: `rule` | `global` | `direct` (same as desktop GUI).
+///
+/// Global turns off `cn_ipset_direct` so China IPs are not diverted around TUN
+/// at the iptables layer (otherwise "global" would still bypass domestic).
+fn act_set_proxy_mode(post: &J) -> J {
+    let mode = post
+        .get("proxy_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(mode.as_str(), "rule" | "global" | "direct") {
+        return err_msg("Invalid proxy_mode (rule / global / direct)");
+    }
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let prev = conf_str(&map, "proxy_mode").unwrap_or_else(|| "rule".into());
+    if prev.eq_ignore_ascii_case(&mode) {
+        return json!({"ok": true, "msg": format!("Already in {mode} mode"), "proxy_mode": mode});
+    }
+    map.insert(ykey("proxy_mode"), Y::String(mode.clone()));
+    if mode == "global" {
+        map.insert(ykey("cn_ipset_direct"), Y::Bool(false));
+    }
+    if let Err(e) = save_conf(&map) {
+        return err_msg(&format!("Save failed: {e}"));
+    }
+    if mode == "global" && is_running() {
+        // Drop CN ipset bypass if it was on.
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "\"{}/scripts/iptables.sh\" ipset-off 2>/dev/null || true",
+                sockrocket_dir().display()
+            ))
+            .status();
+    }
+    if is_running() {
+        run_sh("restart");
+        if !is_running() {
+            return json!({
+                "ok": false,
+                "msg": "Saved mode but service failed to restart — check logs",
+                "proxy_mode": mode
+            });
+        }
+    }
+    let label = match mode.as_str() {
+        "global" => "Global (all via proxy)",
+        "direct" => "Direct (no proxy)",
+        _ => "Rule (load rules + China-direct)",
+    };
+    json!({"ok": true, "msg": format!("Proxy mode: {label}"), "proxy_mode": mode})
+}
+
 /// Flip the two independent toggles.
 ///
 /// Each requested change is applied with a minimal action (see the match
@@ -1367,6 +1433,20 @@ fn act_set_toggles(post: &J) -> J {
             if let Ok(m) = load_conf() {
                 let (_, d) = effective_toggles(&m);
                 cur_dns = d;
+            }
+            // Postcondition: if DNS is supposed to stay on, the hijack file
+            // must exist. Heal with dns-on; do not flip the key off (that
+            // would push clients onto ISP long TTLs).
+            let dns_should_stay = want_dns.unwrap_or(cur_dns);
+            if dns_should_stay && sockrocket_sh().is_file() && !dnsmasq_hijack_conf().exists()
+            {
+                run_sh("dns-on");
+                if !dnsmasq_hijack_conf().exists() {
+                    return json!({
+                        "ok": false,
+                        "msg": "Transparent proxy is off, but DNS hijack is missing — LAN may be on ISP DNS. Check that the DNS port is listening, then toggle DNS hijack on."
+                    });
+                }
             }
         }
         if new_proxy {
@@ -1772,28 +1852,93 @@ fn valid_rule_pattern(rule_type: &str, pattern: &str) -> std::result::Result<Str
     }
 }
 
+fn yaml_to_routing_rule(r: &Y) -> Option<sockrocket_core::RoutingRule> {
+    Some(sockrocket_core::RoutingRule {
+        name: r
+            .get(ykey("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        group: r
+            .get(ykey("group"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        rule_type: r.get(ykey("rule_type"))?.as_str()?.to_string(),
+        pattern: r.get(ykey("pattern"))?.as_str()?.to_string(),
+        target: r
+            .get(ykey("target"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("proxy")
+            .to_string(),
+        enabled: r
+            .get(ykey("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        priority: r
+            .get(ykey("priority"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+    })
+}
+
+fn routing_rule_to_yaml(r: sockrocket_core::RoutingRule) -> Y {
+    let mut entry = Mapping::new();
+    if !r.name.is_empty() {
+        entry.insert(ykey("name"), Y::String(r.name));
+    }
+    if !r.group.is_empty() {
+        entry.insert(ykey("group"), Y::String(r.group));
+    }
+    entry.insert(ykey("rule_type"), Y::String(r.rule_type));
+    entry.insert(ykey("pattern"), Y::String(r.pattern));
+    entry.insert(ykey("target"), Y::String(r.target));
+    entry.insert(ykey("priority"), Y::Number(r.priority.into()));
+    entry.insert(ykey("enabled"), Y::Bool(r.enabled));
+    Y::Mapping(entry)
+}
+
+fn load_routing_rules(map: &Mapping) -> Vec<sockrocket_core::RoutingRule> {
+    map.get(ykey("rules"))
+        .and_then(|v| v.as_sequence())
+        .map(|seq| seq.iter().filter_map(yaml_to_routing_rule).collect())
+        .unwrap_or_default()
+}
+
+fn save_routing_rules(map: &mut Mapping, rules: Vec<sockrocket_core::RoutingRule>) {
+    let seq: Vec<Y> = rules.into_iter().map(routing_rule_to_yaml).collect();
+    map.insert(ykey("rules"), Y::Sequence(seq));
+}
+
+fn same_rule_group(rule_group: &str, want: &str) -> bool {
+    let g = rule_group.trim();
+    let w = want.trim();
+    if w.is_empty() {
+        g.is_empty()
+    } else {
+        g == w
+    }
+}
+
 /// Read the `rules:` sequence as JSON rows for the UI.
 fn act_get_rules() -> J {
     let map = load_conf().unwrap_or_default();
-    let rules: Vec<J> = map
-        .get(ykey("rules"))
-        .and_then(|v| v.as_sequence())
-        .map(|seq| {
-            seq.iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    json!({
-                        "index": i,
-                        "rule_type": r.get(ykey("rule_type")).and_then(|v| v.as_str()).unwrap_or(""),
-                        "pattern": r.get(ykey("pattern")).and_then(|v| v.as_str()).unwrap_or(""),
-                        "target": r.get(ykey("target")).and_then(|v| v.as_str()).unwrap_or("proxy"),
-                        "priority": r.get(ykey("priority")).and_then(|v| v.as_i64()).unwrap_or(0),
-                        "enabled": r.get(ykey("enabled")).and_then(|v| v.as_bool()).unwrap_or(true),
-                    })
-                })
-                .collect()
+    let rules: Vec<J> = load_routing_rules(&map)
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            json!({
+                "index": i,
+                "name": r.name,
+                "group": r.group,
+                "rule_type": r.rule_type,
+                "pattern": r.pattern,
+                "target": r.target,
+                "priority": r.priority,
+                "enabled": r.enabled,
+            })
         })
-        .unwrap_or_default();
+        .collect();
     json!({"ok": true, "rules": rules})
 }
 
@@ -1834,6 +1979,22 @@ fn act_add_rule(post: &J) -> J {
     }
 
     let mut entry = Mapping::new();
+    let name = post
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !name.is_empty() {
+        entry.insert(ykey("name"), Y::String(name.to_string()));
+    }
+    let group = post
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !group.is_empty() {
+        entry.insert(ykey("group"), Y::String(group.to_string()));
+    }
     entry.insert(ykey("rule_type"), Y::String(rule_type.to_string()));
     entry.insert(ykey("pattern"), Y::String(pattern.clone()));
     entry.insert(ykey("target"), Y::String(target.to_string()));
@@ -1944,6 +2105,324 @@ fn act_move_rule(post: &J) -> J {
                 spawn_sh("restart");
             }
             json!({"ok": true, "msg": "Order updated (takes effect after service restart)"})
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+/// Batch paste / import: multiline text → many rules (same parser as desktop GUI).
+fn act_batch_add_rules(post: &J) -> J {
+    let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.trim().is_empty() {
+        return err_msg("Paste one or more rules first");
+    }
+    let default_target = post
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("proxy");
+    if !RULE_TARGETS.contains(&default_target) {
+        return err_msg("Invalid target action (direct / proxy / reject)");
+    }
+    let replace = post
+        .get("replace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let group = post
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let rule_type = post
+        .get("rule_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    // Unified Clash-style parse (`TYPE,pattern,TARGET`). Plain domains/CIDRs
+    // still auto-detect; typed paste without TYPE is accepted when `rule_type`
+    // is set (WebUI type dropdown) for one-line-per-pattern convenience.
+    let looks_clash = text.lines().map(str::trim).any(|l| {
+        let head = l.split([',', ' ', ':']).next().unwrap_or("");
+        matches!(
+            head.to_ascii_uppercase().as_str(),
+            "DOMAIN"
+                | "DOMAIN-SUFFIX"
+                | "DOMAIN-KEYWORD"
+                | "IP-CIDR"
+                | "GEOIP"
+                | "DST-PORT"
+                | "PORT"
+                | "MATCH"
+                | "FINAL"
+        )
+    });
+    let parsed = if looks_clash || rule_type.is_empty() {
+        sockrocket_core::parse_batch_rules_in_group(text, default_target, group)
+    } else if sockrocket_core::rule_type_supports_bulk(rule_type) {
+        sockrocket_core::parse_typed_patterns(text, rule_type, default_target, group)
+    } else {
+        sockrocket_core::parse_batch_rules_in_group(text, default_target, group)
+    };
+    if parsed.rules.is_empty() {
+        let msg = parsed
+            .errors
+            .first()
+            .map(|e| format!("No valid rules (line {}: {})", e.line, e.message))
+            .unwrap_or_else(|| "No valid rules".into());
+        return err_msg(&msg);
+    }
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut existing = load_routing_rules(&map);
+    let conflict = if replace {
+        sockrocket_core::BatchConflict::Replace
+    } else {
+        sockrocket_core::BatchConflict::Skip
+    };
+    let n_in = parsed.rules.len();
+    let err_n = parsed.errors.len();
+    let stats = sockrocket_core::merge_batch_rules(&mut existing, parsed.rules, conflict);
+    save_routing_rules(&mut map, existing);
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running() {
+                spawn_sh("restart");
+            }
+            let mut msg = format!(
+                "Batch: +{} added, {} replaced, {} duplicates (from {} parsed)",
+                stats.added, stats.replaced, stats.skipped, n_in
+            );
+            if err_n > 0 {
+                msg.push_str(&format!("; {err_n} line(s) skipped"));
+            }
+            json!({"ok": true, "msg": msg})
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+fn act_apply_rule_scene(post: &J) -> J {
+    let id = post.get("scene").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(scene) = sockrocket_core::rule_scene_by_id(id) else {
+        return err_msg("Unknown scene");
+    };
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut existing = load_routing_rules(&map);
+    let group_label = match id {
+        "cross_border" => "Cross-border",
+        "domestic_direct" => "Domestic direct",
+        other => other,
+    };
+    let incoming = scene.rules_in_group(group_label);
+    let n = incoming.len();
+    let stats =
+        sockrocket_core::merge_batch_rules(&mut existing, incoming, sockrocket_core::BatchConflict::Skip);
+    save_routing_rules(&mut map, existing);
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running() {
+                spawn_sh("restart");
+            }
+            json!({
+                "ok": true,
+                "msg": format!(
+                    "Scene「{group_label}」: +{} of {} rules ({} already present)",
+                    stats.added, n, stats.skipped
+                )
+            })
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+fn act_export_rules() -> J {
+    let Ok(map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let rules = load_routing_rules(&map);
+    let text = sockrocket_core::format_rules_export(&rules);
+    json!({"ok": true, "text": text, "count": rules.len()})
+}
+
+fn act_set_rule_group_enabled(post: &J) -> J {
+    let group = post
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let enabled = post
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut rules = load_routing_rules(&map);
+    let mut n = 0usize;
+    for r in &mut rules {
+        if same_rule_group(&r.group, &group) {
+            r.enabled = enabled;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return err_msg("No rules in that group");
+    }
+    save_routing_rules(&mut map, rules);
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running() {
+                spawn_sh("restart");
+            }
+            json!({
+                "ok": true,
+                "msg": format!(
+                    "{} {} rule(s) in group",
+                    if enabled { "Enabled" } else { "Disabled" },
+                    n
+                )
+            })
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+fn act_replace_rule_group(post: &J) -> J {
+    let old_group = post
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let new_group = post
+        .get("new_group")
+        .and_then(|v| v.as_str())
+        .unwrap_or(old_group.as_str())
+        .trim()
+        .to_string();
+    if new_group.is_empty() && !old_group.trim().is_empty() {
+        return err_msg("Group name is required");
+    }
+    let rule_type = post
+        .get("rule_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("domain-suffix")
+        .trim();
+    let target = post
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("proxy");
+    if !RULE_TARGETS.contains(&target) {
+        return err_msg("Invalid target action (direct / proxy / reject)");
+    }
+    let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let enabled = post
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let priority = post
+        .get("priority")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+
+    let mut incoming = Vec::new();
+    if text.trim().is_empty() && matches!(rule_type, "match" | "final") {
+        match sockrocket_core::make_typed_rule("match", "*", target, &new_group) {
+            Ok(mut rule) => {
+                rule.enabled = enabled;
+                rule.priority = priority;
+                incoming.push(rule);
+            }
+            Err(e) => return err_msg(&e),
+        }
+    } else if text.trim().is_empty() {
+        return err_msg("Paste the group's patterns first");
+    } else {
+        let looks_clash = text.lines().map(str::trim).any(|l| {
+            let head = l.split([',', ' ', ':']).next().unwrap_or("");
+            matches!(
+                head.to_ascii_uppercase().as_str(),
+                "DOMAIN"
+                    | "DOMAIN-SUFFIX"
+                    | "DOMAIN-KEYWORD"
+                    | "IP-CIDR"
+                    | "GEOIP"
+                    | "DST-PORT"
+                    | "PORT"
+                    | "MATCH"
+                    | "FINAL"
+            )
+        });
+        let parsed = if looks_clash {
+            sockrocket_core::parse_batch_rules_in_group(text, target, &new_group)
+        } else if sockrocket_core::rule_type_supports_bulk(rule_type) {
+            sockrocket_core::parse_typed_patterns(text, rule_type, target, &new_group)
+        } else {
+            sockrocket_core::parse_batch_rules_in_group(text, target, &new_group)
+        };
+        if parsed.rules.is_empty() {
+            let msg = parsed
+                .errors
+                .first()
+                .map(|e| format!("No valid rules (line {}: {})", e.line, e.message))
+                .unwrap_or_else(|| "No valid patterns in the group".into());
+            return err_msg(&msg);
+        }
+        for mut rule in parsed.rules {
+            rule.group = new_group.clone();
+            rule.enabled = enabled;
+            rule.priority = priority;
+            incoming.push(rule);
+        }
+    }
+    if incoming.is_empty() {
+        return err_msg("No valid patterns in the group");
+    }
+
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut rules = load_routing_rules(&map);
+    let n = match sockrocket_core::replace_rule_group(&mut rules, &old_group, incoming) {
+        Ok(n) => n,
+        Err(e) => return err_msg(&e),
+    };
+    save_routing_rules(&mut map, rules);
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running() {
+                spawn_sh("restart");
+            }
+            json!({"ok": true, "msg": format!("Saved group ({n} rule(s))")})
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+fn act_delete_rule_group(post: &J) -> J {
+    let group = post
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut rules = load_routing_rules(&map);
+    let before_n = rules.len();
+    rules.retain(|r| !same_rule_group(&r.group, &group));
+    let removed = before_n - rules.len();
+    if removed == 0 {
+        return err_msg("No rules in that group");
+    }
+    save_routing_rules(&mut map, rules);
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running() {
+                spawn_sh("restart");
+            }
+            json!({"ok": true, "msg": format!("Removed {removed} rule(s) from group")})
         }
         Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
     }
@@ -2470,6 +2949,22 @@ dns_direct_domains:
         // SAMPLE has mode: tun and no explicit toggle keys -> both derived true.
         assert_eq!(s["transparent_proxy"], J::Bool(true), "{s}");
         assert_eq!(s["dns_hijack"], J::Bool(true), "{s}");
+        // Missing proxy_mode key → rule (Merlin historical behaviour).
+        assert_eq!(s["proxy_mode"], J::from("rule"), "{s}");
+    }
+
+    #[test]
+    fn set_proxy_mode_writes_key() {
+        let _env = TestEnv::new(SAMPLE);
+        // No live service in the test harness — save only.
+        let r = act_set_proxy_mode(&json!({"proxy_mode": "global"}));
+        assert_eq!(r["ok"], J::Bool(true), "{r}");
+        assert_eq!(r["proxy_mode"], J::from("global"), "{r}");
+        let map = load_conf().unwrap();
+        assert_eq!(conf_str(&map, "proxy_mode").as_deref(), Some("global"));
+        assert!(!conf_bool(&map, "cn_ipset_direct", true));
+        let s = act_status();
+        assert_eq!(s["proxy_mode"], J::from("global"), "{s}");
     }
 
     #[test]
@@ -2510,6 +3005,30 @@ dns_direct_domains:
         let _env = TestEnv::new(SAMPLE);
         let r = act_set_toggles(&json!({}));
         assert_eq!(r["ok"], J::Bool(false), "{r}");
+    }
+
+    #[test]
+    fn set_toggles_proxy_off_keeps_dns_hijack() {
+        // Regression: closing TUN must NOT force dns_hijack=false (that pushed
+        // LAN onto ISP long TTLs and made re-enable wait ~1min for bare IPs).
+        let cfg = SAMPLE.replace(
+            "mode: \"tun\"",
+            "mode: \"tun\"\ntransparent_proxy: true\ndns_hijack: true",
+        );
+        let _env = TestEnv::new(&cfg);
+        // sockrocket.sh absent → proxy-off is a no-op; keys must still be correct.
+        let _ = act_set_toggles(&json!({"transparent_proxy": false}));
+        let map = load_conf().unwrap();
+        assert_eq!(
+            conf_str(&map, "transparent_proxy").as_deref(),
+            Some("false"),
+            "{map:?}"
+        );
+        assert_eq!(
+            conf_str(&map, "dns_hijack").as_deref(),
+            Some("true"),
+            "dns_hijack must stay on when TUN is turned off"
+        );
     }
 
     // THE LOST-UPDATE REGRESSION: inside one set_toggles request, the proxy

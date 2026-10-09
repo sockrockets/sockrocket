@@ -43,14 +43,19 @@ assert() {
 # "pass" for tests whose subject never ran. Linux keeps the real file and
 # exercises the genuine path.
 make_fake_bin() {
-    src=$(command -v sleep)
-    cp "$src" "$SOCKROCKET_DIR/sockrocket-cli-bin"
-    chmod +x "$SOCKROCKET_DIR/sockrocket-cli-bin"
+    # Prefer exec'ing the real /bin/sleep. Copying the sleep binary into the
+    # sandbox breaks on modern macOS (SIP / arm64e): the copy exits instantly,
+    # so is_running() is always false and half-dead recovery tests look like
+    # "daemon already dead on 1st watchdog". Linux CI still uses PROC_FAKE
+    # for the sockrocket-cli comm match, so the real argv/comm after exec
+    # does not matter.
+    sleep_bin=$(command -v sleep)
+    [ -x /bin/sleep ] && sleep_bin=/bin/sleep
     cat > "$SOCKROCKET_DIR/sockrocket-cli" <<SH
 #!/bin/sh
 mkdir -p "$PROC_FAKE/\$\$" 2>/dev/null
 echo "sockrocket-cli" > "$PROC_FAKE/\$\$/comm" 2>/dev/null
-exec "$SOCKROCKET_DIR/sockrocket-cli-bin" 300
+exec "$sleep_bin" 300
 SH
     chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
 }
@@ -465,6 +470,22 @@ test_proxy_only() {
     teardown
 }
 
+# transparent_proxy=false + dns_hijack=true -> SOCKS mode with DNS hijack
+# (no Fake-IP). Closing TUN must keep short-TTL sockrocket DNS.
+test_dns_without_tun() {
+    printf '\n[11b] transparent_proxy=false, dns_hijack=true: no TUN, DNS hijack on\n'
+    setup
+    sed -i "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i "s/^dns_hijack:.*/dns_hijack: true/" "$SOCKROCKET_DIR/config.yaml"
+    touch "$SANDBOX/tun_dev"
+    rm -f "$DNS_DIR/sockrocket.conf"
+    run_sockrocket start
+    assert "no iptables start" "0" "$(grep -c '^iptables.sh start' "$SANDBOX/iptables.calls")"
+    assert "dns hijack written" "present" \
+        "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo gone)"
+    teardown
+}
+
 # dns_hijack=true but the DNS port is not listening -> refuse (no blackhole).
 test_dns_on_refuses_without_listener() {
     printf '\n[12] dns-on with no listener on the DNS port: refused\n'
@@ -605,7 +626,7 @@ test_start_clears_stale_mark_when_proxy_disabled() {
 test_start_kills_orphan_daemon() {
     printf '\n[21] start: untracked orphan daemon -> killed, new daemon tracked\n'
     setup
-    "$SOCKROCKET_DIR/sockrocket-cli-bin" 300 >/dev/null 2>&1 &
+    /bin/sleep 300 >/dev/null 2>&1 &
     orphan=$!
     echo "$orphan root 0:00 $SOCKROCKET_DIR/sockrocket-cli $SOCKROCKET_DIR/config.yaml --tun" \
         >> "$SANDBOX/ps.table"
@@ -624,7 +645,7 @@ test_start_kills_orphan_daemon() {
 test_stop_kills_orphan_daemon() {
     printf '\n[22] stop: stale pid file + orphan daemon -> orphan killed too\n'
     setup
-    "$SOCKROCKET_DIR/sockrocket-cli-bin" 300 >/dev/null 2>&1 &
+    /bin/sleep 300 >/dev/null 2>&1 &
     orphan=$!
     echo "$orphan root 0:00 $SOCKROCKET_DIR/sockrocket-cli $SOCKROCKET_DIR/config.yaml --tun" \
         >> "$SANDBOX/ps.table"
@@ -685,7 +706,9 @@ test_dns_repin_never_backs_up_pin() {
 # A busybox netstat snapshot can lie (format quirks, a race with a daemon
 # restart), and one bad reading used to tear the whole hijack down. With a
 # LIVE daemon the hijack must survive isolated probe failures and only fail
-# open after 3 consecutive ones.
+# open after 3 consecutive ones. On the 3rd failure the half-dead daemon is
+# also killed so the supervisor can respawn a fresh process (fail-open alone
+# used to leave a zombie pid with dead DNS/TUN).
 test_watchdog_dns_port_failure_threshold() {
     printf '\n[25] watchdog: live daemon + dead DNS port -> fail-open only after 3 consecutive checks\n'
     setup
@@ -695,22 +718,54 @@ test_watchdog_dns_port_failure_threshold() {
 exit 1
 SH
     chmod +x "$SANDBOX/stub/netstat"
+    # Keep outbound probe green so this test isolates the DNS-port path
+    # (otherwise the 3rd watchdog hits outbound-fail degrade first and
+    # never reaches kill_half_dead_daemon).
+    cat > "$SANDBOX/stub/curl" <<'SH'
+#!/bin/sh
+exit 0
+SH
+    chmod +x "$SANDBOX/stub/curl"
 
     run_sockrocket watchdog
     assert "hijack survives 1st failure" "present" \
         "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo gone)"
     assert "failure counted (1)" "1" "$(cat "$SOCKROCKET_DIR/.wdns_fails" 2>/dev/null)"
+    assert "daemon still alive after 1st" "alive" \
+        "$(kill -0 "$FAKE_PID" 2>/dev/null && echo alive || echo dead)"
 
     run_sockrocket watchdog
     assert "hijack survives 2nd failure" "present" \
         "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo gone)"
     assert "failure counted (2)" "2" "$(cat "$SOCKROCKET_DIR/.wdns_fails" 2>/dev/null)"
+    assert "daemon still alive after 2nd" "alive" \
+        "$(kill -0 "$FAKE_PID" 2>/dev/null && echo alive || echo dead)"
 
     run_sockrocket watchdog
     assert "hijack removed on 3rd consecutive failure" "gone" \
         "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo gone)"
     assert "failure counter reset after teardown" "" \
         "$(cat "$SOCKROCKET_DIR/.wdns_fails" 2>/dev/null)"
+    # Give the signal a moment to land (fake daemon is `sleep`).
+    sleep 1
+    assert "half-dead daemon killed on 3rd failure" "dead" \
+        "$(kill -0 "$FAKE_PID" 2>/dev/null && echo alive || echo dead)"
+    assert "no manual-stop marker written" "absent" \
+        "$([ -f "$SOCKROCKET_DIR/stopped" ] && echo present || echo absent)"
+    teardown
+}
+
+# Direct entry used by the guard subshell: kill without writing stopped.
+test_kill_half_dead() {
+    printf '\n[25b] kill-half-dead terminates daemon without writing stopped marker\n'
+    setup
+    spawn_daemon
+    run_sockrocket kill-half-dead "unit-test"
+    sleep 1
+    assert "daemon killed" "dead" \
+        "$(kill -0 "$FAKE_PID" 2>/dev/null && echo alive || echo dead)"
+    assert "stopped marker absent" "absent" \
+        "$([ -f "$SOCKROCKET_DIR/stopped" ] && echo present || echo absent)"
     teardown
 }
 
@@ -725,6 +780,11 @@ test_watchdog_dns_failure_counter_resets() {
 exit 1
 SH
     chmod +x "$SANDBOX/stub/netstat"
+    cat > "$SANDBOX/stub/curl" <<'SH'
+#!/bin/sh
+exit 0
+SH
+    chmod +x "$SANDBOX/stub/curl"
 
     run_sockrocket watchdog
     run_sockrocket watchdog
@@ -778,6 +838,7 @@ test_ensure_tun_insmod_fallback
 test_ensure_tun_total_failure
 test_proxy_off_skips_tun_and_iptables
 test_proxy_only
+test_dns_without_tun
 test_dns_on_refuses_without_listener
 test_proxy_off_keeps_daemon
 test_legacy_mode_tun_derives_both_on
@@ -792,6 +853,7 @@ test_stop_kills_orphan_daemon
 test_dns_unpin_on_stop
 test_dns_repin_never_backs_up_pin
 test_watchdog_dns_port_failure_threshold
+test_kill_half_dead
 test_watchdog_dns_failure_counter_resets
 test_watchdog_selfheals_missing_hijack
 

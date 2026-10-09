@@ -52,6 +52,13 @@ LOCAL_MD5=$(md5 -q "$BIN" 2>/dev/null || md5sum "$BIN" | awk '{print $1}')
 scp_do "$BIN" "$REMOTE_DIR/sockrocket-cli.new"
 scp_do "$ASP" "$REMOTE_DIR/webui/sockrocket.asp"
 scp_do "$ASP" "/www/ext/sockrocket/sockrocket.asp"
+# Softcenter / koolshare menu opens Module_sockrocket.asp — must sync or UI
+# stays stale while /www/ext looks updated.
+ssh_do "mkdir -p /jffs/.koolshare/webs /koolshare/webs /tmp/var/wwwext/sockrocket 2>/dev/null || true"
+scp_do "$ASP" "/jffs/.koolshare/webs/Module_sockrocket.asp"
+# /koolshare may be a separate mount; copy best-effort after Module lands.
+ssh_do "cp -f /jffs/.koolshare/webs/Module_sockrocket.asp /koolshare/webs/Module_sockrocket.asp 2>/dev/null || true
+cp -f $REMOTE_DIR/webui/sockrocket.asp /tmp/var/wwwext/sockrocket/sockrocket.asp 2>/dev/null || true"
 # Normalize LF for ash
 tr -d '\r' < "$SH" > /tmp/sockrocket.sh.lf
 scp_do /tmp/sockrocket.sh.lf "$REMOTE_DIR/scripts/sockrocket.sh"
