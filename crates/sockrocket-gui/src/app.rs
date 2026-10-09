@@ -37,17 +37,17 @@ use sockrocket_core::config::model::{
 };
 use sockrocket_core::proxy::ProxyStats;
 use sockrocket_core::{
-    ConfigWatchEvent, ConfigWatchHandle, ConfigWatcher, DEFAULT_SHARE_PORT, HealthCheckSetup,
-    HealthEvent, Outbound, OutboundFactory, ProbeResult, ProxyMode, ProxyService, Router,
-    RoutingOutbound, ShareServer, SharedOutbound, SharedShareState, SubscriptionFormat,
+    BatchConflict, ConfigWatchEvent, ConfigWatchHandle, ConfigWatcher, DEFAULT_SHARE_PORT,
+    HealthCheckSetup, HealthEvent, Outbound, OutboundFactory, ProbeResult, ProxyMode, ProxyService,
+    Router, RoutingOutbound, ShareServer, SharedOutbound, SharedShareState, SubscriptionFormat,
     SwappableOutbound, TunProxy, clear_system_proxy as clear_os_proxy, config_content_hash,
-    create_outbound, dedup_nodes, fallback_pick, fetch_subscription, generate_token,
-    get_system_proxy as get_os_proxy, local_lan_ip, new_shared_state, node_fingerprint,
-    normalize_node_names, parse_proxy_uri, resolve_members, resolve_to_ips, rule_mode_ruleset,
-    rule_scene_by_id, set_system_proxy as set_os_proxy, setup_tun_routes, start_share_server,
-    system_proxy_supported, uniquify_node_names, url_test_pick, BatchConflict, format_rules_export,
-    format_rule_clash_line, group_member_indices, merge_batch_rules, make_typed_rule,
-    parse_batch_rules_in_group, replace_rule_group, same_rule_group,
+    create_outbound, dedup_nodes, fallback_pick, fetch_subscription, format_rule_clash_line,
+    format_rules_export, generate_token, get_system_proxy as get_os_proxy, group_member_indices,
+    local_lan_ip, make_typed_rule, merge_batch_rules, new_shared_state, node_fingerprint,
+    normalize_node_names, parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group,
+    resolve_members, resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group,
+    set_system_proxy as set_os_proxy, setup_tun_routes, start_share_server, system_proxy_supported,
+    uniquify_node_names, url_test_pick,
 };
 
 /// Main application state
@@ -283,7 +283,9 @@ pub struct AppState {
     /// (see finish_group_test) instead of the global min-latency rule.
     pub(crate) group_test_pending: Option<usize>,
 
-    // Rule tester (Rules page)
+    // Rule tester (Rules page). Held so the InputState Entity stays alive;
+    // live re-eval is driven by the subscription, not field reads.
+    #[allow(dead_code)]
     pub(crate) rule_tester_input: Entity<InputState>,
 
     // Uptime tracking for the dashboard stat card
@@ -495,20 +497,21 @@ impl AppState {
                 .default_value(persisted.http_port.to_string())
         });
         let (system_proxy_enabled, system_proxy_status) = current_system_proxy_state();
-        let rule_batch_input =
-            cx.new(|cx| {
-                InputState::new(window, cx)
-                    .auto_grow(3, 20)
-                    .placeholder(sockrocket_gui::i18n::t("rules.ph.bulk.clash").to_string())
-            });
-        let rule_group_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("新分组"));
+        let rule_batch_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(3, 20)
+                .placeholder(sockrocket_gui::i18n::t("rules.ph.bulk.clash").to_string())
+        });
+        let rule_group_input = cx.new(|cx| InputState::new(window, cx).placeholder("新分组"));
         let rule_pattern_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(sockrocket_gui::i18n::t("rules.ph.domain-suffix").to_string())
         });
-        let rule_priority_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("0").default_value("0"));
+        let rule_priority_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("0")
+                .default_value("0")
+        });
         let rule_filter_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(sockrocket_gui::i18n::t("rules.filter").to_string())
@@ -603,21 +606,22 @@ impl AppState {
             },
         );
         // Batch/add box: live filter of empty state; Cmd/Ctrl+Enter submits.
-        let batch_sub = cx.subscribe_in(
-            &rule_batch_input,
-            window,
-            |this, _, event, window, cx| match event {
-                InputEvent::PressEnter { secondary: true } => {
-                    if this.batch_edit_group.is_some() {
-                        this.save_batch_edit_group(window, cx);
-                    } else {
-                        this.add_rule(window, cx);
+        let batch_sub =
+            cx.subscribe_in(
+                &rule_batch_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::PressEnter { secondary: true } => {
+                        if this.batch_edit_group.is_some() {
+                            this.save_batch_edit_group(window, cx);
+                        } else {
+                            this.add_rule(window, cx);
+                        }
                     }
-                }
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            },
-        );
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                },
+            );
         let filter_sub = cx.subscribe(&rule_filter_input, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
@@ -2374,7 +2378,8 @@ impl AppState {
     /// the app bundle (Application Support / APPDATA / XDG_CONFIG_HOME).
     pub(crate) fn open_update_download(&mut self, cx: &mut Context<Self>) {
         let Some(url) = self.update_download_url.clone() else {
-            self.settings_status = "⚠ No update download ready — check for updates first".to_string();
+            self.settings_status =
+                "⚠ No update download ready — check for updates first".to_string();
             cx.notify();
             return;
         };
@@ -3922,20 +3927,13 @@ fn normalize_rule_priorities(rules: &mut [RoutingRule]) {
 
 /// Dump a group as Clash `TYPE,pattern,TARGET` lines for the batch editor.
 /// Returns `(text, preferred_type, preferred_target)`.
-fn format_group_batch_lines(
-    rules: &[RoutingRule],
-    group: &str,
-) -> (String, String, String) {
+fn format_group_batch_lines(rules: &[RoutingRule], group: &str) -> (String, String, String) {
     let members: Vec<&RoutingRule> = rules
         .iter()
         .filter(|r| same_rule_group(&r.group, group))
         .collect();
     if members.is_empty() {
-        return (
-            String::new(),
-            "domain-suffix".into(),
-            "proxy".into(),
-        );
+        return (String::new(), "domain-suffix".into(), "proxy".into());
     }
     let first = members[0];
     let text = members
@@ -3943,11 +3941,7 @@ fn format_group_batch_lines(
         .map(|r| format_rule_clash_line(r))
         .collect::<Vec<_>>()
         .join("\n");
-    (
-        text,
-        first.rule_type.clone(),
-        first.target.clone(),
-    )
+    (text, first.rule_type.clone(), first.target.clone())
 }
 
 fn lines_look_clash_typed(text: &str) -> bool {
@@ -4047,11 +4041,7 @@ impl AppState {
                 .get(edit_idx)
                 .map(|r| r.group.trim().to_string())
                 .unwrap_or(group);
-            let enabled = self
-                .rules
-                .get(edit_idx)
-                .map(|r| r.enabled)
-                .unwrap_or(true);
+            let enabled = self.rules.get(edit_idx).map(|r| r.enabled).unwrap_or(true);
             let pattern_for_build = if matches!(rule_type.as_str(), "match" | "final") {
                 "*"
             } else {
@@ -4080,11 +4070,7 @@ impl AppState {
             }
             self.clear_rule_pattern_fields(window, cx);
             self.rules_collapsed_groups.remove(&group);
-            self.finish_rule_mutation(
-                sockrocket_gui::i18n::t("rules.status.saved"),
-                window,
-                cx,
-            );
+            self.finish_rule_mutation(sockrocket_gui::i18n::t("rules.status.saved"), window, cx);
             return;
         }
 
@@ -4231,12 +4217,7 @@ impl AppState {
         self.finish_rule_mutation(&format!("✓ 已添加 {shown}"), window, cx);
     }
 
-    fn finish_rule_mutation(
-        &mut self,
-        msg: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn finish_rule_mutation(&mut self, msg: &str, _window: &mut Window, cx: &mut Context<Self>) {
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             format!(
                 "{}{}",
@@ -4398,11 +4379,7 @@ impl AppState {
     }
 
     /// Parse the batch text box and replace the whole group.
-    pub(crate) fn save_batch_edit_group(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn save_batch_edit_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.batch_edit_group.clone() else {
             self.add_rule(window, cx);
             return;
@@ -4415,9 +4392,7 @@ impl AppState {
                 .errors
                 .first()
                 .map(|e| format!("✗ 第 {} 行: {}", e.line, e.message))
-                .unwrap_or_else(|| {
-                    sockrocket_gui::i18n::t("rules.status.batch_empty").into()
-                });
+                .unwrap_or_else(|| sockrocket_gui::i18n::t("rules.status.batch_empty").into());
             self.rules_status = msg;
             cx.notify();
             return;
@@ -4462,10 +4437,10 @@ impl AppState {
         }
         if self.editing_rule_index == Some(index) {
             self.editing_rule_index = None;
-        } else if let Some(edit) = self.editing_rule_index {
-            if edit > index {
-                self.editing_rule_index = Some(edit - 1);
-            }
+        } else if let Some(edit) = self.editing_rule_index
+            && edit > index
+        {
+            self.editing_rule_index = Some(edit - 1);
         }
         self.rules.remove(index);
         self.rules_status = sockrocket_gui::i18n::t("rules.status.removed").to_string();
@@ -4487,85 +4462,127 @@ impl AppState {
     pub(crate) fn load_china_rules(&mut self, cx: &mut Context<Self>) {
         // Add the built-in China direct ruleset as explicit rules
         let china_rules = vec![
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "geoip".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "geoip".into(),
                 pattern: "CN".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "cn".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "baidu.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "qq.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "taobao.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "aliyun.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "jd.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "163.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "bilibili.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "zhihu.com".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "ip-cidr".into(),
                 pattern: "10.0.0.0/8".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "ip-cidr".into(),
                 pattern: "172.16.0.0/12".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "ip-cidr".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "ip-cidr".into(),
                 pattern: "192.168.0.0/16".into(),
                 target: "direct".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "proxy".into(),
                 enabled: true,
@@ -4612,10 +4629,7 @@ impl AppState {
         let text = format_rules_export(&self.rules);
         let n = self.rules.len();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.rules_status = format!(
-            "{} {n}",
-            sockrocket_gui::i18n::t("rules.status.exported")
-        );
+        self.rules_status = format!("{} {n}", sockrocket_gui::i18n::t("rules.status.exported"));
         self.schedule_rules_status_clear(cx);
         cx.notify();
     }

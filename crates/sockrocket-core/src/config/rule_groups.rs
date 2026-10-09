@@ -96,9 +96,7 @@ pub fn replace_rule_group(
     }
     let new_name = incoming[0].group.trim().to_string();
     if !same_rule_group(&new_name, old_group)
-        && rules
-            .iter()
-            .any(|r| same_rule_group(&r.group, &new_name))
+        && rules.iter().any(|r| same_rule_group(&r.group, &new_name))
     {
         return Err(format!("分组「{new_name}」已存在"));
     }
@@ -166,11 +164,7 @@ mod tests {
 
     #[test]
     fn replace_group_keeps_position_and_rejects_name_clash() {
-        let mut rules = vec![
-            r("A", "a.com"),
-            r("B", "b.com"),
-            r("A", "a2.com"),
-        ];
+        let mut rules = vec![r("A", "a.com"), r("B", "b.com"), r("A", "a2.com")];
         let snap = snapshot_rule_group(&rules, "A").unwrap();
         assert_eq!(snap.patterns, vec!["a.com", "a2.com"]);
         assert!(!snap.mixed_type);

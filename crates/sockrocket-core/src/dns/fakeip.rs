@@ -132,11 +132,7 @@ impl FakeIpPool {
                 path.display()
             );
         } else {
-            let n = pool
-                .inner
-                .lock()
-                .map(|g| g.by_domain.len())
-                .unwrap_or(0);
+            let n = pool.inner.lock().map(|g| g.by_domain.len()).unwrap_or(0);
             if n > 0 {
                 tracing::info!(
                     "fake-IP store loaded {} mapping(s) from {}",

@@ -650,8 +650,8 @@ fn init_config(path: &str) -> Result<()> {
 
 async fn load_config(path: &str) -> Result<AppConfig> {
     let content = fs::read_to_string(path)?;
-    let parsed = AppConfig::from_yaml_str(&content)
-        .with_context(|| format!("parse config {}", path))?;
+    let parsed =
+        AppConfig::from_yaml_str(&content).with_context(|| format!("parse config {}", path))?;
     let file_node_count = parsed.nodes.len();
     let has_subscriptions = !parsed.subscriptions.is_empty();
     // Fast path: nodes already persisted in config.yaml. Re-fetching every
@@ -660,9 +660,7 @@ async fn load_config(path: &str) -> Result<AppConfig> {
     // empty nodes list (first install).
     let refresh_subs = env::var_os("SOCKROCKET_REFRESH_SUBS").is_some();
     let config = if file_node_count > 0 && !refresh_subs {
-        tracing::info!(
-            "Using {file_node_count} persisted node(s); skipping subscription fetch"
-        );
+        tracing::info!("Using {file_node_count} persisted node(s); skipping subscription fetch");
         let mut config = parsed;
         normalize_node_names(&mut config.nodes);
         config

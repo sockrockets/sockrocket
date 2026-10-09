@@ -534,27 +534,29 @@ rules: []
 
     #[test]
     fn groups_roundtrip_preserves_type_members_and_current() {
-        let mut config = AppConfig::default();
-        config.groups = vec![
-            ProxyGroupConfig {
-                name: "Auto".to_string(),
-                gtype: GroupType::UrlTest,
-                members: vec!["fp-a".to_string(), "fp-b".to_string()],
-                current: Some("fp-b".to_string()),
-            },
-            ProxyGroupConfig {
-                name: "Manual".to_string(),
-                gtype: GroupType::Select,
-                members: vec![],
-                current: None,
-            },
-            ProxyGroupConfig {
-                name: "Fallback".to_string(),
-                gtype: GroupType::Fallback,
-                members: vec!["fp-a".to_string()],
-                current: None,
-            },
-        ];
+        let config = AppConfig {
+            groups: vec![
+                ProxyGroupConfig {
+                    name: "Auto".to_string(),
+                    gtype: GroupType::UrlTest,
+                    members: vec!["fp-a".to_string(), "fp-b".to_string()],
+                    current: Some("fp-b".to_string()),
+                },
+                ProxyGroupConfig {
+                    name: "Manual".to_string(),
+                    gtype: GroupType::Select,
+                    members: vec![],
+                    current: None,
+                },
+                ProxyGroupConfig {
+                    name: "Fallback".to_string(),
+                    gtype: GroupType::Fallback,
+                    members: vec!["fp-a".to_string()],
+                    current: None,
+                },
+            ],
+            ..AppConfig::default()
+        };
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(
             yaml.contains("type: url-test"),

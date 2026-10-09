@@ -164,71 +164,62 @@ impl AppState {
         let clear_armed = confirm_slot_armed(&CLEAR_CONFIRM_AT);
         let batch_group = self.batch_edit_group.clone();
 
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(self.page_header_v3(
-                        "icons/nav-rules.svg",
-                        ACCENT,
-                        sockrocket_gui::i18n::t("rules.title"),
-                        sockrocket_gui::i18n::t("rules.subtitle"),
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("rules-export")
-                                    .cursor_pointer()
-                                    .text_size(px(TINY))
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                    .child(sockrocket_gui::i18n::t("rules.export").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.export_rules_to_clipboard(cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("clear-rules")
-                                    .cursor_pointer()
-                                    .text_size(px(TINY))
-                                    .text_color(rgb(if clear_armed {
-                                        DANGER
+        let mut content = div().flex().flex_col().gap_2p5().child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(self.page_header_v3(
+                    "icons/nav-rules.svg",
+                    ACCENT,
+                    sockrocket_gui::i18n::t("rules.title"),
+                    sockrocket_gui::i18n::t("rules.subtitle"),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("rules-export")
+                                .cursor_pointer()
+                                .text_size(px(TINY))
+                                .text_color(rgb(TEXT_MUTED))
+                                .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                .child(sockrocket_gui::i18n::t("rules.export").to_string())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_rules_to_clipboard(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("clear-rules")
+                                .cursor_pointer()
+                                .text_size(px(TINY))
+                                .text_color(rgb(if clear_armed { DANGER } else { TEXT_MUTED }))
+                                .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                                .child(if clear_armed {
+                                    sockrocket_gui::i18n::t("rules.clear_confirm").to_string()
+                                } else {
+                                    sockrocket_gui::i18n::t("rules.clear").to_string()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
+                                        CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
+                                        this.clear_rules(cx);
                                     } else {
-                                        TEXT_MUTED
-                                    }))
-                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                    .child(if clear_armed {
-                                        sockrocket_gui::i18n::t("rules.clear_confirm").to_string()
-                                    } else {
-                                        sockrocket_gui::i18n::t("rules.clear").to_string()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
-                                            CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
-                                            this.clear_rules(cx);
-                                        } else {
-                                            CLEAR_CONFIRM_AT
-                                                .store(now_millis(), Ordering::Relaxed);
-                                            schedule_confirm_reset(this, cx);
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
-                    ),
-            );
+                                        CLEAR_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
+                                        schedule_confirm_reset(this, cx);
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                ),
+        );
         let filter_q = self
             .rule_filter_input
             .read(cx)
@@ -296,12 +287,8 @@ impl AppState {
                             .text_color(rgb(ACCENT))
                             .child(sockrocket_gui::i18n::t("rules.group.new").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                let name = this
-                                    .rule_group_input
-                                    .read(cx)
-                                    .value()
-                                    .trim()
-                                    .to_string();
+                                let name =
+                                    this.rule_group_input.read(cx).value().trim().to_string();
                                 if name.is_empty() {
                                     this.rules_status =
                                         sockrocket_gui::i18n::t("rules.status.group_name").into();
@@ -502,9 +489,11 @@ impl AppState {
                                     all_on,
                                     partial,
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_rule_group_enabled(&gkey_switch, !all_on, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_rule_group_enabled(&gkey_switch, !all_on, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 div()
@@ -519,7 +508,8 @@ impl AppState {
                                     .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
                                     .child(sockrocket_gui::i18n::t("rules.batch.mode").to_string())
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        if this.batch_edit_group.as_deref() == Some(gkey_edit.as_str())
+                                        if this.batch_edit_group.as_deref()
+                                            == Some(gkey_edit.as_str())
                                         {
                                             this.cancel_edit_rule(window, cx);
                                         } else {
@@ -734,9 +724,7 @@ impl AppState {
             )
             .when(open, |d| {
                 d.child(deferred(
-                    anchored()
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(panel),
+                    anchored().snap_to_window_with_margin(px(8.0)).child(panel),
                 ))
             })
     }
@@ -810,12 +798,7 @@ impl AppState {
             })
     }
 
-    fn render_inline_editor(
-        &mut self,
-        index: usize,
-        is_last: bool,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_inline_editor(&mut self, index: usize, is_last: bool, cx: &mut Context<Self>) -> Div {
         let cur_type = self.rule_type_sel.clone();
         let pattern_input = self.rule_pattern_input.clone();
         let is_final = matches!(cur_type.as_str(), "match" | "final");
@@ -854,11 +837,15 @@ impl AppState {
                             .child(sockrocket_gui::i18n::t("rules.hint.match"))
                             .into_any_element()
                     } else {
-                        div().flex_1().min_w(px(80.0)).child(
-                            gpui_component::input::Input::new(&pattern_input)
-                                .xsmall()
-                                .w_full(),
-                        ).into_any_element()
+                        div()
+                            .flex_1()
+                            .min_w(px(80.0))
+                            .child(
+                                gpui_component::input::Input::new(&pattern_input)
+                                    .xsmall()
+                                    .w_full(),
+                            )
+                            .into_any_element()
                     })
                     .child(self.render_rule_menu(RuleMenu::Type, cx))
                     .child(self.render_rule_menu(RuleMenu::Target, cx))
@@ -899,7 +886,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.editing_rule_index == Some(index) {
-            return self.render_inline_editor(index, is_last, cx).into_any_element();
+            return self
+                .render_inline_editor(index, is_last, cx)
+                .into_any_element();
         }
         let rule = &self.rules[index];
         let is_enabled = rule.enabled;

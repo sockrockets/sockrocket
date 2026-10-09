@@ -142,22 +142,20 @@ pub fn parse_typed_patterns(
         if line.is_empty() {
             continue;
         }
-        let tokens: Vec<&str> = if matches!(
-            typ,
-            "domain" | "domain-suffix" | "domain-keyword" | "geoip"
-        ) {
-            // geoip: allow `CN US JP` or `CN,US,JP` on one line
-            line.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            // ip-cidr: one CIDR per line (commas rare); still allow comma split
-            line.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
+        let tokens: Vec<&str> =
+            if matches!(typ, "domain" | "domain-suffix" | "domain-keyword" | "geoip") {
+                // geoip: allow `CN US JP` or `CN,US,JP` on one line
+                line.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                // ip-cidr: one CIDR per line (commas rare); still allow comma split
+                line.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
         if tokens.is_empty() {
             continue;
         }
@@ -184,9 +182,7 @@ fn parse_group_directive(trimmed: &str) -> Option<String> {
     }
     let rest = t.trim_start_matches('#').trim();
     let lower = rest.to_ascii_lowercase();
-    let Some(after) = lower.strip_prefix("@group") else {
-        return None;
-    };
+    let after = lower.strip_prefix("@group")?;
     let name = &rest[rest.len() - after.len()..];
     Some(name.trim().to_string())
 }
@@ -198,10 +194,7 @@ fn split_line_and_name(raw: &str) -> (&str, String) {
         return ("", String::new());
     }
     match trimmed.find('#') {
-        Some(i) => (
-            trimmed[..i].trim(),
-            trimmed[i + 1..].trim().to_string(),
-        ),
+        Some(i) => (trimmed[..i].trim(), trimmed[i + 1..].trim().to_string()),
         None => (trimmed, String::new()),
     }
 }
@@ -212,12 +205,7 @@ pub fn format_rule_clash_line(rule: &RoutingRule) -> String {
     if matches!(rule.rule_type.as_str(), "match" | "final") {
         format!("{},{}", typ, export_target(&rule.target))
     } else {
-        format!(
-            "{},{},{}",
-            typ,
-            rule.pattern,
-            export_target(&rule.target)
-        )
+        format!("{},{},{}", typ, rule.pattern, export_target(&rule.target))
     }
 }
 
@@ -300,9 +288,8 @@ fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, Strin
     }
     // Explicit arrow: type:pattern->target  /  type pattern -> target
     if let Some((left, right)) = line.split_once("->") {
-        let target = normalize_target(right.trim()).ok_or_else(|| {
-            format!("Unknown target '{}'", right.trim())
-        })?;
+        let target = normalize_target(right.trim())
+            .ok_or_else(|| format!("Unknown target '{}'", right.trim()))?;
         return parse_typed_left(left.trim(), target);
     }
     // Whitespace: type pattern [target]
@@ -316,17 +303,21 @@ fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, Strin
         return build_rule(normalize_type(parts[0]), parts[1], target);
     }
     // Colon form without arrow: type:pattern
-    if let Some((typ, pat)) = line.split_once(':') {
-        if looks_like_type(typ) {
-            return build_rule(normalize_type(typ), pat.trim(), default_target);
-        }
+    if let Some((typ, pat)) = line.split_once(':')
+        && looks_like_type(typ)
+    {
+        return build_rule(normalize_type(typ), pat.trim(), default_target);
     }
     // Auto-detect plain value
     auto_detect(line, default_target)
 }
 
 fn parse_clash_line(line: &str) -> Result<RoutingRule, String> {
-    let parts: Vec<&str> = line.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = line
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.is_empty() {
         return Err("Empty rule".into());
     }
@@ -356,10 +347,10 @@ fn parse_clash_line(line: &str) -> Result<RoutingRule, String> {
 }
 
 fn parse_typed_left(left: &str, target: &str) -> Result<RoutingRule, String> {
-    if let Some((typ, pat)) = left.split_once(':') {
-        if looks_like_type(typ) {
-            return build_rule(normalize_type(typ), pat.trim(), target);
-        }
+    if let Some((typ, pat)) = left.split_once(':')
+        && looks_like_type(typ)
+    {
+        return build_rule(normalize_type(typ), pat.trim(), target);
     }
     let parts: Vec<&str> = left.split_whitespace().collect();
     if parts.len() >= 2 && looks_like_type(parts[0]) {
@@ -427,7 +418,8 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
     };
     Ok(RoutingRule {
         name: String::new(),
-       group: String::new(), rule_type: if rule_type == "port" {
+        group: String::new(),
+        rule_type: if rule_type == "port" {
             "dst-port".into()
         } else if rule_type == "final" {
             "match".into()
@@ -516,9 +508,7 @@ fn looks_like_domain(s: &str) -> bool {
     }
     if !s.contains('.') {
         // Allow single-label keywords used as suffixes (e.g. "cn") — still ok as domain-suffix.
-        return s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        return s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     }
     s.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -539,9 +529,9 @@ fn looks_like_cidr(s: &str) -> bool {
 }
 
 fn normalize_cidr(s: &str) -> Result<String, String> {
-    let (addr, prefix) = s.split_once('/').ok_or_else(|| {
-        format!("CIDR needs a prefix (e.g. {s}/32)")
-    })?;
+    let (addr, prefix) = s
+        .split_once('/')
+        .ok_or_else(|| format!("CIDR needs a prefix (e.g. {s}/32)"))?;
     let ip: std::net::IpAddr = addr
         .parse()
         .map_err(|_| format!("Invalid IP address '{addr}'"))?;
@@ -571,10 +561,7 @@ mod tests {
 
     #[test]
     fn parses_plain_domains_and_cidrs() {
-        let r = parse_batch_rules(
-            "example.com\n10.0.0.0/8\n1.2.3.4\n# comment\n",
-            "proxy",
-        );
+        let r = parse_batch_rules("example.com\n10.0.0.0/8\n1.2.3.4\n# comment\n", "proxy");
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(r.rules.len(), 3);
         assert_eq!(r.rules[0].rule_type, "domain-suffix");
@@ -602,7 +589,10 @@ mod tests {
 
     #[test]
     fn merge_skips_duplicates() {
-        let mut existing = vec![RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+        let mut existing = vec![RoutingRule {
+            name: String::new(),
+            group: String::new(),
+            rule_type: "domain-suffix".into(),
             pattern: "a.com".into(),
             target: "direct".into(),
             enabled: true,
@@ -663,13 +653,19 @@ mod tests {
     #[test]
     fn export_roundtrip_clash() {
         let rules = vec![
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".into(),
                 pattern: "x.com".into(),
                 target: "proxy".into(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".into(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "match".into(),
                 pattern: "*".into(),
                 target: "direct".into(),
                 enabled: true,

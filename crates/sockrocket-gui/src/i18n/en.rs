@@ -27,7 +27,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "rules.hint.domain" => "Exact host, e.g. www.google.com",
         "rules.hint.domain-keyword" => "Hostname keyword, e.g. google",
         "rules.hint.ip-cidr" => "CIDR or IP, e.g. 10.0.0.0/8",
-        "rules.hint.geoip" => "ISO country code, e.g. CN · HK · TW · US · JP · KR · SG (built-in DB covers CN)",
+        "rules.hint.geoip" => {
+            "ISO country code, e.g. CN · HK · TW · US · JP · KR · SG (built-in DB covers CN)"
+        }
         "rules.hint.dst-port" => "Port or range, e.g. 443 or 1000-2000",
         "rules.hint.match" => "Catch-all for remaining traffic (no pattern needed)",
         "rules.ph.domain-suffix" => "google.com",
@@ -114,7 +116,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.about.github" => "GitHub",
         "settings.about.check_update" => "Check for Updates",
         "settings.about.open_download" => "Download Update",
-        "settings.about.update_keep_config" => "Your settings, nodes, subscriptions, and rules stay in the user data folder — only the app binary is replaced.",
+        "settings.about.update_keep_config" => {
+            "Your settings, nodes, subscriptions, and rules stay in the user data folder — only the app binary is replaced."
+        }
         _ => return None,
     })
 }

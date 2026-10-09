@@ -6,8 +6,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-const RELEASES_LATEST: &str =
-    "https://api.github.com/repos/sockrockets/sockrocket/releases/latest";
+const RELEASES_LATEST: &str = "https://api.github.com/repos/sockrockets/sockrocket/releases/latest";
 const RELEASES_PAGE: &str = "https://github.com/sockrockets/sockrocket/releases/latest";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,10 +107,7 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// Query GitHub for the latest release and compare to `current` (e.g. `0.1.0`).
 ///
 /// `prefer_asset` is an exact asset file name to resolve a direct download URL.
-pub async fn check_for_update(
-    current: &str,
-    prefer_asset: Option<&str>,
-) -> Result<UpdateCheck> {
+pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Result<UpdateCheck> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(20))
@@ -158,11 +154,11 @@ pub async fn check_for_update(
 
     let mut asset_url = None;
     let mut asset_name = None;
-    if let Some(want) = prefer_asset {
-        if let Some(a) = release.assets.iter().find(|a| a.name == want) {
-            asset_url = Some(a.browser_download_url.clone());
-            asset_name = Some(a.name.clone());
-        }
+    if let Some(want) = prefer_asset
+        && let Some(a) = release.assets.iter().find(|a| a.name == want)
+    {
+        asset_url = Some(a.browser_download_url.clone());
+        asset_name = Some(a.name.clone());
     }
 
     let html_url = if release.html_url.is_empty() {

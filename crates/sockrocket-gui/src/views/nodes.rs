@@ -1421,7 +1421,9 @@ impl AppState {
                                 .tooltip("Copy subscription URL to the clipboard")
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(sub_url.clone()));
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        sub_url.clone(),
+                                    ));
                                     this.import_status =
                                         "✓ Subscription URL copied to clipboard".to_string();
                                     cx.notify();
@@ -1591,7 +1593,9 @@ impl AppState {
                                 .tooltip("Copy subscription URL to the clipboard")
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(sub_url.clone()));
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        sub_url.clone(),
+                                    ));
                                     this.import_status =
                                         "✓ Subscription URL copied to clipboard".to_string();
                                     cx.notify();

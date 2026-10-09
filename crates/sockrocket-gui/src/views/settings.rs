@@ -375,9 +375,7 @@ impl AppState {
                             .mt_1()
                             .text_size(px(TINY))
                             .text_color(rgb(TEXT_MUTED))
-                            .child(sockrocket_gui::i18n::t(
-                                "settings.about.update_keep_config",
-                            ))
+                            .child(sockrocket_gui::i18n::t("settings.about.update_keep_config"))
                     })),
             )
     }

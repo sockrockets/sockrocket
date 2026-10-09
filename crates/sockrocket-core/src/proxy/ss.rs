@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn test_ss_outbound_aead_2022() {
         // AEAD 2022 ciphers require base64-encoded keys of specific length
-        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 32]);
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 32]);
         let outbound = SsOutbound::new("127.0.0.1", 8388, "2022-blake3-aes-256-gcm", &key);
         assert!(outbound.is_ok());
     }

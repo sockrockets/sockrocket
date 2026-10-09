@@ -1597,6 +1597,7 @@ mod tests {
     /// a sealed response header, then echoes body chunks — decrypting with
     /// the request cipher and re-encrypting with the response cipher, each
     /// with its own nonce counter, exactly as a real server does.
+    #[allow(clippy::too_many_arguments)]
     async fn fake_server_echo(
         mut server: tokio::io::DuplexStream,
         header_len: usize,

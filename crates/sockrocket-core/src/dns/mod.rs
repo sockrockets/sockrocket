@@ -1617,7 +1617,7 @@ mod tests {
         }
         let total = conns.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            total >= 1 && total <= PROXY_DNS_POOL_SIZE,
+            (1..=PROXY_DNS_POOL_SIZE).contains(&total),
             "pool of {PROXY_DNS_POOL_SIZE} slots must bound connections, got {total}"
         );
     }

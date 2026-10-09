@@ -68,13 +68,19 @@ mod tests {
     #[test]
     fn rule_mode_ruleset_prefers_custom_rules_when_present() {
         let rules = vec![
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".to_string(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".to_string(),
                 pattern: "example.com".to_string(),
                 target: "reject".to_string(),
                 enabled: true,
                 priority: 0,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "match".to_string(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "match".to_string(),
                 pattern: "*".to_string(),
                 target: "proxy".to_string(),
                 enabled: true,
@@ -89,13 +95,19 @@ mod tests {
     #[test]
     fn rule_mode_priority_orders_before_list_index() {
         let rules = vec![
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".to_string(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".to_string(),
                 pattern: "example.com".to_string(),
                 target: "direct".to_string(),
                 enabled: true,
                 priority: 1,
             },
-            RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".to_string(),
+            RoutingRule {
+                name: String::new(),
+                group: String::new(),
+                rule_type: "domain-suffix".to_string(),
                 pattern: "example.com".to_string(),
                 target: "reject".to_string(),
                 enabled: true,
@@ -108,7 +120,10 @@ mod tests {
 
     #[test]
     fn rule_mode_custom_without_final_keeps_china_domains() {
-        let rules = vec![RoutingRule { name: String::new(),group: String::new(), rule_type: "domain-suffix".to_string(),
+        let rules = vec![RoutingRule {
+            name: String::new(),
+            group: String::new(),
+            rule_type: "domain-suffix".to_string(),
             pattern: "example.com".to_string(),
             target: "reject".to_string(),
             enabled: true,

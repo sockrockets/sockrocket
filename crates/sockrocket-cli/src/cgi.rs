@@ -1438,8 +1438,7 @@ fn act_set_toggles(post: &J) -> J {
             // must exist. Heal with dns-on; do not flip the key off (that
             // would push clients onto ISP long TTLs).
             let dns_should_stay = want_dns.unwrap_or(cur_dns);
-            if dns_should_stay && sockrocket_sh().is_file() && !dnsmasq_hijack_conf().exists()
-            {
+            if dns_should_stay && sockrocket_sh().is_file() && !dnsmasq_hijack_conf().exists() {
                 run_sh("dns-on");
                 if !dnsmasq_hijack_conf().exists() {
                     return json!({
@@ -1913,11 +1912,7 @@ fn save_routing_rules(map: &mut Mapping, rules: Vec<sockrocket_core::RoutingRule
 fn same_rule_group(rule_group: &str, want: &str) -> bool {
     let g = rule_group.trim();
     let w = want.trim();
-    if w.is_empty() {
-        g.is_empty()
-    } else {
-        g == w
-    }
+    if w.is_empty() { g.is_empty() } else { g == w }
 }
 
 /// Read the `rules:` sequence as JSON rows for the UI.
@@ -1998,10 +1993,7 @@ fn act_add_rule(post: &J) -> J {
     entry.insert(ykey("rule_type"), Y::String(rule_type.to_string()));
     entry.insert(ykey("pattern"), Y::String(pattern.clone()));
     entry.insert(ykey("target"), Y::String(target.to_string()));
-    let priority = post
-        .get("priority")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
+    let priority = post.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     entry.insert(ykey("priority"), Y::Number(priority.into()));
     entry.insert(ykey("enabled"), Y::Bool(true));
     // Higher priority first: insert at front of equal-priority group so UI
@@ -2217,8 +2209,11 @@ fn act_apply_rule_scene(post: &J) -> J {
     };
     let incoming = scene.rules_in_group(group_label);
     let n = incoming.len();
-    let stats =
-        sockrocket_core::merge_batch_rules(&mut existing, incoming, sockrocket_core::BatchConflict::Skip);
+    let stats = sockrocket_core::merge_batch_rules(
+        &mut existing,
+        incoming,
+        sockrocket_core::BatchConflict::Skip,
+    );
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
@@ -2321,10 +2316,7 @@ fn act_replace_rule_group(post: &J) -> J {
         .get("enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let priority = post
-        .get("priority")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
+    let priority = post.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
     let mut incoming = Vec::new();
     if text.trim().is_empty() && matches!(rule_type, "match" | "final") {
@@ -2438,13 +2430,11 @@ fn act_check_update() -> J {
         Ok(rt) => rt,
         Err(e) => return err_msg(&format!("Runtime error: {e}")),
     };
-    let result = rt.block_on(async {
-        sockrocket_core::check_for_update(current, prefer.as_deref()).await
-    });
+    let result =
+        rt.block_on(async { sockrocket_core::check_for_update(current, prefer.as_deref()).await });
     match result {
         Ok(check) => {
-            let available =
-                check.availability == sockrocket_core::UpdateAvailability::Available;
+            let available = check.availability == sockrocket_core::UpdateAvailability::Available;
             json!({
                 "ok": true,
                 "current": check.current,
@@ -2478,9 +2468,9 @@ fn act_apply_update() -> J {
         Ok(rt) => rt,
         Err(e) => return err_msg(&format!("Runtime error: {e}")),
     };
-    let check = match rt.block_on(async {
-        sockrocket_core::check_for_update(current, Some(asset)).await
-    }) {
+    let check = match rt
+        .block_on(async { sockrocket_core::check_for_update(current, Some(asset)).await })
+    {
         Ok(c) => c,
         Err(e) => return err_msg(&format!("Update check failed: {e}")),
     };
@@ -2523,7 +2513,10 @@ fn act_apply_update() -> J {
         let _ = fs::set_permissions(&bin, p);
     }
     // Record package version for the Web UI.
-    let _ = fs::write(sockrocket_dir().join("version"), format!("{}\n", check.latest));
+    let _ = fs::write(
+        sockrocket_dir().join("version"),
+        format!("{}\n", check.latest),
+    );
     if was_running {
         spawn_sh("start");
     }

@@ -27,7 +27,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "rules.hint.domain" => "精确主机名，例如 www.google.com",
         "rules.hint.domain-keyword" => "主机名关键字，例如 google",
         "rules.hint.ip-cidr" => "网段或 IP，例如 10.0.0.0/8",
-        "rules.hint.geoip" => "两位国家/地区代码，例如 CN 中国 · HK 香港 · TW 台湾 · US 美国 · JP 日本 · KR 韩国 · SG 新加坡（内置库含 CN）",
+        "rules.hint.geoip" => {
+            "两位国家/地区代码，例如 CN 中国 · HK 香港 · TW 台湾 · US 美国 · JP 日本 · KR 韩国 · SG 新加坡（内置库含 CN）"
+        }
         "rules.hint.dst-port" => "端口或区间，例如 443 或 1000-2000",
         "rules.hint.match" => "匹配其余全部流量（无需填写内容）",
         "rules.ph.domain-suffix" => "google.com",
@@ -112,7 +114,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.about.github" => "GitHub",
         "settings.about.check_update" => "检查更新",
         "settings.about.open_download" => "下载更新",
-        "settings.about.update_keep_config" => "设置、节点、订阅与分流规则保存在用户数据目录，更新只替换程序本身，不会清空配置。",
+        "settings.about.update_keep_config" => {
+            "设置、节点、订阅与分流规则保存在用户数据目录，更新只替换程序本身，不会清空配置。"
+        }
         _ => return None,
     })
 }

@@ -27,7 +27,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "rules.hint.domain" => "Host chính xác, vd. www.google.com",
         "rules.hint.domain-keyword" => "Từ khóa hostname, vd. google",
         "rules.hint.ip-cidr" => "CIDR hoặc IP, vd. 10.0.0.0/8",
-        "rules.hint.geoip" => "Mã quốc gia ISO, vd. CN · HK · TW · US · JP · KR · SG (DB tích hợp có CN)",
+        "rules.hint.geoip" => {
+            "Mã quốc gia ISO, vd. CN · HK · TW · US · JP · KR · SG (DB tích hợp có CN)"
+        }
         "rules.hint.dst-port" => "Cổng hoặc khoảng, vd. 443 hoặc 1000-2000",
         "rules.hint.match" => "Bắt mọi lưu lượng còn lại (không cần pattern)",
         "rules.ph.domain-suffix" => "google.com",
@@ -114,7 +116,9 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.about.github" => "GitHub",
         "settings.about.check_update" => "Kiểm tra cập nhật",
         "settings.about.open_download" => "Tải bản cập nhật",
-        "settings.about.update_keep_config" => "Cài đặt, node, subscription và rule nằm trong thư mục dữ liệu người dùng — cập nhật chỉ thay binary, không xóa cấu hình.",
+        "settings.about.update_keep_config" => {
+            "Cài đặt, node, subscription và rule nằm trong thư mục dữ liệu người dùng — cập nhật chỉ thay binary, không xóa cấu hình."
+        }
         _ => return None,
     })
 }
