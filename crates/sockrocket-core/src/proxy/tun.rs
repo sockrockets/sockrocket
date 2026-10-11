@@ -318,11 +318,13 @@ impl TunProxy {
         validate_tun_environment()?;
 
         let mut tun_config = tun::Configuration::default();
+        // Linux/Windows: request a fixed app-specific name so we never collide
+        // with OpenVPN/etc. macOS only accepts `utunN`, and a fixed N fails when
+        // that unit is already taken (common: system VPN / iCloud already hold
+        // utun0–utun3). Leave the name unset so the kernel assigns a free unit.
+        #[cfg(not(target_os = "macos"))]
+        tun_config.tun_name(default_tun_name());
         tun_config
-            // Request a fixed, application-specific device name. Without
-            // this, Linux assigns tun0/tun1/… from the shared TUN pool,
-            // colliding with OpenVPN and other VPN clients on the same host.
-            .tun_name(default_tun_name())
             .address(TUN_IPV4)
             .netmask(TUN_NETMASK)
             .destination(TUN_GATEWAY)
@@ -808,15 +810,13 @@ fn icmpv6_echo_reply(payload: &[u8], reply_src: Ipv6Addr, reply_dst: Ipv6Addr) -
 // ─── Platform default TUN device name ───
 
 fn default_tun_name() -> &'static str {
-    // A fixed, application-specific name on every platform. On Linux the
-    // kernel would otherwise hand out tun0/tun1/… from the shared TUN pool,
-    // which collides with OpenVPN and other VPN clients on the same host —
-    // and on a router it made the fwmark/route scripts operate on someone
-    // else's device. Requesting "sockrocket-tun" explicitly keeps it unambiguous.
+    // Fallback label when the driver does not report a name. On Linux/Windows
+    // we also request this exact name at create time. On macOS the create path
+    // leaves the name unset (kernel picks a free `utunN`); this string is only
+    // used if `tun_name()` somehow fails after a successful create.
     #[cfg(target_os = "macos")]
     {
-        // macOS utun numbering is assigned by the kernel; utun3 is a hint.
-        "utun3"
+        "utun"
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2462,7 +2462,7 @@ pub fn tun_requirements() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        "Requires root privileges (sudo)"
+        "Requires administrator privileges (macOS will prompt to restart elevated)"
     }
     #[cfg(target_os = "windows")]
     {
@@ -2561,7 +2561,14 @@ fn tun_route_failure_hint() -> String {
     match current_privilege_status() {
         PrivilegeStatus::Missing => tun_requirements().to_string(),
         PrivilegeStatus::Privileged => {
-            "The current process already has elevated privileges, so the TUN interface or routing command likely failed to initialize correctly.".to_string()
+            #[cfg(target_os = "macos")]
+            {
+                "Elevated process could not create a utun interface (name conflict or utun control unavailable).".to_string()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                "The current process already has elevated privileges, so the TUN interface or routing command likely failed to initialize correctly.".to_string()
+            }
         }
         PrivilegeStatus::Unknown => format!(
             "Ensure the required routing tools are available and {}",
@@ -2618,6 +2625,126 @@ fn windows_is_elevated() -> Option<bool> {
 /// On Windows this is "running as Administrator"; on Unix, root.
 pub fn tun_privileged() -> bool {
     matches!(current_privilege_status(), PrivilegeStatus::Privileged)
+}
+
+/// Escape a path/arg for a POSIX shell single-quoted string.
+#[cfg(target_os = "macos")]
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Escape a string for an AppleScript double-quoted literal.
+#[cfg(target_os = "macos")]
+fn applescript_double_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// True when a Sockrocket process carrying `--tun-admin-pending` is alive.
+#[cfg(target_os = "macos")]
+fn tun_admin_pending_running() -> bool {
+    use std::process::Command;
+    // Pattern must not start with `-` or pgrep treats it as its own flag.
+    let Ok(output) = Command::new("/usr/bin/pgrep")
+        .args(["-f", "tun-admin-pending"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
+}
+
+/// Relaunch the current executable as root via macOS Authorization
+/// (`osascript` → `do shell script … with administrator privileges`).
+/// Passes `--tun-admin` plus any extra args (typically `--tun-admin-pending`).
+/// On approval the elevated process starts; the caller should exit.
+///
+/// The GUI is left in the foreground of the admin shell (no `nohup`/`&`):
+/// under `do shell script`, `nohup` fails with "can't detach from console"
+/// and a background job is often reaped when that shell exits — which looked
+/// like a crash after the password dialog. We return as soon as the elevated
+/// process appears (or when osascript fails / the user cancels).
+#[cfg(target_os = "macos")]
+pub fn relaunch_elevated(extra_args: &[&str]) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    // Keep the interactive user's HOME so the root GUI still finds config /
+    // WindowServer-friendly paths instead of /var/root.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/root".into());
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+
+    let mut parts = vec![
+        format!("HOME={}", shell_single_quote(&home)),
+        format!("USER={}", shell_single_quote(&user)),
+        "RUST_BACKTRACE=1".into(),
+        shell_single_quote(&exe.to_string_lossy()),
+        shell_single_quote("--tun-admin"),
+    ];
+    for arg in extra_args {
+        parts.push(shell_single_quote(arg));
+    }
+
+    let _ = std::fs::remove_file("/tmp/sockrocket-elevated.log");
+    let shell_cmd = format!("{} >/tmp/sockrocket-elevated.log 2>&1", parts.join(" "));
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        applescript_double_quote(&shell_cmd)
+    );
+
+    let mut child = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to run osascript: {e}"))?;
+
+    // Password dialog can take a while; elevated process must appear before
+    // we declare success. osascript stays alive for the life of the GUI.
+    for _ in 0..1_200 {
+        if tun_admin_pending_running() {
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut err) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                let log =
+                    std::fs::read_to_string("/tmp/sockrocket-elevated.log").unwrap_or_default();
+                if stderr.contains("-128") || stderr.to_ascii_lowercase().contains("user canceled")
+                {
+                    anyhow::bail!("Administrator approval cancelled by user");
+                }
+                anyhow::bail!(
+                    "macOS elevation failed (osascript {}): {} {}",
+                    status,
+                    stderr.trim().replace('\n', " "),
+                    log.trim().replace('\n', " ")
+                );
+            }
+            Ok(None) => {}
+            Err(e) => anyhow::bail!("Failed to wait for osascript: {e}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    anyhow::bail!("Timed out waiting for administrator approval");
+}
+
+/// Relaunch elevated and immediately exit the current (unprivileged) process.
+#[cfg(target_os = "macos")]
+pub fn relaunch_elevated_and_exit(extra_args: &[&str]) -> ! {
+    match relaunch_elevated(extra_args) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("macOS elevation failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Relaunch the current executable with Administrator privileges via the UAC
@@ -2806,6 +2933,14 @@ mod tests {
     fn test_tun_requirements_not_empty() {
         let req = tun_requirements();
         assert!(!req.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_shell_quoting() {
+        assert_eq!(shell_single_quote("abc"), "'abc'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(applescript_double_quote(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 
     #[test]

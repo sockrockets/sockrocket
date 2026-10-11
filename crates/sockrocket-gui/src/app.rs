@@ -778,11 +778,11 @@ impl AppState {
         state.start_auto_refresh(cx);
         state.start_config_watch(cx);
         state.start_ui_heartbeat(cx);
-        // Launched elevated via UAC with a pending TUN request? Start proxy and
-        // then TUN unconditionally â the user already consented at the prompt.
+        // Launched elevated (Windows UAC / macOS admin) with a pending TUN
+        // request? Start proxy then TUN — the user already consented.
         let tun_admin_pending = std::env::args().any(|a| a == "--tun-admin-pending");
         if tun_admin_pending {
-            state.tun_status = "ð Elevated â starting proxy + TUN...".to_string();
+            state.tun_status = "Elevated — starting proxy + TUN…".to_string();
             state.auto_connect_on_startup(cx, true);
         } else if persisted.auto_connect && persisted.active_node.is_some() {
             state.auto_connect_on_startup(cx, persisted.tun_was_enabled);
@@ -2544,28 +2544,20 @@ impl AppState {
             return;
         }
 
-        // TUN needs Administrator on Windows. When launched unprivileged,
-        // relaunch the app through the UAC prompt (`runas`) carrying
+        // TUN needs Administrator (Windows) or root (macOS). When launched
+        // unprivileged, relaunch through the OS auth prompt carrying
         // `--tun-admin-pending`; the elevated instance auto-starts TUN on
         // arrival.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if !sockrocket_core::tun_privileged() {
-            tracing::info!("[tun-uac] not privileged â relaunching elevated off the GPUI thread");
-            self.tun_status = "ð Waiting for UAC approval...".to_string();
+            tracing::info!("[tun-elev] not privileged — relaunching elevated off the GPUI thread");
+            self.tun_status = "Waiting for administrator approval…".to_string();
             cx.notify();
 
-            // ShellExecuteW("runas") must NOT run on the GPUI main thread while
-            // we are inside this click callback. The callback holds a mutable
-            // borrow of `App`; the UAC secure-desktop switch delivers activation
-            // /paint messages that re-enter the window procedure, which tries to
-            // borrow `App` again â "RefCell already borrowed" â a panic
-            // propagating across the `extern "C"` window-proc boundary â abort
-            // ("panic in a function that cannot unwind").
-            //
-            // Running it on a plain OS thread lets the GPUI main thread return
-            // from this listener, release the borrow, and go back to its message
-            // loop *before* any UAC-induced message arrives â so the re-entrant
-            // messages are handled normally instead of fatally.
+            // Elevation dialogs (UAC / macOS auth) must NOT run on the GPUI
+            // main thread while we hold a mutable borrow of `App` inside this
+            // click callback — re-entrant paint/activation can panic. Run on a
+            // plain OS thread so the main loop is free before the dialog appears.
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let outcome = sockrocket_core::relaunch_elevated(&["--tun-admin-pending"])
@@ -2573,16 +2565,14 @@ impl AppState {
                 let _ = tx.send(outcome);
             });
 
-            // Poll for the UAC result on the foreground executor (main thread,
-            // borrow already released) and quit gracefully once approved.
             cx.spawn(async move |weak, cx| {
                 for _ in 0..1200 {
                     match rx.try_recv() {
                         Ok(Ok(())) => {
-                            tracing::info!("[tun-uac] approved â quitting for elevated instance");
+                            tracing::info!("[tun-elev] approved — quitting for elevated instance");
                             weak.update(cx, |this, cx| {
                                 this.tun_status =
-                                    "ð Approved â restarting as Administrator...".to_string();
+                                    "Approved — restarting with administrator privileges…".into();
                                 cx.notify();
                             })
                             .ok();
@@ -2590,9 +2580,9 @@ impl AppState {
                             return;
                         }
                         Ok(Err(msg)) => {
-                            tracing::error!("[tun-uac] elevation failed: {msg}");
+                            tracing::error!("[tun-elev] elevation failed: {msg}");
                             weak.update(cx, |this, cx| {
-                                this.tun_status = format!("â Elevation failed: {msg}");
+                                this.tun_status = format!("Elevation failed: {msg}");
                                 cx.notify();
                             })
                             .ok();

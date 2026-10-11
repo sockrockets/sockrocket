@@ -63,7 +63,7 @@ pub use proxy::tun::{
     resolve_to_ips, resolve_to_ipv4, setup_tun_routes, tun_privileged, tun_requirements,
     tun_supported, update_tun_bypass_ips, wintun_dll_available,
 };
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use proxy::tun::{relaunch_elevated, relaunch_elevated_and_exit};
 pub use proxy::vless::VlessOutbound;
 pub use proxy::vmess::VMessOutbound;
