@@ -350,7 +350,7 @@ post_install_start() {
 ks_install() {
     local VER
     VER=$(read_first_line "$SCRIPT_DIR/version")
-    [ -z "$VER" ] && VER="0.1.1"
+    [ -z "$VER" ] && VER="0.1.2"
     info "Installing Sockrocket ${VER} in koolcenter mode..."
 
     install_common_files
