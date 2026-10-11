@@ -214,6 +214,9 @@ pub struct AppState {
     pub(crate) subscriptions: Vec<Subscription>,
     // Indices of subscriptions currently being refreshed (shows spinner)
     pub(crate) refreshing_subscriptions: std::collections::HashSet<usize>,
+    /// Inline rename for a subscription on the Config list.
+    pub(crate) sub_rename_input: Entity<InputState>,
+    pub(crate) editing_sub_index: Option<usize>,
 
     // Manual node URI input
     pub(crate) node_uri_input: Entity<InputState>,
@@ -633,6 +636,13 @@ impl AppState {
             cx.new(|cx| InputState::new(window, cx).placeholder("New group name"));
         let group_rename_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("New group name"));
+        let sub_rename_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Subscription name"));
+        let sub_rename_sub = cx.subscribe(&sub_rename_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.confirm_sub_rename(cx);
+            }
+        });
 
         let mut state = Self {
             active_view: ActiveView::Home,
@@ -714,6 +724,8 @@ impl AppState {
             selected_node_indices: std::collections::HashSet::new(),
             subscriptions: persisted.subscriptions.clone(),
             refreshing_subscriptions: std::collections::HashSet::new(),
+            sub_rename_input,
+            editing_sub_index: None,
             node_uri_input,
             node_rename_input,
             editing_node_index: None,
@@ -749,6 +761,7 @@ impl AppState {
                 pattern_sub,
                 batch_sub,
                 filter_sub,
+                sub_rename_sub,
             ],
             groups: persisted.groups.clone(),
             group_name_input,
@@ -3840,6 +3853,50 @@ impl AppState {
 // === Subscription management (Config page actions) ===
 
 impl AppState {
+    /// Arm inline rename for the subscription at `index` (Config list).
+    pub(crate) fn begin_sub_rename(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sub) = self.subscriptions.get(index) else {
+            return;
+        };
+        let name = sub.name.clone();
+        self.editing_sub_index = Some(index);
+        self.sub_rename_input.update(cx, |s, cx| {
+            s.set_value(name, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Confirm inline subscription rename from `sub_rename_input`.
+    pub(crate) fn confirm_sub_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.editing_sub_index else {
+            return;
+        };
+        let new_name = self.sub_rename_input.read(cx).value().trim().to_string();
+        if new_name.is_empty() {
+            self.import_status = sockrocket_gui::i18n::t("subs.rename.empty").to_string();
+            cx.notify();
+            return;
+        }
+        if let Some(sub) = self.subscriptions.get_mut(index) {
+            sub.name = new_name;
+            self.import_status = sockrocket_gui::i18n::t("subs.rename.ok").to_string();
+            self.schedule_persist(cx);
+        }
+        self.editing_sub_index = None;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_sub_rename(&mut self, cx: &mut Context<Self>) {
+        self.editing_sub_index = None;
+        cx.notify();
+    }
+
     pub(crate) fn delete_subscription(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.subscriptions.len() {
             return;
@@ -3854,6 +3911,14 @@ impl AppState {
             .active_proxy_node
             .and_then(|i| self.nodes.get(i))
             .map(|n| n.name.clone());
+
+        if self.editing_sub_index == Some(index) {
+            self.editing_sub_index = None;
+        } else if let Some(edit) = self.editing_sub_index
+            && edit > index
+        {
+            self.editing_sub_index = Some(edit - 1);
+        }
 
         self.subscriptions.remove(index);
         // Remove nodes tagged with this subscription URL

@@ -1197,10 +1197,28 @@ function loadSubs() {
       return '<div class="row">' +
         '<span class="badge acc">' + esc(s.format || 'auto') + '</span>' +
         '<span class="r-name">' + esc(s.name) + '<div class="r-sub">' + esc(s.url) + '</div></span>' +
+        '<button class="btn btn-sm" onclick="event.stopPropagation();renameSub(' + s.index + ')" title="Rename subscription">Rename</button>' +
         '<button class="btn btn-sm" onclick="event.stopPropagation();copySubUrl(' + s.index + ')" title="Copy subscription URL">Copy</button>' +
         '<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();delSub(' + s.index + ')">Delete</button>' +
         '</div>';
     }).join('');
+  });
+}
+function renameSub(i) {
+  var subs = S.subs || [];
+  var s = null;
+  for (var k = 0; k < subs.length; k++) {
+    if (subs[k].index === i) { s = subs[k]; break; }
+  }
+  if (!s) s = subs[i];
+  if (!s) { showMsg('Subscription not found', 'err'); return; }
+  var next = prompt('Rename subscription', s.name || '');
+  if (next === null) return;
+  next = String(next).trim();
+  if (!next) { showMsg('Name must not be empty', 'err'); return; }
+  api('rename_sub', { index: i, name: next }, function (d) {
+    toastResp(d);
+    if (d.ok !== false) loadSubs();
   });
 }
 function copySubUrl(i) {

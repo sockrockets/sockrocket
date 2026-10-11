@@ -117,6 +117,10 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.about.update_keep_config" => {
             "设置、节点、订阅与分流规则保存在用户数据目录，更新只替换程序本身，不会清空配置。"
         }
+        "subs.rename.tip" => "重命名订阅",
+        "subs.rename.save" => "保存",
+        "subs.rename.empty" => "⚠ 名称不能为空",
+        "subs.rename.ok" => "✓ 已重命名订阅",
         _ => return None,
     })
 }

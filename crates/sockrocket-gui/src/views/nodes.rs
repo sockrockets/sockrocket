@@ -1501,8 +1501,9 @@ impl AppState {
                 .filter(|n| n.extra.get("sub_url") == Some(&sub.url))
                 .count();
             let is_refreshing = self.refreshing_subscriptions.contains(&i);
+            let editing = self.editing_sub_index == Some(i);
 
-            let row = div()
+            let mut row = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -1511,118 +1512,164 @@ impl AppState {
                 .py_2()
                 .border_b_1()
                 .border_color(rgba(with_alpha(BORDER, 0x99)))
-                .hover(|s| s.bg(rgb(BG_HOVER)))
-                // Left: name + meta info
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(px(SMALL))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(TEXT_PRIMARY))
-                                        .child(name),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(MICRO))
-                                        .font_family(MONO_FONT)
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(format!("{} nodes", node_count)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .text_size(px(MICRO))
-                                        .font_family(MONO_FONT)
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .overflow_x_hidden()
-                                        .child(url_display),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(MICRO))
-                                        .font_family(MONO_FONT)
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(if is_refreshing {
-                                            "· refreshing…".to_string()
-                                        } else {
-                                            format!("· {}", last_updated)
-                                        }),
-                                ),
+                .hover(|s| s.bg(rgb(BG_HOVER)));
+
+            if editing {
+                row = row
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            gpui_component::input::Input::new(&self.sub_rename_input)
+                                .xsmall()
+                                .w_full(),
                         ),
-                )
-                // Right: action buttons
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            Button::new(("interval-btn", i))
-                                .xsmall()
-                                .label(format!("Auto: {}", interval_label))
-                                .tooltip("Click to cycle: Off → 1h → 2h → 6h → 12h → 24h → Off")
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.cycle_refresh_interval(i, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new(("copy-sub-url-btn", i))
-                                .xsmall()
-                                .label("Copy".to_string())
-                                .tooltip("Copy subscription URL to the clipboard")
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        sub_url.clone(),
-                                    ));
-                                    this.import_status =
-                                        "✓ Subscription URL copied to clipboard".to_string();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new(("refresh-sub-btn", i))
-                                .xsmall()
-                                .label("Refresh".to_string())
-                                .tooltip("Fetch new nodes from this subscription now")
-                                .ghost()
-                                .loading(is_refreshing)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.refresh_subscription(i, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new(("delete-sub-btn", i))
-                                .xsmall()
-                                .label("×".to_string())
-                                .tooltip("Remove this subscription and its nodes")
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_subscription(i, cx);
-                                })),
-                        ),
-                );
+                    )
+                    .child(
+                        Button::new(("sub-rename-save", i))
+                            .xsmall()
+                            .label(sockrocket_gui::i18n::t("subs.rename.save").to_string())
+                            .tooltip("Confirm rename")
+                            .primary()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_sub_rename(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(("sub-rename-cancel", i))
+                            .xsmall()
+                            .label(sockrocket_gui::i18n::t("rules.cancel").to_string())
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_sub_rename(cx);
+                            })),
+                    );
+            } else {
+                row = row
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id(("sub-name", i))
+                                            .cursor_pointer()
+                                            .text_size(px(SMALL))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .hover(|s| s.text_color(rgb(TEXT_ACCENT)))
+                                            .child(name)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.begin_sub_rename(i, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(MICRO))
+                                            .font_family(MONO_FONT)
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(format!("{} nodes", node_count)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(px(MICRO))
+                                            .font_family(MONO_FONT)
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .overflow_x_hidden()
+                                            .child(url_display),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(MICRO))
+                                            .font_family(MONO_FONT)
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(if is_refreshing {
+                                                "· refreshing…".to_string()
+                                            } else {
+                                                format!("· {}", last_updated)
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new(("sub-rename-btn", i))
+                                    .xsmall()
+                                    .label("✎".to_string())
+                                    .tooltip(sockrocket_gui::i18n::t("subs.rename.tip").to_string())
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_sub_rename(i, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(("interval-btn", i))
+                                    .xsmall()
+                                    .label(format!("Auto: {}", interval_label))
+                                    .tooltip("Click to cycle: Off → 1h → 2h → 6h → 12h → 24h → Off")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.cycle_refresh_interval(i, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(("copy-sub-url-btn", i))
+                                    .xsmall()
+                                    .label("Copy".to_string())
+                                    .tooltip("Copy subscription URL to the clipboard")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            sub_url.clone(),
+                                        ));
+                                        this.import_status =
+                                            "✓ Subscription URL copied to clipboard".to_string();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("refresh-sub-btn", i))
+                                    .xsmall()
+                                    .label("Refresh".to_string())
+                                    .tooltip("Fetch new nodes from this subscription now")
+                                    .ghost()
+                                    .loading(is_refreshing)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.refresh_subscription(i, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(("delete-sub-btn", i))
+                                    .xsmall()
+                                    .label("×".to_string())
+                                    .tooltip("Remove this subscription and its nodes")
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.delete_subscription(i, cx);
+                                    })),
+                            ),
+                    );
+            }
             rows = rows.child(row);
         }
         section.child(rows)

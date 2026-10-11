@@ -119,6 +119,10 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.about.update_keep_config" => {
             "Your settings, nodes, subscriptions, and rules stay in the user data folder — only the app binary is replaced."
         }
+        "subs.rename.tip" => "Rename subscription",
+        "subs.rename.save" => "Save",
+        "subs.rename.empty" => "⚠ Name must not be empty",
+        "subs.rename.ok" => "✓ Subscription renamed",
         _ => return None,
     })
 }

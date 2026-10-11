@@ -119,6 +119,10 @@ pub fn lookup(key: &str) -> Option<&'static str> {
         "settings.about.update_keep_config" => {
             "Cài đặt, node, subscription và rule nằm trong thư mục dữ liệu người dùng — cập nhật chỉ thay binary, không xóa cấu hình."
         }
+        "subs.rename.tip" => "Đổi tên subscription",
+        "subs.rename.save" => "Lưu",
+        "subs.rename.empty" => "⚠ Tên không được trống",
+        "subs.rename.ok" => "✓ Đã đổi tên subscription",
         _ => return None,
     })
 }

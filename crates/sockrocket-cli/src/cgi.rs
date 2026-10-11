@@ -516,6 +516,7 @@ fn dispatch(action: &str, post: &J) -> J {
         "subscriptions" => act_subscriptions(),
         "add_sub" => act_add_sub(post),
         "del_sub" => act_del_sub(post),
+        "rename_sub" => act_rename_sub(post),
         "update_subs" => act_update_subs(),
         "speedtest" => act_speedtest(),
         "stats" => act_stats(),
@@ -900,6 +901,46 @@ fn act_del_sub(post: &J) -> J {
     map.insert(ykey("subscriptions"), Y::Sequence(seq));
     match save_conf(&map) {
         Ok(()) => json!({"ok": true, "msg": "Subscription deleted"}),
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
+}
+
+/// Rename a subscription display name only — no fetch, no restart.
+fn act_rename_sub(post: &J) -> J {
+    let Some(index) = post
+        .get("index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+    else {
+        return err_msg("Invalid parameters");
+    };
+    let name = post
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return err_msg("Name must not be empty");
+    }
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut seq = match map.remove(ykey("subscriptions")) {
+        Some(Y::Sequence(s)) => s,
+        _ => Vec::new(),
+    };
+    if index >= seq.len() {
+        return err_msg("Subscription index out of range");
+    }
+    match &mut seq[index] {
+        Y::Mapping(m) => {
+            m.insert(ykey("name"), Y::String(name.to_string()));
+        }
+        _ => return err_msg("Invalid subscription entry"),
+    }
+    map.insert(ykey("subscriptions"), Y::Sequence(seq));
+    match save_conf(&map) {
+        Ok(()) => json!({"ok": true, "msg": "Subscription renamed", "name": name}),
         Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
     }
 }
@@ -2775,6 +2816,22 @@ dns_direct_domains:
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0]["name"], J::from("Sub 2"));
+    }
+
+    #[test]
+    fn subscription_rename() {
+        let _env = TestEnv::new(SAMPLE);
+        let r = act_rename_sub(&json!({"index": 0, "name": "  Home  "}));
+        assert_eq!(r["ok"], J::Bool(true), "{r}");
+        assert_eq!(r["name"], J::from("Home"));
+        let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
+        assert_eq!(subs[0]["name"], J::from("Home"));
+        // URL unchanged
+        assert!(!subs[0]["url"].as_str().unwrap_or("").is_empty());
+        let r = act_rename_sub(&json!({"index": 0, "name": "   "}));
+        assert_eq!(r["ok"], J::Bool(false));
+        let r = act_rename_sub(&json!({"index": 99, "name": "X"}));
+        assert_eq!(r["ok"], J::Bool(false));
     }
 
     #[test]
