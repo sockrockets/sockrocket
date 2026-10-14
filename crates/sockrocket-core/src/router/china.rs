@@ -6,6 +6,14 @@
 use super::engine::{MatchRule, RouteAction, RuleSet};
 use super::geoip::GeoIpDb;
 
+/// Curated China domain suffixes shared by routing (`geoip`/domain Direct)
+/// and Merlin split-DNS (Fallback / no fake-IP). Keep this the single list —
+/// a shorter DNS-only copy used to miss CDN hostnames, which then got
+/// fake-IP answers and were dialed through the proxy in Rule mode.
+pub fn china_domain_suffix_list() -> &'static [&'static str] {
+    CHINA_DOMAIN_SUFFIXES
+}
+
 /// Build a [`RuleSet`] with built-in China-direct rules.
 ///
 /// Order:
@@ -245,6 +253,21 @@ mod tests {
     fn china_ruleset_has_rules() {
         let rs = china_direct_ruleset();
         assert!(rs.rules().len() > 100, "should have many rules");
+    }
+
+    #[test]
+    fn dns_china_suffixes_match_routing_list() {
+        let dns = crate::dns::china_domain_suffixes();
+        let routing: Vec<&str> = china_domain_suffix_list().to_vec();
+        assert_eq!(dns.len(), routing.len());
+        for (a, b) in dns.iter().zip(routing.iter()) {
+            assert_eq!(a, b);
+        }
+        assert!(
+            dns.iter().any(|s| s == "meituan.com"),
+            "CDN-heavy domestic names must be on the shared list"
+        );
+        assert!(dns.iter().any(|s| s == "hdslb.com"));
     }
 
     #[test]

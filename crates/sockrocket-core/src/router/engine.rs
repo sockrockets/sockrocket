@@ -353,11 +353,31 @@ async fn resolve_host(host: &str) -> Option<IpAddr> {
         _ => return None,
     };
     let addrs: Vec<_> = addrs.collect();
-    addrs
+    let ip = addrs
         .iter()
         .find(|sa| sa.is_ipv4())
         .or_else(|| addrs.first())
-        .map(|sa| sa.ip())
+        .map(|sa| sa.ip())?;
+
+    // On Merlin, system DNS is hijacked into Sockrocket. A Primary-group
+    // name therefore comes back as a fake-IP (198.18/16). Feeding that into
+    // geoip:CN always misses, so Rule mode incorrectly Proxies domestic
+    // sites that were only missing from the domain list. Re-query a
+    // mainland resolver for a real address before GeoIP matching.
+    if let IpAddr::V4(v4) = ip
+        && crate::dns::fakeip::is_fake_ip(v4)
+    {
+        const DOMESTIC_NS: &[&str] = &["223.5.5.5:53", "119.29.29.29:53"];
+        for ns in DOMESTIC_NS {
+            if let Ok(server) = ns.parse()
+                && let Some(real) = crate::dns::lookup_a_udp(server, host).await
+            {
+                return Some(real);
+            }
+        }
+        return None;
+    }
+    Some(ip)
 }
 
 /// Parse a CIDR string like "192.168.0.0/16" or "::1/128".

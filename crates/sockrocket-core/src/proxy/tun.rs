@@ -415,6 +415,7 @@ impl TunProxy {
             resolver.set_outbound(outbound.clone());
             if let Some(pool) = &fakeip {
                 resolver.set_fakeip(pool.clone());
+                resolver.set_geoip(std::sync::Arc::new(crate::router::china_geoip_db()));
             }
             let dns_resolver = Arc::new(resolver);
 

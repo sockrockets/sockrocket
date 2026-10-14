@@ -16,6 +16,10 @@
 
 **Sockrocket** is a Rust proxy client with a native GUI, a CLI, and a first-class **AsusWRT-Merlin** plugin. One stack from your laptop to the whole LAN.
 
+<p align="center">
+  <img src="docs/screenshots/app.png" alt="Sockrocket desktop" width="720"/>
+</p>
+
 ---
 
 ## Why Sockrocket

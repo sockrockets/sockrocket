@@ -58,6 +58,11 @@ impl GeoIpDb {
             .sort_by_key(|b| std::cmp::Reverse(b.prefix_len));
     }
 
+    /// True when `ip` is classified as mainland China (`CN`).
+    pub fn is_cn(&self, ip: IpAddr) -> bool {
+        matches!(self.lookup(ip), Some(c) if c.eq_ignore_ascii_case("CN"))
+    }
+
     /// Lookup the country code for an IP address.
     pub fn lookup(&self, ip: IpAddr) -> Option<&str> {
         let ip_bits = ip_to_u128(ip);
@@ -167,6 +172,17 @@ mod tests {
         // Public IPs should not match
         assert_eq!(db.lookup("8.8.8.8".parse().unwrap()), None);
         assert_eq!(db.lookup("1.1.1.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn test_china_geoip_is_cn() {
+        let db = crate::router::china_geoip_db();
+        assert!(db.is_cn("114.114.114.114".parse().unwrap()));
+        assert!(!db.is_cn("8.8.8.8".parse().unwrap()));
+        assert!(
+            !db.is_cn("10.0.0.1".parse().unwrap()),
+            "PRIVATE must not count as CN for resolve-then-geoip"
+        );
     }
 
     #[test]

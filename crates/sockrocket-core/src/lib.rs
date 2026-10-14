@@ -77,8 +77,8 @@ pub use dns::{
 };
 
 pub use router::{
-    GeoIpDb, MatchRule, RouteAction, Router, RuleSet, china_direct_ruleset, china_geoip_db,
-    china_ipv4_cidrs, rule_mode_ruleset,
+    GeoIpDb, MatchRule, RouteAction, Router, RuleSet, china_direct_ruleset,
+    china_domain_suffix_list, china_geoip_db, china_ipv4_cidrs, rule_mode_ruleset,
 };
 pub use share_server::{
     DEFAULT_SHARE_PORT, ShareServer, ShareState, SharedShareState, generate_token, local_lan_ip,

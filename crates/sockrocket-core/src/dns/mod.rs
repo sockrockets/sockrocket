@@ -21,8 +21,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::proxy::connector::{BoxProxyStream, SharedOutbound, connect_upstream};
+use crate::router::GeoIpDb;
 
 use self::fakeip::FakeIpPool;
+
+/// Cap for the resolve-then-geoip CN-direct decision cache.
+const CN_DIRECT_CACHE_MAX: usize = 4096;
 
 /// DNS resolver configuration.
 #[derive(Debug, Clone)]
@@ -196,6 +200,15 @@ pub struct DnsResolver {
     /// Fake-IP pool (TUN transparent proxy only). `None` in plain
     /// socks/http mode, where clients need real addresses.
     fakeip: Option<Arc<FakeIpPool>>,
+    /// Optional GeoIP DB for resolve-then-geoip before fake-IP allocation.
+    /// When set with [`Self::set_fakeip`], Primary-group A queries first
+    /// resolve via the clean primary upstream; if any answer is `geoip:CN`,
+    /// the real addresses are returned (domestic direct) instead of a
+    /// fake-IP. Avoids relying on an incomplete domain suffix list.
+    geoip: Option<Arc<GeoIpDb>>,
+    /// Cached per-domain CN-direct decisions from resolve-then-geoip
+    /// (`true` = return real IPs / direct; `false` = fake-IP / proxy).
+    cn_direct: Arc<RwLock<LruCache<String, bool>>>,
     /// Proxy-server hostnames (the tunnel endpoints). These must NEVER be
     /// answered with fake IPs and must resolve via the direct (fallback)
     /// group: the router's own tooling (Web UI speedtest uses system DNS)
@@ -238,6 +251,10 @@ impl DnsResolver {
             proxy_tls_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
             tls_connector: build_dot_tls_connector(),
             fakeip: None,
+            geoip: None,
+            cn_direct: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(CN_DIRECT_CACHE_MAX).expect("capacity is non-zero"),
+            ))),
             server_domains: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
@@ -275,12 +292,19 @@ impl DnsResolver {
     }
 
     /// Attach a fake-IP pool (see [`fakeip`]). With a pool attached, A
-    /// queries for primary-group (international) domains are answered from
-    /// the fake range; the TUN stream handler owns the same pool and dials
-    /// the domain by name. Domestic (fallback-group) names still resolve
-    /// normally so geoip-based direct routing keeps working for them.
+    /// queries for primary-group domains may be answered from the fake
+    /// range (see [`Self::set_geoip`] for resolve-then-geoip). Domestic
+    /// (fallback-group) names still resolve to real addresses.
     pub fn set_fakeip(&mut self, pool: Arc<FakeIpPool>) {
         self.fakeip = Some(pool);
+    }
+
+    /// Attach a GeoIP database so fake-IP mode can classify Primary-group
+    /// names by **resolved IP country** (`geoip:CN` → real address / direct;
+    /// otherwise fake-IP / proxy). Without this, only the domain suffix
+    /// table decides who gets a fake-IP.
+    pub fn set_geoip(&mut self, db: Arc<GeoIpDb>) {
+        self.geoip = Some(db);
     }
 
     /// Whether `ip` belongs to the fake-IP range this resolver hands out.
@@ -342,23 +366,23 @@ impl DnsResolver {
             });
         }
 
-        // Fake-IP interception (transparent proxy): international domains
-        // (primary group) are answered from the fake pool instead of real
-        // upstream resolution. The TUN stream handler maps the fake address
-        // back to the domain and dials by NAME, which keeps the relay's
-        // server-side DNS resolution (unlock model) alive — dialing the
-        // client-resolved real IP fails on exits that can only reach their
-        // own DNS-resolved unlock addresses. Domestic names never enter the
-        // pool: geoip:CN → direct routing needs their real addresses.
+        // Fake-IP interception (transparent proxy) for Primary-group names.
+        // Fallback-group (curated China suffixes / server hosts) always get
+        // real addresses below. When a GeoIP DB is attached, Primary names
+        // are classified by resolve-then-geoip on a *clean* primary upstream
+        // (never domestic UDP — those poison google et al.): any `CN` answer
+        // → real IPs + domestic direct table; otherwise → fake-IP so the TUN
+        // dials by name (DNS-unlock exits).
         if let Some(pool) = &self.fakeip
             && self.match_domain_group(domain) == DnsGroup::Primary
         {
+            if self.geoip.is_some() {
+                return self.resolve_primary_fakeip_or_cn(domain, qtype, pool).await;
+            }
             if qtype == QTYPE_A {
                 return Ok(vec![IpAddr::V4(pool.allocate(domain))]);
             }
-            // AAAA (and every other type): NODATA, so dual-stack clients
-            // fall back to the A answer with its fake IPv4 instead of
-            // holding a real IPv6 that would bypass the domain-dial path.
+            // AAAA (and every other type): NODATA under pure fake-IP mode.
             return Ok(Vec::new());
         }
 
@@ -400,6 +424,77 @@ impl DnsResolver {
         }
 
         self.resolve_dedup(domain, qtype).await
+    }
+
+    /// Primary + fake-IP + GeoIP: resolve-then-geoip, then real CN or fake.
+    async fn resolve_primary_fakeip_or_cn(
+        &self,
+        domain: &str,
+        qtype: u16,
+        pool: &FakeIpPool,
+    ) -> Result<Vec<IpAddr>> {
+        let key = domain.to_lowercase();
+        if let Some(cn) = {
+            let cache = self.cn_direct.read().await;
+            cache.peek(&key).copied()
+        } {
+            return if cn {
+                self.answer_cn_direct(domain, qtype, pool).await
+            } else {
+                Ok(Self::answer_fakeip(pool, domain, qtype))
+            };
+        }
+
+        // Probe A on the clean primary upstream (ProxyTls / 8.8.8.8) — same
+        // path international clients need, without re-entering this hook.
+        let probe = self.resolve_dedup(domain, QTYPE_A).await?;
+        let cn = self.ips_are_cn(&probe);
+        {
+            let mut cache = self.cn_direct.write().await;
+            cache.put(key, cn);
+        }
+
+        if cn {
+            self.record_probe_domestic(domain, pool, &probe);
+            if qtype == QTYPE_A {
+                return Ok(probe);
+            }
+            return self.answer_cn_direct(domain, qtype, pool).await;
+        }
+        Ok(Self::answer_fakeip(pool, domain, qtype))
+    }
+
+    fn answer_fakeip(pool: &FakeIpPool, domain: &str, qtype: u16) -> Vec<IpAddr> {
+        if qtype == QTYPE_A {
+            vec![IpAddr::V4(pool.allocate(domain))]
+        } else {
+            // NODATA for AAAA so dual-stack clients use the fake A answer.
+            Vec::new()
+        }
+    }
+
+    async fn answer_cn_direct(
+        &self,
+        domain: &str,
+        qtype: u16,
+        pool: &FakeIpPool,
+    ) -> Result<Vec<IpAddr>> {
+        let addrs = self.resolve_dedup(domain, qtype).await?;
+        self.record_probe_domestic(domain, pool, &addrs);
+        Ok(addrs)
+    }
+
+    fn ips_are_cn(&self, addrs: &[IpAddr]) -> bool {
+        let Some(geo) = self.geoip.as_ref() else {
+            return false;
+        };
+        addrs.iter().any(|ip| geo.is_cn(*ip))
+    }
+
+    fn record_probe_domestic(&self, domain: &str, pool: &FakeIpPool, addrs: &[IpAddr]) {
+        for addr in addrs {
+            pool.record_domestic(*addr, domain);
+        }
     }
 
     /// Resolve with in-flight dedup: concurrent resolves for the same
@@ -1102,33 +1197,35 @@ pub fn build_dns_error_response(query: &[u8], rcode: u8) -> Vec<u8> {
     resp
 }
 
-/// Common China domain suffixes for DNS splitting.
+/// China domain suffixes for DNS splitting (same curated list as routing).
+///
+/// Names on this list use Fallback (domestic resolvers + real IPs, never
+/// fake-IP). Everything else is Primary and may get a fake-IP in TUN mode.
+/// Must stay in sync with [`crate::router::china_domain_suffix_list`] —
+/// otherwise CDN hostnames of domestic apps miss the list, get fake-IP,
+/// and Rule mode dials them through the proxy.
 pub fn china_domain_suffixes() -> Vec<String> {
-    vec![
-        "cn".to_string(),
-        "com.cn".to_string(),
-        "net.cn".to_string(),
-        "org.cn".to_string(),
-        "baidu.com".to_string(),
-        "qq.com".to_string(),
-        "taobao.com".to_string(),
-        "tmall.com".to_string(),
-        "jd.com".to_string(),
-        "alipay.com".to_string(),
-        "weibo.com".to_string(),
-        "bilibili.com".to_string(),
-        "zhihu.com".to_string(),
-        "163.com".to_string(),
-        "douyin.com".to_string(),
-        "tiktok.com".to_string(),
-        "sina.com".to_string(),
-        "sohu.com".to_string(),
-        "csdn.net".to_string(),
-        "aliyun.com".to_string(),
-        // Domestic services on non-.cn domains whose CDN ranges geoip
-        // databases often miss — the DNS-split decision is the reliable
-        // signal (see FakeIpPool::record_domestic).
-    ]
+    crate::router::china_domain_suffix_list()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Resolve `domain` for an A record via a plain UDP nameserver.
+///
+/// Used when system DNS would return a Sockrocket fake-IP (Merlin LAN
+/// hijack loops back into this daemon) and GeoIP needs a real address.
+pub(crate) async fn lookup_a_udp(server: SocketAddr, domain: &str) -> Option<IpAddr> {
+    let query = build_dns_query(domain, QTYPE_A);
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    socket.send_to(&query, server).await.ok()?;
+    let mut buf = [0u8; 512];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    let addrs = parse_dns_response(&buf[..n]).ok()?;
+    addrs.into_iter().find(|a| a.is_ipv4())
 }
 
 /// Create a DnsConfig with China DNS splitting.
@@ -1865,5 +1962,53 @@ mod tests {
             .await
             .expect("listener must stop on shutdown")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fakeip_resolve_then_geoip_cn_returns_real_ip() {
+        let cn_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let (server, _) = spawn_mock_dns(vec![cn_ip], vec![], false).await;
+        let mut resolver = resolver_to(server);
+        let pool = FakeIpPool::new();
+        resolver.set_fakeip(pool.clone());
+        let mut geo = GeoIpDb::new();
+        geo.add_entry("1.2.3.0/24", "CN");
+        geo.build();
+        resolver.set_geoip(Arc::new(geo));
+
+        // Domain is Primary (empty domain_rules) → would have been fake-IP
+        // without geoip; with geoip:CN on the probe answer → real IP.
+        let addrs = resolver.resolve("cdn.random-domestic.test").await.unwrap();
+        assert_eq!(addrs, vec![cn_ip]);
+        assert!(!resolver.is_fake(&addrs[0]));
+        assert_eq!(
+            pool.lookup_domestic(cn_ip).as_deref(),
+            Some("cdn.random-domestic.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn fakeip_resolve_then_geoip_non_cn_stays_fake() {
+        let overseas = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let (server, _) = spawn_mock_dns(vec![overseas], vec![], false).await;
+        let mut resolver = resolver_to(server);
+        let pool = FakeIpPool::new();
+        resolver.set_fakeip(pool.clone());
+        let mut geo = GeoIpDb::new();
+        geo.add_entry("1.2.3.0/24", "CN");
+        geo.build();
+        resolver.set_geoip(Arc::new(geo));
+
+        let addrs = resolver.resolve("www.google.test").await.unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert!(resolver.is_fake(&addrs[0]));
+        assert_eq!(
+            pool.lookup(match addrs[0] {
+                IpAddr::V4(v) => v,
+                _ => panic!("expected v4 fake"),
+            })
+            .as_deref(),
+            Some("www.google.test")
+        );
     }
 }

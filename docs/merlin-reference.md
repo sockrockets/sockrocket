@@ -27,9 +27,15 @@ Browser → TCP 198.18.0.x:443
   → MARK 0x4765 → policy table 5370 → dev sockrocket-tun → ipstack
   → Fake IP → domain lookup → router rules → proxy outbound (dial by domain)
 
-Domestic example (e.g. example.cn in suffix list):
+Domestic example (e.g. example.cn / curated China suffixes):
   → Fallback resolvers → real IP, cached in domestic direct table
   → Traffic may RETURN before TUN (cn ipset) or hit direct table inside TUN
+
+DNS Fallback suffixes and routing China-direct suffixes share one list
+(`china_domain_suffix_list`) as a fast path. For everything else, Fake-IP
+mode runs **resolve-then-geoip**: clean primary upstream (DoT via node) →
+if any A is `geoip:CN`, return the real address (domestic direct table);
+otherwise allocate a fake-IP so TUN still dials by name for unlock exits.
 ```
 
 ### 1.2 Processes on router

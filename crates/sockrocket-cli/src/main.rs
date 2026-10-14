@@ -170,7 +170,10 @@ async fn async_main() -> Result<()> {
             }
             if let Some(pool) = &fakeip_pool {
                 resolver.set_fakeip(pool.clone());
-                tracing::info!("DNS: fake-IP mode active (198.18.0.0/16) for transparent proxy");
+                resolver.set_geoip(Arc::new(sockrocket_core::china_geoip_db()));
+                tracing::info!(
+                    "DNS: fake-IP mode active (198.18.0.0/16); resolve-then-geoip:CN → real/direct"
+                );
             }
             let shutdown = Arc::new(tokio::sync::Notify::new());
             let task = tokio::spawn({

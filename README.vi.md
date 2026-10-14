@@ -16,6 +16,10 @@
 
 **Sockrocket** là client proxy viết bằng Rust: GUI native, CLI, và plugin **AsusWRT-Merlin** hạng nhất. Một stack từ máy tính đến cả LAN.
 
+<p align="center">
+  <img src="docs/screenshots/app.png" alt="Sockrocket desktop" width="720"/>
+</p>
+
 ---
 
 ## Vì sao chọn Sockrocket

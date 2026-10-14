@@ -16,6 +16,10 @@
 
 **Sockrocket** 是 Rust 代理客户端：原生 GUI、CLI，以及一等公民的 **华硕梅林（AsusWRT-Merlin）** 插件。从电脑到整网 LAN，同一套栈。
 
+<p align="center">
+  <img src="docs/screenshots/app.png" alt="Sockrocket 桌面端" width="720"/>
+</p>
+
 ---
 
 ## 为什么选 Sockrocket
