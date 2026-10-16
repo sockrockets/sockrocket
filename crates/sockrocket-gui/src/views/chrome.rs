@@ -1,9 +1,7 @@
-// === Chrome (v2): title bar, icon sidebar, status bar ===
-// TitleBar 34px: logo | drag strip | mode capsule · node badge | controls.
-// Borderless against the 38px icon rail below it — both share BG_SIDEBAR so
-// the chrome reads as one continuous surface (ui-prototype-v2 §topbar).
-// StatusBar 26px: status pill · node latency | ports · speeds · version.
-// Visual recipes follow ui-prototype-v2 via `crate::theme`.
+// === Chrome (macOS-leaning): title bar, labeled sidebar, status bar ===
+// TitleBar ~44px: brand | drag | mode segmented control · node.
+// Sidebar ~168px with icon + label (System Settings style).
+// StatusBar 28px: quiet meta, hairline top.
 
 use crate::app::*;
 use crate::theme::*;
@@ -44,11 +42,10 @@ fn vsep() -> Div {
         .bg(rgba(with_alpha(BORDER, 0x99)))
 }
 
-/// MICRO mono status bar item.
+/// Quiet status bar meta item.
 fn statusbar_item(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(MICRO))
-        .font_family(MONO_FONT)
         .text_color(rgb(TEXT_SECONDARY))
         .child(text.into())
 }
@@ -68,6 +65,12 @@ const NAV_ITEMS: &[(&str, &str, &str, ActiveView)] = &[
         "Ctrl+2",
         "icons/nav-nodes.svg",
         ActiveView::Nodes,
+    ),
+    (
+        "nav.subscriptions",
+        "Ctrl+8",
+        "icons/nav-nodes.svg",
+        ActiveView::Config,
     ),
     (
         "nav.groups",
@@ -218,38 +221,31 @@ impl AppState {
 
         div()
             .id("title-bar")
-            .h(px(34.0))
+            .h(px(52.0))
             .w_full()
             .flex()
             .flex_row()
             .items_center()
-            // macOS traffic lights sit over the title bar; match gpui-component's
-            // TITLE_BAR_LEFT_PADDING so the logo/brand is not covered.
+            // macOS traffic lights sit over the title bar; keep brand clear.
             .when(cfg!(target_os = "macos"), |el| el.pl(px(80.0)))
-            .when(!cfg!(target_os = "macos"), |el| el.pl_2())
+            .when(!cfg!(target_os = "macos"), |el| el.pl_3())
             .bg(rgb(BG_SIDEBAR))
-            // No bottom border: the title bar and the sidebar share
-            // BG_SIDEBAR, so chrome reads as one continuous surface; the
-            // content area separates by background color alone.
-            // ── Left: logo (cyan block + sockrocket mark) ──────────────
+            .border_b_1()
+            .border_color(rgba(with_alpha(BORDER, 0xcc)))
+            // ── Left: quiet brand mark ────────────────────────────────
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_1p5()
+                    .gap_2()
                     .h_full()
-                    // Logo mark: cyan gradient block + dark sockrocket
                     .child(
                         div()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(4.0))
-                            .bg(linear_gradient(
-                                135.0,
-                                linear_color_stop(rgba(0x22d3eeff), 0.0),
-                                linear_color_stop(rgba(0x22d3ee80), 1.0),
-                            ))
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(ACCENT))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -257,13 +253,13 @@ impl AppState {
                                 Icon::empty()
                                     .path("icons/sockrocket.svg")
                                     .with_size(Size::Size(px(12.0)))
-                                    .text_color(rgb(BG_APP)),
+                                    .text_color(rgb(0xffffff)),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(PAGE_TITLE))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT_PRIMARY))
                             .child(sockrocket_gui::i18n::t("chrome.brand")),
                     ),
@@ -289,28 +285,25 @@ impl AppState {
                     .gap_2()
                     .h_full()
                     .pr_2()
-                    // Mode capsule: segmented control (Rule / Global / Direct)
+                    // Mode: NSSegmentedControl-style
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(2.0))
-                            .p(px(2.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(BG_HOVER))
-                            .border_1()
-                            .border_color(rgba(with_alpha(BORDER, 0x99)))
+                        seg_group()
                             .child(
-                                seg_button("mode-rule", "Rule", self.proxy_mode == ProxyMode::Rule)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                seg_button(
+                                    "mode-rule",
+                                    sockrocket_gui::i18n::t("chrome.mode.rule"),
+                                    self.proxy_mode == ProxyMode::Rule,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.set_proxy_mode(ProxyMode::Rule, cx);
-                                    })),
+                                    },
+                                )),
                             )
                             .child(
                                 seg_button(
                                     "mode-global",
-                                    "Global",
+                                    sockrocket_gui::i18n::t("chrome.mode.global"),
                                     self.proxy_mode == ProxyMode::Global,
                                 )
                                 .on_click(cx.listener(
@@ -322,7 +315,7 @@ impl AppState {
                             .child(
                                 seg_button(
                                     "mode-direct",
-                                    "Direct",
+                                    sockrocket_gui::i18n::t("chrome.mode.direct"),
                                     self.proxy_mode == ProxyMode::Direct,
                                 )
                                 .on_click(cx.listener(
@@ -333,11 +326,13 @@ impl AppState {
                             ),
                     )
                     .child(vsep().h(px(14.0)))
-                    // Active node badge (click → Nodes page)
                     .children(active_node_info.map(|(name, latency)| {
                         let connected = self.proxy_running;
                         div()
                             .id("titlebar-node-badge")
+                            .max_w(px(260.0))
+                            .min_w_0()
+                            .overflow_hidden()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -345,22 +340,12 @@ impl AppState {
                             .px_2()
                             .py_0p5()
                             .rounded(px(6.0))
-                            .border_1()
                             .cursor_pointer()
-                            .bg(if connected {
-                                rgba(with_alpha(SUCCESS, 0x0d))
-                            } else {
-                                rgba(with_alpha(TEXT_MUTED, 0x0d))
-                            })
-                            .border_color(if connected {
-                                rgba(with_alpha(SUCCESS, 0x33))
-                            } else {
-                                rgba(with_alpha(TEXT_MUTED, 0x33))
-                            })
+                            .hover(|s| s.bg(rgb(BG_HOVER)))
                             .tooltip(|window, cx| {
-                                gpui_component::tooltip::Tooltip::new(
-                                    "Active node — open Nodes (Ctrl+2)",
-                                )
+                                gpui_component::tooltip::Tooltip::new(sockrocket_gui::i18n::t(
+                                    "chrome.node_tip",
+                                ))
                                 .build(window, cx)
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -370,20 +355,18 @@ impl AppState {
                             .child(
                                 div()
                                     .text_size(px(MICRO))
-                                    .font_family(MONO_FONT)
-                                    .text_color(if connected {
-                                        rgb(SUCCESS)
-                                    } else {
-                                        rgb(TEXT_SECONDARY)
-                                    })
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
                                     .child(name),
                             )
                             .when(!latency.is_empty(), |this| {
                                 this.child(
                                     div()
                                         .text_size(px(TINY))
-                                        .font_family(MONO_FONT)
-                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_color(rgb(TEXT_SECONDARY))
                                         .child(latency),
                                 )
                             })
@@ -416,19 +399,19 @@ impl AppState {
                     .unwrap_or_default();
                 format!("{}{}", n.name, latency)
             })
-            .unwrap_or_else(|| "no node".to_string());
+            .unwrap_or_else(|| sockrocket_gui::i18n::t("chrome.no_node").to_string());
 
         div()
             .w_full()
-            .h(px(26.0))
+            .h(px(28.0))
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .px_3()
+            .px_4()
             .bg(rgb(BG_SIDEBAR))
             .border_t_1()
-            .border_color(rgba(with_alpha(BORDER, 0x99)))
+            .border_color(rgba(with_alpha(BORDER, 0xcc)))
             // ── Left: language · status · node summary ─────────────────
             .child(
                 div()
@@ -442,7 +425,6 @@ impl AppState {
                         div()
                             .id("statusbar-language")
                             .text_size(px(MICRO))
-                            .font_family(MONO_FONT)
                             .text_color(rgb(TEXT_MUTED))
                             .cursor_pointer()
                             .hover(|s| s.text_color(rgb(TEXT_SECONDARY)))
@@ -470,8 +452,8 @@ impl AppState {
                             .child(
                                 div()
                                     .text_size(px(MICRO))
-                                    .font_family(MONO_FONT)
-                                    .text_color(rgb(kind.color()))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT_PRIMARY))
                                     .child(kind.label()),
                             ),
                     )
@@ -479,8 +461,7 @@ impl AppState {
                         div()
                             .min_w_0()
                             .text_size(px(MICRO))
-                            .font_family(MONO_FONT)
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(rgb(TEXT_SECONDARY))
                             .child(node_summary),
                     ),
             )
@@ -492,22 +473,10 @@ impl AppState {
                     .items_center()
                     .gap_3()
                     .flex_shrink_0()
-                    .child(statusbar_item(format!("SOCKS :{}", self.socks_port)))
-                    .child(statusbar_item(format!("HTTP :{}", self.http_port)))
-                    .child(
-                        div()
-                            .text_size(px(MICRO))
-                            .font_family(MONO_FONT)
-                            .text_color(rgb(ACCENT))
-                            .child(format!("↑ {}", up)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(MICRO))
-                            .font_family(MONO_FONT)
-                            .text_color(rgb(SUCCESS))
-                            .child(format!("↓ {}", down)),
-                    )
+                    .child(statusbar_item(format!("SOCKS {}", self.socks_port)))
+                    .child(statusbar_item(format!("HTTP {}", self.http_port)))
+                    .child(statusbar_item(format!("↑ {up}")))
+                    .child(statusbar_item(format!("↓ {down}")))
                     .child(statusbar_item(format!("{} nodes", self.nodes.len())))
                     .child(statusbar_item(format!("v{}", env!("CARGO_PKG_VERSION")))),
             )
@@ -516,52 +485,74 @@ impl AppState {
     pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_view.clone();
 
-        let mut nav = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_1()
-            .pt_2()
-            .flex_1();
+        let mut nav = div().flex().flex_col().gap(px(4.0)).px_3().pt_4().flex_1();
 
         for (i, (key, shortcut, icon, view)) in NAV_ITEMS.iter().enumerate() {
-            // Separator before the secondary group (Settings), per v2
-            if i == 6 {
+            // Settings sits apart as a secondary group.
+            if i == NAV_ITEMS.len() - 1 {
                 nav = nav.child(
                     div()
-                        .w(px(20.0))
                         .h(px(1.0))
-                        .my_1()
-                        .bg(rgba(with_alpha(BORDER, 0x99))),
+                        .mx_2()
+                        .my_2()
+                        .bg(rgba(with_alpha(BORDER, 0xaa))),
                 );
             }
             let label = sockrocket_gui::i18n::t(key);
-            nav = nav.child(self.nav_icon_item(
-                key,
-                label,
-                shortcut,
-                icon,
-                view.clone(),
-                &active,
-                cx,
-            ));
+            nav =
+                nav.child(self.nav_row_item(key, label, shortcut, icon, view.clone(), &active, cx));
         }
 
         div()
-            .w(px(38.0))
+            .w(px(224.0))
             .h_full()
             .flex()
             .flex_col()
             .bg(rgb(BG_SIDEBAR))
             .border_r_1()
-            .border_color(rgba(with_alpha(BORDER, 0x99)))
+            .border_color(rgba(with_alpha(BORDER, 0xcc)))
+            .child(
+                div()
+                    .id("sidebar-search")
+                    .mx_3()
+                    .mt_4()
+                    .px_2()
+                    .py_2()
+                    .rounded(px(8.0))
+                    .bg(rgba(0xffffff99))
+                    .border_1()
+                    .border_color(rgba(with_alpha(BORDER, 0x99)))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(BG_PANEL)))
+                    .child(nav_icon("icons/search.svg", TEXT_SECONDARY))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(SMALL))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(sockrocket_gui::i18n::t("chrome.search")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(MICRO))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(if cfg!(target_os = "macos") {
+                                "⌘K"
+                            } else {
+                                "Ctrl K"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
+            )
             .child(nav)
     }
 
-    /// v2 icon-only nav button: 32×32, active = cyan/10 tinted bg + accent
-    /// icon + 2px accent left bar; tooltip carries label + shortcut.
+    /// Labeled sidebar row (System Settings style).
     #[allow(clippy::too_many_arguments)]
-    fn nav_icon_item(
+    fn nav_row_item(
         &self,
         id_key: &str,
         label: &str,
@@ -572,19 +563,25 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active = *active == view;
+        let shortcut = if cfg!(target_os = "macos") {
+            shortcut.replace("Ctrl+", "⌘")
+        } else {
+            shortcut.to_string()
+        };
         let tooltip_text = SharedString::from(format!("{} · {}", label, shortcut));
 
         div()
             .id(SharedString::from(format!("nav-{}", id_key)))
-            .relative()
-            .w(px(32.0))
-            .h(px(32.0))
+            .w_full()
+            .h(px(36.0))
+            .px_2()
             .rounded(px(8.0))
             .cursor_pointer()
             .flex()
+            .flex_row()
             .items_center()
-            .justify_center()
-            .when(is_active, |d| d.bg(rgba(with_alpha(ACCENT, 0x1a))))
+            .gap_2()
+            .when(is_active, |d| d.bg(rgb(ACCENT)))
             .when(!is_active, |d| d.hover(|s| s.bg(rgb(BG_HOVER))))
             .tooltip(move |window, cx| {
                 gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
@@ -592,21 +589,34 @@ impl AppState {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.set_view(view.clone(), cx);
             }))
-            // Active indicator: 2px ACCENT bar on the left edge
             .child(
                 div()
-                    .absolute()
-                    .left(px(-3.0))
-                    .top(px(9.0))
-                    .w(px(2.0))
-                    .h(px(14.0))
-                    .rounded_r(px(2.0))
-                    .bg(if is_active {
-                        rgb(ACCENT)
-                    } else {
-                        rgba(0x00000000)
-                    }),
+                    .size(px(24.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(match id_key {
+                        "nav.dashboard" => ACCENT,
+                        "nav.nodes" => 0x34a853,
+                        "nav.groups" => 0x8856d9,
+                        "nav.connections" => 0x00a3a3,
+                        "nav.rules" => 0xf09628,
+                        "nav.logs" => 0x6e7785,
+                        _ => 0x8b8d98,
+                    }))
+                    .child(nav_icon(icon, 0xffffff)),
             )
-            .child(nav_icon(icon, if is_active { ACCENT } else { TEXT_MUTED }))
+            .child(
+                div()
+                    .text_size(px(BODY))
+                    .font_weight(if is_active {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(rgb(if is_active { 0xffffff } else { TEXT_PRIMARY }))
+                    .child(label.to_string()),
+            )
     }
 }

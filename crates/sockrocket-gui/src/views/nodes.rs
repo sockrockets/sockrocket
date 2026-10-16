@@ -21,34 +21,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// v3 subscription bar collapse state (starts collapsed like the prototype).
 static SUBS_BAR_OPEN: AtomicBool = AtomicBool::new(false);
 
-/// v3 filter chip: bordered micro pill; active = cyan tint, inactive = muted.
+/// Filter chip: soft fill when active (shared theme recipe).
 fn v3_chip(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     active: bool,
 ) -> Stateful<Div> {
-    let base = div()
-        .id(id)
-        .px_2p5()
-        .py(px(4.0))
-        .rounded(px(6.0))
-        .border_1()
-        .text_size(px(MICRO))
-        .cursor_pointer();
-    if active {
-        base.bg(rgba(with_alpha(ACCENT, 0x1a)))
-            .border_color(rgba(with_alpha(ACCENT, 0x33)))
-            .text_color(rgb(ACCENT))
-            .child(label.into())
-    } else {
-        base.border_color(rgba(with_alpha(BORDER, 0x99)))
-            .text_color(rgb(TEXT_MUTED))
-            .hover(|s| {
-                s.text_color(rgb(TEXT_SECONDARY))
-                    .border_color(rgba(with_alpha(TEXT_MUTED, 0x4d)))
-            })
-            .child(label.into())
-    }
+    filter_chip(id, label, active)
 }
 
 // === Destructive-action two-step confirm (design-system §5.2) ===
@@ -103,22 +82,34 @@ fn hairline() -> Div {
     div().w_full().h(px(1.0)).bg(rgba(with_alpha(BORDER, 0x99)))
 }
 
-/// v2 cyan-tint button (px-3 py-1.5 rounded-lg, ACCENT 0x1a bg + 0x33
-/// border + cyan text); used for "Test All" / "Test Latency" / "Connect".
+/// Soft action button for toolbar ("Test All" / "Connect").
 fn tint_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_3()
-        .py(px(6.0))
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .border_1()
-        .bg(rgba(with_alpha(ACCENT, 0x1a)))
-        .border_color(rgba(with_alpha(ACCENT, 0x33)))
-        .text_size(px(SMALL))
-        .text_color(rgb(ACCENT))
-        .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
-        .child(label.into())
+    tint_action(id, label)
+}
+
+/// Sidebar + content horizontal padding (must stay in sync with chrome / content).
+const NODES_SIDEBAR_W: f32 = 168.0;
+const NODES_CONTENT_PAD_X: f32 = 40.0; // px_5 × 2
+
+/// How the Nodes page splits list vs detail for the current window width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodesLayout {
+    /// Side-by-side list + fixed-width detail panel.
+    Split { detail_w: u32 },
+    /// Stacked: list fills height; detail sits under it when a node is selected.
+    Stack,
+}
+
+fn nodes_layout(window: &Window) -> NodesLayout {
+    let content_w =
+        (f32::from(window.viewport_size().width) - NODES_SIDEBAR_W - NODES_CONTENT_PAD_X).max(0.0);
+    if content_w >= 780.0 {
+        NodesLayout::Split { detail_w: 240 }
+    } else if content_w >= 600.0 {
+        NodesLayout::Split { detail_w: 200 }
+    } else {
+        NodesLayout::Stack
+    }
 }
 
 /// Map a legacy ✓/✗/⚠-prefixed status message to an alert severity so all
@@ -162,7 +153,9 @@ impl AppState {
     }
 
     #[allow(clippy::let_and_return)]
-    pub(crate) fn render_nodes(&mut self, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn render_nodes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let layout = nodes_layout(window);
+        let compact = matches!(layout, NodesLayout::Stack);
         let node_count = self.nodes.len();
 
         // Read and apply text filter
@@ -270,6 +263,12 @@ impl AppState {
             .gap_3()
             .h_full()
             .min_h_0()
+            .child(self.page_header_v3(
+                "icons/nav-nodes.svg",
+                ACCENT,
+                sockrocket_gui::i18n::t("nav.nodes"),
+                sockrocket_gui::i18n::t("nodes.subtitle"),
+            ))
             // --- Subscription bar (v3): collapsible glass panel ---
             .child(self.render_subs_bar(cx))
             .when(self.show_share_panel, |d| {
@@ -283,24 +282,24 @@ impl AppState {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .items_center()
                         .gap_2()
                         .px_3()
                         .py_2()
-                        .rounded(px(8.0))
-                        .bg(rgba(with_alpha(ACCENT, 0x0d)))
-                        .border_1()
-                        .border_color(rgba(with_alpha(ACCENT, 0x33)))
+                        .rounded(px(10.0))
+                        .bg(rgb(BG_PANEL))
                         .child(
                             div()
                                 .text_size(px(SMALL))
-                                .font_family(MONO_FONT)
-                                .text_color(rgb(ACCENT))
-                                .child(format!("{} selected", sel_count)),
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(format!("{sel_count} selected")),
                         )
-                        .child(div().flex_1())
+                        .child(div().flex_1().min_w(px(8.0)))
                         .child(
-                            Button::new("batch-test-btn").xsmall()
+                            Button::new("batch-test-btn")
+                                .xsmall()
                                 .label("Test".to_string())
                                 .tooltip("Test latency for selected nodes")
                                 .ghost()
@@ -322,23 +321,30 @@ impl AppState {
                                 })),
                         )
                         .child(
-                            Button::new("copy-share-btn").xsmall()
+                            Button::new("copy-share-btn")
+                                .xsmall()
                                 .label("Export".to_string())
                                 .tooltip("Copy share URIs for selected nodes to clipboard")
                                 .ghost()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    let links: Vec<String> = this.selected_node_indices
+                                    let links: Vec<String> = this
+                                        .selected_node_indices
                                         .iter()
                                         .filter(|&&i| i < this.nodes.len())
-                                        .map(|&i| sockrocket_core::config::v2ray::node_to_share_uri(&this.nodes[i]))
+                                        .map(|&i| {
+                                            sockrocket_core::config::v2ray::node_to_share_uri(
+                                                &this.nodes[i],
+                                            )
+                                        })
                                         .collect();
                                     let text = links.join("\n");
                                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                                 })),
                         )
                         .child(
-                            Button::new("select-all-btn").xsmall()
-                                .label("Select All".to_string())
+                            Button::new("select-all-btn")
+                                .xsmall()
+                                .label(if compact { "All" } else { "Select All" }.to_string())
                                 .tooltip("Select all visible nodes")
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -349,7 +355,8 @@ impl AppState {
                                 })),
                         )
                         .child(
-                            Button::new("delete-selected-btn").xsmall()
+                            Button::new("delete-selected-btn")
+                                .xsmall()
                                 .label(if delete_selected_armed {
                                     "Confirm?".to_string()
                                 } else {
@@ -367,13 +374,14 @@ impl AppState {
                                         // Stop the proxy first if the active node is
                                         // being deleted (same rule as delete_node).
                                         if this.proxy_running
-                                            && this
-                                                .active_proxy_node
-                                                .is_some_and(|a| this.selected_node_indices.contains(&a))
+                                            && this.active_proxy_node.is_some_and(|a| {
+                                                this.selected_node_indices.contains(&a)
+                                            })
                                         {
                                             this.stop_proxy(cx);
                                         }
-                                        let mut indices: Vec<usize> = this.selected_node_indices.drain().collect();
+                                        let mut indices: Vec<usize> =
+                                            this.selected_node_indices.drain().collect();
                                         indices.sort_unstable_by(|a, b| b.cmp(a));
                                         for idx in indices {
                                             if idx < this.nodes.len() {
@@ -398,7 +406,8 @@ impl AppState {
                                 })),
                         )
                         .child(
-                            Button::new("deselect-all-btn").xsmall()
+                            Button::new("deselect-all-btn")
+                                .xsmall()
                                 .label("Clear".to_string())
                                 .tooltip("Clear selection")
                                 .ghost()
@@ -418,12 +427,7 @@ impl AppState {
             })
             .child({
                 // Filter chips (v3 bordered chips): protocol + tag
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .gap_1p5()
-                    .flex_wrap()
-                    .items_center();
+                let mut row = div().flex().flex_row().gap_1p5().flex_wrap().items_center();
                 if !present_protocols.is_empty() {
                     let all_active = proto_filter.is_none();
                     row = row.child(
@@ -467,316 +471,337 @@ impl AppState {
                             .mx_1(),
                     );
                     let no_tag = cur_tag_filter.is_none();
-                    row = row.child(
-                        v3_chip("tag-all", "All Tags", no_tag).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.tag_filter = None;
-                                cx.notify();
-                            },
-                        )),
-                    );
+                    row = row.child(v3_chip("tag-all", "All Tags", no_tag).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.tag_filter = None;
+                            cx.notify();
+                        },
+                    )));
                     for tag in &all_tags {
                         let tag_clone = tag.clone();
                         let active = cur_tag_filter.as_deref() == Some(tag.as_str());
                         let btn_id = format!("tag-{}", tag);
                         row = row.child(
-                            v3_chip(SharedString::from(btn_id), SharedString::from(format!("#{}", tag)), active)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            v3_chip(
+                                SharedString::from(btn_id),
+                                SharedString::from(format!("#{}", tag)),
+                                active,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.tag_filter = Some(tag_clone.clone());
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         );
                     }
                 }
 
-                // v2 body: horizontal flex — left column (toolbar + chips +
-                // node table) flex-1, right column 240px detail panel.
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_4()
-                    .flex_1()
-                    .min_h_0()
-                    // Left column: toolbar + filter chips + node table
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            // --- Toolbar (v2): search + Test All (cyan tint) + Sort + Dedup + Share ---
+                let detail_panel = {
+                    let selected = self
+                        .selected_node
+                        .and_then(|index| self.nodes.get(index).cloned().map(|node| (index, node)));
+                    match selected {
+                        Some((index, node)) => {
+                            let panel = self.render_selected_node_details(&node, index, cx);
+                            if compact {
+                                panel
+                                    .id("node-detail-stack")
+                                    .max_h(px(280.0))
+                                    .overflow_y_scroll()
+                                    .into_any_element()
+                            } else {
+                                panel.into_any_element()
+                            }
+                        }
+                        None if !compact => card()
                             .child(
                                 div()
                                     .flex()
-                                    .flex_row()
+                                    .flex_col()
                                     .items_center()
+                                    .py_8()
                                     .gap_2()
                                     .child(
                                         div()
-                                            .flex_1()
-                                            .min_w(px(160.0))
-                                            .max_w(px(280.0))
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_3()
-                                            .py(px(6.0))
-                                            .rounded(px(8.0))
-                                            .bg(rgb(BG_HOVER))
-                                            .border_1()
-                                            .border_color(rgba(with_alpha(BORDER, 0x99)))
-                                            .child(
-                                                Icon::empty()
-                                                    .path("icons/search.svg")
-                                                    .with_size(ComponentSize::Size(px(14.0)))
-                                                    .text_color(rgb(TEXT_MUTED)),
-                                            )
-                                            .child(
-                                                gpui_component::input::Input::new(&node_filter_input)
-                                                    .xsmall()
-                                                    .appearance(false)
-                                                    .w_full(),
-                                            ),
+                                            .text_size(px(SMALL))
+                                            .text_color(rgb(TEXT_SECONDARY))
+                                            .child("No node selected"),
                                     )
                                     .child(
-                                        tint_button(
-                                            "test-all-btn",
-                                            if self.latency_testing.is_empty() {
-                                                "Test All"
-                                            } else {
-                                                "Testing…"
-                                            },
-                                        )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.auto_select_best = false;
-                                                this.test_all_latency(cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("sort-latency-btn").xsmall()
-                                            .label("Sort ↓".to_string())
-                                            .tooltip("Sort nodes by latency (fastest first)")
-                                            .ghost()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.sort_nodes_by_latency(cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("dedup-nodes-btn").xsmall()
-                                            .label("Dedup".to_string())
-                                            .tooltip("Remove duplicate nodes (same server + credentials)")
-                                            .ghost()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.dedup_nodes_action(cx);
-                                            })),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        Button::new("share-panel-btn").xsmall()
-                                            .label("Share / Export".to_string())
-                                            .tooltip("Export a subscription or share nodes on the LAN")
-                                            .ghost()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_share_panel = !this.show_share_panel;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("delete-all-btn").xsmall()
-                                            .label(if delete_all_armed {
-                                                "Confirm?".to_string()
-                                            } else {
-                                                "Delete All".to_string()
-                                            })
-                                            .tooltip(if delete_all_armed {
-                                                "Click again within 3 s to delete all nodes"
-                                            } else {
-                                                "Delete all nodes"
-                                            })
-                                            .when(delete_all_armed, |b| b.danger())
-                                            .when(!delete_all_armed, |b| b.ghost())
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if confirm_armed(&DELETE_ALL_ARMED_AT) {
-                                                    DELETE_ALL_ARMED_AT.store(0, Ordering::Relaxed);
-                                                    this.delete_all_nodes(cx);
-                                                } else {
-                                                    this.arm_destructive_confirm(&DELETE_ALL_ARMED_AT, cx);
-                                                }
-                                            })),
+                                        div()
+                                            .text_size(px(SMALL))
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child("Click a node to view details"),
                                     ),
                             )
-                            .child(row)
-                            .child({
-                                // v2: table in a glass panel; header fixed, list scrolls
-                                let hcell = |text: &str| {
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_size(px(MICRO))
-                                        .font_family(MONO_FONT)
-                                        .text_color(rgb(TEXT_MUTED))
-                                        .child(text.to_string())
-                                };
-                                let header = div()
+                            .into_any_element(),
+                        None => div().into_any_element(),
+                    }
+                };
+
+                let list_column = div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    // Toolbar wraps on narrow widths so actions stay reachable.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(140.0))
+                                    .when(!compact, |d| d.max_w(px(320.0)))
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
                                     .px_3()
-                                    .py_2()
-                                    .border_b_1()
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .bg(rgb(BG_HOVER))
+                                    .border_1()
                                     .border_color(rgba(with_alpha(BORDER, 0x99)))
-                                    .child(div().w(px(20.0)).flex_shrink_0())
-                                    .child(hcell("NODE"))
                                     .child(
-                                        div()
-                                            .w(px(40.0))
-                                            .flex_shrink_0()
-                                            .text_size(px(MICRO))
-                                            .font_family(MONO_FONT)
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .text_center()
-                                            .child("TYPE"),
+                                        Icon::empty()
+                                            .path("icons/search.svg")
+                                            .with_size(ComponentSize::Size(px(14.0)))
+                                            .text_color(rgb(TEXT_MUTED)),
                                     )
                                     .child(
-                                        div()
-                                            .w(px(64.0))
-                                            .flex_shrink_0()
-                                            .text_size(px(MICRO))
-                                            .font_family(MONO_FONT)
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .text_right()
-                                            .child("LATENCY"),
-                                    )
-                                    .child(div().w(px(48.0)).flex_shrink_0());
-
-                                let body = if node_count == 0 {
-                                    empty_state(
-                                        "No nodes yet",
-                                        Some(
-                                            Button::new("empty-add-subscription-btn").xsmall()
-                                                .label("Add Subscription".to_string())
-                                                .tooltip("Go to the Config tab to import a subscription")
-                                                .primary()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.active_view = ActiveView::Config;
-                                                    this.config_tab = ConfigTab::ImportSubscription;
-                                                    cx.notify();
-                                                }))
-                                                .into_any_element(),
-                                        ),
-                                    )
-                                    .into_any_element()
-                                } else if filtered_indices.is_empty() {
-                                    empty_state("No nodes match the current filter", None)
-                                        .into_any_element()
-                                } else {
-                                    // Virtualized rendering: only the visible
-                                    // rows are built each frame. The previous
-                                    // version rendered *every* filtered node
-                                    // into a full element subtree on every
-                                    // frame — with 165 nodes that's 165
-                                    // `render_node_item` calls per frame,
-                                    // which measurably stuttered scrolling.
-                                    // `uniform_list` renders just the visible
-                                    // range (rows are uniform height) and
-                                    // provides its own scroll handling, so the
-                                    // outer wrapper must NOT also scroll.
-                                    let indices = filtered_indices.clone();
-                                    uniform_list(
-                                        "node-uniform-list",
-                                        indices.len(),
-                                        cx.processor(
-                                            move |this, range: std::ops::Range<usize>, _window, cx| {
-                                                let indices = indices.clone();
-                                                range
-                                                    .map(|row| {
-                                                        let node_index = indices[row];
-                                                        this.render_node_item(node_index, cx)
-                                                            .into_any_element()
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            },
-                                        ),
-                                    )
-                                    .flex_1()
-                                    .min_h_0()
-                                    .into_any_element()
-                                };
-
-                                card()
-                                    .p_0()
-                                    .gap_0()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_hidden()
-                                    .when(node_count > 0, |d| d.child(header))
-                                    .child(
-                                        div()
-                                            .id("node-table-body")
-                                            // Must be a flex column, not the
-                                            // default block: flex_1 only
-                                            // propagates a definite height to
-                                            // the uniform_list through a flex
-                                            // chain; a block parent leaves the
-                                            // list at its intrinsic height
-                                            // (one row), rendering it blank.
-                                            .flex()
-                                            .flex_col()
-                                            .flex_1()
-                                            .min_h_0()
-                                            // No overflow_y_scroll here: when
-                                            // the body is a uniform_list it
-                                            // scrolls itself; a nested scroller
-                                            // would clip it to one row.
-                                            .child(body),
-                                    )
-                            }),
-                    )
-                    // Right column: detail panel (v2: w-60 shrink-0)
-                    .child(
-                        div()
-                            .w(px(240.0))
-                            .flex_shrink_0()
-                            .flex()
-                            .flex_col()
+                                        gpui_component::input::Input::new(&node_filter_input)
+                                            .xsmall()
+                                            .appearance(false)
+                                            .w_full(),
+                                    ),
+                            )
                             .child(
-                                if let Some(index) = self.selected_node {
-                                    if let Some(node) = self.nodes.get(index).cloned() {
-                                        self.render_selected_node_details(&node, index, cx)
-                                            .into_any_element()
+                                tint_button(
+                                    "test-all-btn",
+                                    if self.latency_testing.is_empty() {
+                                        if compact { "Test" } else { "Test All" }
                                     } else {
-                                        div().into_any_element()
-                                    }
-                                } else {
-                                    card()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .items_center()
-                                                .py_8()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(SMALL))
-                                                        .text_color(rgb(TEXT_SECONDARY))
-                                                        .child("No node selected"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(SMALL))
-                                                        .text_color(rgb(TEXT_MUTED))
-                                                        .child("Click a node to view details"),
-                                                ),
-                                        )
-                                        .into_any_element()
-                                },
+                                        "Testing…"
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.auto_select_best = false;
+                                        this.test_all_latency(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new("sort-latency-btn")
+                                    .xsmall()
+                                    .label("Sort ↓".to_string())
+                                    .tooltip("Sort nodes by latency (fastest first)")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sort_nodes_by_latency(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("dedup-nodes-btn")
+                                    .xsmall()
+                                    .label("Dedup".to_string())
+                                    .tooltip("Remove duplicate nodes (same server + credentials)")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dedup_nodes_action(cx);
+                                    })),
+                            )
+                            .child(div().flex_1().min_w(px(4.0)))
+                            .child(
+                                Button::new("share-panel-btn")
+                                    .xsmall()
+                                    .label(
+                                        if compact { "Share" } else { "Share / Export" }
+                                            .to_string(),
+                                    )
+                                    .tooltip("Export a subscription or share nodes on the LAN")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_share_panel = !this.show_share_panel;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("delete-all-btn")
+                                    .xsmall()
+                                    .label(if delete_all_armed {
+                                        "Confirm?".to_string()
+                                    } else if compact {
+                                        "Delete".to_string()
+                                    } else {
+                                        "Delete All".to_string()
+                                    })
+                                    .tooltip(if delete_all_armed {
+                                        "Click again within 3 s to delete all nodes"
+                                    } else {
+                                        "Delete all nodes"
+                                    })
+                                    .when(delete_all_armed, |b| b.danger())
+                                    .when(!delete_all_armed, |b| b.ghost())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if confirm_armed(&DELETE_ALL_ARMED_AT) {
+                                            DELETE_ALL_ARMED_AT.store(0, Ordering::Relaxed);
+                                            this.delete_all_nodes(cx);
+                                        } else {
+                                            this.arm_destructive_confirm(&DELETE_ALL_ARMED_AT, cx);
+                                        }
+                                    })),
                             ),
                     )
+                    .child(row)
+                    .child({
+                        let hcell = |text: &str| {
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(MICRO))
+                                .font_family(MONO_FONT)
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(text.to_string())
+                        };
+                        let show_type = !compact;
+                        let header = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgba(with_alpha(BORDER, 0x99)))
+                            .child(div().w(px(20.0)).flex_shrink_0())
+                            .child(hcell("NODE"))
+                            .when(show_type, |d| {
+                                d.child(
+                                    div()
+                                        .w(px(40.0))
+                                        .flex_shrink_0()
+                                        .text_size(px(MICRO))
+                                        .font_family(MONO_FONT)
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .text_center()
+                                        .child("TYPE"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .w(if compact { px(56.0) } else { px(64.0) })
+                                    .flex_shrink_0()
+                                    .text_size(px(MICRO))
+                                    .font_family(MONO_FONT)
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_right()
+                                    .child("LATENCY"),
+                            )
+                            .child(div().w(px(48.0)).flex_shrink_0());
+
+                        let body = if node_count == 0 {
+                            empty_state(
+                                "No nodes yet",
+                                Some(
+                                    Button::new("empty-add-subscription-btn")
+                                        .xsmall()
+                                        .label("Add Subscription".to_string())
+                                        .tooltip("Go to the Config tab to import a subscription")
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.active_view = ActiveView::Config;
+                                            this.config_tab = ConfigTab::ImportSubscription;
+                                            cx.notify();
+                                        }))
+                                        .into_any_element(),
+                                ),
+                            )
+                            .into_any_element()
+                        } else if filtered_indices.is_empty() {
+                            empty_state("No nodes match the current filter", None)
+                                .into_any_element()
+                        } else {
+                            let indices = filtered_indices.clone();
+                            let hide_type = compact;
+                            uniform_list(
+                                "node-uniform-list",
+                                indices.len(),
+                                cx.processor(
+                                    move |this, range: std::ops::Range<usize>, _window, cx| {
+                                        let indices = indices.clone();
+                                        range
+                                            .map(|row| {
+                                                let node_index = indices[row];
+                                                this.render_node_item(node_index, hide_type, cx)
+                                                    .into_any_element()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    },
+                                ),
+                            )
+                            .flex_1()
+                            .min_h_0()
+                            .into_any_element()
+                        };
+
+                        card()
+                            .p_0()
+                            .gap_0()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .when(node_count > 0, |d| d.child(header))
+                            .child(
+                                div()
+                                    .id("node-table-body")
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(body),
+                            )
+                    });
+
+                match layout {
+                    NodesLayout::Split { detail_w } => div()
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .flex_1()
+                        .min_h_0()
+                        .child(list_column)
+                        .child(
+                            div()
+                                .id("node-detail-pane")
+                                .w(px(detail_w as f32))
+                                .flex_shrink_0()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .child(detail_panel),
+                        ),
+                    NodesLayout::Stack => div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .flex_1()
+                        .min_h_0()
+                        .child(list_column)
+                        .when(self.selected_node.is_some(), |d| {
+                            d.child(div().w_full().flex_shrink_0().child(detail_panel))
+                        }),
+                }
             });
 
         content
@@ -999,6 +1024,7 @@ impl AppState {
     pub(crate) fn render_node_item(
         &mut self,
         index: usize,
+        hide_type: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let node = &self.nodes[index];
@@ -1120,22 +1146,28 @@ impl AppState {
                             .overflow_x_hidden()
                             .child(name),
                     )
-                    .when(is_active, |d| d.child(mini_badge("in use", ACCENT))),
+                    .when(is_active, |d| d.child(mini_badge("in use", ACCENT)))
+                    // Narrow layout: fold TYPE into the name row as a small badge.
+                    .when(hide_type, |d| {
+                        d.child(mini_badge(proto_short, proto_badge_color(proto_short)))
+                    }),
             )
-            // Column 4: protocol badge (v2: colored mini_badge, w-10 centered)
-            .child(
-                div()
-                    .w(px(40.0))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_row()
-                    .justify_center()
-                    .child(mini_badge(proto_short, proto_badge_color(proto_short))),
-            )
+            // Column 4: protocol badge (hidden on narrow — shown next to name)
+            .when(!hide_type, |d| {
+                d.child(
+                    div()
+                        .w(px(40.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_row()
+                        .justify_center()
+                        .child(mini_badge(proto_short, proto_badge_color(proto_short))),
+                )
+            })
             // Column 5: latency (v3: w-16 right-aligned, value + small "ms")
             .child(
                 div()
-                    .w(px(64.0))
+                    .w(if hide_type { px(56.0) } else { px(64.0) })
                     .flex_shrink_0()
                     .flex()
                     .flex_row()

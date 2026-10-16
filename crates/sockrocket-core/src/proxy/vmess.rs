@@ -114,63 +114,91 @@ impl VMessOutbound {
     }
 }
 
+impl VMessOutbound {
+    async fn connect_command(
+        &self,
+        target_host: String,
+        port: u16,
+        command: u8,
+    ) -> Result<VMessStream> {
+        let stream = self.pool.get().await.with_context(|| {
+            format!(
+                "VMess: failed to connect to {}:{} (target: {}:{})",
+                self.server, self.port, target_host, port
+            )
+        })?;
+
+        // Generate session keys (in a block so rng drops before await)
+        let (req_body_key, req_body_iv, resp_auth, header) = {
+            let mut rng = rand::rng();
+            let req_body_key: [u8; 16] = rng.random();
+            let req_body_iv: [u8; 16] = rng.random();
+            let resp_auth: u8 = rng.random();
+
+            let header = build_vmess_header_command(
+                &self.uuid,
+                &req_body_key,
+                &req_body_iv,
+                resp_auth,
+                self.security,
+                &target_host,
+                port,
+                command,
+            )?;
+
+            (req_body_key, req_body_iv, resp_auth, header)
+        };
+
+        // Derive response keys
+        let resp_body_key_full = sha256_bytes(&req_body_key);
+        let resp_body_iv_full = sha256_bytes(&req_body_iv);
+
+        // Wrap in VMess AEAD stream
+        let vmess_stream = VMessStream::new(
+            stream,
+            header,
+            req_body_key,
+            req_body_iv,
+            resp_body_key_full[..16]
+                .try_into()
+                .expect("sha256 output is 32 bytes, first 16 is always valid"),
+            resp_body_iv_full[..16]
+                .try_into()
+                .expect("sha256 output is 32 bytes, first 16 is always valid"),
+            resp_auth,
+            self.security,
+        )
+        .await?;
+
+        Ok(vmess_stream)
+    }
+}
+
 impl Outbound for VMessOutbound {
     fn connect(
         &self,
         host: &str,
         port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
-        let target_host = host.to_string();
+        let host = host.to_owned();
         Box::pin(async move {
-            let stream = self.pool.get().await.with_context(|| {
-                format!(
-                    "VMess: failed to connect to {}:{} (target: {}:{})",
-                    self.server, self.port, target_host, port
-                )
-            })?;
+            Ok(Box::new(self.connect_command(host, port, 1).await?) as BoxProxyStream)
+        })
+    }
 
-            // Generate session keys (in a block so rng drops before await)
-            let (req_body_key, req_body_iv, resp_auth, header) = {
-                let mut rng = rand::rng();
-                let req_body_key: [u8; 16] = rng.random();
-                let req_body_iv: [u8; 16] = rng.random();
-                let resp_auth: u8 = rng.random();
-
-                let header = build_vmess_header(
-                    &self.uuid,
-                    &req_body_key,
-                    &req_body_iv,
-                    resp_auth,
-                    self.security,
-                    &target_host,
-                    port,
-                )?;
-
-                (req_body_key, req_body_iv, resp_auth, header)
-            };
-
-            // Derive response keys
-            let resp_body_key_full = sha256_bytes(&req_body_key);
-            let resp_body_iv_full = sha256_bytes(&req_body_iv);
-
-            // Wrap in VMess AEAD stream
-            let vmess_stream = VMessStream::new(
-                stream,
-                header,
-                req_body_key,
-                req_body_iv,
-                resp_body_key_full[..16]
-                    .try_into()
-                    .expect("sha256 output is 32 bytes, first 16 is always valid"),
-                resp_body_iv_full[..16]
-                    .try_into()
-                    .expect("sha256 output is 32 bytes, first 16 is always valid"),
-                resp_auth,
-                self.security,
-            )
-            .await?;
-
-            Ok(Box::new(vmess_stream) as BoxProxyStream)
+    fn connect_datagram(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            let stream = self.connect_command(host, port, 2).await?;
+            let max = stream.max_chunk;
+            Ok(super::stream_datagram::StreamDatagram::boxed(
+                Box::new(stream),
+                super::stream_datagram::Framing::NativeChunks(max),
+            ))
         })
     }
 
@@ -339,6 +367,7 @@ fn kdf(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Build the full VMess AEAD request header bytes.
+#[cfg(test)]
 fn build_vmess_header(
     uuid: &[u8; 16],
     body_key: &[u8; 16],
@@ -347,6 +376,20 @@ fn build_vmess_header(
     security: VMessSecurity,
     host: &str,
     port: u16,
+) -> Result<Vec<u8>> {
+    build_vmess_header_command(uuid, body_key, body_iv, resp_auth, security, host, port, 1)
+}
+
+#[allow(clippy::too_many_arguments)] // Protocol fields share one authenticated header.
+fn build_vmess_header_command(
+    uuid: &[u8; 16],
+    body_key: &[u8; 16],
+    body_iv: &[u8; 16],
+    resp_auth: u8,
+    security: VMessSecurity,
+    host: &str,
+    port: u16,
+    command: u8,
 ) -> Result<Vec<u8>> {
     let cmd_key = vmess_cmd_key(uuid);
     let timestamp = SystemTime::now()
@@ -379,8 +422,8 @@ fn build_vmess_header(
     header.push((padding_len << 4) | security.byte());
     // Reserved
     header.push(0);
-    // Command: TCP
-    header.push(0x01);
+    // VMess command: TCP=1, UDP=2.
+    header.push(command);
 
     // Port (big-endian)
     header.extend_from_slice(&port.to_be_bytes());

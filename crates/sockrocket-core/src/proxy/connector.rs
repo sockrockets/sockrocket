@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::datagram::{BoxDatagram, DatagramFuture};
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -21,6 +22,26 @@ pub trait Outbound: Send + Sync + 'static {
         host: &str,
         port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>>;
+
+    /// One stable decision object per accepted request.
+    fn runtime_snapshot(&self) -> Option<SharedOutbound> {
+        None
+    }
+    fn dns_snapshot(&self) -> Option<(SharedOutbound, Option<Arc<crate::dns::DnsConfig>>)> {
+        None
+    }
+    fn routing_policy(&self) -> Option<Arc<crate::router::Router>> {
+        None
+    }
+    fn is_direct(&self) -> bool {
+        false
+    }
+
+    /// Datagram support is an explicit capability. Never tunnel payloads
+    /// through `connect`, which only provides TCP byte-stream semantics.
+    fn connect_datagram(&self, _host: &str, _port: u16) -> DatagramFuture<'_, BoxDatagram> {
+        Box::pin(async { anyhow::bail!("Outbound does not support UDP datagrams") })
+    }
 
     fn name(&self) -> &str;
 }
@@ -71,6 +92,15 @@ impl Outbound for DirectOutbound {
             let stream = super::transport::connect_tcp(&addr, DIRECT_CONNECT_TIMEOUT).await?;
             Ok(Box::new(stream) as BoxProxyStream)
         })
+    }
+
+    fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move { super::datagram::connect_direct(&host, port).await })
+    }
+
+    fn is_direct(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &str {
@@ -148,6 +178,19 @@ impl Outbound for RetryOutbound {
         })
     }
 
+    fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
+        let inner = SharedOutbound(self.inner.clone());
+        let host = host.to_owned();
+        Box::pin(async move { inner.0.connect_datagram(&host, port).await })
+    }
+
+    fn is_direct(&self) -> bool {
+        self.inner.is_direct()
+    }
+    fn routing_policy(&self) -> Option<Arc<crate::router::Router>> {
+        self.inner.routing_policy()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -157,31 +200,68 @@ impl Outbound for RetryOutbound {
 #[derive(Clone)]
 pub struct SharedOutbound(pub Arc<dyn Outbound>);
 
+/// Enforce a node's explicit UDP-disabled setting at the transport boundary.
+pub struct StreamOnlyOutbound(pub SharedOutbound);
+impl Outbound for StreamOnlyOutbound {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+        let host = host.to_owned();
+        Box::pin(async move { self.0.connect(&host, port).await })
+    }
+    fn name(&self) -> &str {
+        self.0.0.name()
+    }
+    fn is_direct(&self) -> bool {
+        self.0.0.is_direct()
+    }
+    fn routing_policy(&self) -> Option<Arc<crate::router::Router>> {
+        self.0.0.routing_policy()
+    }
+}
+
 /// An outbound whose inner connector can be swapped at runtime.
 ///
 /// Servers hold a `SharedOutbound` clone of this wrapper, so calling
 /// [`SwappableOutbound::set`] redirects all *new* connections to the new
 /// outbound without rebinding the local listeners. In-flight connections
 /// keep using the outbound they started with.
+struct PublishedOutbound {
+    outbound: SharedOutbound,
+    dns: Option<Arc<crate::dns::DnsConfig>>,
+}
 pub struct SwappableOutbound {
-    inner: std::sync::RwLock<SharedOutbound>,
+    inner: std::sync::RwLock<PublishedOutbound>,
 }
 
 impl SwappableOutbound {
     pub fn new(outbound: SharedOutbound) -> Self {
         Self {
-            inner: std::sync::RwLock::new(outbound),
+            inner: std::sync::RwLock::new(PublishedOutbound {
+                outbound,
+                dns: None,
+            }),
         }
     }
 
     /// Replace the inner outbound (e.g. switch to another node).
     pub fn set(&self, outbound: SharedOutbound) {
-        *self.inner.write().unwrap() = outbound;
+        self.inner.write().unwrap().outbound = outbound;
+    }
+
+    /// Atomically commit transport, embedded routing policy and DNS settings.
+    pub fn publish(&self, outbound: SharedOutbound, dns: Arc<crate::dns::DnsConfig>) {
+        *self.inner.write().unwrap() = PublishedOutbound {
+            outbound,
+            dns: Some(dns),
+        };
     }
 
     /// Clone the current inner outbound.
     pub fn current(&self) -> SharedOutbound {
-        self.inner.read().unwrap().clone()
+        self.inner.read().unwrap().outbound.clone()
     }
 }
 
@@ -194,6 +274,21 @@ impl Outbound for SwappableOutbound {
         let inner = self.current();
         let host = host.to_owned();
         Box::pin(async move { inner.connect(&host, port).await })
+    }
+
+    fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
+        let inner = self.current();
+        let host = host.to_owned();
+        Box::pin(async move { inner.0.connect_datagram(&host, port).await })
+    }
+
+    fn dns_snapshot(&self) -> Option<(SharedOutbound, Option<Arc<crate::dns::DnsConfig>>)> {
+        let state = self.inner.read().unwrap();
+        Some((state.outbound.clone(), state.dns.clone()))
+    }
+
+    fn runtime_snapshot(&self) -> Option<SharedOutbound> {
+        Some(self.current())
     }
 
     fn name(&self) -> &str {

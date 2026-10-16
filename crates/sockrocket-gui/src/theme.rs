@@ -1,65 +1,53 @@
 //! Design tokens & shared UI primitives for the Sockrocket console UI.
 //!
-//! Source of truth: `docs/design-system.md` §1–§4. All views must reference
-//! these constants and helpers instead of scattering magic values.
-//!
-//! Token values match the spec exactly; the legacy `app.rs` palette is gone.
+//! macOS Settings palette (light appearance): system blue accent,
+//! soft elevated surfaces, hairline separators, SF-style type scale.
+//! Views should use these helpers instead of scattering magic values.
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 
-// === §1 Color tokens (v2: ui-prototype-v2/index.html tailwind config) ===
+// === Semantic colors: macOS Settings light appearance ===
 
-/// App background (`app` #080a10).
-pub(crate) const BG_APP: u32 = 0x080a10;
-/// Card / panel background (`surface` #0d1117).
-pub(crate) const BG_PANEL: u32 = 0x0d1117;
-/// Sidebar / statusbar background (`surface/80` ≈ #0d1117).
-pub(crate) const BG_SIDEBAR: u32 = 0x0d1117;
-/// Row / item hover background (`surface-hover` #131922).
-pub(crate) const BG_HOVER: u32 = 0x131922;
-/// Hairline border base color (`border-subtle` rgba(30,40,55,0.6) — apply as
-/// `rgba(with_alpha(BORDER, 0x99))` to match the prototype's translucency).
-pub(crate) const BORDER: u32 = 0x1e2837;
-/// Primary readable text (#f0f2f5).
-pub(crate) const TEXT_PRIMARY: u32 = 0xf0f2f5;
-/// Secondary / meta text (#8b95a5).
-pub(crate) const TEXT_SECONDARY: u32 = 0x8b95a5;
-/// Muted labels / placeholders / disabled (#4a5568).
-pub(crate) const TEXT_MUTED: u32 = 0x4a5568;
-/// Brand accent: active / connecting / selected / links.
-pub(crate) const ACCENT: u32 = 0x22d3ee;
-/// Connected, low latency, success.
-pub(crate) const SUCCESS: u32 = 0x34d399;
-/// Warning, medium latency.
-pub(crate) const WARNING: u32 = 0xfbbf24;
-/// Failure, high latency, destructive actions.
-pub(crate) const DANGER: u32 = 0xf87171;
-/// Secondary accent: proxy groups, VMess protocol badges.
-pub(crate) const PURPLE: u32 = 0xa78bfa;
-/// Table row selected state (steadier than hover).
-pub(crate) const BG_ACTIVE_ROW: u32 = 0x161d28;
-/// Bright accent text variant (hover / active emphasis).
-pub(crate) const TEXT_ACCENT: u32 = 0x7ee7f8;
+/// Main grouped window background.
+pub(crate) const BG_APP: u32 = 0xf5f5f7;
+/// White grouped content surfaces.
+pub(crate) const BG_PANEL: u32 = 0xffffff;
+/// Quiet sidebar and title-bar background.
+pub(crate) const BG_SIDEBAR: u32 = 0xececf0;
+pub(crate) const BG_HOVER: u32 = 0xe5e5ea;
+pub(crate) const BG_ACTIVE_ROW: u32 = 0xe8f1ff;
+pub(crate) const BORDER: u32 = 0xdcdce1;
+pub(crate) const TEXT_PRIMARY: u32 = 0x1d1d1f;
+pub(crate) const TEXT_SECONDARY: u32 = 0x6e6e73;
+pub(crate) const TEXT_MUTED: u32 = 0x76767c;
+pub(crate) const ACCENT: u32 = 0x007aff;
+pub(crate) const SUCCESS: u32 = 0x248a3d;
+pub(crate) const WARNING: u32 = 0x946200;
+pub(crate) const DANGER: u32 = 0xc9342b;
+pub(crate) const PURPLE: u32 = 0x8944ab;
+pub(crate) const TEXT_ACCENT: u32 = 0x0065d1;
 
-// === §2 Type scale (px) ===
+// === Type scale (px) — closer to macOS control sizes ===
 
-/// Page header title, semibold.
+/// Navigation / window brand.
 pub(crate) const PAGE_TITLE: f32 = 13.0;
-/// Hero status heading, bold.
-pub(crate) const HEADING: f32 = 16.0;
-/// Section label, semibold + uppercase.
-pub(crate) const SECTION_LABEL: f32 = 10.0;
-/// Body text, buttons, forms.
-pub(crate) const BODY: f32 = 12.0;
-/// Auxiliary info, secondary table columns.
-pub(crate) const SMALL: f32 = 11.0;
-/// Data values, status bar, chips (usually mono).
-pub(crate) const MICRO: f32 = 10.0;
-/// Tiny status badges, minimal labels.
-pub(crate) const TINY: f32 = 9.0;
+/// Page large title (macOS Settings-style).
+pub(crate) const LARGE_TITLE: f32 = 24.0;
+/// Hero connection status.
+pub(crate) const HEADING: f32 = 22.0;
+/// Section headers (sentence case, not shouty mono).
+pub(crate) const SECTION_LABEL: f32 = 11.0;
+/// Body / buttons.
+pub(crate) const BODY: f32 = 13.0;
+/// Secondary meta.
+pub(crate) const SMALL: f32 = 12.0;
+/// Compact chrome / status bar.
+pub(crate) const MICRO: f32 = 11.0;
+/// Badges.
+pub(crate) const TINY: f32 = 10.0;
 
-/// Latency color thresholds (v2): <80 good, 80–200 fair, >200 poor.
+/// Latency color thresholds: <80 good, 80–200 fair, >200 poor.
 pub(crate) fn latency_color(ms: u64) -> u32 {
     if ms < 80 {
         SUCCESS
@@ -70,17 +58,19 @@ pub(crate) fn latency_color(ms: u64) -> u32 {
     }
 }
 
-/// Monospace font family for data (latency, ports, IPs, URLs, tokens, logs).
-/// JetBrains Mono is embedded at startup (see main.rs), so every platform
-/// renders the v2 `font-mono-data` typeface identically.
-pub(crate) const MONO_FONT: &str = "JetBrains Mono";
+/// Monospace for data (ports, IPs, logs). Prefer SF Mono on Apple platforms.
+pub(crate) const MONO_FONT: &str = if cfg!(target_os = "macos") {
+    "SF Mono"
+} else {
+    "JetBrains Mono"
+};
 
 /// Bake an alpha channel into an `0xRRGGBB` token, returning `0xRRGGBBAA`.
 pub(crate) fn with_alpha(color: u32, alpha: u8) -> u32 {
     (color << 8) | alpha as u32
 }
 
-// === §4 Component recipes ===
+// === Component recipes ===
 
 /// Alert strip severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +92,7 @@ impl AlertKind {
     }
 }
 
-/// Connection-state categories for [`status_pill`], mapped from the single
-/// connection state machine (design-system §5.1).
+/// Connection-state categories for status chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusKind {
     Connected,
@@ -131,35 +120,31 @@ impl StatusKind {
             StatusKind::Connecting => "Connecting",
             StatusKind::Unreachable => "Unreachable",
             StatusKind::Error => "Error",
-            StatusKind::Stopped => "Stopped",
+            StatusKind::Stopped => "Not Connected",
         }
     }
 }
 
-/// MICRO mono, muted, uppercase section label (e.g. "CONNECTION").
+/// Small uppercase-ish section caption (Settings style: secondary, medium).
 pub(crate) fn section_label(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(SECTION_LABEL))
-        .font_family(MONO_FONT)
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(TEXT_MUTED))
-        .child(text.into().to_uppercase())
+        .text_color(rgb(TEXT_SECONDARY))
+        .child(text.into())
 }
 
-/// 6px semantic status dot.
+/// 8px semantic status dot (slightly larger, Mac-like).
 pub(crate) fn status_dot(color: u32) -> Div {
     div()
-        .w(px(6.0))
-        .h(px(6.0))
+        .w(px(8.0))
+        .h(px(8.0))
         .rounded_full()
         .flex_shrink_0()
         .bg(rgb(color))
 }
 
-/// In-page toggle tab: active = 2px ACCENT bottom border + primary text;
-/// inactive = muted text, hover brightens. No background fill.
-///
-/// Returns a `Stateful<Div>` so callers can attach `.on_click(...)`.
+/// In-page toggle tab.
 pub(crate) fn tab_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -168,7 +153,7 @@ pub(crate) fn tab_button(
     let btn = div()
         .id(id)
         .px_2()
-        .py(px(2.0))
+        .py(px(4.0))
         .cursor_pointer()
         .border_b_2()
         .text_size(px(BODY));
@@ -182,20 +167,19 @@ pub(crate) fn tab_button(
     btn.child(label.into())
 }
 
-/// Status / error strip: 3px semantic left bar + 8% tinted bg + SMALL text.
+/// Status / error strip: soft tint, no loud neon bar.
 pub(crate) fn alert_strip(kind: AlertKind, msg: impl Into<SharedString>) -> Div {
     let color = kind.color();
     div()
         .flex()
         .flex_row()
         .w_full()
-        .rounded(px(4.0))
-        .bg(rgba(with_alpha(color, 0x14)))
-        .child(div().w(px(3.0)).flex_shrink_0().bg(rgb(color)))
+        .rounded(px(8.0))
+        .bg(rgba(with_alpha(color, 0x18)))
         .child(
             div()
-                .px_2()
-                .py_1p5()
+                .px_3()
+                .py_2()
                 .min_w_0()
                 .text_size(px(SMALL))
                 .text_color(rgb(color))
@@ -203,7 +187,7 @@ pub(crate) fn alert_strip(kind: AlertKind, msg: impl Into<SharedString>) -> Div 
         )
 }
 
-/// Detail key/value row: key SMALL muted, value MICRO mono primary.
+/// Detail key/value row.
 pub(crate) fn kv_row(key: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
     div()
         .flex()
@@ -211,26 +195,24 @@ pub(crate) fn kv_row(key: impl Into<SharedString>, value: impl Into<SharedString
         .items_center()
         .justify_between()
         .gap_2()
-        .py_0p5()
+        .py_1()
         .child(
             div()
                 .flex_shrink_0()
                 .text_size(px(SMALL))
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(TEXT_SECONDARY))
                 .child(key.into()),
         )
         .child(
             div()
                 .min_w_0()
-                .text_size(px(MICRO))
-                .font_family(MONO_FONT)
+                .text_size(px(SMALL))
                 .text_color(rgb(TEXT_PRIMARY))
                 .child(value.into()),
         )
 }
 
-/// Empty-list placeholder: bordered container, generous padding, centered
-/// SMALL muted hint plus an optional primary action element.
+/// Empty-list placeholder.
 pub(crate) fn empty_state(hint: impl Into<SharedString>, action: Option<AnyElement>) -> Div {
     div()
         .w_full()
@@ -238,54 +220,48 @@ pub(crate) fn empty_state(hint: impl Into<SharedString>, action: Option<AnyEleme
         .flex_col()
         .items_center()
         .justify_center()
-        .gap_2()
-        .p_6()
-        .rounded(px(6.0))
+        .gap_3()
+        .p_8()
+        .rounded(px(12.0))
         .border_1()
-        .border_color(rgba(with_alpha(BORDER, 0x99)))
+        .border_color(rgba(with_alpha(BORDER, 0xb0)))
+        .bg(rgb(BG_PANEL))
         .child(
             div()
-                .text_size(px(SMALL))
-                .text_color(rgb(TEXT_MUTED))
+                .text_size(px(BODY))
+                .text_color(rgb(TEXT_SECONDARY))
                 .child(hint.into()),
         )
         .when_some(action, |d, action| d.child(action))
 }
 
-/// Panel card (v2 `glass-panel`): `BG_PANEL` + 1px translucent BORDER +
-/// rounded-xl (12px) + p 14 + gap 8.
-/// Never nest cards; use a hairline divider + [`section_label`] instead.
+/// Grouped inset panel (macOS Settings-style), not a heavy bordered card.
 pub(crate) fn card() -> Div {
     div()
-        .p(px(14.0))
+        .p(px(16.0))
         .flex()
         .flex_col()
         .gap_2()
         .rounded(px(12.0))
-        .bg(rgb(BG_PANEL))
         .border_1()
-        .border_color(rgba(with_alpha(BORDER, 0x99)))
+        .border_color(rgba(with_alpha(BORDER, 0xb0)))
+        .bg(rgb(BG_PANEL))
 }
 
-// === v2 component recipes ===
-
-/// Mini status badge: TINY mono, tinted bg + hairline border, rounded 3.
-/// Used for protocol types, rule targets, group types in dense tables.
+/// Mini status badge.
 pub(crate) fn mini_badge(text: impl Into<SharedString>, color: u32) -> Div {
     div()
-        .px_1()
-        .rounded(px(3.0))
-        .border_1()
-        .border_color(rgba(with_alpha(color, 0x40)))
-        .bg(rgba(with_alpha(color, 0x14)))
+        .px_1p5()
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .bg(rgba(with_alpha(color, 0x22)))
         .text_size(px(TINY))
-        .font_family(MONO_FONT)
+        .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(color))
         .child(text.into())
 }
 
-/// v2 protocol badge colors: VLESS cyan / SS green / VMess purple /
-/// Trojan amber / Hysteria2+Tuic red.
+/// Protocol badge colors.
 pub(crate) fn proto_badge_color(short: &str) -> u32 {
     match short {
         "vless" => ACCENT,
@@ -297,33 +273,32 @@ pub(crate) fn proto_badge_color(short: &str) -> u32 {
     }
 }
 
-/// iOS-style toggle switch (v2). Returns `Stateful<Div>` for `.on_click`.
+/// iOS / macOS toggle switch.
 pub(crate) fn toggle_switch(id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
     let track = div()
         .id(id)
-        .w(px(32.0))
-        .h(px(17.0))
+        .w(px(36.0))
+        .h(px(20.0))
         .rounded_full()
         .flex_shrink_0()
         .cursor_pointer()
         .bg(if on {
-            rgba(with_alpha(ACCENT, 0x4d))
+            rgb(SUCCESS)
         } else {
-            rgba(with_alpha(TEXT_MUTED, 0x4d))
+            rgba(with_alpha(TEXT_MUTED, 0x66))
         });
     track.child(
         div()
-            .w(px(13.0))
-            .h(px(13.0))
+            .w(px(16.0))
+            .h(px(16.0))
             .rounded_full()
             .mt(px(2.0))
-            .ml(if on { px(17.0) } else { px(2.0) })
-            .bg(if on { rgb(ACCENT) } else { rgb(TEXT_MUTED) }),
+            .ml(if on { px(18.0) } else { px(2.0) })
+            .bg(rgb(0xffffff)),
     )
 }
 
-/// Throughput sparkline: up to 60 bars of 2px, green = upload / cyan = download.
-/// Static render of the sampled history ring buffers (no animation, §9.1).
+/// Throughput sparkline.
 pub(crate) fn throughput_sparkline(upload: &[f64], download: &[f64], height: f32) -> Div {
     let max = upload
         .iter()
@@ -331,8 +306,6 @@ pub(crate) fn throughput_sparkline(upload: &[f64], download: &[f64], height: f32
         .cloned()
         .fold(1.0f64, f64::max);
     let n = upload.len().max(download.len());
-    // Flat history reads as a glitchy dotted strip — render a clean hairline
-    // baseline instead (v2 sparkline zero-state).
     if n == 0 || max <= 1.0 {
         return div()
             .flex()
@@ -366,17 +339,54 @@ pub(crate) fn throughput_sparkline(upload: &[f64], download: &[f64], height: f32
         let color = if v <= 0.0 {
             rgba(with_alpha(TEXT_MUTED, 0x40))
         } else if down >= up {
-            rgba(with_alpha(ACCENT, 0x8c))
+            rgba(with_alpha(ACCENT, 0x99))
         } else {
-            rgba(with_alpha(SUCCESS, 0x73))
+            rgba(with_alpha(SUCCESS, 0x99))
         };
         row = row.child(div().w(px(2.0)).h(px(h)).rounded(px(1.0)).bg(color));
     }
     row
 }
 
-/// Segmented capsule button (mode switcher): active = tinted ACCENT bg +
-/// border + accent text; inactive = muted text. `Stateful` for `.on_click`.
+/// Filled primary action (Connect / Apply).
+pub(crate) fn primary_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_4()
+        .py(px(6.0))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .bg(rgb(ACCENT))
+        .text_size(px(SMALL))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(0xffffff))
+        .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0xcc))))
+        .child(label.into())
+}
+
+/// Quiet secondary / tint button (no loud neon border).
+pub(crate) fn tint_action(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py(px(5.0))
+        .rounded(px(7.0))
+        .cursor_pointer()
+        .bg(rgba(with_alpha(ACCENT, 0x22)))
+        .text_size(px(SMALL))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(TEXT_ACCENT))
+        .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
+        .child(label.into())
+}
+
+/// Segmented control segment (macOS NSSegmentedControl feel).
 pub(crate) fn seg_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -384,56 +394,82 @@ pub(crate) fn seg_button(
 ) -> Stateful<Div> {
     let btn = div()
         .id(id)
-        .px_2p5()
-        .py_0p5()
+        .px_3()
+        .py(px(3.0))
         .rounded(px(6.0))
         .cursor_pointer()
-        .border_1()
         .text_size(px(MICRO))
         .font_weight(FontWeight::MEDIUM);
     let btn = if active {
-        btn.bg(rgba(with_alpha(ACCENT, 0x1a)))
-            .border_color(rgba(with_alpha(ACCENT, 0x40)))
-            .text_color(rgb(ACCENT))
+        btn.bg(rgb(BG_PANEL)).text_color(rgb(TEXT_PRIMARY))
     } else {
-        btn.border_color(rgba(0x00000000))
-            .text_color(rgb(TEXT_SECONDARY))
+        btn.text_color(rgb(TEXT_SECONDARY))
             .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
     };
     btn.child(label.into())
 }
 
-/// Dashboard stat card (v2): uppercase micro label / 24px bold mono value /
-/// micro mono note.
-pub(crate) fn stat_card(
+/// Capsule wrapper for a row of [`seg_button`]s (title-bar mode control).
+pub(crate) fn seg_group() -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(1.0))
+        .p(px(2.0))
+        .rounded(px(8.0))
+        .bg(rgba(with_alpha(BORDER, 0x66)))
+}
+
+/// Soft filter / scene chip (Nodes protocol chips, Rules presets).
+pub(crate) fn filter_chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    let base = div()
+        .id(id)
+        .px_2p5()
+        .py(px(4.0))
+        .rounded(px(7.0))
+        .text_size(px(MICRO))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer();
+    if active {
+        base.bg(rgba(with_alpha(ACCENT, 0x33)))
+            .text_color(rgb(TEXT_PRIMARY))
+            .child(label.into())
+    } else {
+        base.bg(rgba(with_alpha(BORDER, 0x66)))
+            .text_color(rgb(TEXT_SECONDARY))
+            .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+            .child(label.into())
+    }
+}
+
+/// Compact inline metric (replaces heavy stat cards on Home).
+pub(crate) fn inline_metric(
     label: impl Into<SharedString>,
     value: impl Into<SharedString>,
-    sub: impl Into<SharedString>,
     value_color: u32,
 ) -> Div {
-    card()
-        .p(px(16.0))
-        .gap(px(4.0))
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .min_w(px(76.0))
+        .flex_shrink_0()
         .child(
             div()
-                .text_size(px(MICRO))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(TEXT_MUTED))
-                .child(label.into().to_uppercase()),
+                .text_size(px(TINY))
+                .text_color(rgb(TEXT_SECONDARY))
+                .child(label.into()),
         )
         .child(
             div()
-                .text_size(px(24.0))
-                .font_family(MONO_FONT)
-                .font_weight(FontWeight::BOLD)
+                .text_size(px(BODY))
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(value_color))
                 .child(value.into()),
-        )
-        .child(
-            div()
-                .text_size(px(MICRO))
-                .font_family(MONO_FONT)
-                .text_color(rgb(TEXT_MUTED))
-                .child(sub.into()),
         )
 }

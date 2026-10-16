@@ -94,6 +94,26 @@ impl Outbound for TrojanOutbound {
         })
     }
 
+    fn connect_datagram(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            let mut stream = self.pool.get().await?;
+            let mut header = build_trojan_request(&self.password_hash, &host, port)?;
+            header[58] = 3;
+            let address = header[59..header.len() - 2].to_vec();
+            stream.write_all(&header).await?;
+            stream.flush().await?;
+            Ok(super::stream_datagram::StreamDatagram::boxed(
+                stream,
+                super::stream_datagram::Framing::Trojan(address),
+            ))
+        })
+    }
+
     fn name(&self) -> &str {
         "trojan"
     }

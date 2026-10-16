@@ -3028,28 +3028,29 @@ impl AppState {
         let Some(final_outbound) = self.build_current_outbound() else {
             return false;
         };
+        // Prepare loop avoidance before publishing the new node. Keep old
+        // bypasses until teardown so existing QUIC connections can drain.
+        if self.tun_enabled {
+            let node_ips = self
+                .selected_node
+                .and_then(|i| self.nodes.get(i))
+                .map(|node| resolve_to_ips(&node.server))
+                .unwrap_or_default();
+            if node_ips.is_empty() || sockrocket_core::update_tun_bypass_ips(&node_ips).is_err() {
+                self.tun_status = "Node switch needs a TUN restart: bypass routes not ready".into();
+                return false;
+            }
+        }
         let mut swapped = false;
         if let Some(swappable) = &self.proxy_swappable {
             swappable.set(final_outbound.clone());
             swapped = true;
         }
-        if self.tun_enabled {
-            if let Some(swappable) = &self.tun_swappable {
-                swappable.set(final_outbound.clone());
-                swapped = true;
-            }
-            // CRITICAL: the outbound is now the new node, but TUN's
-            // loop-avoidance routes still exempt the *old* node's IP. Without
-            // updating them, the new node's traffic is routed into TUN and
-            // loops, so the node reports unreachable even though it is fine.
-            let node_ips = self
-                .selected_node
-                .and_then(|i| self.nodes.get(i))
-                .map(|n| resolve_to_ips(&n.server))
-                .unwrap_or_default();
-            if let Err(e) = sockrocket_core::update_tun_bypass_ips(&node_ips) {
-                tracing::warn!("failed to update TUN bypass routes on node switch: {:#}", e);
-            }
+        if self.tun_enabled
+            && let Some(swappable) = &self.tun_swappable
+        {
+            swappable.set(final_outbound.clone());
+            swapped = true;
         }
         if swapped {
             self.active_proxy_node = self.selected_node;
@@ -3520,6 +3521,7 @@ impl AppState {
                 self.subscriptions = new_config.subscriptions.clone();
                 self.rules = new_config.rules.clone();
                 self.proxy_mode = new_config.proxy_mode.clone();
+                let health_was_enabled = self.health_check.enabled;
                 self.health_check = new_config.health_check.clone();
                 // External group edits apply immediately; clamp index-keyed
                 // Groups page UI state against the new list.
@@ -3562,22 +3564,13 @@ impl AppState {
                 }
 
                 if self.proxy_running && restart_fields.is_empty() {
-                    if self.health_check.enabled {
+                    if self.health_check.enabled || health_was_enabled {
                         // The health monitor holds a node/rules snapshot;
                         // restart the proxy so it rebuilds from fresh state.
                         self.restart_proxy_with_current_state(cx);
                     } else {
-                        // Hot-swap the outbound without touching listeners.
-                        let new_outbound = self
-                            .selected_node
-                            .and_then(|index| self.nodes.get(index))
-                            .and_then(|node| create_outbound(node).ok())
-                            .map(|base| apply_proxy_mode(base, &self.proxy_mode, &self.rules));
-                        if let (Some(swappable), Some(outbound)) =
-                            (self.proxy_swappable.clone(), new_outbound)
-                        {
-                            swappable.set(outbound);
-                            self.active_proxy_node = self.selected_node;
+                        if !self.apply_outbound_hot_swap(cx) {
+                            self.restart_proxy_with_current_state(cx);
                         }
                     }
                 }
@@ -3699,7 +3692,7 @@ impl Render for AppState {
                     .flex_row()
                     .overflow_hidden()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_content(cx)),
+                    .child(self.render_content(window, cx)),
             )
             .child(self.render_statusbar(cx))
             // Ctrl+K command palette overlay (top-most layer)
@@ -3710,7 +3703,11 @@ impl Render for AppState {
 // === Content Router ===
 
 impl AppState {
-    pub(crate) fn render_content(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let active = self.active_view.clone();
         // v2: content-area p-4; dashboard centered max-w-4xl, settings max-w-2xl,
         // every other page fills the width. Nodes/Connections/Logs fill the
@@ -3726,8 +3723,8 @@ impl AppState {
         // scrolling. (Other table pages size to content + page-scroll.)
         let virtualized_page = matches!(active, ActiveView::Nodes);
         let max_w = match active {
-            ActiveView::Home => px(896.0),
-            ActiveView::Settings => px(672.0),
+            ActiveView::Home => px(760.0),
+            ActiveView::Settings => px(760.0),
             _ => px(0.0),
         };
         div()
@@ -3738,7 +3735,9 @@ impl AppState {
             .overflow_x_hidden()
             .when(!virtualized_page, |d| d.overflow_y_scroll())
             .when(virtualized_page, |d| d.overflow_y_hidden())
-            .p_4()
+            .px(px(28.0))
+            .py(px(24.0))
+            .bg(rgb(BG_APP))
             .child(
                 div()
                     .w_full()
@@ -3757,7 +3756,7 @@ impl AppState {
                     )
                     .child(match active {
                         ActiveView::Home => self.render_home(cx).into_any_element(),
-                        ActiveView::Nodes => self.render_nodes(cx).into_any_element(),
+                        ActiveView::Nodes => self.render_nodes(window, cx).into_any_element(),
                         ActiveView::Groups => self.render_groups(cx).into_any_element(),
                         ActiveView::Connections => self.render_connections(cx).into_any_element(),
                         ActiveView::Config => self.render_config(cx).into_any_element(),
@@ -3772,18 +3771,18 @@ impl AppState {
 // === Shared view helpers (used by multiple pages) ===
 
 impl AppState {
-    /// Page header title: PAGE_TITLE, semibold, primary text.
+    /// Page header title (large, Settings-style).
     pub(crate) fn page_header(&self, title: &str) -> Div {
-        div().pb_1().mb_1().child(
+        div().pb_2().mb_1().child(
             div()
-                .text_size(px(PAGE_TITLE))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(LARGE_TITLE))
+                .font_weight(FontWeight::BOLD)
                 .text_color(rgb(TEXT_PRIMARY))
                 .child(title.to_string()),
         )
     }
 
-    /// v3 page header: 28px tinted icon square + title + micro muted subtitle.
+    /// Page header with icon + subtitle (no heavy bordered badge).
     pub(crate) fn page_header_v3(
         &self,
         icon_path: &str,
@@ -3792,28 +3791,26 @@ impl AppState {
         subtitle: &str,
     ) -> Div {
         div()
-            .pb_1()
-            .mb_1()
+            .pb_2()
+            .mb_2()
             .flex()
             .flex_row()
             .items_center()
-            .gap_2p5()
+            .gap_3()
             .child(
                 div()
-                    .w(px(32.0))
-                    .h(px(32.0))
-                    .rounded(px(8.0))
+                    .w(px(36.0))
+                    .h(px(36.0))
+                    .rounded(px(9.0))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(with_alpha(icon_color, 0x1a)))
-                    .border_1()
-                    .border_color(rgba(with_alpha(icon_color, 0x33)))
+                    .bg(rgba(with_alpha(icon_color, 0x22)))
                     .child(
                         Icon::empty()
                             .path(SharedString::from(icon_path.to_string()))
-                            .with_size(ComponentSize::Size(px(16.0)))
+                            .with_size(ComponentSize::Size(px(18.0)))
                             .text_color(rgb(icon_color)),
                     ),
             )
@@ -3821,19 +3818,18 @@ impl AppState {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(1.0))
+                    .gap(px(2.0))
                     .child(
                         div()
-                            .text_size(px(PAGE_TITLE))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(LARGE_TITLE))
+                            .font_weight(FontWeight::BOLD)
                             .text_color(rgb(TEXT_PRIMARY))
                             .child(title.to_string()),
                     )
                     .child(
                         div()
-                            .text_size(px(MICRO))
-                            .font_family(MONO_FONT)
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_size(px(SMALL))
+                            .text_color(rgb(TEXT_SECONDARY))
                             .child(subtitle.to_string()),
                     ),
             )
@@ -4129,12 +4125,13 @@ impl AppState {
             return;
         }
 
-        let group = if let Some(g) = self.adding_rule_group.clone() {
-            g
-        } else {
-            group
-        };
-        if group.is_empty() && self.adding_rule_group.is_none() {
+        // Single-rule composer (Mac: add one row to a group, stay open for more).
+        if let Some(group) = self.adding_rule_group.clone() {
+            self.save_composer_rule(&group, window, cx);
+            return;
+        }
+
+        if group.is_empty() {
             self.rules_status = "⚠ 请先选择或填写分组，再添加规则".into();
             cx.notify();
             return;
@@ -4376,14 +4373,128 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open a group for writing — same as batch edit (one rule per line).
+    /// Open the single-rule composer at the bottom of a group (Mac: Add).
     pub(crate) fn begin_add_in_group(
         &mut self,
         group: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.begin_batch_edit_group(group, window, cx);
+        self.editing_rule_index = None;
+        self.editing_group = None;
+        self.batch_edit_group = None;
+        self.rules_new_group_open = false;
+        self.rule_menu = None;
+        self.rules_collapsed_groups.remove(group);
+        self.adding_rule_group = Some(group.to_string());
+        self.rule_target_sel = "proxy".into();
+        self.select_rule_type("domain-suffix", window, cx);
+        self.rule_pattern_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.rule_batch_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        let label = if group.trim().is_empty() {
+            sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
+        } else {
+            group.to_string()
+        };
+        self.rules_status = format!(
+            "{}「{label}」",
+            sockrocket_gui::i18n::t("rules.status.adding")
+        );
+        cx.notify();
+    }
+
+    /// Persist one rule from the pattern composer into `group`, keep composer open.
+    fn save_composer_rule(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rule_type = self.rule_type_sel.clone();
+        let target = self.rule_target_sel.clone();
+        let priority = self
+            .rule_priority_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(0);
+
+        if matches!(rule_type.as_str(), "match" | "final") {
+            if self
+                .rules
+                .iter()
+                .any(|r| matches!(r.rule_type.as_str(), "match" | "final"))
+            {
+                self.rules_status = "⚠ FINAL 规则已存在".into();
+                cx.notify();
+                return;
+            }
+            self.rules.push(RoutingRule {
+                name: String::new(),
+                group: group.to_string(),
+                rule_type: "match".into(),
+                pattern: "*".into(),
+                target: target.trim().to_string(),
+                enabled: true,
+                priority,
+            });
+            self.rules_collapsed_groups.remove(group);
+            self.rule_pattern_input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+            self.finish_rule_mutation(
+                sockrocket_gui::i18n::t("rules.status.added_match"),
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let pattern = self.rule_pattern_input.read(cx).value().trim().to_string();
+        if pattern.is_empty() {
+            self.rules_status = "⚠ 请填写规则内容".into();
+            cx.notify();
+            return;
+        }
+
+        let mut new_rule = match make_typed_rule(&rule_type, &pattern, &target, group) {
+            Ok(r) => r,
+            Err(msg) => {
+                self.rules_status = format!("✗ {msg}");
+                cx.notify();
+                return;
+            }
+        };
+        new_rule.priority = priority;
+
+        if let Some(existing) = self
+            .rules
+            .iter()
+            .find(|r| r.rule_type == new_rule.rule_type && r.pattern == new_rule.pattern)
+        {
+            self.rules_status = format!(
+                "⚠ 已存在：{} {} → {}",
+                existing.rule_type, existing.pattern, existing.target
+            );
+            cx.notify();
+            return;
+        }
+
+        let shown = format!("{} → {}", new_rule.pattern, new_rule.target);
+        let insert_at = self
+            .rules
+            .iter()
+            .position(|r| r.priority <= priority)
+            .unwrap_or(self.rules.len());
+        self.rules.insert(insert_at, new_rule);
+        self.rules_collapsed_groups.remove(group);
+        self.rule_pattern_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.finish_rule_mutation(&format!("✓ 已添加 {shown}"), window, cx);
     }
 
     pub(crate) fn cancel_edit_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4396,6 +4507,7 @@ impl AppState {
         self.clear_rule_pattern_fields(window, cx);
         let t = self.rule_type_sel.clone();
         self.select_rule_type(&t, window, cx);
+        cx.notify();
     }
 
     /// Open a group's rules as one-per-line text for batch write / edit.
@@ -4847,17 +4959,29 @@ pub(crate) fn format_bytes(n: u64) -> String {
 }
 
 pub(crate) fn ui_font() -> Font {
-    // v2 design typeface: Inter (embedded, see main.rs), with CJK-capable
-    // system fallbacks so Chinese text still renders.
+    // Prefer San Francisco on macOS; Inter elsewhere (embedded in main.rs).
+    #[cfg(target_os = "macos")]
+    let mut font = font(".AppleSystemUIFont");
+    #[cfg(not(target_os = "macos"))]
     let mut font = font("Inter");
-    // Windows-only fallbacks (gpui logs an error for every name that does not
-    // resolve, so keep this list to fonts that actually ship with Windows).
-    font.fallbacks = Some(FontFallbacks::from_fonts(vec![
-        "Microsoft YaHei UI".to_string(),
-        "Microsoft YaHei".to_string(),
-        "DengXian".to_string(),
-        "Segoe UI".to_string(),
-    ]));
+    #[cfg(target_os = "macos")]
+    {
+        font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "SF Pro Text".to_string(),
+            "Helvetica Neue".to_string(),
+            "PingFang SC".to_string(),
+        ]));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows-only fallbacks (gpui errors on missing names).
+        font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "Microsoft YaHei UI".to_string(),
+            "Microsoft YaHei".to_string(),
+            "DengXian".to_string(),
+            "Segoe UI".to_string(),
+        ]));
+    }
     font
 }
 
@@ -5102,12 +5226,11 @@ pub(crate) fn save_gui_state(
         std::fs::create_dir_all(parent)?;
     }
     let content = serde_yaml::to_string(config)?;
-    // Suppress the hot-reload event for our own write. Noted *before*
-    // writing so the poller can never observe the new mtime first.
+    sockrocket_core::config::storage::atomic_write_private(&path, &content, true)?;
+    // Only suppress content that was actually committed to disk.
     if let Some(handle) = watch {
         handle.note_saved(config, config_content_hash(&content));
     }
-    std::fs::write(path, content)?;
     Ok(())
 }
 

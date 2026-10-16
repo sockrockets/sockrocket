@@ -1,4 +1,4 @@
-//! Rules view — compact Clash/Surge-style layout: add/batch → list → optional templates.
+//! Rules view — macOS Settings-style groups and list rows.
 
 use crate::app::*;
 use crate::theme::*;
@@ -127,26 +127,39 @@ fn short_target(target: &str) -> &'static str {
     sockrocket_gui::i18n::t(key)
 }
 
-/// `on` = all enabled, `partial` = mixed (border only).
+/// Group enable control: full / mixed / off (Mac checkbox-ish mark).
 fn quiet_mark(id: impl Into<ElementId>, on: bool, partial: bool) -> Stateful<Div> {
-    let border = if on || partial { ACCENT } else { TEXT_MUTED };
     let fill = if on {
-        rgb(ACCENT)
+        rgb(SUCCESS)
     } else if partial {
-        rgba(with_alpha(ACCENT, 0x55))
+        rgba(with_alpha(SUCCESS, 0x66))
     } else {
-        rgba(0x00000000)
+        rgba(with_alpha(TEXT_MUTED, 0x55))
     };
     div()
         .id(id)
-        .w(px(10.0))
-        .h(px(10.0))
-        .rounded_full()
+        .w(px(18.0))
+        .h(px(18.0))
+        .rounded(px(5.0))
         .flex_shrink_0()
         .cursor_pointer()
-        .border_1()
-        .border_color(rgb(border))
+        .flex()
+        .items_center()
+        .justify_center()
         .bg(fill)
+        .child(
+            div()
+                .text_size(px(TINY))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(0xffffff))
+                .child(if on {
+                    "✓"
+                } else if partial {
+                    "–"
+                } else {
+                    ""
+                }),
+        )
 }
 
 fn display_pattern(rule: &RoutingRule) -> String {
@@ -157,6 +170,49 @@ fn display_pattern(rule: &RoutingRule) -> String {
     }
 }
 
+fn target_color(target: &str) -> u32 {
+    match target {
+        "direct" => SUCCESS,
+        "reject" => DANGER,
+        _ => ACCENT,
+    }
+}
+
+fn text_action(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    color: u32,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py(px(3.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .text_size(px(SMALL))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(color))
+        .hover(|s| s.bg(rgb(BG_HOVER)))
+        .child(label.into())
+}
+
+fn scene_chip(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+    filter_chip(id, label, false)
+}
+
+fn rules_status_kind(msg: &str) -> AlertKind {
+    let t = msg.trim_start();
+    if t.starts_with('✗') {
+        AlertKind::Danger
+    } else if t.starts_with('⚠') {
+        AlertKind::Warning
+    } else if t.starts_with('✓') {
+        AlertKind::Success
+    } else {
+        AlertKind::Info
+    }
+}
+
 impl AppState {
     pub(crate) fn render_rules(&mut self, cx: &mut Context<Self>) -> Div {
         let rule_count = self.rules.len();
@@ -164,13 +220,13 @@ impl AppState {
         let clear_armed = confirm_slot_armed(&CLEAR_CONFIRM_AT);
         let batch_group = self.batch_edit_group.clone();
 
-        let mut content = div().flex().flex_col().gap_2p5().child(
+        let mut content = div().flex().flex_col().gap_3().child(
             div()
                 .flex()
                 .flex_row()
-                .items_center()
+                .items_start()
                 .justify_between()
-                .gap_2()
+                .gap_3()
                 .child(self.page_header_v3(
                     "icons/nav-rules.svg",
                     ACCENT,
@@ -182,41 +238,38 @@ impl AppState {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
+                        .pt_1()
                         .child(
-                            div()
-                                .id("rules-export")
-                                .cursor_pointer()
-                                .text_size(px(TINY))
-                                .text_color(rgb(TEXT_MUTED))
-                                .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                .child(sockrocket_gui::i18n::t("rules.export").to_string())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.export_rules_to_clipboard(cx);
-                                })),
+                            text_action(
+                                "rules-export",
+                                sockrocket_gui::i18n::t("rules.export"),
+                                TEXT_SECONDARY,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_rules_to_clipboard(cx);
+                            })),
                         )
                         .child(
-                            div()
-                                .id("clear-rules")
-                                .cursor_pointer()
-                                .text_size(px(TINY))
-                                .text_color(rgb(if clear_armed { DANGER } else { TEXT_MUTED }))
-                                .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                .child(if clear_armed {
-                                    sockrocket_gui::i18n::t("rules.clear_confirm").to_string()
+                            text_action(
+                                "clear-rules",
+                                if clear_armed {
+                                    sockrocket_gui::i18n::t("rules.clear_confirm")
                                 } else {
-                                    sockrocket_gui::i18n::t("rules.clear").to_string()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
-                                        CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
-                                        this.clear_rules(cx);
-                                    } else {
-                                        CLEAR_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
-                                        schedule_confirm_reset(this, cx);
-                                        cx.notify();
-                                    }
-                                })),
+                                    sockrocket_gui::i18n::t("rules.clear")
+                                },
+                                if clear_armed { DANGER } else { TEXT_SECONDARY },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
+                                    CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
+                                    this.clear_rules(cx);
+                                } else {
+                                    CLEAR_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
+                                    schedule_confirm_reset(this, cx);
+                                    cx.notify();
+                                }
+                            })),
                         ),
                 ),
         );
@@ -229,163 +282,150 @@ impl AppState {
         let rule_filter_input = self.rule_filter_input.clone();
         let new_group_open = self.rules_new_group_open;
         content = content.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
+            card()
+                .p(px(10.0))
                 .gap_2()
                 .child(
-                    div().flex_1().min_w(px(120.0)).child(
-                        gpui_component::input::Input::new(&rule_filter_input)
-                            .xsmall()
-                            .w_full(),
-                    ),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div().flex_1().min_w(px(140.0)).child(
+                                gpui_component::input::Input::new(&rule_filter_input)
+                                    .xsmall()
+                                    .w_full(),
+                            ),
+                        )
+                        .when(!new_group_open, |d| {
+                            d.child(
+                                tint_action(
+                                    "open-new-rule-group",
+                                    sockrocket_gui::i18n::t("rules.group.new"),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.rules_new_group_open = true;
+                                        this.rule_group_input.update(cx, |state, cx| {
+                                            state.set_value("", window, cx);
+                                            state.focus(window, cx);
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        }),
                 )
-                .when(!new_group_open, |d| {
+                .when(new_group_open, |d| {
                     d.child(
                         div()
-                            .id("open-new-rule-group")
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .text_color(rgb(TEXT_MUTED))
-                            .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                            .child(sockrocket_gui::i18n::t("rules.group.new").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.rules_new_group_open = true;
-                                this.rule_group_input.update(cx, |state, cx| {
-                                    state.set_value("", window, cx);
-                                    state.focus(window, cx);
-                                });
-                                cx.notify();
-                            })),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div().flex_1().min_w(px(120.0)).child(
+                                    gpui_component::input::Input::new(&self.rule_group_input)
+                                        .xsmall()
+                                        .w_full(),
+                                ),
+                            )
+                            .child(
+                                primary_button(
+                                    "confirm-new-rule-group",
+                                    sockrocket_gui::i18n::t("rules.group.new"),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        let name = this
+                                            .rule_group_input
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        if name.is_empty() {
+                                            this.rules_status =
+                                                sockrocket_gui::i18n::t("rules.status.group_name")
+                                                    .into();
+                                            cx.notify();
+                                        } else {
+                                            this.begin_add_in_group(&name, window, cx);
+                                        }
+                                    },
+                                )),
+                            )
+                            .child(
+                                text_action(
+                                    "cancel-new-rule-group",
+                                    sockrocket_gui::i18n::t("rules.cancel"),
+                                    TEXT_SECONDARY,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.rules_new_group_open = false;
+                                        this.rule_group_input.update(cx, |state, cx| {
+                                            state.set_value("", window, cx);
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
                     )
                 }),
         );
-        if new_group_open {
-            content = content.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded(px(6.0))
-                    .bg(rgba(with_alpha(BG_HOVER, 0x66)))
-                    .child(
-                        div().flex_1().min_w(px(100.0)).child(
-                            gpui_component::input::Input::new(&self.rule_group_input)
-                                .xsmall()
-                                .w_full(),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .id("confirm-new-rule-group")
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .text_color(rgb(ACCENT))
-                            .child(sockrocket_gui::i18n::t("rules.group.new").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let name =
-                                    this.rule_group_input.read(cx).value().trim().to_string();
-                                if name.is_empty() {
-                                    this.rules_status =
-                                        sockrocket_gui::i18n::t("rules.status.group_name").into();
-                                    cx.notify();
-                                } else {
-                                    this.begin_add_in_group(&name, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("cancel-new-rule-group")
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(sockrocket_gui::i18n::t("rules.cancel").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.rules_new_group_open = false;
-                                this.rule_group_input.update(cx, |state, cx| {
-                                    state.set_value("", window, cx);
-                                });
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
         content = content.children(if rules_status.is_empty() {
             None
         } else {
-            Some(
-                div()
-                    .text_size(px(TINY))
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(rules_status),
-            )
+            Some(alert_strip(rules_status_kind(&rules_status), rules_status))
         });
 
-        let show_empty = rule_count == 0 && batch_group.is_none();
+        let adding_group = self.adding_rule_group.clone();
+        let show_empty = rule_count == 0 && batch_group.is_none() && adding_group.is_none();
         if show_empty {
             content = content.child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .pt_4()
                     .child(empty_state(
                         sockrocket_gui::i18n::t("rules.empty"),
                         Some(
                             div()
-                                .id("empty-new-group")
-                                .cursor_pointer()
-                                .text_size(px(SMALL))
-                                .text_color(rgb(TEXT_ACCENT))
-                                .child(sockrocket_gui::i18n::t("rules.empty.cta").to_string())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.rules_new_group_open = true;
-                                    this.rule_group_input.update(cx, |state, cx| {
-                                        state.set_value("", window, cx);
-                                        state.focus(window, cx);
-                                    });
-                                    cx.notify();
-                                }))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    tint_action(
+                                        "empty-new-group",
+                                        sockrocket_gui::i18n::t("rules.empty.cta"),
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.rules_new_group_open = true;
+                                            this.rule_group_input.update(cx, |state, cx| {
+                                                state.set_value("", window, cx);
+                                                state.focus(window, cx);
+                                            });
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(MICRO))
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(sockrocket_gui::i18n::t("rules.empty.or_preset")),
+                                )
                                 .into_any_element(),
                         ),
                     ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_3()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_size(px(TINY))
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child(sockrocket_gui::i18n::t("rules.scenes.title")),
-                            )
-                            .children(builtin_rule_scenes().iter().map(|scene| {
-                                let id = scene.id;
-                                div()
-                                    .id(SharedString::from(format!("scene-empty-{id}")))
-                                    .cursor_pointer()
-                                    .text_size(px(TINY))
-                                    .text_color(rgb(TEXT_SECONDARY))
-                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                    .child(sockrocket_gui::i18n::t(scene.title_key).to_string())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.apply_rule_scene(id, cx);
-                                    }))
-                            })),
-                    ),
+                    .child(self.render_scene_bar("scene-empty", cx)),
             );
         } else {
             let groups = sockrocket_core::group_rules_for_display(&self.rules);
-            let mut list = div().flex().flex_col().gap_3();
+            let mut list = div().flex().flex_col().gap_2p5();
             let mut any_shown = false;
             for bucket in groups {
                 let gkey = bucket.name.clone();
@@ -403,6 +443,7 @@ impl AppState {
                     .count();
                 let gkey_toggle = gkey.clone();
                 let gkey_switch = gkey.clone();
+                let gkey_add = gkey.clone();
                 let gkey_edit = gkey.clone();
                 let gkey_del = gkey.clone();
                 let del_armed = group_delete_armed(&gkey);
@@ -434,29 +475,30 @@ impl AppState {
 
                 let header_group = SharedString::from(format!("grp-hover-{gkey}"));
                 let batch_here = batch_group.as_deref() == Some(gkey.as_str());
-                let mut section = div()
+                let adding_here = adding_group.as_deref() == Some(gkey.as_str());
+                let expanded = !collapsed || !filter_q.is_empty() || batch_here || adding_here;
+                let mut section = card()
+                    .p_0()
+                    .gap_0()
                     .group(header_group.clone())
-                    .flex()
-                    .flex_col()
-                    .when(batch_here, |d| {
-                        d.pl_2()
-                            .border_l_2()
-                            .border_color(rgba(with_alpha(ACCENT, 0x55)))
+                    .when(batch_here || adding_here, |d| {
+                        d.border_1().border_color(rgba(with_alpha(ACCENT, 0x55)))
                     })
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
-                            .py_1()
+                            .gap_1p5()
+                            .px_3()
+                            .py_2()
                             .child(
                                 div()
                                     .id(SharedString::from(format!("grp-toggle-{gkey}")))
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap_1p5()
+                                    .gap_2()
                                     .flex_1()
                                     .min_w_0()
                                     .cursor_pointer()
@@ -465,23 +507,67 @@ impl AppState {
                                     }))
                                     .child(
                                         div()
+                                            .w(px(16.0))
                                             .text_size(px(TINY))
                                             .text_color(rgb(TEXT_MUTED))
-                                            .child(if collapsed { "▸" } else { "▾" }),
+                                            .child(if collapsed && !batch_here && !adding_here {
+                                                "▸"
+                                            } else {
+                                                "▾"
+                                            }),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(BODY))
-                                            .font_weight(FontWeight::MEDIUM)
+                                            .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgb(TEXT_PRIMARY))
                                             .child(title),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(px(TINY))
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .child(count_label),
-                                    ),
+                                    .child(mini_badge(count_label, TEXT_MUTED)),
+                            )
+                            .child(
+                                text_action(
+                                    SharedString::from(format!("grp-add-{gkey}")),
+                                    sockrocket_gui::i18n::t("rules.group.add"),
+                                    if adding_here {
+                                        TEXT_ACCENT
+                                    } else {
+                                        TEXT_SECONDARY
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if this.adding_rule_group.as_deref()
+                                            == Some(gkey_add.as_str())
+                                        {
+                                            this.cancel_edit_rule(window, cx);
+                                        } else {
+                                            this.begin_add_in_group(&gkey_add, window, cx);
+                                        }
+                                    },
+                                )),
+                            )
+                            .child(
+                                text_action(
+                                    SharedString::from(format!("grp-edit-{gkey}")),
+                                    sockrocket_gui::i18n::t("rules.batch.mode"),
+                                    if batch_here {
+                                        TEXT_ACCENT
+                                    } else {
+                                        TEXT_SECONDARY
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if this.batch_edit_group.as_deref()
+                                            == Some(gkey_edit.as_str())
+                                        {
+                                            this.cancel_edit_rule(window, cx);
+                                        } else {
+                                            this.begin_batch_edit_group(&gkey_edit, window, cx);
+                                        }
+                                    },
+                                )),
                             )
                             .child(
                                 quiet_mark(
@@ -496,42 +582,20 @@ impl AppState {
                                 )),
                             )
                             .child(
-                                div()
-                                    .id(SharedString::from(format!("grp-edit-{gkey}")))
-                                    .cursor_pointer()
-                                    .text_size(px(TINY))
-                                    .text_color(rgb(if batch_here {
-                                        TEXT_ACCENT
+                                text_action(
+                                    SharedString::from(format!("grp-del-{gkey}")),
+                                    if del_armed {
+                                        sockrocket_gui::i18n::t("rules.clear_confirm")
                                     } else {
-                                        TEXT_MUTED
-                                    }))
-                                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                    .child(sockrocket_gui::i18n::t("rules.batch.mode").to_string())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if this.batch_edit_group.as_deref()
-                                            == Some(gkey_edit.as_str())
-                                        {
-                                            this.cancel_edit_rule(window, cx);
-                                        } else {
-                                            this.begin_batch_edit_group(&gkey_edit, window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("grp-del-{gkey}")))
-                                    .cursor_pointer()
-                                    .text_size(px(TINY))
-                                    .text_color(rgb(if del_armed { DANGER } else { TEXT_MUTED }))
-                                    .when(!del_armed, |d| {
-                                        d.invisible().group_hover(header_group, |s| s.visible())
-                                    })
-                                    .child(if del_armed {
-                                        sockrocket_gui::i18n::t("rules.clear_confirm").to_string()
-                                    } else {
-                                        "×".to_string()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        "×"
+                                    },
+                                    if del_armed { DANGER } else { TEXT_SECONDARY },
+                                )
+                                .when(!del_armed, |d| {
+                                    d.invisible().group_hover(header_group, |s| s.visible())
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         if group_delete_armed(&gkey_del) {
                                             GROUP_DEL_AT.store(0, Ordering::Relaxed);
                                             this.delete_rule_group(&gkey_del, cx);
@@ -540,97 +604,183 @@ impl AppState {
                                             schedule_confirm_reset(this, cx);
                                             cx.notify();
                                         }
-                                    })),
+                                    },
+                                )),
                             ),
                     );
 
                 if batch_here {
-                    section = section.child(self.render_batch_editor(cx));
-                } else if !collapsed || !filter_q.is_empty() {
+                    section = section.child(
+                        div()
+                            .border_t_1()
+                            .border_color(rgba(with_alpha(BORDER, 0x40)))
+                            .child(self.render_batch_editor(cx)),
+                    );
+                } else if expanded {
+                    let mut rows = div()
+                        .flex()
+                        .flex_col()
+                        .border_t_1()
+                        .border_color(rgba(with_alpha(BORDER, 0x40)));
+                    let show_footer = adding_here || filter_q.is_empty();
                     let last = *shown.last().unwrap_or(&0);
                     for (pos, &i) in shown.iter().enumerate() {
-                        section = section.child(self.render_rule_item(
-                            i,
-                            i == last || pos + 1 == shown.len(),
-                            cx,
-                        ));
+                        let is_last_row = !show_footer && (i == last || pos + 1 == shown.len());
+                        rows = rows.child(self.render_rule_item(i, is_last_row, cx));
                     }
+                    if adding_here {
+                        rows = rows.child(self.render_add_composer(cx));
+                    } else if filter_q.is_empty() {
+                        let gkey_footer = gkey.clone();
+                        rows = rows.child(
+                            div()
+                                .id(SharedString::from(format!("grp-add-row-{gkey}")))
+                                .px_3()
+                                .py_2()
+                                .cursor_pointer()
+                                .text_size(px(SMALL))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(TEXT_ACCENT))
+                                .hover(|s| s.bg(rgba(with_alpha(BG_HOVER, 0x55))))
+                                .child(format!("+ {}", sockrocket_gui::i18n::t("rules.add.row")))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_add_in_group(&gkey_footer, window, cx);
+                                })),
+                        );
+                    }
+                    section = section.child(rows);
                 }
                 list = list.child(section);
             }
-            if let Some(name) = batch_group.clone() {
+
+            // Brand-new group (no rules yet): composer or batch card.
+            for mode in ["add", "batch"] {
+                let name = if mode == "add" {
+                    adding_group.clone()
+                } else {
+                    batch_group.clone()
+                };
+                let Some(name) = name else { continue };
                 let exists = sockrocket_core::group_rules_for_display(&self.rules)
                     .iter()
                     .any(|b| b.name == name);
-                if !exists {
-                    any_shown = true;
-                    let title = if name.is_empty() {
-                        sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
-                    } else {
-                        name
-                    };
-                    list = list.child(
-                        div()
-                            .pl_2()
-                            .border_l_2()
-                            .border_color(rgba(with_alpha(ACCENT, 0x55)))
-                            .child(
-                                div()
-                                    .py_1()
-                                    .text_size(px(BODY))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .child(title),
-                            )
-                            .child(self.render_batch_editor(cx)),
-                    );
+                if exists {
+                    continue;
                 }
+                any_shown = true;
+                let title = if name.is_empty() {
+                    sockrocket_gui::i18n::t("rules.group.ungrouped").to_string()
+                } else {
+                    name.clone()
+                };
+                let name_cancel = name.clone();
+                list = list.child(
+                    card()
+                        .p_0()
+                        .gap_0()
+                        .border_1()
+                        .border_color(rgba(with_alpha(ACCENT, 0x55)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(BODY))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT_PRIMARY))
+                                        .child(title),
+                                )
+                                .child(
+                                    text_action(
+                                        SharedString::from(format!(
+                                            "orphan-cancel-{mode}-{name_cancel}"
+                                        )),
+                                        sockrocket_gui::i18n::t("rules.cancel"),
+                                        TEXT_SECONDARY,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.cancel_edit_rule(window, cx);
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .border_t_1()
+                                .border_color(rgba(with_alpha(BORDER, 0x40)))
+                                .child(if mode == "add" {
+                                    self.render_add_composer(cx)
+                                } else {
+                                    self.render_batch_editor(cx)
+                                }),
+                        ),
+                );
             }
+
             if !any_shown && !filter_q.is_empty() {
                 list = list.child(
-                    div()
-                        .pl_4()
-                        .py_2()
-                        .text_size(px(TINY))
-                        .text_color(rgb(TEXT_MUTED))
-                        .child(sockrocket_gui::i18n::t("rules.filter.empty")),
+                    card().child(
+                        div()
+                            .py_2()
+                            .text_size(px(SMALL))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t("rules.filter.empty")),
+                    ),
                 );
             }
             content = content.child(list);
-
-            if rule_count > 0 {
-                content = content.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_3()
-                        .pt_1()
-                        .child(
-                            div()
-                                .text_size(px(TINY))
-                                .text_color(rgb(TEXT_MUTED))
-                                .child(sockrocket_gui::i18n::t("rules.scenes.title")),
-                        )
-                        .children(builtin_rule_scenes().iter().map(|scene| {
-                            let id = scene.id;
-                            div()
-                                .id(SharedString::from(format!("scene-{id}")))
-                                .cursor_pointer()
-                                .text_size(px(TINY))
-                                .text_color(rgb(TEXT_SECONDARY))
-                                .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                                .child(sockrocket_gui::i18n::t(scene.title_key).to_string())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.apply_rule_scene(id, cx);
-                                }))
-                        })),
-                );
-            }
+            content = content.child(self.render_scene_bar("scene", cx));
         }
 
         content
+    }
+
+    fn render_scene_bar(&mut self, id_prefix: &str, cx: &mut Context<Self>) -> Div {
+        card()
+            .p(px(12.0))
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_size(px(MICRO))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(sockrocket_gui::i18n::t("rules.scenes.title")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(MICRO))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t("rules.scenes.hint")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1p5()
+                    .children(builtin_rule_scenes().iter().map(|scene| {
+                        let id = scene.id;
+                        let eid = SharedString::from(format!("{id_prefix}-{id}"));
+                        scene_chip(eid, sockrocket_gui::i18n::t(scene.title_key).to_string())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_rule_scene(id, cx);
+                            }))
+                    })),
+            )
     }
 
     fn render_rule_menu(&mut self, menu: RuleMenu, cx: &mut Context<Self>) -> Div {
@@ -654,11 +804,11 @@ impl AppState {
         let mut panel = div()
             .mt_1()
             .py_1()
-            .min_w(px(100.0))
-            .rounded(px(6.0))
+            .min_w(px(120.0))
+            .rounded(px(8.0))
             .bg(rgb(BG_PANEL))
             .border_1()
-            .border_color(rgba(with_alpha(BORDER, 0xaa)))
+            .border_color(rgba(with_alpha(BORDER, 0x88)))
             .shadow_md()
             .occlude();
         for (value, key) in options {
@@ -669,11 +819,17 @@ impl AppState {
             panel = panel.child(
                 div()
                     .id(SharedString::from(format!("{id}-{value}")))
-                    .px_2p5()
-                    .py_1()
+                    .px_3()
+                    .py_1p5()
                     .cursor_pointer()
                     .text_size(px(SMALL))
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
                     .text_color(rgb(if active { TEXT_ACCENT } else { TEXT_SECONDARY }))
+                    .when(active, |d| d.bg(rgba(with_alpha(ACCENT, 0x14))))
                     .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
                     .child(sockrocket_gui::i18n::t(key).to_string())
                     .on_mouse_down(
@@ -703,11 +859,15 @@ impl AppState {
             .child(
                 div()
                     .id(id)
-                    .px_1()
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(6.0))
                     .cursor_pointer()
-                    .text_size(px(TINY))
+                    .bg(rgba(with_alpha(BORDER, 0x55)))
+                    .text_size(px(MICRO))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(TEXT_SECONDARY))
-                    .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
+                    .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
                     .child(format!("{current} ▾"))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
@@ -733,20 +893,15 @@ impl AppState {
     fn render_batch_editor(&mut self, cx: &mut Context<Self>) -> Div {
         let batch_input = self.rule_batch_input.clone();
         div()
-            .ml_2()
-            .mr_1()
-            .mb_1()
-            .mt_0p5()
-            .px_2p5()
-            .py_2()
-            .rounded(px(6.0))
-            .bg(rgba(with_alpha(BG_HOVER, 0x55)))
+            .px_3()
+            .py_2p5()
             .flex()
             .flex_col()
-            .gap_1p5()
+            .gap_2()
+            .bg(rgba(with_alpha(ACCENT, 0x0a)))
             .child(
                 div()
-                    .text_size(px(TINY))
+                    .text_size(px(MICRO))
                     .text_color(rgb(TEXT_MUTED))
                     .child(sockrocket_gui::i18n::t("rules.batch.hint").to_string()),
             )
@@ -757,69 +912,60 @@ impl AppState {
                         .w_full(),
                 ),
             )
-            .child({
-                let row = div()
+            .child(
+                div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(self.render_rule_menu(RuleMenu::Target, cx));
-                row.child(div().flex_1())
+                    .child(self.render_rule_menu(RuleMenu::Target, cx))
+                    .child(div().flex_1())
                     .child(
-                        div()
-                            .id("batch-cancel")
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .text_color(rgb(TEXT_MUTED))
-                            .hover(|s| s.text_color(rgb(TEXT_PRIMARY)))
-                            .child(sockrocket_gui::i18n::t("rules.cancel").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel_edit_rule(window, cx);
-                            })),
+                        text_action(
+                            "batch-cancel",
+                            sockrocket_gui::i18n::t("rules.cancel"),
+                            TEXT_SECONDARY,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_edit_rule(window, cx);
+                        })),
                     )
                     .child(
-                        div()
-                            .id("batch-save")
-                            .px_2()
-                            .py_0p5()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .font_weight(FontWeight::MEDIUM)
-                            .bg(rgba(with_alpha(ACCENT, 0x22)))
-                            .text_color(rgb(TEXT_ACCENT))
-                            .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
-                            .child(sockrocket_gui::i18n::t("rules.batch.save").to_string())
+                        tint_action("batch-save", sockrocket_gui::i18n::t("rules.batch.save"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.rule_menu = None;
                                 this.save_batch_edit_group(window, cx);
                             })),
-                    )
-            })
+                    ),
+            )
     }
 
-    fn render_inline_editor(&mut self, index: usize, is_last: bool, cx: &mut Context<Self>) -> Div {
+    fn render_rule_composer(&mut self, id_prefix: &str, cx: &mut Context<Self>) -> Div {
         let cur_type = self.rule_type_sel.clone();
         let pattern_input = self.rule_pattern_input.clone();
         let is_final = matches!(cur_type.as_str(), "match" | "final");
-        let is_geoip = cur_type == "geoip";
+        let hint_key = match cur_type.as_str() {
+            "geoip" => Some("rules.hint.geoip"),
+            "domain" => Some("rules.hint.domain"),
+            "domain-keyword" => Some("rules.hint.domain-keyword"),
+            "ip-cidr" => Some("rules.hint.ip-cidr"),
+            "dst-port" | "port" => Some("rules.hint.dst-port"),
+            "match" | "final" => Some("rules.hint.match"),
+            _ => Some("rules.hint.domain-suffix"),
+        };
         div()
-            .ml_2()
-            .mr_1()
-            .my_0p5()
-            .px_2p5()
-            .py_1p5()
-            .rounded(px(6.0))
-            .bg(rgba(with_alpha(ACCENT, 0x10)))
+            .px_3()
+            .py_2p5()
             .flex()
             .flex_col()
-            .gap_1()
-            .when(is_geoip, |d| {
+            .gap_1p5()
+            .bg(rgba(with_alpha(ACCENT, 0x0c)))
+            .when_some(hint_key, |d, key| {
                 d.child(
                     div()
-                        .text_size(px(TINY))
+                        .text_size(px(MICRO))
                         .text_color(rgb(TEXT_MUTED))
-                        .child(sockrocket_gui::i18n::t("rules.hint.geoip").to_string()),
+                        .child(sockrocket_gui::i18n::t(key).to_string()),
                 )
             })
             .child(
@@ -828,18 +974,17 @@ impl AppState {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .when(!is_last, |d| d)
                     .child(if is_final {
                         div()
                             .flex_1()
                             .text_size(px(SMALL))
                             .text_color(rgb(TEXT_MUTED))
-                            .child(sockrocket_gui::i18n::t("rules.hint.match"))
+                            .child(sockrocket_gui::i18n::t("rules.match.label"))
                             .into_any_element()
                     } else {
                         div()
                             .flex_1()
-                            .min_w(px(80.0))
+                            .min_w(px(100.0))
                             .child(
                                 gpui_component::input::Input::new(&pattern_input)
                                     .xsmall()
@@ -850,33 +995,33 @@ impl AppState {
                     .child(self.render_rule_menu(RuleMenu::Type, cx))
                     .child(self.render_rule_menu(RuleMenu::Target, cx))
                     .child(
-                        div()
-                            .id(SharedString::from(format!("inline-cancel-{index}")))
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(sockrocket_gui::i18n::t("rules.cancel").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel_edit_rule(window, cx);
-                            })),
+                        text_action(
+                            SharedString::from(format!("{id_prefix}-cancel")),
+                            sockrocket_gui::i18n::t("rules.cancel"),
+                            TEXT_SECONDARY,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_edit_rule(window, cx);
+                        })),
                     )
                     .child(
-                        div()
-                            .id(SharedString::from(format!("inline-save-{index}")))
-                            .px_2()
-                            .py_0p5()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_size(px(TINY))
-                            .font_weight(FontWeight::MEDIUM)
-                            .bg(rgba(with_alpha(ACCENT, 0x22)))
-                            .text_color(rgb(TEXT_ACCENT))
-                            .child(sockrocket_gui::i18n::t("rules.save").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_rule(window, cx);
-                            })),
+                        tint_action(
+                            SharedString::from(format!("{id_prefix}-save")),
+                            sockrocket_gui::i18n::t("rules.save"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_rule(window, cx);
+                        })),
                     ),
             )
+    }
+
+    fn render_add_composer(&mut self, cx: &mut Context<Self>) -> Div {
+        self.render_rule_composer("add", cx)
+    }
+
+    fn render_inline_editor(&mut self, index: usize, cx: &mut Context<Self>) -> Div {
+        self.render_rule_composer(&format!("inline-{index}"), cx)
     }
 
     pub(crate) fn render_rule_item(
@@ -886,18 +1031,14 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.editing_rule_index == Some(index) {
-            return self
-                .render_inline_editor(index, is_last, cx)
-                .into_any_element();
+            return self.render_inline_editor(index, cx).into_any_element();
         }
         let rule = &self.rules[index];
         let is_enabled = rule.enabled;
         let pattern = display_pattern(rule);
-        let meta = format!(
-            "{} · {}",
-            short_type(&rule.rule_type),
-            short_target(&rule.target)
-        );
+        let type_label = short_type(&rule.rule_type).to_string();
+        let target_label = short_target(&rule.target).to_string();
+        let tgt_color = target_color(&rule.target);
         let pattern_color = if is_enabled { TEXT_PRIMARY } else { TEXT_MUTED };
         let del_armed = delete_confirm_armed(index);
         let weak = cx.entity().downgrade();
@@ -910,15 +1051,12 @@ impl AppState {
             .flex_row()
             .items_center()
             .gap_2()
-            .pl_4()
-            .pr_1()
-            .py_1()
-            .rounded(px(4.0))
+            .px_3()
+            .py(px(8.0))
             .when(!is_last, |d| {
-                d.border_b_1().border_color(rgba(with_alpha(BORDER, 0x18)))
+                d.border_b_1().border_color(rgba(with_alpha(BORDER, 0x28)))
             })
-            .when(!is_enabled, |d| d.opacity(0.4))
-            .hover(|s| s.bg(rgba(with_alpha(BG_HOVER, 0x40))))
+            .hover(|s| s.bg(rgba(with_alpha(BG_HOVER, 0x55))))
             .on_hover(move |is_hovered, _window, cx| {
                 let next = if *is_hovered { Some(index) } else { None };
                 if hovered_rule() != next {
@@ -941,16 +1079,10 @@ impl AppState {
                         this.start_edit_rule(index, window, cx);
                     })),
             )
+            .child(mini_badge(type_label, TEXT_MUTED))
+            .child(mini_badge(target_label, tgt_color))
             .child(
-                div()
-                    .text_size(px(TINY))
-                    .text_color(rgb(TEXT_MUTED))
-                    .invisible()
-                    .group_hover(row_group.clone(), |s| s.visible())
-                    .child(meta),
-            )
-            .child(
-                quiet_mark(("rule-switch", index), is_enabled, false).on_click(cx.listener(
+                toggle_switch(("rule-switch", index), is_enabled).on_click(cx.listener(
                     move |this, _, _, cx| {
                         if let Some(rule) = this.rules.get_mut(index) {
                             rule.enabled = !rule.enabled;
@@ -964,24 +1096,22 @@ impl AppState {
                 )),
             )
             .child(if del_armed {
-                div()
-                    .id(("rule-del-confirm", index))
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(px(TINY))
-                    .text_color(rgb(DANGER))
-                    .child(sockrocket_gui::i18n::t("rules.clear_confirm").to_string())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        disarm_delete_confirm();
-                        this.delete_rule(index, cx);
-                    }))
-                    .into_any_element()
+                text_action(
+                    ("rule-del-confirm", index),
+                    sockrocket_gui::i18n::t("rules.clear_confirm"),
+                    DANGER,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    disarm_delete_confirm();
+                    this.delete_rule(index, cx);
+                }))
+                .into_any_element()
             } else {
                 div()
                     .id(("rule-del", index))
-                    .w(px(18.0))
-                    .h(px(18.0))
-                    .rounded(px(4.0))
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(6.0))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -992,7 +1122,7 @@ impl AppState {
                     .child(
                         Icon::empty()
                             .path("icons/trash-2.svg")
-                            .with_size(gpui_component::Size::Size(px(11.0)))
+                            .with_size(gpui_component::Size::Size(px(12.0)))
                             .text_color(rgb(TEXT_MUTED)),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {

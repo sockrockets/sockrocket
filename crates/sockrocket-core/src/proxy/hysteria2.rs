@@ -55,7 +55,7 @@ impl Hysteria2Attempt {
         } else {
             "[::]:0".parse()?
         };
-        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+        let mut endpoint = super::quic_conn::client_endpoint(bind_addr)?;
         endpoint.set_default_client_config(client_config.clone());
 
         let connecting = endpoint
@@ -110,6 +110,7 @@ pub struct Hysteria2Outbound {
     alpn_candidates: Vec<String>,
     working_alpn: std::sync::Mutex<Option<String>>,
     conn_state: QuicConnectionState,
+    udp_hub: tokio::sync::Mutex<Option<Arc<super::quic_datagram::Hub>>>,
 }
 
 impl Hysteria2Outbound {
@@ -140,6 +141,7 @@ impl Hysteria2Outbound {
             alpn_candidates,
             working_alpn: std::sync::Mutex::new(None),
             conn_state: QuicConnectionState::new(),
+            udp_hub: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -475,6 +477,25 @@ impl Outbound for Hysteria2Outbound {
                 return Ok(Box::new(stream) as BoxProxyStream);
             }
             Err(last_err)
+        })
+    }
+
+    fn connect_datagram(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            let connection = self.get_connection().await?;
+            let mut hub = self.udp_hub.lock().await;
+            if hub.as_ref().is_none_or(|hub| !hub.matches(&connection)) {
+                *hub = Some(super::quic_datagram::Hub::new(
+                    connection,
+                    super::quic_datagram::Protocol::Hysteria2,
+                ));
+            }
+            hub.as_ref().unwrap().associate(&host, port)
         })
     }
 

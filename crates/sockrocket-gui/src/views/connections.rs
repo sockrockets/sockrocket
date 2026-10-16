@@ -37,39 +37,38 @@ impl AppState {
             .map(|n| n.name.clone())
             .filter(|_| self.proxy_running);
 
-        // --- Header (v2): title + cyan active badge | total count ──
+        // --- Header: Mac page header + live counts ---
         let header = div()
             .flex()
             .flex_row()
-            .items_center()
+            .items_start()
             .justify_between()
-            .pb_1()
-            .mb_1()
+            .gap_3()
+            .child(self.page_header_v3(
+                "icons/nav-connections.svg",
+                ACCENT,
+                sockrocket_gui::i18n::t("nav.connections"),
+                sockrocket_gui::i18n::t("connections.subtitle"),
+            ))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
+                    .pt_1()
+                    .child(mini_badge(format!("{} active", active_n), ACCENT))
                     .child(
                         div()
-                            .text_size(px(PAGE_TITLE))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT_PRIMARY))
-                            .child("Connections"),
-                    )
-                    .child(mini_badge(format!("{} active", active_n), ACCENT)),
-            )
-            .child(
-                div()
-                    .text_size(px(MICRO))
-                    .font_family(MONO_FONT)
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(format!("{} total", total_n)),
+                            .text_size(px(MICRO))
+                            .font_family(MONO_FONT)
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(format!("{} total", total_n)),
+                    ),
             );
 
-        // --- Filter chips ---
-        let mut chips = div().flex().flex_row().gap_1().mb_2();
+        // --- Filter: same segmented capsule as title-bar mode control ---
+        let mut chips = seg_group().mb_2();
         for f in [ConnFilter::All, ConnFilter::Socks5, ConnFilter::Http] {
             chips = chips.child(
                 seg_button(

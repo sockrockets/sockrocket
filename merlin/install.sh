@@ -459,13 +459,9 @@ merlin_install() {
     info "Hooking into Merlin startup scripts..."
 
     install_hook "/jffs/scripts/firewall-start" \
-'[ -f /jffs/addons/sockrocket/stopped ] && exit 0
-# Reapply transparent proxy (mangle) when TUN is up. DNS NAT is intentionally
-# NOT flushed by iptables.sh start; restore it if sockrocket.conf says hijack.
-[ -x /jffs/addons/sockrocket/scripts/iptables.sh ] && /jffs/addons/sockrocket/scripts/iptables.sh start
-[ -f /jffs/configs/dnsmasq.d/sockrocket.conf ] && \
-  [ -x /jffs/addons/sockrocket/scripts/iptables.sh ] && \
-  /jffs/addons/sockrocket/scripts/iptables.sh dns-start
+'# Serialized reapply; respects manual stop and degraded fail-open state.
+[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+  /jffs/addons/sockrocket/scripts/sockrocket.sh firewall-restore
 '
 
     install_hook "/jffs/scripts/services-start" \

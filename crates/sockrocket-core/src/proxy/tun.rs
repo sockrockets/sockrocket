@@ -12,6 +12,7 @@ use tun::AbstractDevice;
 
 use super::connector::{SharedOutbound, connect_upstream};
 use super::relay::relay_bidirectional;
+use super::routing::RoutingState;
 use crate::dns::DnsResolver;
 use crate::dns::fakeip::{FakeIpPool, is_fake_ip};
 use crate::router::Router;
@@ -21,6 +22,7 @@ use crate::router::Router;
 /// Saved state for emergency route restoration when the process exits.
 #[derive(Clone)]
 struct TunExitState {
+    scoped_default_v4: bool,
     orig_gateway: Ipv4Addr,
     orig_iface: String,
     bypass_ips: Vec<Ipv4Addr>,
@@ -61,7 +63,11 @@ fn save_tun_exit_state(
     v6: Option<TunV6ExitState>,
 ) {
     if let Ok(mut guard) = tun_exit_state().lock() {
+        let scoped_default_v4 = guard.as_ref().is_some_and(|state| {
+            state.orig_gateway == gateway && state.orig_iface == iface && state.scoped_default_v4
+        });
         *guard = Some(TunExitState {
+            scoped_default_v4,
             orig_gateway: gateway,
             orig_iface: iface.to_string(),
             bypass_ips: bypass_ips.to_vec(),
@@ -133,6 +139,12 @@ pub fn emergency_restore_routes() {
         }
         for ip in &state.bypass_ips {
             let _ = run_cmd_sync("route", &["-n", "delete", "-host", &ip.to_string()]);
+        }
+        if state.scoped_default_v4 {
+            let _ = run_cmd_sync_strs(
+                "route",
+                &macos_scoped_v4_args("delete", &state.orig_iface, &state.orig_gateway),
+            );
         }
     }
 
@@ -263,6 +275,7 @@ fn tun_tcp_mss(mtu: u16) -> u16 {
 /// Creates a TUN device, intercepts all TCP/UDP traffic via the `ipstack`
 /// userspace TCP/IP stack, and forwards connections through the proxy outbound.
 pub struct TunProxy {
+    routing: RoutingState,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     tun_name: String,
@@ -276,6 +289,15 @@ pub struct TunProxy {
     /// first, so this stays pending. Callers (CLI under supervisor) should
     /// exit on completion so a fresh process can rebuild TUN+DNS.
     unexpected_exit_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Drop for TunProxy {
+    fn drop(&mut self) {
+        // Failed route setup can drop a freshly started proxy without stop().
+        // Signal the owner task to drain streams and release the device safely.
+        self.running.store(false, Ordering::Relaxed);
+        self.shutdown.notify_one();
+    }
 }
 
 /// Information needed to set up system routes for TUN mode.
@@ -391,7 +413,7 @@ impl TunProxy {
 
         // Cap concurrent stream tasks so a LAN scan / download burst cannot
         // grow the JoinSet (and ipstack session table) without bound.
-        const MAX_TUN_STREAMS: usize = 512;
+        let max_tun_streams = crate::resources::ResourceBudget::detect().tun_streams;
         let active_streams = Arc::new(AtomicUsize::new(0));
 
         /// Decrements the active-stream counter when a per-stream task ends.
@@ -402,6 +424,8 @@ impl TunProxy {
             }
         }
 
+        let routing = RoutingState::new(router);
+        let stream_routing = routing.clone();
         let handle = tokio::spawn(async move {
             // Create DNS resolver for intercepting TUN DNS queries.
             //
@@ -412,7 +436,7 @@ impl TunProxy {
             // pipeline, so every DNS path returns clean answers.
             let mut resolver =
                 DnsResolver::with_config(crate::dns::china_split_dns_config_proxy_tls());
-            resolver.set_outbound(outbound.clone());
+            resolver.follow_runtime(outbound.clone());
             if let Some(pool) = &fakeip {
                 resolver.set_fakeip(pool.clone());
                 resolver.set_geoip(std::sync::Arc::new(crate::router::china_geoip_db()));
@@ -444,19 +468,25 @@ impl TunProxy {
                 };
                 match accepted {
                     Ok(stream) => {
-                        if active_streams.load(Ordering::Relaxed) >= MAX_TUN_STREAMS {
+                        if active_streams.load(Ordering::Relaxed) >= max_tun_streams {
                             // Drop the stream by letting it fall out of scope:
                             // ipstack closes/RSTs; prefer this over unbounded
                             // memory growth under a connection flood.
                             tracing::debug!(
-                                "TUN stream cap ({MAX_TUN_STREAMS}) reached — dropping new session"
+                                "TUN stream cap ({max_tun_streams}) reached — dropping new session"
                             );
                             continue;
                         }
-                        let outbound = outbound.clone();
+                        // Route policy and node come from the same published object.
+                        let (outbound, router) = match outbound.0.runtime_snapshot() {
+                            Some(snapshot) => {
+                                let router = snapshot.0.routing_policy();
+                                (snapshot, router)
+                            }
+                            None => (outbound.clone(), stream_routing.snapshot()),
+                        };
                         let resolver = dns_resolver.clone();
                         let fakeip = fakeip.clone();
-                        let router = router.clone();
                         let active = active_streams.clone();
                         active.fetch_add(1, Ordering::Relaxed);
                         streams.spawn(async move {
@@ -499,6 +529,7 @@ impl TunProxy {
         });
 
         Ok(TunProxy {
+            routing,
             running,
             handle: Some(handle),
             tun_name,
@@ -514,6 +545,11 @@ impl TunProxy {
     /// exit the process so `sockrocket.sh`'s supervisor can respawn.
     pub fn take_unexpected_exit(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         self.unexpected_exit_rx.take()
+    }
+
+    /// Publish rules for new streams without rebuilding the interface.
+    pub fn replace_router(&self, router: Option<Arc<Router>>) {
+        self.routing.replace(router);
     }
 
     /// Get the TUN device name.
@@ -544,21 +580,11 @@ impl TunProxy {
     /// next packet.
     pub async fn stop(mut self) {
         self.running.store(false, Ordering::Relaxed);
-        self.shutdown.notify_waiters();
+        self.shutdown.notify_one();
         if let Some(h) = self.handle.take() {
             let _ = h.await;
         }
         tracing::info!("TUN proxy stopped");
-    }
-}
-
-impl Drop for TunProxy {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        self.shutdown.notify_waiters();
-        if let Some(h) = self.handle.take() {
-            h.abort();
-        }
     }
 }
 
@@ -631,25 +657,20 @@ async fn handle_tun_stream(
                 if force_direct { " (direct)" } else { "" }
             );
 
-            // TODO: this relays UDP payload over a TCP-oriented outbound
-            // (UDP-over-TCP) — incorrect semantics kept as a temporary
-            // behavior until a proper UDP association path exists. The
-            // connect_upstream() timeout at least bounds the error path so
-            // a dead node can't hang this task forever.
-            match connect_tun_upstream(&outbound, &host, port, force_direct).await {
-                Ok(mut remote) => {
-                    let result = relay_bidirectional(&mut udp, &mut remote).await;
-                    let _ = remote.shutdown().await;
-                    let _ = udp.shutdown().await;
-                    if let Err(e) = result {
-                        tracing::debug!("TUN UDP relay error {}:{}: {}", host, port, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("TUN UDP connect failed {}:{}: {}", host, port, e);
-                    let _ = udp.shutdown().await;
-                }
-            }
+            let transport = if force_direct {
+                SharedOutbound::direct()
+            } else {
+                outbound
+            };
+            let remote = tokio::time::timeout(
+                super::connector::UPSTREAM_CONNECT_TIMEOUT,
+                transport.0.connect_datagram(&host, port),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("UDP association timed out"))??;
+            let result = super::datagram::relay(&mut udp, remote.as_ref()).await;
+            let _ = udp.shutdown().await;
+            result?;
         }
         IpStackStream::UnknownTransport(pkt) => {
             if pkt.src_addr().is_ipv4()
@@ -758,6 +779,11 @@ fn tun_dial_target(
             };
         }
         if let Some(domain) = pool.lookup_domestic(addr.ip()) {
+            // Global and Direct have no rule router. Honor their outbound
+            // mode instead of forcibly bypassing it for domestic answers.
+            if router.is_none() {
+                return Ok((domain, addr.port(), false));
+            }
             if let Some(action) = router.and_then(|r| r.route_domain_only(&domain)) {
                 tracing::debug!(
                     "TUN {} (domestic {}): user domain rule → {:?}",
@@ -864,16 +890,6 @@ fn add_bypass_route(ip: &Ipv4Addr, gateway: &Ipv4Addr) {
     );
 }
 
-/// Remove one loop-avoidance route for `ip` (platform-specific).
-#[cfg(target_os = "windows")]
-fn remove_bypass_route(ip: &Ipv4Addr, gateway: &Ipv4Addr) {
-    let gw = gateway.to_string();
-    let _ = run_cmd(
-        "route",
-        &["delete", &ip.to_string(), "mask", "255.255.255.255", &gw],
-    );
-}
-
 #[cfg(target_os = "linux")]
 fn add_bypass_route(ip: &Ipv4Addr, gateway: &Ipv4Addr) {
     let _ = run_cmd(
@@ -888,22 +904,12 @@ fn add_bypass_route(ip: &Ipv4Addr, gateway: &Ipv4Addr) {
     );
 }
 
-#[cfg(target_os = "linux")]
-fn remove_bypass_route(_ip: &Ipv4Addr, _gateway: &Ipv4Addr) {
-    let _ = run_cmd("ip", &["route", "del", &format!("{}/32", _ip)]);
-}
-
 #[cfg(target_os = "macos")]
 fn add_bypass_route(ip: &Ipv4Addr, gateway: &Ipv4Addr) {
     let _ = run_cmd(
         "route",
         &["-n", "add", "-host", &ip.to_string(), &gateway.to_string()],
     );
-}
-
-#[cfg(target_os = "macos")]
-fn remove_bypass_route(ip: &Ipv4Addr, _gateway: &Ipv4Addr) {
-    let _ = run_cmd("route", &["-n", "delete", "-host", &ip.to_string()]);
 }
 
 // ─── IPv6 device configuration and bypass routes ───
@@ -1097,9 +1103,13 @@ pub fn update_tun_bypass_ips(proxy_server_ips: &[IpAddr]) -> Result<()> {
 
     for ip in &old_ips {
         if !new_ips.contains(ip) {
-            remove_bypass_route(ip, &gateway);
+            new_ips.push(*ip);
         }
     }
+    anyhow::ensure!(
+        new_ips.len() <= 4096,
+        "TUN bypass route budget exceeded; restart TUN to reset"
+    );
     for ip in &new_ips {
         if !old_ips.contains(ip) {
             add_bypass_route(ip, &gateway);
@@ -1110,7 +1120,7 @@ pub fn update_tun_bypass_ips(proxy_server_ips: &[IpAddr]) -> Result<()> {
     let new_v6_state = if let Some(v6) = old_v6 {
         for ip in &v6.bypass_ips {
             if !new_ips_v6.contains(ip) {
-                remove_bypass_route_v6(ip, &v6.orig_gateway, &v6.orig_iface);
+                new_ips_v6.push(*ip);
             }
         }
         for ip in &new_ips_v6 {
@@ -1179,16 +1189,27 @@ pub fn setup_tun_routes(
     // direct-routed connections don't follow the TUN default route straight
     // back into the TUN (infinite session loop). Must be active before the
     // routes below are changed.
-    install_outbound_bind(&orig_iface);
-
+    anyhow::ensure!(
+        orig_gateway != TUN_GATEWAY
+            && !orig_iface.starts_with("utun")
+            && !orig_iface.starts_with("sockrocket-tun"),
+        "Another TUN already owns the default route; stop that VPN before enabling Sockrocket TUN"
+    );
+    install_outbound_bind(&orig_iface)?;
+    // Register rollback BEFORE the first route mutation, including partial setup.
+    save_tun_exit_state(orig_gateway, &orig_iface, &bypass_ips, None);
     #[cfg(target_os = "linux")]
-    setup_routes_linux(route_info, &bypass_ips, &orig_gateway, &orig_iface)?;
-
+    let setup = setup_routes_linux(route_info, &bypass_ips, &orig_gateway, &orig_iface);
     #[cfg(target_os = "macos")]
-    setup_routes_macos(route_info, &bypass_ips, &orig_gateway, &orig_iface)?;
-
+    let setup = setup_routes_macos(route_info, &bypass_ips, &orig_gateway, &orig_iface);
     #[cfg(target_os = "windows")]
-    setup_routes_windows(route_info, &bypass_ips, &orig_gateway, &orig_iface)?;
+    let setup = setup_routes_windows(route_info, &bypass_ips, &orig_gateway, &orig_iface);
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let setup: Result<()> = anyhow::bail!("Platform TUN routing unsupported");
+    if let Err(error) = setup {
+        emergency_restore_routes();
+        return Err(error);
+    }
 
     tracing::info!("Default route set to TUN device {}", route_info.tun_name);
 
@@ -1199,7 +1220,13 @@ pub fn setup_tun_routes(
     // if the TunRouteGuard is never properly dropped (e.g., process killed).
     save_tun_exit_state(orig_gateway, &orig_iface, &bypass_ips, v6_state.clone());
 
+    let scoped_default_v4 = tun_exit_state()
+        .lock()
+        .ok()
+        .and_then(|state| state.as_ref().map(|state| state.scoped_default_v4))
+        .unwrap_or(false);
     Ok(TunRouteGuard {
+        scoped_default_v4,
         orig_gateway,
         orig_iface,
         bypass_ips,
@@ -1210,7 +1237,7 @@ pub fn setup_tun_routes(
 
 /// Activate outbound-socket binding to the physical interface for the
 /// duration of TUN mode (see the `outbound_bind` module docs for why).
-fn install_outbound_bind(orig_iface: &str) {
+fn install_outbound_bind(orig_iface: &str) -> Result<()> {
     #[cfg(windows)]
     {
         // On Windows the "interface" learned from `route print` is the
@@ -1230,10 +1257,7 @@ fn install_outbound_bind(orig_iface: &str) {
                 });
             }
             None => {
-                tracing::warn!(
-                    "Could not resolve interface index for {}; direct traffic may loop into TUN",
-                    orig_iface
-                );
+                bail!("Cannot bind outbound sockets to physical interface {orig_iface}");
             }
         }
     }
@@ -1252,19 +1276,17 @@ fn install_outbound_bind(orig_iface: &str) {
                 super::outbound_bind::set_outbound_bind(super::outbound_bind::OutboundBind {
                     if_index_v4: Some(idx),
                     if_index_v6: Some(idx),
-                    if_name: None,
+                    if_name: Some(orig_iface.to_owned()),
                 });
             }
             None => {
-                tracing::warn!(
-                    "Could not resolve interface index for {}; direct traffic may loop into TUN",
-                    orig_iface
-                );
+                bail!("Cannot bind outbound sockets to physical interface {orig_iface}");
             }
         }
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let _ = orig_iface;
+    Ok(())
 }
 
 /// Set up IPv6 routes through the TUN device on a best-effort basis.
@@ -1363,6 +1385,8 @@ fn setup_tun_routes_v6(
 
 /// Guard that restores system routes when dropped.
 pub struct TunRouteGuard {
+    #[allow(dead_code)] // macOS only
+    scoped_default_v4: bool,
     #[allow(dead_code)] // read under cfg(macos) restore; stored for all platforms
     orig_gateway: Ipv4Addr,
     #[allow(dead_code)] // retained for diagnostics / future restore paths
@@ -1555,13 +1579,44 @@ fn setup_routes_linux_v6(
 
 // ─── macOS implementation ───
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_scoped_v4_args(action: &str, iface: &str, gateway: &Ipv4Addr) -> Vec<String> {
+    vec![
+        "-n".into(),
+        action.into(),
+        "-ifscope".into(),
+        iface.into(),
+        "default".into(),
+        gateway.to_string(),
+    ]
+}
+
 #[cfg(target_os = "macos")]
 fn setup_routes_macos(
     route_info: &TunRouteInfo,
     proxy_server_ips: &[Ipv4Addr],
     orig_gateway: &Ipv4Addr,
-    _orig_iface: &str,
+    orig_iface: &str,
 ) -> Result<()> {
+    // IP_BOUND_IF sockets need an interface-scoped default after the global
+    // default moves to utun. Without it connect() fails with ENETUNREACH.
+    let scoped = run_cmd("route", &["-n", "get", "-ifscope", orig_iface, "default"]);
+    let already_present = scoped.as_ref().is_ok_and(|output| {
+        output
+            .lines()
+            .any(|line| line.trim() == format!("interface: {orig_iface}"))
+    });
+    if !already_present {
+        run_cmd_strs(
+            "route",
+            &macos_scoped_v4_args("add", orig_iface, orig_gateway),
+        )?;
+        if let Ok(mut state) = tun_exit_state().lock()
+            && let Some(state) = state.as_mut()
+        {
+            state.scoped_default_v4 = true;
+        }
+    }
     let gw_str = orig_gateway.to_string();
     // Add direct routes for proxy server IPs (loop avoidance)
     for ip in proxy_server_ips {
@@ -1601,6 +1656,13 @@ impl TunRouteGuard {
         }
         for ip in &self.bypass_ips {
             let _ = run_cmd("route", &["-n", "delete", "-host", &ip.to_string()]);
+        }
+
+        if self.scoped_default_v4 {
+            let _ = run_cmd_strs(
+                "route",
+                &macos_scoped_v4_args("delete", &self.orig_iface, &self.orig_gateway),
+            );
         }
 
         // IPv6: macOS only tolerates one default route per family, so setup

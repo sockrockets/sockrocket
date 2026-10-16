@@ -211,41 +211,57 @@ do_start() {
     info "Setting up transparent proxy rules (fwmark → $TUN_DEV)..."
     info "LAN: $LAN_SUBNET  mark=$TUN_MARK"
 
-    iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null \
-        || iptables -t mangle -F "$MANGLE_CHAIN"
-    iptables -t mangle -A "$MANGLE_CHAIN" -d "$ROUTER_IP"    -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 10.0.0.0/8     -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 172.16.0.0/12  -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 192.168.0.0/16 -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 100.64.0.0/10  -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 127.0.0.0/8    -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 169.254.0.0/16 -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 224.0.0.0/4    -j RETURN
-    iptables -t mangle -A "$MANGLE_CHAIN" -d 240.0.0.0/4    -j RETURN
-    # QUIC/HTTP3 (UDP 443) must NOT enter the TUN: Sockrocket relays UDP payloads
-    # over a TCP-oriented outbound (incorrect semantics), so captured QUIC
-    # just stalls until the browser's fallback timer fires. Leaving it direct
-    # keeps CN sites fast (their QUIC works) and costs nothing for blocked
-    # sites — their QUIC is unreachable directly anyway, and the browser
-    # falls back to TCP 443, which IS proxied below.
-    iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p udp --dport 443 -j RETURN
+    if ! iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null \
+        && ! iptables -t mangle -F "$MANGLE_CHAIN"; then
+        err "Cannot create TUN mark chain"
+        return 1
+    fi
+    local dest proto
+    for dest in "$ROUTER_IP" 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 \
+        100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A "$MANGLE_CHAIN" -d "$dest" -j RETURN || {
+            flush_chains
+            return 1
+        }
+    done
+    # Capture QUIC only when the active node has a real datagram transport.
+    local udp_supported=0
+    if "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
+        udp_supported=1
+    else
+        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p udp --dport 443 -j RETURN || {
+            flush_chains
+            return 1
+        }
+    fi
     # Optional: CN-range bypass BEFORE the MARK rules (hardware NAT for
     # domestic traffic). Gated by the cn_ipset_direct config toggle.
     if [ "$(get_conf cn_ipset_direct)" = "true" ]; then
         do_ipset_start
     fi
     # Mark all other LAN-originated TCP+UDP; policy routing sends them into TUN.
-    iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p tcp \
-        -j MARK --set-mark "$TUN_MARK"
-    iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p udp \
-        -j MARK --set-mark "$TUN_MARK"
-    iptables -t mangle -C PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null \
-        || iptables -t mangle -A PREROUTING -j "$MANGLE_CHAIN"
+    for proto in tcp udp; do
+        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p "$proto" \
+            -j MARK --set-mark "$TUN_MARK" || {
+                flush_chains
+                return 1
+            }
+    done
+    # Stage routing before exposing MARK rules to LAN packets. Repeated
+    # firewall/WAN events must not accumulate identical policy rules.
+    if ! ip route replace default dev "$TUN_DEV" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; then
+        flush_chains
+        err "TUN route setup failed — LAN marking remains disabled"
+        return 1
+    fi
+    if ! ip rule show 2>/dev/null | grep -Eq "fwmark ${TUN_MARK}(/0xffffffff)? .*lookup ${SOCKROCKET_RT_TABLE}([[:space:]]|$)"; then
+        if ! ip rule add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; then
+            flush_chains
+            err "TUN policy rule setup failed — LAN marking remains disabled"
+            return 1
+        fi
+    fi
 
-    ip rule  add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
-    ip route replace default dev "$TUN_DEV" table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
-    # Drop the TUN-off blackhole so Fake-IP traffic can be MARK'd into TUN again.
-    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
 
     # Return-path forwarding: replies sockrocket-cli injects into the TUN (src =
     # public internet IP, dst = LAN client) traverse the filter FORWARD
@@ -256,8 +272,42 @@ do_start() {
     # and dropped: the flow hangs mid-transfer with no RST either way.
     # Accept everything out of the TUN explicitly; the daemon only injects
     # packets for flows it accepted, so this grants no new reachability.
-    iptables -C FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null \
-        || iptables -I FORWARD 1 -i "$TUN_DEV" -j ACCEPT
+    if ! iptables -C FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null \
+        && ! iptables -I FORWARD 1 -i "$TUN_DEV" -j ACCEPT; then
+        flush_chains
+        err "TUN return-path forwarding unavailable"
+        return 1
+    fi
+
+    # Fake-IP (198.18/16) fail-fast for unmarked traffic (notably QUIC UDP/443
+    # RETURN above). Marked Fake-IP TCP uses SOCKROCKET_RT_TABLE and never
+    # consults main, so the TUN path stays intact. Use `unreachable` (ICMP)
+    # not `blackhole` (silent) — silent drops make browser/HTTP3 wait minutes
+    # before falling back to TCP. FORWARD REJECT is a belt-and-suspenders
+    # if the route is missing; insert after TUN ACCEPT so it stays #1.
+    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
+    ip route replace unreachable 198.18.0.0/16 2>/dev/null \
+        || ip route add unreachable 198.18.0.0/16 2>/dev/null || true
+    iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+        -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    if [ "$udp_supported" != 1 ]; then
+        iptables -I FORWARD 1 -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+            -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
+    fi
+    # Keep TUN return-path ACCEPT at the very top (above Fake-IP REJECT).
+    iptables -D FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null || true
+    if ! iptables -I FORWARD 1 -i "$TUN_DEV" -j ACCEPT; then
+        flush_chains
+        err "TUN return-path reordering failed"
+        return 1
+    fi
+
+    if ! iptables -t mangle -C PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null \
+        && ! iptables -t mangle -A PREROUTING -j "$MANGLE_CHAIN"; then
+        flush_chains
+        err "TUN mark-chain attach failed"
+        return 1
+    fi
 
     ok "Transparent proxy applied (LAN TCP+UDP → $TUN_DEV)"
 }
@@ -270,16 +320,17 @@ do_start() {
 # Router-originated queries traverse OUTPUT, not PREROUTING, so dnsmasq's own
 # upstreams (direct server + Sockrocket listener) are never looped back.
 do_dns_start() {
-    iptables -t nat -N "$DNS_CHAIN" 2>/dev/null \
-        || iptables -t nat -F "$DNS_CHAIN"
-    # Queries already addressed to the router land in dnsmasq directly.
-    iptables -t nat -A "$DNS_CHAIN" -d "$ROUTER_IP" -j RETURN
-    iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p udp --dport 53 \
-        -j REDIRECT --to-ports 53
-    iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p tcp --dport 53 \
-        -j REDIRECT --to-ports 53
-    iptables -t nat -C PREROUTING -j "$DNS_CHAIN" 2>/dev/null \
-        || iptables -t nat -A PREROUTING -j "$DNS_CHAIN"
+    if ! {
+        { iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || iptables -t nat -F "$DNS_CHAIN"; } &&
+        iptables -t nat -A "$DNS_CHAIN" -d "$ROUTER_IP" -j RETURN &&
+        iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p udp --dport 53 -j REDIRECT --to-ports 53 &&
+        iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p tcp --dport 53 -j REDIRECT --to-ports 53 &&
+        { iptables -t nat -C PREROUTING -j "$DNS_CHAIN" 2>/dev/null ||
+          iptables -t nat -A PREROUTING -j "$DNS_CHAIN"; }
+    }; then
+        do_dns_stop
+        return 1
+    fi
     ok "DNS hijack applied (LAN :53 → router dnsmasq)"
 }
 
@@ -309,6 +360,9 @@ do_stop() {
     # tun0 rule older builds may have installed.
     iptables -D FORWARD -i sockrocket-tun -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i tun0 -j ACCEPT 2>/dev/null || true
+    # Fake-IP QUIC fail-fast reject (see do_start).
+    iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+        -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
 
     # CN ipset bypass (may be absent — destroy is idempotent)
     do_ipset_stop 2>/dev/null || true
@@ -356,6 +410,11 @@ do_verify() {
     }
     ip rule 2>/dev/null | grep -q "fwmark $TUN_MARK" || {
         err "ip rule for fwmark $TUN_MARK missing"
+        errors=$((errors + 1))
+    }
+    # Fake-IP fail-fast must stay while TUN is up (QUIC→TCP fallback).
+    ip route show 2>/dev/null | grep -Eq "(unreachable|blackhole) 198.18.0.0/16" || {
+        err "Fake-IP unreachable/blackhole 198.18.0.0/16 missing (QUIC fall-back will be slow)"
         errors=$((errors + 1))
     }
     if [ "$(get_conf cn_ipset_direct)" = "true" ]; then

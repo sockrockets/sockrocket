@@ -292,6 +292,20 @@ pub enum ProxyProtocol {
 }
 
 impl ProxyProtocol {
+    /// Configured UDP capability; ShadowTLS currently provides streams only.
+    pub fn supports_udp(&self) -> bool {
+        match self {
+            Self::Shadowsocks {
+                udp, shadow_tls, ..
+            } => *udp && shadow_tls.is_none(),
+            Self::VMess { udp, .. }
+            | Self::VLess { udp, .. }
+            | Self::Tuic { udp, .. }
+            | Self::Trojan { udp, .. }
+            | Self::Hysteria2 { udp, .. } => *udp,
+        }
+    }
+
     /// Short protocol label, used for grouping and display.
     pub fn name(&self) -> &'static str {
         match self {

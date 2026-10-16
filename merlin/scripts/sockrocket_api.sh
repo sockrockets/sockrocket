@@ -13,7 +13,9 @@
 
 source /koolshare/scripts/base.sh
 
-ACTION="$1"
+# koolcenter prepends the numeric job ID before params[0].
+# base.sh also reads $1 into ID for http_response.
+ACTION="${2:-$1}"
 SOCKROCKET_BIN="/jffs/addons/sockrocket/sockrocket-cli"
 SEQ=$(dbus get sockrocket_rpc_seq 2>/dev/null)
 # Only digits — dbus value is interpolated into a filesystem path.
@@ -39,11 +41,11 @@ fi
 # before the JSON body — strip them. POST body goes via stdin with
 # REQUEST_METHOD set and no CONTENT_LENGTH (CGI reads stdin to EOF).
 if [ -n "$ARGS" ]; then
-    printf '%s' "$ARGS" | REQUEST_METHOD=POST QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi 2>/dev/null | sed '1,3d' > "$RESULT"
+    printf '%s' "$ARGS" | SOCKROCKET_LOCAL_RPC=1 REQUEST_METHOD=POST QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi 2>/dev/null | sed '1,3d' > "$RESULT"
 else
-    QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi 2>/dev/null | sed '1,3d' > "$RESULT"
+    SOCKROCKET_LOCAL_RPC=1 REQUEST_METHOD=POST QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi </dev/null 2>/dev/null | sed '1,3d' > "$RESULT"
 fi
 
 # Tell the platform job system we are done.
-http_response "Sockrocket ${ACTION} ok" >/dev/null 2>&1
+http_response "$ID" >/dev/null 2>&1
 exit 0

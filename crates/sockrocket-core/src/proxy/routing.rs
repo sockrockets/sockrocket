@@ -7,6 +7,25 @@ use anyhow::Result;
 use super::connector::{BoxProxyStream, Outbound, SharedOutbound};
 use crate::router::{RouteAction, Router};
 
+/// Shared immutable rule snapshots for long-lived listeners. Never hold the
+/// lock across an await; accepted streams retain their own snapshot.
+#[derive(Clone)]
+pub struct RoutingState(Arc<std::sync::RwLock<Option<Arc<Router>>>>);
+
+impl RoutingState {
+    pub fn new(router: Option<Arc<Router>>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(router)))
+    }
+
+    pub fn snapshot(&self) -> Option<Arc<Router>> {
+        self.0.read().unwrap().clone()
+    }
+
+    pub fn replace(&self, router: Option<Arc<Router>>) {
+        *self.0.write().unwrap() = router;
+    }
+}
+
 /// An outbound that routes connections through a Router, dispatching to
 /// either a proxy outbound, direct outbound, or rejecting the connection.
 pub struct RoutingOutbound {
@@ -46,6 +65,28 @@ impl Outbound for RoutingOutbound {
                 }
             }
         })
+    }
+
+    fn connect_datagram(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            match self.router.route_resolving(&host, port).await {
+                RouteAction::Direct => self.direct_outbound.0.connect_datagram(&host, port).await,
+                RouteAction::Proxy => self.proxy_outbound.0.connect_datagram(&host, port).await,
+                RouteAction::Reject => anyhow::bail!("UDP rejected by routing rule"),
+            }
+        })
+    }
+
+    fn routing_policy(&self) -> Option<Arc<Router>> {
+        Some(self.router.clone())
+    }
+    fn is_direct(&self) -> bool {
+        self.proxy_outbound.0.is_direct()
     }
 
     fn name(&self) -> &str {

@@ -86,6 +86,9 @@ async fn read_http_header<R: AsyncRead + Unpin>(stream: &mut R) -> Result<(Vec<u
         // Look for \r\n\r\n
         if let Some(pos) = find_header_end(&buf[cursor..]) {
             let end = cursor + pos + 4;
+            if end > MAX_HEADER_SIZE {
+                bail!("HTTP header exceeds {} bytes", MAX_HEADER_SIZE);
+            }
             let header = buf[..end].to_vec();
             let remaining = buf[end..].to_vec();
             return Ok((header, remaining));
@@ -110,24 +113,30 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
 
 /// Parse "host:port" from CONNECT target or Host header.
 fn parse_host_port(target: &str, default_port: u16) -> Result<(String, u16)> {
-    // Handle [ipv6]:port
-    if let Some(bracket_end) = target.find(']') {
-        let host = &target[1..bracket_end];
-        let port = if target.len() > bracket_end + 2 && target.as_bytes()[bracket_end + 1] == b':' {
-            target[bracket_end + 2..].parse::<u16>()?
-        } else {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, suffix) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("Unclosed IPv6 address"))?;
+        host.parse::<std::net::Ipv6Addr>()?;
+        let port = if suffix.is_empty() {
             default_port
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid IPv6 authority"))?
+                .parse::<u16>()?
         };
         return Ok((host.to_string(), port));
     }
 
-    // Handle host:port
-    if let Some(colon) = target.rfind(':')
-        && let Ok(port) = target[colon + 1..].parse::<u16>()
-    {
-        return Ok((target[..colon].to_string(), port));
+    let (host, port) = match target.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>()?),
+        None => (target, default_port),
+    };
+    if host.is_empty() || host.contains(['[', ']']) {
+        bail!("Invalid host in proxy target");
     }
-    Ok((target.to_string(), default_port))
+    Ok((host.to_string(), port))
 }
 
 /// Extract the request method, target, and HTTP version from the first line.

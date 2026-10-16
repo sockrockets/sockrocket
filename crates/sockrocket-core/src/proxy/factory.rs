@@ -40,6 +40,17 @@ pub fn create_outbound_unwarmed(node: &Node) -> Result<SharedOutbound> {
 }
 
 fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> {
+    let outbound = build_outbound_inner(node, warm_pool)?;
+    if node.protocol.supports_udp() {
+        Ok(outbound)
+    } else {
+        Ok(SharedOutbound(Arc::new(
+            super::connector::StreamOnlyOutbound(outbound),
+        )))
+    }
+}
+
+fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> {
     match &node.protocol {
         ProxyProtocol::VLess { uuid, .. } => {
             let out = if warm_pool {
@@ -68,7 +79,7 @@ fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound>
             cipher,
             password,
             shadow_tls,
-            ..
+            udp,
         } => {
             let normalized_cipher = normalize_ss_cipher(cipher);
             let out = match shadow_tls {
@@ -96,12 +107,10 @@ fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound>
                     };
                     Arc::new(st_out) as Arc<dyn Outbound>
                 }
-                None => Arc::new(SsOutbound::new(
-                    &node.server,
-                    node.port,
-                    normalized_cipher,
-                    password,
-                )?) as Arc<dyn Outbound>,
+                None => Arc::new(
+                    SsOutbound::new(&node.server, node.port, normalized_cipher, password)?
+                        .with_udp(*udp),
+                ) as Arc<dyn Outbound>,
             };
             Ok(SharedOutbound(out).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }

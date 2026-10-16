@@ -404,8 +404,8 @@ fn main() {
             .expect("failed to load embedded fonts");
 
         gpui_component::init(cx);
-        // Force dark mode to match our fixed dark color scheme
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        // Match component inputs, menus and popovers to the Settings palette.
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
 
         // Application menu (macOS menu bar shows the first menu as the app name).
         // Without Quit here, the traffic-light close is the only exit path and
@@ -427,8 +427,21 @@ fn main() {
             KeyBinding::new("ctrl-5", app::SwitchToLogs, None),
             KeyBinding::new("ctrl-6", app::SwitchToSettings, None),
             KeyBinding::new("ctrl-7", app::SwitchToGroups, None),
+            KeyBinding::new("ctrl-8", app::SwitchToConfig, None),
             KeyBinding::new("ctrl-t", app::TestAllLatency, None),
             KeyBinding::new("ctrl-m", app::CycleProxyMode, None),
+        ]);
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([
+            KeyBinding::new("cmd-k", app::OpenCommandPalette, None),
+            KeyBinding::new("cmd-1", app::SwitchToHome, None),
+            KeyBinding::new("cmd-2", app::SwitchToNodes, None),
+            KeyBinding::new("cmd-3", app::SwitchToConnections, None),
+            KeyBinding::new("cmd-4", app::SwitchToRules, None),
+            KeyBinding::new("cmd-5", app::SwitchToLogs, None),
+            KeyBinding::new("cmd-6", app::SwitchToSettings, None),
+            KeyBinding::new("cmd-7", app::SwitchToGroups, None),
+            KeyBinding::new("cmd-8", app::SwitchToConfig, None),
         ]);
         cx.set_menus(vec![Menu {
             name: "Sockrocket".into(),
@@ -453,9 +466,9 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                 point(px(100.0), px(100.0)),
-                size(px(960.0), px(640.0)),
+                size(px(1080.0), px(760.0)),
             ))),
-            window_min_size: Some(size(px(680.0), px(480.0))),
+            window_min_size: Some(size(px(860.0), px(600.0))),
             titlebar: Some(app::AppState::titlebar_options()),
             ..Default::default()
         };

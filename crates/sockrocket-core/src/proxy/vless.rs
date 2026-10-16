@@ -97,6 +97,25 @@ impl Outbound for VlessOutbound {
         })
     }
 
+    fn connect_datagram(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            let mut stream = self.pool.get().await?;
+            let mut header = build_vless_request(&self.uuid, &host, port)?;
+            header[18] = 2;
+            stream.write_all(&header).await?;
+            stream.flush().await?;
+            Ok(super::stream_datagram::StreamDatagram::boxed(
+                Box::new(VlessStream::new(stream)),
+                super::stream_datagram::Framing::Length16,
+            ))
+        })
+    }
+
     fn name(&self) -> &str {
         "vless"
     }

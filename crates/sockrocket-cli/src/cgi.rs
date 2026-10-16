@@ -16,12 +16,15 @@
 //! Paths default to the router layout under `/jffs/addons/sockrocket` and can be
 //! overridden with `SOCKROCKET_DIR` (used by unit tests and local debugging).
 
+mod http;
+mod storage;
+
 use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -45,8 +48,25 @@ pub fn is_cgi() -> bool {
 /// CGI entry point: reads the request, dispatches, prints the response.
 pub fn run() -> Result<()> {
     let action = query_param("action").unwrap_or_default();
+    let method = env::var("REQUEST_METHOD").unwrap_or_else(|_| "GET".into());
+    let network = env::var("GATEWAY_INTERFACE").is_ok()
+        && env::var("SOCKROCKET_LOCAL_RPC").as_deref() != Ok("1");
+    let request_header = env::var("HTTP_X_SOCKROCKET_REQUEST").ok();
+    let origin = env::var("HTTP_ORIGIN").ok();
+    let host = env::var("HTTP_HOST").unwrap_or_default();
+    let origin_ok = origin.is_none_or(|origin| {
+        origin == format!("http://{host}") || origin == format!("https://{host}")
+    });
+    if (network && (request_header.as_deref() != Some("1") || !origin_ok))
+        || (!read_only_action(&action) && method != "POST")
+    {
+        println!(
+            "Status: 403 Forbidden\nContent-Type: application/json\n\n{{\"ok\":false,\"error\":\"request_denied\"}}"
+        );
+        return Ok(());
+    }
     let body = if env::var("REQUEST_METHOD").as_deref() == Ok("POST") {
-        read_post_body().unwrap_or_default()
+        read_post_body()?
     } else {
         // Allow POST-style calls in `sockrocket-cli cgi` testing mode via stdin? No —
         // actions that need a body also work without one (they error cleanly).
@@ -55,7 +75,7 @@ pub fn run() -> Result<()> {
     let post: J = if body.is_empty() {
         J::Null
     } else {
-        serde_json::from_str(&body).unwrap_or(J::Null)
+        serde_json::from_str(&body)?
     };
 
     println!("Content-Type: application/json");
@@ -175,7 +195,12 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn run_sh(action: &str) {
+fn run_sh(action: &str) -> Result<()> {
+    // Editing/importing settings must not undo an explicit manual stop.
+    // The Start action uses "start" and remains available.
+    if action == "restart" && sockrocket_dir().join("stopped").exists() {
+        return Ok(());
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -189,31 +214,12 @@ fn run_sh(action: &str) {
             cmd.stderr(f2);
         }
     }
-    let _ = cmd.status();
-}
-
-/// Fire-and-forget `sockrocket.sh <action>` in the background (output → sockrocket.log).
-/// Reaps the child on a detached thread so the long-lived API process does not
-/// accumulate zombies (router PID tables are tiny).
-fn spawn_sh(action: &str) {
-    let mut cmd = Command::new("sh");
-    cmd.arg(sockrocket_sh()).arg(action);
-    if let Ok(f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path())
-        && let Ok(f2) = f.try_clone()
-    {
-        cmd.stdout(f).stderr(f2);
-    }
-    if let Ok(mut child) = cmd.spawn() {
-        std::thread::Builder::new()
-            .name("sockrocket-sh-reaper".into())
-            .spawn(move || {
-                let _ = child.wait();
-            })
-            .ok();
-    }
+    let status = cmd.status().context("Cannot invoke lifecycle controller")?;
+    anyhow::ensure!(
+        status.success(),
+        "Lifecycle action {action} failed with {status}"
+    );
+    Ok(())
 }
 
 fn tail_lines(path: &PathBuf, n: usize) -> String {
@@ -246,12 +252,8 @@ fn load_conf() -> Result<Mapping> {
 }
 
 fn save_conf(map: &Mapping) -> Result<()> {
-    let tmp = conf_path().with_extension("yaml.tmp");
     let text = serde_yaml::to_string(&Y::Mapping(map.clone()))?;
-    fs::write(&tmp, text)?;
-    let _ = fs::copy(conf_path(), conf_path().with_extension("yaml.bak"));
-    fs::rename(&tmp, conf_path())?;
-    Ok(())
+    storage::atomic_write(&text)
 }
 
 fn conf_str(map: &Mapping, key: &str) -> Option<String> {
@@ -358,150 +360,41 @@ fn set_active_node(map: &mut Mapping, index: usize) {
 // daemon, so the UI can still start/stop the service while the proxy is
 // stopped — and it replaces one process spawn per request with a thread.
 
-/// Default port for `sockrocket-cli api` (Web UI ↔ router JSON API).
-pub const DEFAULT_API_PORT: u16 = 18188;
-
-struct ApiRequest {
-    method: String,
-    action: String,
-    body: String,
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Read one HTTP request. Returns None on malformed/oversized input or EOF.
-/// Caps: 16 KB headers, 1 MB body — plenty for save_config payloads.
-async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<ApiRequest> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 4096];
-    let header_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos;
-        }
-        if buf.len() > 16 * 1024 {
-            return None;
-        }
-        match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
-        }
-    };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_uppercase();
-    let target = parts.next().unwrap_or("/").to_string();
-
-    // Query string: /api?action=version&...
-    let mut action = String::new();
-    if let Some((_, qs)) = target.split_once('?') {
-        for pair in qs.split('&') {
-            if let Some((k, v)) = pair.split_once('=')
-                && k == "action"
-            {
-                action = v.to_string();
-            }
-        }
-    }
-
-    let mut content_len = 0usize;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_len = value.trim().parse().unwrap_or(0);
-        }
-    }
-    if content_len > 1024 * 1024 {
-        return None;
-    }
-
-    let mut body = buf.split_off(header_end + 4);
-    while body.len() < content_len {
-        match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => body.extend_from_slice(&tmp[..n]),
-        }
-    }
-    body.truncate(content_len);
-
-    Some(ApiRequest {
-        method,
+fn read_only_action(action: &str) -> bool {
+    matches!(
         action,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    })
+        "status"
+            | "nodes"
+            | "log"
+            | "config"
+            | "version"
+            | "subscriptions"
+            | "stats"
+            | "node_details"
+            | "sysinfo"
+            | "get_direct_domains"
+            | "get_rules"
+            | "export_rules"
+    )
 }
 
-/// Serve the Web UI JSON API over plain HTTP on 0.0.0.0:<port>.
-/// CORS is wide open because the page is served by the router's httpd on a
-/// different port — LAN-scoped, same trust level as the router's own UI.
-pub async fn serve_api(port: u16) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-    use tokio::sync::Semaphore;
-
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .await
-        .with_context(|| format!("bind API port {port}"))?;
-    println!("sockrocket API listening on 0.0.0.0:{port}");
-
-    // Cap in-flight CGI handlers. Unbounded accept→spawn_blocking let a
-    // Test-all + status polling storm open dozens of threads on a 1-core
-    // ARM router and stall the data-plane / DNS.
-    let api_slots = Arc::new(Semaphore::new(6));
-
-    loop {
-        let (mut sock, _peer) = match listener.accept().await {
-            Ok(x) => x,
-            Err(_) => continue,
-        };
-        let api_slots = api_slots.clone();
-        tokio::spawn(async move {
-            let Ok(_slot) = api_slots.acquire_owned().await else {
-                return;
-            };
-            let req = match tokio::time::timeout(Duration::from_secs(10), read_request(&mut sock))
-                .await
-            {
-                Ok(Some(r)) => r,
-                _ => return,
-            };
-            if req.method == "OPTIONS" {
-                let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-                return;
-            }
-            // dispatch() shells out (speedtest, sockrocket.sh, …) and can take
-            // seconds — keep it off the async reactor.
-            let out = tokio::task::spawn_blocking(move || {
-                let post: J = if req.body.is_empty() {
-                    J::Null
-                } else {
-                    serde_json::from_str(&req.body).unwrap_or(J::Null)
-                };
-                dispatch(&req.action, &post)
-            })
-            .await
-            .unwrap_or_else(|_| json!({"ok": false, "msg": "internal error"}));
-            let body = serde_json::to_string(&out).unwrap_or_else(|_| "{}".into());
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(body.as_bytes()).await;
-        });
-    }
-}
+pub use http::{DEFAULT_API_PORT, serve_api};
 
 // === Actions ===
 
 fn dispatch(action: &str, post: &J) -> J {
+    let _transaction = if read_only_action(action) {
+        None
+    } else {
+        match storage::MutationGuard::acquire() {
+            Ok(guard) => Some(guard),
+            Err(e) => return err_msg(&format!("Configuration transaction failed: {e}")),
+        }
+    };
+    dispatch_inner(action, post)
+}
+
+fn dispatch_inner(action: &str, post: &J) -> J {
     match action {
         "status" => act_status(),
         "start" => act_start(),
@@ -594,7 +487,9 @@ fn act_start() -> J {
     if is_running() {
         return err_msg("Already running");
     }
-    run_sh("start");
+    if let Err(error) = run_sh("start") {
+        return err_msg(&error.to_string());
+    }
     std::thread::sleep(Duration::from_secs(1));
     if is_running() {
         json!({"ok": true, "msg": "Sockrocket started"})
@@ -607,10 +502,14 @@ fn act_start() -> J {
 fn act_stop() -> J {
     // run_sh blocks until sockrocket.sh finishes, so the verdict below reflects the
     // real post-stop state rather than a sleep-and-hope guess.
-    run_sh("stop");
+    if let Err(error) = run_sh("stop") {
+        return err_msg(&error.to_string());
+    }
     // Belt: if DNS hijack / MARK rules somehow survived stop, force restore.
-    if dnsmasq_hijack_conf().exists() {
-        run_sh("network-restore");
+    if dnsmasq_hijack_conf().exists()
+        && let Err(error) = run_sh("network-restore")
+    {
+        return err_msg(&error.to_string());
     }
     let stopped = !is_running();
     let hijack_gone = !dnsmasq_hijack_conf().exists();
@@ -629,7 +528,9 @@ fn act_stop() -> J {
 }
 
 fn act_restart() -> J {
-    run_sh("restart");
+    if let Err(error) = run_sh("restart") {
+        return err_msg(&error.to_string());
+    }
     std::thread::sleep(Duration::from_secs(1));
     if is_running() {
         json!({"ok": true, "msg": "Sockrocket restarted"})
@@ -724,16 +625,15 @@ fn act_save_config(post: &J) -> J {
     if let Err(e) = serde_yaml::from_str::<sockrocket_core::AppConfig>(&text) {
         return json!({"ok": false, "msg": format!("Config validation failed: {e}")});
     }
-    let tmp = conf_path().with_extension("yaml.tmp");
-    if fs::write(&tmp, &bytes).is_err() {
-        return err_msg("Failed to write temp file");
+    if let Err(error) =
+        sockrocket_core::config::storage::atomic_write_private(&conf_path(), &text, true)
+    {
+        return err_msg(&format!("Failed to persist config: {error}"));
     }
-    let _ = fs::copy(conf_path(), conf_path().with_extension("yaml.bak"));
-    if fs::rename(&tmp, conf_path()).is_err() {
-        return err_msg("Failed to replace config file");
-    }
-    if is_running() {
-        spawn_sh("restart");
+    if is_running()
+        && let Err(error) = run_sh("restart")
+    {
+        return err_msg(&error.to_string());
     }
     json!({"ok": true, "msg": "Config saved and validated"})
 }
@@ -817,10 +717,9 @@ fn merge_and_persist_nodes(extra: Vec<sockrocket_core::Node>) -> Result<usize, S
         ykey("nodes"),
         serde_yaml::to_value(&cfg.nodes).map_err(|e| format!("Serialize nodes failed: {e}"))?,
     );
-    let tmp = conf_path().with_extension("yaml.tmp");
     let out = serde_yaml::to_string(&value).map_err(|e| format!("Serialize config failed: {e}"))?;
-    fs::write(&tmp, out).map_err(|e| format!("Failed to write temp config: {e}"))?;
-    fs::rename(&tmp, conf_path()).map_err(|e| format!("Failed to replace config: {e}"))?;
+    sockrocket_core::config::storage::atomic_write_private(&conf_path(), &out, true)
+        .map_err(|e| format!("Failed to persist config: {e}"))?;
     Ok(count)
 }
 
@@ -859,7 +758,9 @@ fn act_add_sub(post: &J) -> J {
             let fetched = nodes.len();
             match merge_and_persist_nodes(nodes) {
                 Ok(total) => {
-                    spawn_sh("restart");
+                    if let Err(error) = run_sh("restart") {
+                        return err_msg(&error.to_string());
+                    }
                     json!({
                         "ok": true,
                         "msg": format!("Parsed {fetched} node(s) (total {total}); restarting…"),
@@ -995,7 +896,9 @@ fn act_update_subs() -> J {
     let fetched = all.len();
     match merge_and_persist_nodes(all) {
         Ok(total) => {
-            spawn_sh("restart");
+            if let Err(error) = run_sh("restart") {
+                return err_msg(&error.to_string());
+            }
             let warn = if errors.is_empty() {
                 String::new()
             } else {
@@ -1305,8 +1208,10 @@ fn act_set_mode(post: &J) -> J {
     map.insert(ykey("mode"), Y::String(mode.to_string()));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": "Mode set; takes effect after restart"})
         }
@@ -1353,7 +1258,9 @@ fn act_set_proxy_mode(post: &J) -> J {
             .status();
     }
     if is_running() {
-        run_sh("restart");
+        if let Err(error) = run_sh("restart") {
+            return err_msg(&error.to_string());
+        }
         if !is_running() {
             return json!({
                 "ok": false,
@@ -1424,7 +1331,9 @@ fn act_set_toggles(post: &J) -> J {
             }
             // restart brings up --tun + iptables + dnsmasq per the keys.
             // do_start rewrites `mode` on disk while we are in here.
-            run_sh("restart");
+            if let Err(error) = run_sh("restart") {
+                return err_msg(&error.to_string());
+            }
             let ok = run_cmd(
                 "iptables",
                 &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
@@ -1446,7 +1355,9 @@ fn act_set_toggles(post: &J) -> J {
                 let _ = save_conf(&map);
                 // Config now says TUN off — tear MARK rules and restart plain
                 // daemon; DNS hijack is re-applied by do_start when wanted.
-                run_sh("proxy-off");
+                if let Err(error) = run_sh("proxy-off") {
+                    return err_msg(&error.to_string());
+                }
                 return json!({"ok": false, "msg": "Failed to enable transparent proxy: TUN/iptables/DNS hijack not ready (check the tun module and logs)"});
             }
         } else {
@@ -1454,7 +1365,9 @@ fn act_set_toggles(post: &J) -> J {
             // daemon serves real IPs (no Fake-IP) with short TTL — LAN stays
             // online, and re-enabling TUN recovers in seconds instead of
             // waiting out ISP DNS TTLs (~60s+).
-            run_sh("proxy-off");
+            if let Err(error) = run_sh("proxy-off") {
+                return err_msg(&error.to_string());
+            }
             let still_on = run_cmd(
                 "iptables",
                 &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
@@ -1480,7 +1393,9 @@ fn act_set_toggles(post: &J) -> J {
             // would push clients onto ISP long TTLs).
             let dns_should_stay = want_dns.unwrap_or(cur_dns);
             if dns_should_stay && sockrocket_sh().is_file() && !dnsmasq_hijack_conf().exists() {
-                run_sh("dns-on");
+                if let Err(error) = run_sh("dns-on") {
+                    return err_msg(&error.to_string());
+                }
                 if !dnsmasq_hijack_conf().exists() {
                     return json!({
                         "ok": false,
@@ -1509,7 +1424,9 @@ fn act_set_toggles(post: &J) -> J {
         if let Err(e) = save_conf(&map) {
             return err_msg(&format!("Save failed: {e}"));
         }
-        run_sh(if new_dns { "dns-on" } else { "dns-off" });
+        if let Err(error) = run_sh(if new_dns { "dns-on" } else { "dns-off" }) {
+            return err_msg(&error.to_string());
+        }
         let installed = dnsmasq_hijack_conf().exists();
         if installed != new_dns {
             let mut map = match load_conf() {
@@ -1795,8 +1712,10 @@ fn act_set_direct_server(post: &J) -> J {
     map.insert(ykey("dns_direct_server"), Y::String(server.to_string()));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": format!("DNS server updated to {server}; takes effect after restart")})
         }
@@ -2055,8 +1974,10 @@ fn act_add_rule(post: &J) -> J {
         Ok(()) => {
             // The TUN-side rule override reads the router built at daemon
             // start, so rules need a full restart to take effect there.
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": format!("Added {rule_type} {pattern} -> {target} (takes effect after service restart)")})
         }
@@ -2086,8 +2007,10 @@ fn act_del_rule(post: &J) -> J {
     map.insert(ykey("rules"), Y::Sequence(seq));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": "Deleted (takes effect after service restart)"})
         }
@@ -2134,8 +2057,10 @@ fn act_move_rule(post: &J) -> J {
     map.insert(ykey("rules"), Y::Sequence(seq));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": "Order updated (takes effect after service restart)"})
         }
@@ -2218,8 +2143,10 @@ fn act_batch_add_rules(post: &J) -> J {
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             let mut msg = format!(
                 "Batch: +{} added, {} replaced, {} duplicates (from {} parsed)",
@@ -2258,8 +2185,10 @@ fn act_apply_rule_scene(post: &J) -> J {
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({
                 "ok": true,
@@ -2309,8 +2238,10 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({
                 "ok": true,
@@ -2424,8 +2355,10 @@ fn act_replace_rule_group(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": format!("Saved group ({n} rule(s))")})
         }
@@ -2452,8 +2385,10 @@ fn act_delete_rule_group(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running() {
-                spawn_sh("restart");
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return err_msg(&error.to_string());
             }
             json!({"ok": true, "msg": format!("Removed {removed} rule(s) from group")})
         }
@@ -2532,15 +2467,15 @@ fn act_apply_update() -> J {
 
     let bin = sockrocket_dir().join("sockrocket-cli");
     let was_running = is_running();
-    if was_running {
-        run_sh("stop");
+    if was_running && let Err(error) = run_sh("stop") {
+        return err_msg(&error.to_string());
     }
     // Preserve mode bits when possible.
     let mode = fs::metadata(&bin).ok().map(|m| m.permissions());
     if let Err(e) = fs::copy(&dest, &bin) {
         let _ = fs::remove_file(&dest);
-        if was_running {
-            spawn_sh("start");
+        if was_running && let Err(error) = run_sh("start") {
+            return err_msg(&error.to_string());
         }
         return err_msg(&format!("Failed to replace binary: {e}"));
     }
@@ -2558,8 +2493,8 @@ fn act_apply_update() -> J {
         sockrocket_dir().join("version"),
         format!("{}\n", check.latest),
     );
-    if was_running {
-        spawn_sh("start");
+    if was_running && let Err(error) = run_sh("start") {
+        return err_msg(&error.to_string());
     }
     // Restart API after the HTTP response is flushed — killing ourselves
     // mid-write drops the WebUI reply.
@@ -2673,6 +2608,8 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("config.yaml"), config).unwrap();
+            fs::create_dir_all(dir.join("scripts")).unwrap();
+            fs::write(dir.join("scripts/sockrocket.sh"), "#!/bin/sh\nexit 0\n").unwrap();
             unsafe { env::set_var("SOCKROCKET_DIR", &dir) };
             Self { dir, _guard: guard }
         }

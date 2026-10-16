@@ -224,14 +224,33 @@ release_lock() {
     rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
+run_locked() {
+    local timeout="$1" result
+    shift
+    acquire_lock "$timeout" || return 1
+    "$@"
+    result=$?
+    release_lock
+    return "$result"
+}
+
+do_restart() {
+    do_stop && do_start
+}
+
 # ── Log rotation ──────────────────────────────────────────────────────────────
 rotate_log() {
     [ -f "$SOCKROCKET_LOG" ] || return
     local size
     size=$(wc -c < "$SOCKROCKET_LOG" 2>/dev/null || echo 0)
     if [ "$size" -gt "$LOG_MAX_BYTES" ]; then
-        tail -c "$((LOG_MAX_BYTES / 2))" "$SOCKROCKET_LOG" > "$SOCKROCKET_LOG.tmp" \
-            && mv "$SOCKROCKET_LOG.tmp" "$SOCKROCKET_LOG"
+        # Keep the inode: daemon/API writers hold O_APPEND descriptors open.
+        # Renaming a replacement leaves them writing an unlinked, unbounded
+        # file on JFFS until the next restart.
+        if tail -c "$((LOG_MAX_BYTES / 2))" "$SOCKROCKET_LOG" > "$SOCKROCKET_LOG.tmp"; then
+            cat "$SOCKROCKET_LOG.tmp" > "$SOCKROCKET_LOG"
+        fi
+        rm -f "$SOCKROCKET_LOG.tmp"
         info "Log rotated (was ${size} bytes)"
     fi
 }
@@ -315,7 +334,7 @@ pin_dns_upstream() {
     # pin: a restart while pinned would "restore" a dead upstream forever.
     grep -q "^server=127.0.0.1#" "$resolv_file" 2>/dev/null || \
         cp "$resolv_file" "$bak_file" 2>/dev/null || true
-    echo "server=127.0.0.1#${dns_port}" > "$resolv_file"
+    echo "server=127.0.0.1#${dns_port}" > "$resolv_file" || return 1
     kill -HUP "$(pidof dnsmasq)" 2>/dev/null
     ok "dnsmasq upstream pinned to 127.0.0.1#${dns_port} (LAN queries no longer go through ISP DNS)"
 }
@@ -348,6 +367,14 @@ unpin_dns_upstream() {
     ok "dnsmasq upstream restored to ISP DNS"
 }
 
+dns_listener_healthy() {
+    local dns_port
+    dns_port=$(get_config_value dns_port)
+    dns_port=${dns_port:-5300}
+    netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" || return 1
+    "$SOCKROCKET_BIN" --dns-health "$dns_port" >/dev/null 2>&1
+}
+
 update_dnsmasq() {
     local action="$1"
     # Overridable for tests/integration/sockrocket_sh_test.sh (default stays the firmware path).
@@ -357,7 +384,8 @@ update_dnsmasq() {
 
     mkdir -p "$DNSMASQ_CONF_DIR"
 
-    if [ "$action" = "start" ] && [ -f "$TEMPLATE" ]; then        local dns_port router_ip dns_server
+    if [ "$action" = "start" ] && [ -f "$TEMPLATE" ]; then
+        local dns_port router_ip
         dns_port=$(get_config_value dns_port)
         dns_port=${dns_port:-5300}
         # Fail-safe: only hijack default DNS when Sockrocket's DNS listener is
@@ -365,10 +393,10 @@ update_dnsmasq() {
         # blackhole every LAN lookup, taking the whole network offline.
         # Matches ":port " (followed by the peer column) or ":port" at
         # end-of-line, since busybox netstat column spacing varies.
-        if ! netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
-            rm -f "$SOCKROCKET_DNSMASQ"
+        if ! dns_listener_healthy; then
+            update_dnsmasq stop
             warn "Sockrocket DNS port $dns_port not listening -- DNS split not enabled (LAN DNS unchanged)"
-            return 0
+            return 1
         fi
         router_ip=$(nvram get lan_ipaddr 2>/dev/null)
         # nvram exits 0 with an empty value for unset keys — the `||`
@@ -386,26 +414,66 @@ update_dnsmasq() {
         # listener, whose china-split serves domestic names from
         # 223.5.5.5/119.29.29.29 itself.
         if service restart_dnsmasq >/dev/null 2>&1; then
-            pin_dns_upstream
+            if ! pin_dns_upstream; then
+                update_dnsmasq stop
+                return 1
+            fi
             # Also force-capture LAN DNS that bypasses the router entirely
             # (devices hard-coded to 8.8.8.8 & friends — GFW poisons those
             # UDP answers on the wire). Redirect every LAN :53 query into
             # this dnsmasq so the china-split above applies to them too.
-            [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
-                "$SOCKROCKET_DIR/scripts/iptables.sh" dns-start >/dev/null 2>&1 || true
+            if ! "$SOCKROCKET_DIR/scripts/iptables.sh" dns-start >/dev/null 2>&1; then
+                update_dnsmasq stop
+                return 1
+            fi
             ok "dnsmasq rules applied (DNS port: $dns_port, all queries via Sockrocket listener)"
         else
-            log_error "dnsmasq restart FAILED — DNS may be broken! Check config with: dnsmasq --test"
-            log_warn "dnsmasq config written but restart failed (DNS port: $dns_port)"
+            # A malformed/unsupported snippet can prevent dnsmasq from
+            # starting at all. Remove our contribution and restore direct
+            # upstreams before retrying the firmware service.
+            log_error "dnsmasq restart failed — rolling back Sockrocket DNS config"
+            update_dnsmasq stop
+            return 1
         fi
     elif [ "$action" = "stop" ]; then
+        local changed=0 resolv_file
+        [ -f "$SOCKROCKET_DNSMASQ" ] && changed=1
+        resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
+        grep -q '^server=127.0.0.1#' "$resolv_file" 2>/dev/null && changed=1
         rm -f "$SOCKROCKET_DNSMASQ"
         [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
             "$SOCKROCKET_DIR/scripts/iptables.sh" dns-stop >/dev/null 2>&1 || true
         # Unpin BEFORE restarting dnsmasq, so the restarted daemon reads the
         # restored ISP upstreams instead of our now-dead listener.
         unpin_dns_upstream
-        service restart_dnsmasq 2>/dev/null && ok "dnsmasq rules removed" || log_warn "dnsmasq restart failed during cleanup"
+        # The guard may retry fail-open every few seconds. Restarting an
+        # already restored dnsmasq on each retry creates a DNS outage loop.
+        if [ "$changed" = "1" ]; then
+            service restart_dnsmasq 2>/dev/null || {
+                log_warn "dnsmasq restart failed during cleanup"
+                return 1
+            }
+            ok "dnsmasq rules removed"
+        fi
+    fi
+}
+
+# Activate routing before DNS: fake-IP answers require a working data path.
+activate_startup_network() {
+    if [ "$want_proxy" = "true" ]; then
+        if ! wait_for_tun 20 ||
+            ! "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1; then
+            enter_lan_degraded "startup TUN/routing setup failed"
+            return 1
+        fi
+    fi
+    if [ "$want_dns" = "true" ]; then
+        if ! wait_for_dns 15 || ! update_dnsmasq start; then
+            enter_lan_degraded "startup DNS setup failed"
+            return 1
+        fi
+    elif [ -f "${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf" ]; then
+        update_dnsmasq stop
     fi
 }
 
@@ -538,7 +606,8 @@ do_start() {
     # IPs (china-split) so closing TUN does not push clients onto ISP DNS
     # (long TTLs → ~1min bare-IP blackhole after re-enable).
 
-    # Fail-open marker: keep the daemon (SOCKS/HTTP) up for recovery probes,
+    local launch_tun="$want_proxy"
+    # Fail-open marker: keep the daemon up for recovery probes,
     # but do not re-hijack LAN until try_recover_lan_proxy clears the marker.
     if [ -f "${SOCKROCKET_DIR}/.lan_degraded" ]; then
         if [ "$want_proxy" = "true" ] || [ "$want_dns" = "true" ]; then
@@ -549,9 +618,10 @@ do_start() {
     fi
 
     # TUN must be up BEFORE handing --tun to sockrocket-cli.
-    if [ "$want_proxy" = "true" ] && ! ensure_tun; then
+    if [ "$launch_tun" = "true" ] && ! ensure_tun; then
         log_error "Failed to enable transparent proxy: TUN device unavailable (tried modprobe/insmod/mknod)"
         want_proxy=false
+        launch_tun=false
         # Keep DNS hijack if wanted — SOCKS mode has no Fake-IP.
     fi
 
@@ -559,7 +629,10 @@ do_start() {
     # from its parent. core_pattern is system-wide and idempotent.
     enable_core_dumps
 
-    if [ "$want_proxy" = "true" ]; then
+    # Even during fail-open, create the requested TUN device without
+    # installing LAN routes. Otherwise recovery cannot restore transparent
+    # proxying: a SOCKS-only process never creates the missing interface.
+    if [ "$launch_tun" = "true" ]; then
         start_daemon_supervised 1
         [ "$(get_config_value mode)" != "tun" ] && sed -i 's/^mode:.*/mode: "tun"/' "$SOCKROCKET_CONF" 2>/dev/null
     else
@@ -575,25 +648,26 @@ do_start() {
     done
     if is_running; then
         ok "Sockrocket started (PID $(cat "$SOCKROCKET_PID"))"
+        # Keep recovery active even when synchronous activation fails below.
+        start_guard
         # Softcenter offline install must not block 20–35s on TUN/DNS waits —
         # that freezes the software-center UI ("loading data"). FAST_START
         # applies rules in the background; normal starts wait as before.
         if [ "${SOCKROCKET_FAST_START:-0}" = "1" ]; then
             (
                 trap '' HUP INT TERM
-                if [ "$want_proxy" = "true" ]; then
-                    if wait_for_tun 20; then
-                        [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
-                            "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1
-                    fi
-                fi
-                if [ "$want_dns" = "true" ]; then
-                    if wait_for_dns 15; then
-                        update_dnsmasq start
-                    fi
-                elif [ -f "${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf" ]; then
-                    update_dnsmasq stop
-                fi
+                trap 'release_lock' EXIT
+                # This child must not inherit ownership of the parent's
+                # lock, or race a later stop while waiting for DNS/TUN.
+                LOCK_HELD=0
+                acquire_lock 40 || exit 1
+                [ -f "$SOCKROCKET_DIR/stopped" ] && exit 0
+                [ -f "$DEGRADED_FILE" ] && exit 0
+                is_running || exit 0
+                [ "$(count_section nodes)" != "0" ] || exit 0
+                want_proxy=$(conf_bool transparent_proxy true)
+                want_dns=$(conf_bool dns_hijack false)
+                activate_startup_network || exit 1
                 if [ "$want_proxy" != "true" ] && \
                     iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
                     [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
@@ -601,29 +675,13 @@ do_start() {
                 fi
             ) >> "$SOCKROCKET_LOG" 2>&1 &
         else
-            if [ "$want_proxy" = "true" ]; then
-                if wait_for_tun 20; then
-                    [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1
-                else
-                    log_warn "TUN device not ready within 20s -- transparent proxy not enabled (check the log)"
-                fi
-            fi
-            if [ "$want_dns" = "true" ]; then
-                if wait_for_dns 15; then
-                    update_dnsmasq start
-                else
-                    log_warn "DNS port 5300 not listening within 15s -- DNS split not enabled (LAN DNS unchanged)"
-                fi
-            elif [ -f "${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf" ]; then
-                update_dnsmasq stop
-            fi
+            activate_startup_network || return 1
             if [ "$want_proxy" != "true" ] && \
                 iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
                 [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1
             fi
         fi
         setup_cron
-        start_guard
         try_recover_lan_proxy
     else
         log_error "Sockrocket failed to start. Last log lines:"
@@ -748,6 +806,7 @@ restore_direct_network() {
     fi
     # Full restore: drop Fake-IP blackhole too (TUN-off path keeps it for fail-fast).
     ip route del blackhole 198.18.0.0/16 2>/dev/null || true
+    ip route del unreachable 198.18.0.0/16 2>/dev/null || true
 
     # dnsmasq hijack file + upstream pin
     update_dnsmasq stop
@@ -931,9 +990,9 @@ do_update_subs() {
     if is_running; then
         do_stop
         # Persisted nodes normally skip WAN fetch on start; force refresh here.
-        SOCKROCKET_REFRESH_SUBS=1 do_start
+        SOCKROCKET_REFRESH_SUBS=1 do_start || return 1
     else
-        SOCKROCKET_REFRESH_SUBS=1 do_start
+        SOCKROCKET_REFRESH_SUBS=1 do_start || return 1
     fi
     ok "Subscription update triggered"
 }
@@ -1144,6 +1203,8 @@ start_daemon_supervised() {
     local use_tun="$1"
     stop_supervisor
     (
+        LOCK_HELD=0
+        trap - EXIT
         trap '' HUP INT TERM
         while [ ! -f "$SOCKROCKET_DIR/stopped" ]; do
             if [ "$use_tun" = "1" ]; then
@@ -1203,10 +1264,13 @@ start_daemon_supervised() {
 start_guard() {
     stop_guard
     (
+        LOCK_HELD=0
+        trap - EXIT
         trap '' HUP INT TERM
-        local dns_miss=0
+        local dns_miss=0 dns_tick=0
         while true; do
             sleep 3
+            dns_tick=$((dns_tick + 1))
             [ -f "$SOCKROCKET_DIR/stopped" ] && exit 0
 
             if [ -f "$DEGRADED_FILE" ]; then
@@ -1228,7 +1292,12 @@ start_guard() {
                 local dns_port
                 dns_port=$(get_config_value dns_port)
                 dns_port=${dns_port:-5300}
-                if netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
+                # Probe answers every 15s; still notice a lost port each tick.
+                if netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" &&
+                    [ "$((dns_tick % 5))" -ne 0 ]; then
+                    continue
+                fi
+                if dns_listener_healthy; then
                     dns_miss=0
                 else
                     dns_miss=$((dns_miss + 1))
@@ -1270,7 +1339,7 @@ outbound_probe_ok() {
     http_port=$(get_config_value http_port)
     http_port=${http_port:-1087}
     if which curl >/dev/null 2>&1; then
-        curl -x "http://127.0.0.1:${http_port}" -sS -m 5 -o /dev/null \
+        curl -x "http://127.0.0.1:${http_port}" -fsS -m 5 -o /dev/null \
             "http://www.gstatic.com/generate_204" 2>/dev/null && return 0
         return 1
     fi
@@ -1281,11 +1350,36 @@ outbound_probe_ok() {
     fi
 }
 
+# Busybox shells on 32-bit routers must not multiply MemTotal by 100 in
+# shell arithmetic. awk also supports older kernels without MemAvailable.
+memory_used_pct() {
+    awk '
+        /^MemTotal:/ { total=$2 }
+        /^MemAvailable:/ { available=$2; have_available=1 }
+        /^MemFree:/ { free_mem=$2 }
+        /^Buffers:/ { buffers=$2 }
+        /^Cached:/ { cached=$2 }
+        END {
+            if (total > 0) {
+                if (!have_available) available=free_mem+buffers+cached
+                printf "%.0f\n", (total-available)*100/total
+            }
+        }
+    ' "${SOCKROCKET_MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null
+}
+
 # Re-apply transparent proxy + DNS hijack from config after a fail-open, once
 # the daemon and outbound path look healthy again.
 try_recover_lan_proxy() {
     [ -f "$DEGRADED_FILE" ] || return 0
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
     is_running || return 0
+    [ "$(count_section nodes)" != "0" ] || return 1
+    # Hysteresis: watchdog degrades at 85%; only re-arm below 80%.
+    # Both cron and the fast guard call this function.
+    local mem_pct
+    mem_pct=$(memory_used_pct)
+    [ -z "$mem_pct" ] || [ "$mem_pct" -lt 80 ] || return 1
 
     local dns_port
     dns_port=$(get_config_value dns_port)
@@ -1304,21 +1398,48 @@ try_recover_lan_proxy() {
 
     log_warn "LAN recovering — re-applying proxy path (was: $(cat "$DEGRADED_FILE" 2>/dev/null))"
     if [ "$want_proxy" = "true" ]; then
-        ensure_tun || log_warn "Recover: TUN unavailable"
-        if ip link show sockrocket-tun >/dev/null 2>&1 \
-            || ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2"; then
-            [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
-                "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1
+        # Never enable fake-IP DNS or clear the marker without a working
+        # transparent path. A running SOCKS listener alone is insufficient.
+        wait_for_tun 1 || return 1
+        [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] || return 1
+        if ! "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1; then
+            enter_lan_degraded "recovery firewall setup failed"
+            return 1
         fi
     fi
     if [ "$want_dns" = "true" ]; then
-        update_dnsmasq start
+        if ! update_dnsmasq start; then
+            enter_lan_degraded "recovery DNS setup failed"
+            return 1
+        fi
     fi
     rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
     ok "LAN proxy path restored after fail-open"
 }
 
 # ── Watchdog ──────────────────────────────────────────────────────────────────
+do_firewall_restore() {
+    # Firmware firewall rebuilds must respect the same fail-open and stop
+    # intent as the watchdog. Do not re-arm merely because a TUN exists.
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ -f "$DEGRADED_FILE" ] && return 0
+    is_running || return 0
+    [ "$(count_section nodes)" != "0" ] || return 0
+    if [ "$(conf_bool transparent_proxy true)" = "true" ]; then
+        wait_for_tun 1 || return 1
+        "$SOCKROCKET_DIR/scripts/iptables.sh" start || {
+            enter_lan_degraded "firewall rebuild failed"
+            return 1
+        }
+    fi
+    if [ "$(conf_bool dns_hijack false)" = "true" ] && \
+        [ -f "${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf" ]; then
+        wait_for_dns 1 || return 1
+        "$SOCKROCKET_DIR/scripts/iptables.sh" dns-start || return 1
+    fi
+    return 0
+}
+
 do_watchdog() {
     local issues=0
 
@@ -1344,12 +1465,9 @@ do_watchdog() {
 
     # Memory pressure: fail-open WITHOUT rewriting user toggles so we can
     # recover automatically once memory recovers.
-    local mem_total mem_avail mem_pct=0
-    mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
-    mem_avail=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
-    if [ -n "$mem_total" ] && [ "$mem_total" -gt 0 ] && [ -n "$mem_avail" ]; then
-        mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
-    fi
+    local mem_pct
+    mem_pct=$(memory_used_pct)
+    mem_pct=${mem_pct:-0}
     if [ "$mem_pct" -ge 85 ]; then
         enter_lan_degraded "memory pressure ${mem_pct}%"
         issues=$((issues + 1))
@@ -1544,6 +1662,9 @@ do_watchdog() {
     [ "$issues" -gt 0 ] && log_warn "Watchdog: $issues issue(s) found and addressed"
 }
 
+do_api_restart() { do_api_stop && do_api_start; }
+do_network_restore() { restore_direct_network || return 1; ok "Direct network restored"; }
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 # Ensure lock is released on script exit (even on signal).
 # INT/TERM must exit after the handler — the EXIT trap then releases the
@@ -1554,59 +1675,46 @@ trap 'exit 143' TERM
 
 case "$1" in
     start)
-        acquire_lock && { do_start; release_lock; } || true
+        run_locked 15 do_start
         ;;
     stop)
-        acquire_lock && { do_stop; release_lock; } || true
+        run_locked 15 do_stop
         ;;
     restart)
-        acquire_lock && {
-            do_stop
-            # Process already waited-out in do_stop; no fixed 1s pause.
-            do_start
-            release_lock
-        } || true
+        run_locked 15 do_restart
         ;;
     reload)
-        acquire_lock || exit 1
-        if is_running; then
-            info "Reloading Sockrocket config..."
-            do_stop
-            do_start
-        else
-            do_start
-        fi
-        release_lock
+        run_locked 15 do_restart
         ;;
     status)  do_status ;;
     log)     tail -100 "$SOCKROCKET_LOG" 2>/dev/null || info "No log file found" ;;
     api-start)
-        acquire_lock 5 && { do_api_start; release_lock; } || true
+        run_locked 5 do_api_start
         ;;
     api-stop)
-        acquire_lock 5 && { do_api_stop; release_lock; } || true
+        run_locked 5 do_api_stop
         ;;
     api-restart)
-        acquire_lock 5 && { do_api_stop; do_api_start; release_lock; } || true
+        run_locked 5 do_api_restart
         ;;
     update-subs)
-        acquire_lock && { do_update_subs; release_lock; } || true
+        run_locked 15 do_update_subs
         ;;
     watchdog) acquire_lock 5 && { do_watchdog; release_lock; } || log_warn "Watchdog: previous run still active, skipping" ;;
     ensure-tun)
-        acquire_lock 5 && { ensure_tun && log_info "TUN device ready" || log_error "TUN unavailable"; release_lock; } || true
+        run_locked 5 ensure_tun
         ;;
     dns-on)
-        acquire_lock && { do_dns_on && log_ok "DNS hijack enabled" || log_error "Failed to enable DNS hijack"; release_lock; } || true
+        run_locked 15 do_dns_on
         ;;
     dns-off)
-        acquire_lock && { do_dns_off && log_ok "DNS hijack disabled" || log_error "Failed to disable DNS hijack"; release_lock; } || true
+        run_locked 15 do_dns_off
         ;;
     pin-dns)
-        acquire_lock 5 && { pin_dns_upstream; release_lock; } || true
+        run_locked 5 pin_dns_upstream
         ;;
     proxy-off)
-        acquire_lock && { do_proxy_off && log_ok "Transparent proxy disabled" || log_error "Failed to disable transparent proxy"; release_lock; } || true
+        run_locked 15 do_proxy_off
         ;;
     ensure-sshd)
         ensure_sshd
@@ -1614,11 +1722,14 @@ case "$1" in
     network-restore)
         # Emergency / uninstall helper: tear down proxy+DNS without needing a
         # running daemon. Guarantees direct LAN connectivity.
-        acquire_lock && { restore_direct_network; ok "Direct network restored"; release_lock; } || true
+        run_locked 15 do_network_restore
         ;;
     recover)
         # Second-scale re-arm after fail-open (called by the guard loop).
-        acquire_lock 5 && { try_recover_lan_proxy; release_lock; } || true
+        run_locked 5 try_recover_lan_proxy
+        ;;
+    firewall-restore)
+        run_locked 5 do_firewall_restore
         ;;
     kill-half-dead)
         # Called by the guard subshell (cannot inherit functions). Optional

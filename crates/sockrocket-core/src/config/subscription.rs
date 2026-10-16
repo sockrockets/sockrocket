@@ -34,6 +34,7 @@ pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
         .get(&sub.url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("Failed to fetch subscription")?;
 
     let status = response.status();
@@ -44,6 +45,7 @@ pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
     let content = response
         .text()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("Failed to read subscription body")?;
 
     parse_subscription_content(&content, &sub.format)

@@ -10,3 +10,5 @@ pub mod singbox;
 pub mod subscription;
 pub mod v2ray;
 pub mod watch;
+
+pub mod storage;

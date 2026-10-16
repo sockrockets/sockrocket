@@ -240,77 +240,38 @@ impl AppState {
             .flex_col()
             .gap_3()
             .h_full()
-            // === Page header (v2): tinted icon block + title + count | Search ===
+            // === Page header (aligned with Rules / Groups) ===
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .items_center()
+                    .items_start()
                     .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_3()
-                            // 32px cyan-tinted rounded-lg icon block
-                            .child(
-                                div()
-                                    .w(px(32.0))
-                                    .h(px(32.0))
-                                    .rounded(px(8.0))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .border_1()
-                                    .bg(rgba(with_alpha(ACCENT, 0x1a)))
-                                    .border_color(rgba(with_alpha(ACCENT, 0x33)))
-                                    .child(
-                                        Icon::empty()
-                                            .path("icons/square-terminal.svg")
-                                            .with_size(ComponentSize::Size(px(16.0)))
-                                            .text_color(rgb(ACCENT)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(PAGE_TITLE))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(TEXT_PRIMARY))
-                                            .child("Logs"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(MICRO))
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .child(format!(
-                                                "{} entries · {}",
-                                                fmt_count(total_count),
-                                                if paused { "paused" } else { "live" }
-                                            )),
-                                    ),
-                            ),
-                    )
-                    // Ghost Search button: focuses the text filter input
+                    .gap_3()
+                    .child(self.page_header_v3(
+                        "icons/nav-logs.svg",
+                        ACCENT,
+                        sockrocket_gui::i18n::t("nav.logs"),
+                        &format!(
+                            "{} · {} entries · {}",
+                            sockrocket_gui::i18n::t("logs.subtitle"),
+                            fmt_count(total_count),
+                            if paused { "paused" } else { "live" }
+                        ),
+                    ))
                     .child(
                         div()
                             .id("log-search-btn")
+                            .mt_1()
                             .px_3()
                             .py(px(6.0))
                             .rounded(px(8.0))
-                            .border_1()
-                            .border_color(rgba(with_alpha(BORDER, 0x99)))
                             .cursor_pointer()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1p5()
+                            .bg(rgba(with_alpha(BORDER, 0x66)))
                             .text_size(px(SMALL))
                             .text_color(rgb(TEXT_SECONDARY))
                             .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))

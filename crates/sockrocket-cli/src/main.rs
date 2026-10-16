@@ -58,6 +58,14 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(index) = args.iter().position(|arg| arg == "--dns-health") {
+        let port = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("DNS port required"))?
+            .parse::<u16>()?;
+        return sockrocket_core::dns::check_dns_listener(([127, 0, 0, 1], port).into()).await;
+    }
+
     // Handle --init: generate a default config and exit
     if args.iter().any(|a| a == "--init") {
         let path = args
@@ -77,6 +85,21 @@ async fn async_main() -> Result<()> {
             println!("{cidr}");
         }
         return Ok(());
+    }
+
+    if let Some(index) = args.iter().position(|arg| arg == "--supports-udp") {
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
+        if config.proxy_mode == ProxyMode::Direct {
+            return Ok(());
+        }
+        let selected = resolve_active_index(&config)?.and_then(|index| config.nodes.get(index));
+        if selected.is_some_and(|node| node.protocol.supports_udp()) {
+            return Ok(());
+        }
+        bail!("UDP disabled or unsupported for this node");
     }
 
     // API mode: `sockrocket-cli api [port]` — standalone HTTP JSON backend for the
@@ -116,6 +139,10 @@ async fn async_main() -> Result<()> {
     // Swappable wrapper: health-check failover and config hot-reload replace
     // the inner outbound without rebinding the local listeners.
     let swappable = Arc::new(SwappableOutbound::new(outbound.clone()));
+    swappable.publish(
+        outbound.clone(),
+        Arc::new(read_router_dns_config(&config_path, &config.nodes)?),
+    );
     let shared_outbound = SharedOutbound(swappable.clone());
 
     // Start HTTP/SOCKS5 proxy service
@@ -150,6 +177,7 @@ async fn async_main() -> Result<()> {
     // and direct-upstream server live as router-only keys in config.yaml and
     // are read Value-level here: core's AppConfig does not model them.
     let dns_port = read_dns_port(&config_path);
+    let (dns_failure_tx, mut dns_failure_rx) = tokio::sync::oneshot::channel();
     let dns_listener = match dns_port {
         Some(port) => {
             // International domains resolve via DNS-over-TCP through the
@@ -162,8 +190,8 @@ async fn async_main() -> Result<()> {
             }
             let mut resolver = DnsResolver::with_config(dns_config);
             resolver.set_server_domains(server_domains.clone());
+            resolver.follow_runtime(shared_outbound.clone());
             if active_index.is_some() {
-                resolver.set_outbound(shared_outbound.clone());
                 tracing::info!(
                     "DNS: international domains resolve via DNS-over-TLS through the proxy node"
                 );
@@ -182,7 +210,8 @@ async fn async_main() -> Result<()> {
                     if let Err(e) =
                         sockrocket_core::serve_dns_udp("127.0.0.1", port, resolver, shutdown).await
                     {
-                        tracing::warn!("DNS listener failed: {e:#}");
+                        tracing::error!("DNS listener failed: {e:#}");
+                        let _ = dns_failure_tx.send(e.to_string());
                     }
                 }
             });
@@ -420,6 +449,12 @@ async fn async_main() -> Result<()> {
                 }
                 break;
             }
+            failure = &mut dns_failure_rx, if dns_port.is_some() => {
+                tracing::error!(
+                    "DNS listener exited unexpectedly ({failure:?}) — shutting down so supervisor can recover"
+                );
+                break;
+            }
             event = config_watcher.next() => {
                 let Some(event) = event else { break };
                 match event {
@@ -443,13 +478,21 @@ async fn async_main() -> Result<()> {
                                     .and_then(|i| new_config.nodes.get(i))
                                     .map(|n| n.name.clone())
                                     .unwrap_or_else(|| "direct".to_string());
-                                swappable.set(new_outbound);
+                                let dns_config=match read_router_dns_config(&config_path,&new_config.nodes) {
+                                    Ok(config)=>config,
+                                    Err(error)=>{tracing::error!("DNS config reload rejected: {error:#}");continue;}
+                                };
+                                swappable.publish(new_outbound,Arc::new(dns_config));
+                                let new_router = router_for_mode(&new_config);
+                                if let Some(tun) = &tun_proxy {
+                                    tun.replace_router(new_router.clone());
+                                }
                                 if let Ok(mut set) = server_domains.write() {
                                     *set = collect_server_domains(&new_config.nodes);
                                 }
-                                outbound_factory =
-                                    make_outbound_factory(router_for_mode(&new_config));
-                                if new_config.health_check.enabled {
+                                outbound_factory = make_outbound_factory(new_router);
+                                // Disabling health checks must also stop the old monitor.
+                                {
                                     service
                                         .restart_health_check(HealthCheckSetup {
                                             config: new_config.health_check.clone(),
@@ -491,7 +534,9 @@ async fn async_main() -> Result<()> {
     // Stop the DNS listener before the proxy/TUN so dnsmasq's forwarded
     // queries fail fast instead of hitting a half-torn-down resolver.
     if let Some((shutdown, task)) = dns_listener {
-        shutdown.notify_waiters();
+        // One listener owns this notification. Store a permit even if it
+        // has not yet reached notified() (e.g. immediate startup shutdown).
+        shutdown.notify_one();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
     }
 
@@ -506,6 +551,52 @@ async fn async_main() -> Result<()> {
     sockrocket_core::emergency_restore_routes();
 
     Ok(())
+}
+
+fn read_router_dns_config(
+    path: &str,
+    nodes: &[sockrocket_core::Node],
+) -> Result<sockrocket_core::dns::DnsConfig> {
+    use sockrocket_core::dns::{DnsGroup, DnsServer};
+    let value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+    let mut config = sockrocket_core::china_split_dns_config();
+    if let Some(server) = value
+        .get("dns_direct_server")
+        .and_then(|value| value.as_str())
+    {
+        let ip = server
+            .parse::<std::net::IpAddr>()
+            .context("Invalid dns_direct_server")?;
+        config.fallback = vec![DnsServer::Udp((ip, 53).into())];
+    }
+    if let Some(domains) = value.get("dns_direct_domains") {
+        let domains = domains
+            .as_sequence()
+            .ok_or_else(|| anyhow::anyhow!("dns_direct_domains must be a list"))?;
+        for domain in domains {
+            let domain = domain
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("DNS direct domain must be text"))?
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            anyhow::ensure!(
+                !domain.is_empty()
+                    && domain.len() <= 253
+                    && domain
+                        .split('.')
+                        .all(|label| !label.is_empty() && label.len() <= 63),
+                "Invalid DNS direct domain"
+            );
+            config.domain_rules.insert(domain, DnsGroup::Fallback);
+        }
+    }
+    for node in nodes {
+        let server = node.server.trim_end_matches('.').to_ascii_lowercase();
+        if server.parse::<IpAddr>().is_err() {
+            config.domain_rules.insert(server, DnsGroup::Fallback);
+        }
+    }
+    Ok(config)
 }
 
 /// Read the router-only `dns_port` key from config.yaml.
@@ -777,9 +868,6 @@ async fn apply_reloaded_config(
 ) -> Result<(AppConfig, Option<usize>, SharedOutbound)> {
     normalize_node_names(&mut config.nodes);
     let index = resolve_active_index(&config)?;
-    // NOTE: the TUN-side domain-rule override keeps the router built at
-    // process start; reloaded rules apply to the routing outbound only
-    // until the next restart.
     let outbound = build_outbound(&config, index, router_for_mode(&config).as_ref())?;
     Ok((config, index, outbound))
 }

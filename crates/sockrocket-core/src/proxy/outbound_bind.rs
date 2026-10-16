@@ -60,10 +60,27 @@ pub fn apply_to_tcp_socket(socket: &tokio::net::TcpSocket, is_v6: bool) -> std::
     apply(socket, &bind, is_v6)
 }
 
-#[cfg(windows)]
-fn apply(socket: &tokio::net::TcpSocket, bind: &OutboundBind, is_v6: bool) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawSocket;
+/// Apply the same physical-interface protection to UDP (DNS and datagrams).
+pub fn apply_to_udp_socket(socket: &tokio::net::UdpSocket, is_v6: bool) -> std::io::Result<()> {
+    let Some(bind) = outbound_bind() else {
+        return Ok(());
+    };
+    apply(socket, &bind, is_v6)
+}
 
+pub fn apply_to_std_udp_socket(socket: &std::net::UdpSocket, is_v6: bool) -> std::io::Result<()> {
+    let Some(bind) = outbound_bind() else {
+        return Ok(());
+    };
+    apply(socket, &bind, is_v6)
+}
+
+#[cfg(windows)]
+fn apply<S: std::os::windows::io::AsRawSocket>(
+    socket: &S,
+    bind: &OutboundBind,
+    is_v6: bool,
+) -> std::io::Result<()> {
     // ws2_32 is already loaded/linked by std::net; declare the one symbol we
     // need instead of taking a windows-sys dependency.
     #[link(name = "ws2_32")]
@@ -107,9 +124,11 @@ fn apply(socket: &tokio::net::TcpSocket, bind: &OutboundBind, is_v6: bool) -> st
 }
 
 #[cfg(target_os = "linux")]
-fn apply(socket: &tokio::net::TcpSocket, bind: &OutboundBind, _is_v6: bool) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
+fn apply<S: std::os::fd::AsRawFd>(
+    socket: &S,
+    bind: &OutboundBind,
+    _is_v6: bool,
+) -> std::io::Result<()> {
     // SO_BINDTODEVICE is family-agnostic; bind by interface name. Raw
     // setsockopt instead of socket2::SockRef::bind_device, which is gated
     // behind socket2's (unenabled) "all" feature.
@@ -139,9 +158,11 @@ fn apply(socket: &tokio::net::TcpSocket, bind: &OutboundBind, _is_v6: bool) -> s
 }
 
 #[cfg(target_os = "macos")]
-fn apply(socket: &tokio::net::TcpSocket, bind: &OutboundBind, is_v6: bool) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
+fn apply<S: std::os::fd::AsRawFd>(
+    socket: &S,
+    bind: &OutboundBind,
+    is_v6: bool,
+) -> std::io::Result<()> {
     // IP_BOUND_IF / IPV6_BOUND_IF — raw setsockopt instead of
     // socket2::SockRef::bind_device_by_index_*, which need socket2's "all" feature.
     let index = if is_v6 {
@@ -179,11 +200,7 @@ fn apply(socket: &tokio::net::TcpSocket, bind: &OutboundBind, is_v6: bool) -> st
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn apply(
-    _socket: &tokio::net::TcpSocket,
-    _bind: &OutboundBind,
-    _is_v6: bool,
-) -> std::io::Result<()> {
+fn apply<S>(_socket: &S, _bind: &OutboundBind, _is_v6: bool) -> std::io::Result<()> {
     Ok(())
 }
 

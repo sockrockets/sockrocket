@@ -7,6 +7,14 @@
 //! - DNS split: route China domains to local DNS, others to remote DNS
 
 pub mod fakeip;
+mod listener;
+pub use listener::check_listener as check_dns_listener;
+mod upstream;
+mod wire;
+pub use wire::{
+    build_dns_error_response, build_dns_response, build_dns_response_with_ttl, parse_dns_query,
+};
+use wire::{build_dns_query, parse_dns_response, validate_response};
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -73,7 +81,7 @@ pub enum DnsGroup {
 }
 
 /// DNS server types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsServer {
     /// Standard UDP DNS
     Udp(SocketAddr),
@@ -126,7 +134,34 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const STALE_WHILE_REVALIDATE: Duration = Duration::from_secs(300);
 
 /// In-flight DNS query entry for deduplication.
-type InflightEntry = Arc<tokio::sync::OnceCell<Result<Vec<IpAddr>, String>>>;
+#[derive(Clone)]
+struct LookupAnswer {
+    addresses: Vec<IpAddr>,
+    ttl: u32,
+}
+type InflightEntry = Arc<tokio::sync::OnceCell<Result<LookupAnswer, String>>>;
+type InflightMap = Arc<std::sync::Mutex<HashMap<CacheKey, InflightEntry>>>;
+
+// Synchronous cleanup also runs when a DNS request future is cancelled.
+struct InflightGuard {
+    map: InflightMap,
+    key: CacheKey,
+    cell: InflightEntry,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        // Keep the shared cell while another caller is still using it.
+        if Arc::strong_count(&self.cell) == 2
+            && map
+                .get(&self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.cell))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
 
 /// Number of slots in each proxy-DNS connection pool. Four concurrent
 /// international lookups cover a typical multi-domain page load without
@@ -136,8 +171,13 @@ const PROXY_DNS_POOL_SIZE: usize = 4;
 /// A small pool of independently-locked proxy-DNS connection slots.
 /// `acquire()` picks a free slot without waiting (round-robin + try_lock)
 /// and only queues when every slot is busy.
+struct PooledDnsStream {
+    stream: BoxProxyStream,
+    outbound: SharedOutbound,
+    server: DnsServer,
+}
 struct ProxyConnPool {
-    slots: Vec<Mutex<Option<BoxProxyStream>>>,
+    slots: Vec<Mutex<Option<PooledDnsStream>>>,
     cursor: std::sync::atomic::AtomicUsize,
 }
 
@@ -149,7 +189,7 @@ impl ProxyConnPool {
         }
     }
 
-    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, Option<BoxProxyStream>> {
+    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, Option<PooledDnsStream>> {
         use std::sync::atomic::Ordering;
         let n = self.slots.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
@@ -161,6 +201,13 @@ impl ProxyConnPool {
         }
         self.slots[start % n].lock().await
     }
+}
+
+struct RuntimeDnsCache {
+    outbound: SharedOutbound,
+    cache: Arc<RwLock<LruCache<CacheKey, CacheEntry>>>,
+    inflight: InflightMap,
+    cn_direct: Arc<RwLock<LruCache<String, bool>>>,
 }
 
 /// The main DNS resolver.
@@ -179,11 +226,16 @@ pub struct DnsResolver {
     doh_client: reqwest::Client,
     /// In-flight queries: concurrent resolves for the same (domain, qtype)
     /// share one query
-    inflight: Arc<Mutex<HashMap<CacheKey, InflightEntry>>>,
+    inflight: InflightMap,
+    /// Bound detached stale-cache refreshes as well as foreground DNS work.
+    refresh_slots: Arc<tokio::sync::Semaphore>,
     /// Outbound used by [`DnsServer::ProxyTcp`] servers. `None` until
     /// [`Self::set_outbound`] is called; ProxyTcp queries fail fast with a
     /// clear error in that state.
     outbound: Option<SharedOutbound>,
+    follow_runtime: bool,
+    primary_override: Option<Arc<Vec<DnsServer>>>,
+    runtime_cache: Arc<std::sync::Mutex<Option<RuntimeDnsCache>>>,
     /// Shared DNS-over-TCP connections through the proxy. Small pool of
     /// slots, each independently locked: queries within one slot are
     /// serialized (one outstanding exchange per connection), but different
@@ -245,8 +297,12 @@ impl DnsResolver {
                 NonZeroUsize::new(DNS_CACHE_MAX_ENTRIES).expect("capacity is non-zero"),
             ))),
             doh_client,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            refresh_slots: Arc::new(tokio::sync::Semaphore::new(16)),
             outbound: None,
+            follow_runtime: false,
+            primary_override: None,
+            runtime_cache: Arc::new(std::sync::Mutex::new(None)),
             proxy_tcp_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
             proxy_tls_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
             tls_connector: build_dot_tls_connector(),
@@ -325,6 +381,79 @@ impl DnsResolver {
         self.outbound = Some(outbound);
     }
 
+    /// Follow a published outbound's DNS policy, including direct/proxy changes.
+    pub fn follow_runtime(&mut self, outbound: SharedOutbound) {
+        self.outbound = Some(outbound);
+        self.follow_runtime = true;
+    }
+
+    fn query_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        if let Some(outbound) = &self.outbound
+            && let Some((current, config)) = outbound.0.dns_snapshot().or_else(|| {
+                outbound
+                    .0
+                    .runtime_snapshot()
+                    .map(|outbound| (outbound, None))
+            })
+        {
+            if let Some(config) = config {
+                snapshot.config = config;
+            }
+            let mut generation = self.runtime_cache.lock().unwrap();
+            if generation
+                .as_ref()
+                .is_none_or(|cache| !Arc::ptr_eq(&cache.outbound.0, &current.0))
+            {
+                *generation = Some(RuntimeDnsCache {
+                    outbound: current.clone(),
+                    cache: Arc::new(RwLock::new(LruCache::new(
+                        NonZeroUsize::new(DNS_CACHE_MAX_ENTRIES).unwrap(),
+                    ))),
+                    inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    cn_direct: Arc::new(RwLock::new(LruCache::new(
+                        NonZeroUsize::new(CN_DIRECT_CACHE_MAX).unwrap(),
+                    ))),
+                });
+            }
+            let generation = generation.as_ref().unwrap();
+            snapshot.cache = generation.cache.clone();
+            snapshot.inflight = generation.inflight.clone();
+            snapshot.cn_direct = generation.cn_direct.clone();
+            snapshot.outbound = Some(current);
+        }
+        if self.follow_runtime {
+            if snapshot
+                .outbound
+                .as_ref()
+                .is_some_and(|outbound| outbound.0.is_direct())
+            {
+                snapshot.fakeip = None;
+            }
+            snapshot.primary_override = Some(Arc::new(
+                if snapshot
+                    .outbound
+                    .as_ref()
+                    .is_some_and(|outbound| outbound.0.is_direct())
+                {
+                    vec![
+                        DnsServer::Udp(([8, 8, 8, 8], 53).into()),
+                        DnsServer::Udp(([1, 1, 1, 1], 53).into()),
+                    ]
+                } else {
+                    vec![
+                        DnsServer::ProxyTls(([8, 8, 8, 8], 853).into(), "dns.google".into()),
+                        DnsServer::ProxyTls(
+                            ([1, 1, 1, 1], 853).into(),
+                            "cloudflare-dns.com".into(),
+                        ),
+                    ]
+                },
+            ));
+        }
+        snapshot
+    }
+
     /// Resolve a hostname to IP addresses (A-record query).
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
         self.resolve_with_qtype(domain, QTYPE_A).await
@@ -336,6 +465,25 @@ impl DnsResolver {
     /// answers, timeouts) are cached as negative entries for
     /// [`NEGATIVE_CACHE_TTL`] and resolve to an empty address list.
     pub async fn resolve_with_qtype(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
+        self.query_snapshot()
+            .resolve_qtype_snapshot(domain, qtype)
+            .await
+    }
+
+    async fn resolve_qtype_snapshot(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
+        // DNS names are case-insensitive. Canonicalize before policy, cache
+        // and fake-IP lookup so uppercase/trailing-dot names cannot bypass
+        // the domestic group or create unrelated cache entries.
+        let canonical = domain.trim_end_matches('.').to_ascii_lowercase();
+        if canonical.len() > 253
+            || (!canonical.is_empty()
+                && canonical
+                    .split('.')
+                    .any(|label| label.is_empty() || label.len() > 63))
+        {
+            bail!("Invalid DNS name length");
+        }
+        let domain = canonical.as_str();
         let result = self.resolve_qtype_inner(domain, qtype).await;
         // Domestic-group answers are real addresses; remember them on EVERY
         // return path (fresh resolve, cache hit, stale serve) so the TUN
@@ -412,11 +560,14 @@ impl DnsResolver {
                     // refresh in the background through the normal resolve
                     // path so in-flight dedup applies (no duplicate query if
                     // a foreground resolve for the same key is running).
-                    let resolver = self.clone();
-                    let domain_owned = domain.to_string();
-                    tokio::spawn(async move {
-                        let _ = resolver.resolve_dedup(&domain_owned, qtype).await;
-                    });
+                    if let Ok(slot) = self.refresh_slots.clone().try_acquire_owned() {
+                        let resolver = self.clone();
+                        let domain_owned = domain.to_string();
+                        tokio::spawn(async move {
+                            let _slot = slot;
+                            let _ = resolver.resolve_dedup(&domain_owned, qtype).await;
+                        });
+                    }
                     return Ok(addrs);
                 }
                 None => {}
@@ -503,15 +654,21 @@ impl DnsResolver {
     async fn resolve_dedup(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
         let key: CacheKey = (domain.to_string(), qtype);
         let cell = {
-            let mut inflight = self.inflight.lock().await;
+            let mut inflight = self.inflight.lock().unwrap();
             inflight
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
                 .clone()
         };
 
+        let guard = InflightGuard {
+            map: self.inflight.clone(),
+            key: key.clone(),
+            cell,
+        };
         // Only the first caller runs resolve_uncached(); others wait for its result.
-        let result = cell
+        let result = guard
+            .cell
             .get_or_init(|| async {
                 self.resolve_uncached(domain, qtype)
                     .await
@@ -519,97 +676,50 @@ impl DnsResolver {
             })
             .await;
 
-        // Clean up inflight entry so future queries aren't stale
-        {
-            let mut inflight = self.inflight.lock().await;
-            inflight.remove(&key);
-        }
-
         let result = result.clone().map_err(|e| anyhow::anyhow!("{}", e));
 
-        // Cache the outcome: positive answers get the configured TTL,
-        // failures get a short negative TTL so repeated queries for a
-        // failing name don't each pay the full timeout chain.
         if self.config.cache_enabled {
             let (addresses, ttl) = match &result {
-                Ok(addrs) if !addrs.is_empty() => {
+                Ok(answer) if !answer.addresses.is_empty() => {
                     let ttl = if self.config.cache_ttl > 0 {
                         self.config.cache_ttl
                     } else {
-                        300 // default 5 minutes
+                        answer.ttl
                     };
-                    (addrs.clone(), Duration::from_secs(ttl as u64))
+                    (answer.addresses.clone(), Duration::from_secs(ttl as u64))
                 }
                 _ => (Vec::new(), NEGATIVE_CACHE_TTL),
             };
-            let mut cache = self.cache.write().await;
-            cache.put(
-                key,
-                CacheEntry {
-                    addresses,
-                    expires_at: Instant::now() + ttl,
-                },
-            );
-        }
-
-        result
-    }
-
-    /// Perform the actual DNS resolution (post-cache, no dedup).
-    ///
-    /// The matched server group is queried with all its servers racing — the
-    /// first answer (even an empty/NODATA one, which is a legitimate reply)
-    /// wins. There is deliberately NO cross-group fallback: an international
-    /// domain whose primary group fails must NOT be re-queried against the
-    /// domestic fallback, because domestic resolvers return GFW-poisoned
-    /// fake records for exactly those domains (observed: 223.5.5.5 answers
-    /// www.google.com with poisoned A/AAAA records). A clean SERVFAIL is
-    /// strictly better than a poisoned answer.
-    async fn resolve_uncached(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        let group = self.match_domain_group(domain);
-        let servers = match group {
-            DnsGroup::Primary => &self.config.servers,
-            DnsGroup::Fallback => &self.config.fallback,
-        };
-
-        self.race_group(servers, domain, qtype).await
-    }
-
-    /// Query all servers in a group concurrently; the first answer wins.
-    ///
-    /// An empty answer (NODATA) from a reachable server is a valid result and
-    /// wins immediately — it must not fall through to another group (see
-    /// [`Self::resolve_uncached`]).
-    async fn race_group(
-        &self,
-        servers: &[DnsServer],
-        domain: &str,
-        qtype: u16,
-    ) -> Result<Vec<IpAddr>> {
-        if servers.is_empty() {
-            bail!("No DNS servers configured");
-        }
-
-        let mut set = tokio::task::JoinSet::new();
-        for server in servers {
-            let resolver = self.clone();
-            let server = server.clone();
-            let domain = domain.to_string();
-            set.spawn(async move { resolver.query_server(&server, &domain, qtype).await });
-        }
-
-        let mut last_err = None;
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(Ok(addrs)) => {
-                    set.abort_all();
-                    return Ok(addrs);
-                }
-                Ok(Err(e)) => last_err = Some(e),
-                Err(e) => last_err = Some(anyhow::anyhow!("DNS query task failed: {}", e)),
+            if ttl.is_zero() {
+                self.cache.write().await.pop(&key);
+            } else {
+                self.cache.write().await.put(
+                    key,
+                    CacheEntry {
+                        addresses,
+                        expires_at: Instant::now() + ttl,
+                    },
+                );
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No DNS servers configured")))
+        result.map(|answer| answer.addresses)
+    }
+
+    async fn resolve_uncached(&self, domain: &str, qtype: u16) -> Result<LookupAnswer> {
+        let query = build_dns_query(domain, qtype);
+        let reply = self.exchange_raw(&query).await?;
+        let addresses = parse_dns_response(&reply)?
+            .into_iter()
+            .filter(|ip| match qtype {
+                1 => ip.is_ipv4(),
+                28 => ip.is_ipv6(),
+                _ => true,
+            })
+            .collect();
+        Ok(LookupAnswer {
+            addresses,
+            ttl: wire::answer_ttl(&reply)?,
+        })
     }
 
     /// Resolve to first IPv4 address.
@@ -641,13 +751,15 @@ impl DnsResolver {
 
     /// Clear the DNS cache.
     pub async fn clear_cache(&self) {
-        let mut cache = self.cache.write().await;
+        let snapshot = self.query_snapshot();
+        let mut cache = snapshot.cache.write().await;
         cache.clear();
     }
 
     /// Get cache statistics: (total_entries, expired_entries).
     pub async fn cache_stats(&self) -> (usize, usize) {
-        let cache = self.cache.read().await;
+        let snapshot = self.query_snapshot();
+        let cache = snapshot.cache.read().await;
         let now = Instant::now();
         let total = cache.len();
         let expired = cache.iter().filter(|(_, e)| e.expires_at <= now).count();
@@ -676,248 +788,9 @@ impl DnsResolver {
         }
         DnsGroup::Primary
     }
-
-    async fn query_server(
-        &self,
-        server: &DnsServer,
-        domain: &str,
-        qtype: u16,
-    ) -> Result<Vec<IpAddr>> {
-        match server {
-            DnsServer::Udp(addr) => self.query_udp(*addr, domain, qtype).await,
-            DnsServer::DoH(url) => self.query_doh(url, domain, qtype).await,
-            DnsServer::ProxyTcp(addr) => self.query_proxy_tcp(*addr, domain, qtype).await,
-            DnsServer::ProxyTls(addr, sni) => self.query_proxy_tls(*addr, sni, domain, qtype).await,
-        }
-    }
-
-    /// Query DNS over TCP through the configured proxy outbound.
-    ///
-    /// Draws a slot from the resolver's connection pool: exchanges within a
-    /// slot are serialized (each bounded by an 8s timeout), slots run
-    /// concurrently. On any failure the slot's connection is dropped and the
-    /// query retried once on a fresh connection.
-    async fn query_proxy_tcp(
-        &self,
-        server: SocketAddr,
-        domain: &str,
-        qtype: u16,
-    ) -> Result<Vec<IpAddr>> {
-        let outbound = self
-            .outbound
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ProxyTcp DNS server configured but no outbound set"))?;
-        let query = build_dns_query(domain, qtype);
-
-        let mut conn = self.proxy_tcp_conn.acquire().await;
-        let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..2 {
-            if conn.is_none() {
-                tracing::debug!(
-                    "ProxyTcp: dialing {} for {} (attempt {})",
-                    server,
-                    domain,
-                    attempt
-                );
-                match connect_upstream(outbound, &server.ip().to_string(), server.port()).await {
-                    Ok(stream) => {
-                        tracing::debug!("ProxyTcp: connected to {}", server);
-                        *conn = Some(stream);
-                    }
-                    Err(e) => {
-                        tracing::debug!("ProxyTcp: connect to {} failed: {:#}", server, e);
-                        last_err = Some(e);
-                        continue;
-                    }
-                }
-            }
-            let stream = conn.as_mut().expect("connection just ensured");
-
-            match tokio::time::timeout(Duration::from_secs(8), dns_tcp_exchange(stream, &query))
-                .await
-            {
-                Ok(Ok(addrs)) => return Ok(addrs),
-                Ok(Err(e)) => {
-                    tracing::debug!("ProxyTcp: exchange with {} failed: {:#}", server, e);
-                    last_err = Some(e);
-                }
-                Err(_) => {
-                    tracing::debug!("ProxyTcp: exchange with {} timed out", server);
-                    last_err = Some(anyhow::anyhow!("ProxyTcp DNS query timeout"));
-                }
-            }
-            // Broken connection (or a poisoned/stuck exchange): drop it so
-            // the retry dials a fresh one.
-            *conn = None;
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("ProxyTcp DNS query failed")))
-    }
-
-    /// Query DNS over TLS (RFC 7858) through the configured proxy outbound.
-    ///
-    /// Same pooled-connection discipline as [`Self::query_proxy_tcp`],
-    /// plus a TLS handshake after the proxy dial. TLS is the whole point:
-    /// relay exits that transparently hijack plaintext port-53 DNS
-    /// cannot touch port 853 without a valid certificate for `sni`.
-    async fn query_proxy_tls(
-        &self,
-        server: SocketAddr,
-        sni: &str,
-        domain: &str,
-        qtype: u16,
-    ) -> Result<Vec<IpAddr>> {
-        let outbound = self
-            .outbound
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ProxyTls DNS server configured but no outbound set"))?;
-        let query = build_dns_query(domain, qtype);
-        let server_name = rustls_pki_types::ServerName::try_from(sni.to_owned())
-            .map_err(|e| anyhow::anyhow!("invalid DoT SNI '{}': {}", sni, e))?;
-
-        let mut conn = self.proxy_tls_conn.acquire().await;
-        let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..2 {
-            if conn.is_none() {
-                tracing::debug!(
-                    "ProxyTls: dialing {} (SNI {}) for {} (attempt {})",
-                    server,
-                    sni,
-                    domain,
-                    attempt
-                );
-                match connect_upstream(outbound, &server.ip().to_string(), server.port()).await {
-                    Ok(stream) => {
-                        match self
-                            .tls_connector
-                            .connect(server_name.clone(), stream)
-                            .await
-                        {
-                            Ok(tls_stream) => {
-                                tracing::debug!(
-                                    "ProxyTls: TLS established to {} ({})",
-                                    server,
-                                    sni
-                                );
-                                *conn = Some(Box::new(tls_stream) as BoxProxyStream);
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "ProxyTls: TLS handshake with {} failed: {:#}",
-                                    server,
-                                    e
-                                );
-                                last_err =
-                                    Some(anyhow::anyhow!("DoT TLS handshake failed: {:#}", e));
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("ProxyTls: connect to {} failed: {:#}", server, e);
-                        last_err = Some(e);
-                        continue;
-                    }
-                }
-            }
-            let stream = conn.as_mut().expect("connection just ensured");
-
-            match tokio::time::timeout(Duration::from_secs(8), dns_tcp_exchange(stream, &query))
-                .await
-            {
-                Ok(Ok(addrs)) => return Ok(addrs),
-                Ok(Err(e)) => {
-                    tracing::debug!("ProxyTls: exchange with {} failed: {:#}", server, e);
-                    last_err = Some(e);
-                }
-                Err(_) => {
-                    tracing::debug!("ProxyTls: exchange with {} timed out", server);
-                    last_err = Some(anyhow::anyhow!("ProxyTls DNS query timeout"));
-                }
-            }
-            *conn = None;
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("ProxyTls DNS query failed")))
-    }
-
-    /// Query DNS over UDP.
-    async fn query_udp(&self, server: SocketAddr, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        let query = build_dns_query(domain, qtype);
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.send_to(&query, server).await?;
-
-        let mut buf = [0u8; 512];
-        let timeout = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf));
-        let (n, _) = timeout
-            .await
-            .map_err(|_| anyhow::anyhow!("DNS query timeout"))??;
-
-        parse_dns_response(&buf[..n])
-    }
-
-    /// Query DNS over HTTPS (DoH) using wireformat.
-    async fn query_doh(&self, url: &str, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        let query = build_dns_query(domain, qtype);
-
-        let resp = self
-            .doh_client
-            .post(url)
-            .header("Content-Type", "application/dns-message")
-            .header("Accept", "application/dns-message")
-            .body(query)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            bail!("DoH server returned status {}", resp.status());
-        }
-
-        let body = resp.bytes().await?;
-        parse_dns_response(&body)
-    }
 }
 
 // --- DNS wire format helpers ---
-
-/// One RFC 7858-style DNS exchange over a (possibly TLS-wrapped) TCP stream:
-/// sends `[u16 length][query]`, reads the framed reply, parses it.
-/// Shared by the plain (`ProxyTcp`) and TLS (`ProxyTls`) proxy paths.
-async fn dns_tcp_exchange(stream: &mut BoxProxyStream, query: &[u8]) -> Result<Vec<IpAddr>> {
-    let mut framed = Vec::with_capacity(query.len() + 2);
-    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-    framed.extend_from_slice(query);
-    stream.write_all(&framed).await?;
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    if resp_len == 0 {
-        bail!("Empty DNS-over-TCP response");
-    }
-    let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp).await?;
-
-    // Orphan-response guard. The exchange runs on a SHARED connection, and a
-    // racing query that lost `race_group` is aborted mid-exchange — its query
-    // was already written, so its response arrives LATE and sits in the read
-    // buffer. Without ID validation the NEXT exchange (any domain) reads that
-    // stale response, caches it under the wrong name for 600s, and clients
-    // connect to a different site's IP — observed as github.com
-    // answering with Google IPs and youtube serving Apple IPs, producing
-    // ERR_CERT_COMMON_NAME_INVALID all over the LAN. A mismatched ID means
-    // the stream is desynced by at least one orphan; bail and let the caller
-    // drop the connection and redial (both proxy exchange paths do).
-    if resp.len() >= 2 && query.len() >= 2 && resp[0..2] != query[0..2] {
-        bail!(
-            "DNS response ID mismatch (query {:02x}{:02x}, got {:02x}{:02x}) — stale orphan response on shared connection",
-            query[0],
-            query[1],
-            resp[0],
-            resp[1]
-        );
-    }
-
-    parse_dns_response(&resp)
-}
 
 /// Build the TLS connector used for DNS-over-TLS through the proxy.
 ///
@@ -939,264 +812,6 @@ fn build_dot_tls_connector() -> tokio_rustls::TlsConnector {
 }
 
 /// Build a minimal DNS query packet for the given query type (1 = A, 28 = AAAA).
-fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64);
-
-    // Header
-    let id: u16 = rand::random();
-    buf.extend_from_slice(&id.to_be_bytes()); // ID
-    buf.extend_from_slice(&[0x01, 0x00]); // Flags: standard query, recursion desired
-    buf.extend_from_slice(&[0x00, 0x01]); // QDCOUNT: 1
-    buf.extend_from_slice(&[0x00, 0x00]); // ANCOUNT: 0
-    buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT: 0
-    buf.extend_from_slice(&[0x00, 0x00]); // ARCOUNT: 0
-
-    // Question section
-    for label in domain.split('.') {
-        let bytes = label.as_bytes();
-        buf.push(bytes.len() as u8);
-        buf.extend_from_slice(bytes);
-    }
-    buf.push(0x00); // Root label
-
-    buf.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
-    buf.extend_from_slice(&[0x00, 0x01]); // QCLASS: IN
-
-    buf
-}
-
-/// Parse a DNS response and extract IP addresses.
-fn parse_dns_response(data: &[u8]) -> Result<Vec<IpAddr>> {
-    if data.len() < 12 {
-        bail!("DNS response too short");
-    }
-
-    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
-    let rcode = data[3] & 0x0F;
-
-    if rcode != 0 {
-        bail!("DNS response error: rcode={}", rcode);
-    }
-
-    // Skip header (12 bytes) and question section
-    let mut pos = 12;
-
-    // Skip question section (QDCOUNT = data[4..6])
-    let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
-    for _ in 0..qdcount {
-        pos = skip_dns_name(data, pos)?;
-        pos += 4; // QTYPE + QCLASS
-    }
-
-    // Parse answer section
-    let mut addrs = Vec::new();
-    for _ in 0..ancount {
-        if pos >= data.len() {
-            break;
-        }
-        pos = skip_dns_name(data, pos)?;
-        if pos + 10 > data.len() {
-            break;
-        }
-
-        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
-        pos += 10;
-
-        if pos + rdlength > data.len() {
-            break;
-        }
-
-        match rtype {
-            1 if rdlength == 4 => {
-                // A record
-                let ip = Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
-                addrs.push(IpAddr::V4(ip));
-            }
-            28 if rdlength == 16 => {
-                // AAAA record
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&data[pos..pos + 16]);
-                addrs.push(IpAddr::V6(octets.into()));
-            }
-            _ => {}
-        }
-        pos += rdlength;
-    }
-
-    Ok(addrs)
-}
-
-/// Skip a DNS name (handles compression pointers).
-#[allow(unused_assignments)]
-fn skip_dns_name(data: &[u8], mut pos: usize) -> Result<usize> {
-    let mut jumped = false;
-    loop {
-        if pos >= data.len() {
-            bail!("DNS name extends beyond packet");
-        }
-        let len = data[pos] as usize;
-        if len == 0 {
-            if !jumped {
-                pos += 1;
-            }
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            // Compression pointer
-            if !jumped {
-                pos += 2;
-                jumped = true;
-            }
-            break;
-        }
-        if !jumped {
-            pos += 1 + len;
-        } else {
-            break;
-        }
-    }
-    Ok(pos)
-}
-
-/// Extract the queried domain name and query type from a raw DNS packet.
-///
-/// Returns `(domain, qtype)` where qtype is 1 for A, 28 for AAAA, etc.
-pub fn parse_dns_query(data: &[u8]) -> Result<(String, u16)> {
-    if data.len() < 12 {
-        bail!("DNS packet too short");
-    }
-    let mut pos = 12; // skip header
-    let mut domain = String::new();
-    loop {
-        if pos >= data.len() {
-            bail!("DNS question extends beyond packet");
-        }
-        let len = data[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            bail!("Unexpected compression pointer in question");
-        }
-        pos += 1;
-        if pos + len > data.len() {
-            bail!("DNS label extends beyond packet");
-        }
-        if !domain.is_empty() {
-            domain.push('.');
-        }
-        domain.push_str(&String::from_utf8_lossy(&data[pos..pos + len]));
-        pos += len;
-    }
-    if pos + 4 > data.len() {
-        bail!("DNS question QTYPE/QCLASS missing");
-    }
-    let qtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-    Ok((domain, qtype))
-}
-
-/// Build a DNS response packet from a query packet and a set of resolved IPs.
-///
-/// Preserves the query ID and question section, adds A/AAAA answers with
-/// the default TTL (300s).
-pub fn build_dns_response(query: &[u8], addresses: &[IpAddr]) -> Result<Vec<u8>> {
-    build_dns_response_with_ttl(query, addresses, 300)
-}
-
-/// Like [`build_dns_response`] but with an explicit answer TTL.
-///
-/// Fake-IP answers need a short TTL (a few seconds): the fake address is
-/// only meaningful while the pool remembers the mapping, and long client /
-/// dnsmasq caching would outlive evictions and resolvers being restarted.
-pub fn build_dns_response_with_ttl(
-    query: &[u8],
-    addresses: &[IpAddr],
-    ttl: u32,
-) -> Result<Vec<u8>> {
-    if query.len() < 12 {
-        bail!("Query packet too short to build response");
-    }
-
-    // Find end of question section
-    let mut qend = 12;
-    loop {
-        if qend >= query.len() {
-            bail!("Malformed DNS query: question section overflows");
-        }
-        let len = query[qend] as usize;
-        if len == 0 {
-            qend += 1; // null terminator
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            qend += 2;
-            break;
-        }
-        qend += 1 + len;
-    }
-    qend += 4; // QTYPE + QCLASS
-
-    let an_count = addresses.len() as u16;
-    let mut resp = Vec::with_capacity(qend + addresses.len() * 16 + 32);
-
-    // Copy header from query
-    resp.extend_from_slice(&query[..2]); // ID
-
-    // Flags: response, recursion desired+available, no error
-    resp.extend_from_slice(&[0x81, 0x80]);
-
-    // QDCOUNT = 1
-    resp.extend_from_slice(&[0x00, 0x01]);
-    // ANCOUNT
-    resp.extend_from_slice(&an_count.to_be_bytes());
-    // NSCOUNT, ARCOUNT = 0
-    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
-    // Copy question section from query
-    resp.extend_from_slice(&query[12..qend]);
-
-    // Answer records
-    for addr in addresses {
-        // Name pointer to question
-        resp.extend_from_slice(&[0xC0, 0x0C]);
-        match addr {
-            IpAddr::V4(v4) => {
-                resp.extend_from_slice(&[0x00, 0x01]); // A
-                resp.extend_from_slice(&[0x00, 0x01]); // IN
-                resp.extend_from_slice(&ttl.to_be_bytes());
-                resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
-                resp.extend_from_slice(&v4.octets());
-            }
-            IpAddr::V6(v6) => {
-                resp.extend_from_slice(&[0x00, 0x1C]); // AAAA
-                resp.extend_from_slice(&[0x00, 0x01]); // IN
-                resp.extend_from_slice(&ttl.to_be_bytes());
-                resp.extend_from_slice(&[0x00, 0x10]); // RDLENGTH
-                resp.extend_from_slice(&v6.octets());
-            }
-        }
-    }
-
-    Ok(resp)
-}
-
-/// Build a DNS NXDOMAIN (or SERVFAIL) error response from a query packet.
-pub fn build_dns_error_response(query: &[u8], rcode: u8) -> Vec<u8> {
-    if query.len() < 12 {
-        return Vec::new();
-    }
-    let mut resp = query.to_vec();
-    // Set QR=1 (response), keep RD, set RA, set rcode
-    resp[2] = 0x81;
-    resp[3] = 0x80 | (rcode & 0x0F);
-    // Zero out ANCOUNT
-    resp[6] = 0;
-    resp[7] = 0;
-    resp
-}
-
 /// China domain suffixes for DNS splitting (same curated list as routing).
 ///
 /// Names on this list use Fallback (domestic resolvers + real IPs, never
@@ -1218,6 +833,7 @@ pub fn china_domain_suffixes() -> Vec<String> {
 pub(crate) async fn lookup_a_udp(server: SocketAddr, domain: &str) -> Option<IpAddr> {
     let query = build_dns_query(domain, QTYPE_A);
     let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    crate::proxy::outbound_bind::apply_to_udp_socket(&socket, server.is_ipv6()).ok()?;
     socket.send_to(&query, server).await.ok()?;
     let mut buf = [0u8; 512];
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
@@ -1286,63 +902,65 @@ pub fn china_split_dns_config_proxy_tls() -> DnsConfig {
 /// (`serve_dns_udp`) used on the router, where dnsmasq forwards LAN queries to
 /// this port for China-domain splitting.
 pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u8> {
-    match parse_dns_query(query) {
-        Ok((domain, qtype)) => {
-            tracing::trace!("DNS: {} (type {})", domain, qtype);
-
-            // Resolve with the client's query type: AAAA queries go upstream
-            // as real AAAA queries and are cached per (domain, qtype).
-            let timeout = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                resolver.resolve_with_qtype(&domain, qtype),
-            );
-
-            match timeout.await {
-                Ok(Ok(addrs)) => {
-                    // Defensive filter by query type: A (1) → IPv4 only,
-                    // AAAA (28) → IPv6 only. Cache entries are already keyed
-                    // by qtype; this guards against mixed upstream answers.
-                    let filtered: Vec<IpAddr> = match qtype {
-                        1 => addrs.into_iter().filter(|a| a.is_ipv4()).collect(),
-                        28 => addrs.into_iter().filter(|a| a.is_ipv6()).collect(),
-                        _ => addrs,
-                    };
-                    // Fake-IP answers: TTL=5 so clients re-ask after pool
-                    // restart/eviction. Domestic with Fake-IP mode: TTL=30
-                    // (domestic-IP table is process memory). Without Fake-IP
-                    // (TUN off, SOCKS + DNS hijack): also TTL=5 — otherwise
-                    // international real IPs cache for minutes and re-enabling
-                    // TUN blackholes bare-IP dials through unlock exits.
-                    let ttl = if filtered.iter().any(|a| resolver.is_fake(a)) {
-                        5
-                    } else if resolver.has_fakeip() {
-                        30
-                    } else {
-                        5
-                    };
-                    match build_dns_response_with_ttl(query, &filtered, ttl) {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            tracing::debug!("DNS response build error for {}: {}", domain, e);
-                            build_dns_error_response(query, 2)
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!("DNS resolve error for {}: {}", domain, e);
-                    build_dns_error_response(query, 2) // SERVFAIL
-                }
-                Err(_) => {
-                    tracing::debug!("DNS timeout for {}", domain);
-                    build_dns_error_response(query, 2) // SERVFAIL
-                }
-            }
-        }
-        Err(e) => {
-            tracing::trace!("DNS parse error: {}", e);
-            build_dns_error_response(query, 1) // FORMERR
-        }
+    if parse_dns_query(query).is_err() {
+        return build_dns_error_response(query, 1);
     }
+    let snapshot = resolver.query_snapshot();
+    match tokio::time::timeout(Duration::from_secs(5), answer_wire(&snapshot, query)).await {
+        Ok(Ok(reply)) => reply,
+        _ => build_dns_error_response(query, 2),
+    }
+}
+
+async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
+    let (domain, qtype) = parse_dns_query(query)?;
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    let Some(pool) = &resolver.fakeip else {
+        return resolver.exchange_raw(query).await;
+    };
+    if !matches!(qtype, 1 | 28) {
+        return resolver.exchange_raw(query).await;
+    }
+    if resolver.match_domain_group(&domain) == DnsGroup::Fallback {
+        let mut reply = resolver.exchange_raw(query).await?;
+        wire::cap_ttl(&mut reply, 30)?;
+        if let Ok(addresses) = parse_dns_response(&reply) {
+            resolver.record_probe_domestic(&domain, pool, &addresses);
+        }
+        return Ok(reply);
+    }
+    // Keep negative responses intact; fake addresses only represent successful A answers.
+    let probe_query = if qtype == 1 {
+        query.to_vec()
+    } else {
+        build_dns_query(&domain, 1)
+    };
+    let mut probe = resolver.exchange_raw(&probe_query).await?;
+    if probe[3] & 0x0f != 0 {
+        if qtype == 1 {
+            return Ok(probe);
+        }
+        return resolver.exchange_raw(query).await;
+    }
+    let addresses = parse_dns_response(&probe)?;
+    if resolver.ips_are_cn(&addresses) {
+        wire::cap_ttl(&mut probe, 30)?;
+        resolver.record_probe_domestic(&domain, pool, &addresses);
+        if qtype == 1 {
+            return Ok(probe);
+        }
+        let reply = resolver.exchange_raw(query).await?;
+        if let Ok(addresses) = parse_dns_response(&reply) {
+            resolver.record_probe_domestic(&domain, pool, &addresses);
+        }
+        return Ok(reply);
+    }
+    let fake = if addresses.is_empty() || qtype != 1 {
+        vec![]
+    } else {
+        vec![IpAddr::V4(pool.allocate(&domain))]
+    };
+    build_dns_response_with_ttl(query, &fake, 5)
 }
 
 /// Serve DNS over UDP on `bind_addr:port` until `shutdown` fires.
@@ -1357,30 +975,51 @@ pub async fn serve_dns_udp(
     resolver: DnsResolver,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    let socket = UdpSocket::bind((bind_addr, port)).await?;
-    tracing::info!("DNS listener: udp://{bind_addr}:{port}");
+    listener::serve(bind_addr, port, resolver, shutdown).await
+}
+
+async fn serve_dns_socket(
+    socket: UdpSocket,
+    resolver: DnsResolver,
+    shutdown: Arc<tokio::sync::Notify>,
+    max_inflight: usize,
+) -> Result<()> {
     let socket = Arc::new(socket);
+    let mut queries = tokio::task::JoinSet::new();
+    let mut buf = [0u8; 65535];
 
     loop {
-        let mut buf = vec![0u8; 1500];
         let (n, peer) = tokio::select! {
+            biased;
             _ = shutdown.notified() => break,
+            Some(_) = queries.join_next(), if !queries.is_empty() => continue,
             res = socket.recv_from(&mut buf) => res?,
         };
         if n < 12 {
             continue; // too short to be a DNS packet
         }
+        // Upstream timeouts must not turn a LAN DNS burst into an
+        // unbounded number of tasks waiting for resolver/pool slots.
+        if queries.len() >= max_inflight {
+            let response = build_dns_error_response(&buf[..n], 2);
+            let _ = socket.send_to(&response, peer).await;
+            continue;
+        }
         let query = buf[..n].to_vec();
         let socket = socket.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
-            let resp = answer_raw_dns_query(&resolver, &query).await;
+        queries.spawn(async move {
+            let resp = wire::udp_response(&query, answer_raw_dns_query(&resolver, &query).await);
             if let Err(e) = socket.send_to(&resp, peer).await {
                 tracing::debug!("DNS send to {peer} failed: {e}");
             }
         });
     }
 
+    // In-flight tasks own socket clones. Cancel and reap them before
+    // returning so shutdown releases the port even with stalled upstreams.
+    queries.abort_all();
+    while queries.join_next().await.is_some() {}
     tracing::info!("DNS listener stopped");
     Ok(())
 }

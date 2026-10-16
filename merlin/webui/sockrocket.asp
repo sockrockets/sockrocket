@@ -611,12 +611,9 @@ var API_PORT = (typeof SOCKROCKET_API_PORT === 'number' && SOCKROCKET_API_PORT >
 function apiBase() { return 'http://' + location.hostname + ':' + API_PORT + '/api'; }
 
 function probeTransport(cb) {
-  probeGet(apiBase() + '?action=version', 2500, function (ok) {
-    if (ok) { TRANSPORT = 'http'; return cb(); }
-    probeGet('/cgi-bin/sockrocket.cgi?action=version', 0, function (ok2) {
-      TRANSPORT = ok2 ? 'cgi' : 'ksc';
-      cb();
-    });
+  probeGet('/cgi-bin/sockrocket.cgi?action=version', 2500, function (ok) {
+    TRANSPORT = ok ? 'cgi' : 'ksc';
+    cb();
   });
 }
 
@@ -629,6 +626,7 @@ function probeGet(url, timeout, cb) {
   // the whole boot (every button dead). Keep it inside the try.
   try {
     xhr.open('GET', url, true);
+    xhr.setRequestHeader('X-Sockrocket-Request', '1');
     if (timeout) xhr.timeout = timeout;
     xhr.onload = function () { finish(xhr.status === 200 && xhr.responseText.indexOf('"version"') >= 0); };
     xhr.onerror = function () { finish(false); };
@@ -647,7 +645,8 @@ function apiXhr(base, action, data, cb, errCb, timeoutMs) {
   // Same as probeGet: open()/setRequestHeader() throw on a malformed URL and
   // must not escape uncaught.
   try {
-    xhr.open(data ? 'POST' : 'GET', base + '?action=' + action, true);
+    xhr.open('POST', base + '?action=' + action, true);
+    xhr.setRequestHeader('X-Sockrocket-Request', '1');
     xhr.setRequestHeader('Content-Type', 'application/json');
     if (timeoutMs) xhr.timeout = timeoutMs;
   } catch (e) {
@@ -674,24 +673,67 @@ function apiXhr(base, action, data, cb, errCb, timeoutMs) {
   xhr.ontimeout = function () {
     if (errCb) errCb({ error_code: 'timeout' });
   };
-  xhr.send(data ? JSON.stringify(data) : null);
+  xhr.send(JSON.stringify(data || {}));
 }
 
-function apiKsc(action, data, cb, errCb) {
+var kscQueue = [];
+var kscBusy = false;
+function apiKsc(action, data, cb, errCb, timeoutMs) {
+  if (kscQueue.length >= 16) {
+    if (errCb) errCb({ error_code: 'busy' });
+    return;
+  }
+  kscQueue.push([action, data, cb, errCb, timeoutMs]);
+  drainKscQueue();
+}
+function drainKscQueue() {
+  if (kscBusy || !kscQueue.length) return;
+  kscBusy = true;
+  var request = kscQueue.shift();
+  function finish(callback, value) {
+    kscBusy = false;
+    try { if (callback) callback(value); }
+    finally { drainKscQueue(); }
+  }
+  apiKscRequest(request[0], request[1], function (d) { finish(request[2], d); },
+    function (e) { finish(request[3], e); }, request[4]);
+}
+function apiKscRequest(action, data, cb, errCb, timeoutMs) {
   // Full ms timestamp + wide random suffix: the old `Date.now() % 1e9 +
   // random(0..999)` form collided when two requests fired within the same
   // millisecond, making them poll (and possibly read) the same result file.
   var seq = String(Date.now()) + String(Math.floor(Math.random() * 1000000));
   var job = {
-    id: seq,
+    id: Math.floor(Math.random() * 999999) + 1,
     method: 'sockrocket_api.sh',
     params: [action],
     fields: { sockrocket_rpc_seq: seq, sockrocket_rpc_args: data ? JSON.stringify(data) : '' }
   };
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/_api/', true);
+  xhr.setRequestHeader('X-Sockrocket-Request', '1');
   xhr.setRequestHeader('Content-Type', 'application/json');
-  xhr.onload = function () { pollKscResult(seq, 0, cb, errCb); };
+  xhr.timeout = timeoutMs || 45000;
+  xhr.onload = function () {
+    if (xhr.status !== 200) {
+      showMsg('Router API request failed (' + xhr.status + ')', 'err');
+      if (errCb) errCb({ error_code: 'http_error' });
+      return;
+    }
+    try {
+      var ack = JSON.parse(xhr.responseText);
+      if (String(ack.result) !== String(job.id)) throw new Error('dispatch rejected');
+    } catch (e) {
+      showMsg('Router rejected the API job', 'err');
+      if (errCb) errCb({ error_code: 'dispatch_error' });
+      return;
+    }
+    pollKscResult(seq, 0, cb, errCb);
+  };
+  xhr.ontimeout = function () {
+    showMsg('Router API request timed out', 'err');
+    if (errCb) errCb({ error_code: 'timeout' });
+  };
   xhr.onerror = function () {
     showMsg('Cannot connect to the router API', 'err');
     if (errCb) errCb({ error_code: 'network_error' });
@@ -709,6 +751,7 @@ function pollKscResult(seq, tries, cb, errCb) {
   }
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/_temp/sockrocket_rpc_' + seq + '.json?_=' + Math.random(), true);
+  xhr.timeout = 5000;
   xhr.onload = function () {
     var t = (xhr.responseText || '').trim();
     if (xhr.status === 200 && t.charAt(0) === '{') {
@@ -726,6 +769,7 @@ function pollKscResult(seq, tries, cb, errCb) {
   xhr.onerror = function () {
     setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb); }, 200);
   };
+  xhr.ontimeout = xhr.onerror;
   try { xhr.send(null); } catch (e) { setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb); }, 200); }
 }
 
@@ -1611,29 +1655,13 @@ function toggleLogAuto() {
 }
 
 /* ══ Boot ══════════════════════════════════════════════════════════ */
-function ensureRunning(cb) {
-  api('status', null, function (d) {
-    if (d && d.running) { if (cb) cb(); return; }
-    showMsg('Starting Sockrocket…', 'info');
-    api('start', {}, function (r) {
-      toastResp(r, 'Started');
-      setTimeout(function () { refreshStatus(true); if (cb) cb(); }, 1500);
-    }, function () { if (cb) cb(); }, 20000);
-  }, function () {
-    // API down — try start via KSC/cgi anyway (start also brings up the API)
-    api('start', {}, function () {
-      setTimeout(function () { probeTransport(function () { refreshStatus(true); if (cb) cb(); }); }, 2000);
-    }, function () { if (cb) cb(); }, 20000);
-  }, 5000);
-}
 
 probeTransport(function () {
-  ensureRunning(function () {
-    loadNodes();
-    refreshStatus(true);
-    var tick = 0;
-    setInterval(function () { refreshStatus(++tick % 5 === 0); }, 4000);
-  });
+  // Opening the settings page must never change the user's stopped state.
+  loadNodes();
+  refreshStatus(true);
+  var tick = 0;
+  setInterval(function () { refreshStatus(++tick % 5 === 0); }, 4000);
 });
 </script>
 </body>

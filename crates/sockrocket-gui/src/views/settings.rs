@@ -9,7 +9,7 @@
 // v2 elements intentionally omitted (unsupported by this app, no fakes):
 //   - "Auto-start on login" / "Minimize to tray" toggles
 //   - Keyboard Shortcuts card (shortcuts live in tooltips)
-//   - Theme picker (app is fixed dark) — shown as a static ghost label
+//   - Theme picker (app uses the light Settings palette) — shown as a static ghost label
 
 use crate::app::*;
 use crate::theme::*;
@@ -55,14 +55,12 @@ impl AppState {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            // Title
-            .child(
-                div()
-                    .text_size(px(PAGE_TITLE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT_PRIMARY))
-                    .child(sockrocket_gui::i18n::t("settings.title")),
-            )
+            .child(self.page_header_v3(
+                "icons/nav-settings.svg",
+                ACCENT,
+                sockrocket_gui::i18n::t("settings.title"),
+                sockrocket_gui::i18n::t("settings.section.system"),
+            ))
             // === PROXY card (v2: three label/input rows + Apply Changes) ===
             .child(
                 card()
@@ -87,22 +85,7 @@ impl AppState {
                     ))
                     .child(hairline())
                     .child(
-                        // v2 Apply Changes: cyan tint, px-4 py-1.5 rounded-lg
-                        div()
-                            .id("apply-settings")
-                            .flex()
-                            .flex_row()
-                            .px_4()
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .bg(rgba(with_alpha(ACCENT, 0x1a)))
-                            .border_color(rgba(with_alpha(ACCENT, 0x33)))
-                            .text_size(px(SMALL))
-                            .text_color(rgb(ACCENT))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x2e))))
-                            .child(sockrocket_gui::i18n::t("settings.apply"))
+                        primary_button("apply-settings", sockrocket_gui::i18n::t("settings.apply"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.apply_settings(cx);
                             })),
@@ -221,7 +204,7 @@ impl AppState {
                                     .text_color(rgb(TEXT_SECONDARY))
                                     .child(sockrocket_gui::i18n::t("settings.theme")),
                             )
-                            // Static ghost label: the app is fixed dark, so the
+                            // Static ghost label: the app uses the light Settings palette, so the
                             // v2 theme dropdown is rendered non-interactive.
                             .child(
                                 div()
@@ -232,7 +215,7 @@ impl AppState {
                                     .border_color(rgba(with_alpha(BORDER, 0x99)))
                                     .text_size(px(SMALL))
                                     .text_color(rgb(TEXT_SECONDARY))
-                                    .child(sockrocket_gui::i18n::t("settings.theme.dark")),
+                                    .child(sockrocket_gui::i18n::t("settings.theme.light")),
                             ),
                     ),
             )
@@ -248,18 +231,13 @@ impl AppState {
                             .flex_row()
                             .items_center()
                             .gap_3()
-                            // 40px cyan gradient logo block + dark sockrocket
                             .child(
                                 div()
                                     .w(px(40.0))
                                     .h(px(40.0))
                                     .rounded(px(12.0))
                                     .flex_shrink_0()
-                                    .bg(linear_gradient(
-                                        135.0,
-                                        linear_color_stop(rgba(0x22d3eeff), 0.0),
-                                        linear_color_stop(rgba(0x22d3ee80), 1.0),
-                                    ))
+                                    .bg(rgb(ACCENT))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -267,7 +245,7 @@ impl AppState {
                                         Icon::empty()
                                             .path("icons/sockrocket.svg")
                                             .with_size(ComponentSize::Size(px(20.0)))
-                                            .text_color(rgb(BG_APP)),
+                                            .text_color(rgb(0xffffff)),
                                     ),
                             )
                             .child(

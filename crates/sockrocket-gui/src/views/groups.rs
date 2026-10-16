@@ -38,22 +38,9 @@ fn group_type_color(t: GroupType) -> u32 {
     }
 }
 
-/// v2 cyan-tint button (same recipe as the Nodes page tint_button): used for
-/// "Add Group" and the empty-state template action.
+/// Soft accent action — same recipe as Nodes / theme::tint_action.
 fn tint_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_3()
-        .py(px(6.0))
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .border_1()
-        .bg(rgba(with_alpha(ACCENT, 0x1a)))
-        .border_color(rgba(with_alpha(ACCENT, 0x33)))
-        .text_size(px(SMALL))
-        .text_color(rgb(ACCENT))
-        .hover(|s| s.bg(rgba(with_alpha(ACCENT, 0x33))))
-        .child(label.into())
+    tint_action(id, label)
 }
 
 /// Small bordered action chip in group card headers (Test Now / + Nodes / ✎ / ✕).

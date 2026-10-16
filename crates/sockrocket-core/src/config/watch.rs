@@ -83,7 +83,7 @@ impl ConfigWatchHandle {
 pub struct ConfigWatcher {
     shutdown_tx: watch::Sender<bool>,
     handle: JoinHandle<()>,
-    events_rx: mpsc::UnboundedReceiver<ConfigWatchEvent>,
+    events_rx: mpsc::Receiver<ConfigWatchEvent>,
     state: Arc<Mutex<WatcherState>>,
 }
 
@@ -108,7 +108,7 @@ impl ConfigWatcher {
         }));
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::channel(8);
         let task_state = state.clone();
 
         let handle = tokio::spawn(async move {
@@ -153,10 +153,12 @@ impl ConfigWatcher {
                             "config file changed, reloaded (requires restart: {:?})",
                             requires_restart
                         );
-                        let _ = events_tx.send(ConfigWatchEvent::Reloaded(ReloadedConfig {
-                            config,
-                            requires_restart,
-                        }));
+                        let _ = events_tx
+                            .send(ConfigWatchEvent::Reloaded(ReloadedConfig {
+                                config,
+                                requires_restart,
+                            }))
+                            .await;
                     }
                     Err(e) => {
                         // Keep the previous config; never let a bad edit
@@ -165,7 +167,9 @@ impl ConfigWatcher {
                             "config file changed but failed to parse, keeping previous config: {}",
                             e
                         );
-                        let _ = events_tx.send(ConfigWatchEvent::ParseError(format!("{:#}", e)));
+                        let _ = events_tx
+                            .send(ConfigWatchEvent::ParseError(format!("{:#}", e)))
+                            .await;
                     }
                 }
             }

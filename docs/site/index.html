@@ -586,13 +586,13 @@
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0" data-i18n="hero-btn-download">Download v0.1.0</a>
           <a class="btn btn-ghost" href="https://github.com/sockrockets/sockrocket" data-i18n="hero-btn-github">View source</a>
-        </div>
-      </div>
+  </div>
+  </div>
       <div class="hero-visual" aria-hidden="true">
         <div class="orbit"></div>
         <div class="orbit orbit-2"></div>
         <img class="mark" src="assets/logo.svg" alt=""/>
-      </div>
+</div>
     </div>
   </section>
 
@@ -602,9 +602,9 @@
     <div class="strip-item"><div class="strip-num">7.4k</div><div class="strip-label" data-i18n="stat-cidrs">CN CIDRs</div></div>
     <div class="strip-item"><div class="strip-num">5<span>+</span></div><div class="strip-label" data-i18n="stat-arch">Arch targets</div></div>
     <div class="strip-item"><div class="strip-num">100<span>%</span></div><div class="strip-label" data-i18n="stat-rust">Rust</div></div>
-  </div>
+</div>
 
-  <section id="features">
+<section id="features">
     <div class="kicker" data-i18n="feat-label">Features</div>
     <h2 data-i18n="feat-h2">Built for daily use,<br/>not demo day.</h2>
     <p class="lede" data-i18n="feat-sub">Through-proxy latency, real routing, and a Merlin plugin that shares the same engine as the desktop client.</p>
@@ -614,42 +614,42 @@
         <div>
           <h3 data-i18n="fc1-title">Warm through-proxy tests</h3>
           <p data-i18n="fc1-desc">Node ranking measures exit-side RTT on a warm path — what browsing feels like, not a fake TCP ping to server:port.</p>
-        </div>
+    </div>
       </article>
       <article class="feat">
         <div class="feat-ico">🧭</div>
         <div>
           <h3 data-i18n="fc2-title">Smart routing</h3>
           <p data-i18n="fc2-desc">Domain, GeoIP (built-in CN CIDRs), and CIDR rules. System proxy for typical apps; TUN when something ignores the OS proxy. <a href="#routing">How GeoIP works →</a></p>
-        </div>
+    </div>
       </article>
       <article class="feat">
         <div class="feat-ico">🔏</div>
         <div>
           <h3 data-i18n="fc3-title">TLS fingerprint craft</h3>
           <p data-i18n="fc3-desc">Patched rustls (craftls) with REALITY and browser-like ClientHello — built for hostile networks.</p>
-        </div>
+    </div>
       </article>
       <article class="feat">
         <div class="feat-ico">📡</div>
         <div>
           <h3 data-i18n="fc4-title">Subscriptions</h3>
           <p data-i18n="fc4-desc">Clash, V2Ray / VMess, SingBox URLs. Auto-detect, update, dedupe, batch test.</p>
-        </div>
+    </div>
       </article>
       <article class="feat">
         <div class="feat-ico">🖥️</div>
         <div>
           <h3 data-i18n="fc5-title">GUI + CLI</h3>
           <p data-i18n="fc5-desc">Native GPUI desktop app and a lean CLI for headless or scripted setups.</p>
-        </div>
+    </div>
       </article>
       <article class="feat">
         <div class="feat-ico">🛰️</div>
         <div>
           <h3 data-i18n="fc6-title">LAN-wide Merlin</h3>
           <p data-i18n="fc6-desc">Official AsusWRT-Merlin package: one musl binary, Web UI, iptables/DNS, hot-reload node switch.</p>
-        </div>
+    </div>
       </article>
     </div>
   </section>
@@ -699,8 +699,8 @@
       &nbsp;&nbsp;- <span class="n">rule_type</span>: <span class="k">"final"</span><br/>
       &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">pattern</span>: <span class="k">""</span><br/>
       &nbsp;&nbsp;&nbsp;&nbsp;<span class="n">target</span>: <span class="k">"proxy"</span>
-    </div>
-  </section>
+  </div>
+</section>
 
   <div class="merlin" id="merlin">
     <div class="merlin-inner">
@@ -727,8 +727,8 @@
       <div class="proto"><strong>Trojan</strong><span data-i18n="uc-trojan">HTTPS camouflage</span><div class="chips"><span class="chip">TLS</span></div></div>
       <div class="proto"><strong>TUIC v5</strong><span data-i18n="uc-tuic">0-RTT reconnect</span><div class="chips"><span class="chip hot">QUIC</span></div></div>
       <div class="proto"><strong>Hysteria2</strong><span data-i18n="uc-hy2">Lossy networks</span><div class="chips"><span class="chip hot">QUIC</span></div></div>
-    </div>
-  </section>
+  </div>
+</section>
 
   <section id="install">
     <div class="kicker" data-i18n="install-label">Setup &amp; config</div>
@@ -760,7 +760,7 @@
         <span class="c"># Windows — extract ZIP, run Sockrocket.exe</span>
       </div>
       <p class="use-hint" data-i18n="gui-hint">Language: status-bar cycle EN → VI → 中文 (saved). Do not paste subscription URLs into public chats.</p>
-    </div>
+  </div>
 
     <div id="tab-cli" class="use-panel">
       <ol class="use-steps">
@@ -786,7 +786,7 @@
         <span class="n">active_node</span>: <span class="k">0</span>
       </div>
       <p class="use-hint" data-i18n="cli-hint">Full field reference: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a> · example: <a href="https://github.com/sockrockets/sockrocket/blob/main/config.yaml.example">config.yaml.example</a>.</p>
-    </div>
+  </div>
 
     <div id="tab-merlin" class="use-panel">
       <ol class="use-steps">
@@ -809,7 +809,7 @@
         <span class="n">ssh</span> admin@192.168.50.1<br/>
         <span class="n">cd</span> /tmp &amp;&amp; <span class="n">tar</span> xzf sockrocket-merlin-hnd_v8.tar.gz<br/>
         <span class="n">sh</span> sockrocket/install.sh hnd_v8
-      </div>
+  </div>
       <p class="use-hint" data-i18n="mer-hint">Archive root is always <code>sockrocket/</code> (koolcenter module name). LAN devices need no client — traffic hits iptables/TUN on the router, then GeoIP/domain rules. Full guide: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>.</p>
     </div>
   </section>
@@ -840,8 +840,8 @@
           <a href="https://github.com/sockrockets/sockrocket/issues">Open Issues</a>
         </div>
       </div>
-    </div>
-  </section>
+  </div>
+</section>
 
   <section id="download">
     <div class="kicker" data-i18n="dl-label">Download</div>
@@ -849,36 +849,36 @@
     <p class="lede" data-i18n="dl-sub">Prebuilt GUI, CLI, and Merlin packages on GitHub Releases.</p>
     <div class="dl-row">
       <div class="dl">
-        <h3>Linux</h3>
+      <h3>Linux</h3>
         <p data-i18n="dl-linux">x86_64 and aarch64 GUI + CLI.</p>
         <div class="dl-links">
           <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Releases</a>
-        </div>
       </div>
+    </div>
       <div class="dl">
-        <h3>macOS</h3>
+      <h3>macOS</h3>
         <p data-i18n="dl-macos">Intel and Apple Silicon native.</p>
         <div class="dl-links">
           <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Releases</a>
-        </div>
       </div>
+    </div>
       <div class="dl">
-        <h3>Windows</h3>
+      <h3>Windows</h3>
         <p data-i18n="dl-windows">x86_64 GUI + CLI .exe.</p>
         <div class="dl-links">
           <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Releases</a>
-        </div>
       </div>
+    </div>
       <div class="dl">
         <h3>Merlin</h3>
         <p data-i18n="dl-merlin">arm64 / armv7 soft &amp; hard float packages.</p>
         <div class="dl-links">
           <a href="https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0">Packages</a>
           <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">Docs</a>
-        </div>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 </main>
 
 <footer>
@@ -899,8 +899,8 @@
 </footer>
 
 <script>
-const translations = {
-  en: {
+  const translations = {
+    en: {
     'nav-features': 'Features', 'nav-routing': 'Routing', 'nav-setup': 'Setup', 'nav-merlin': 'Merlin', 'nav-protocols': 'Protocols',
     'nav-download': 'Download', 'nav-community': 'Community', 'nav-cta': 'v0.1.0 ↓',
     'eyebrow': 'v0.1.0 · Open source · Apache-2.0',
@@ -1297,13 +1297,13 @@ function detectLang() {
   return 'en';
 }
 
-function applyLang(lang) {
+  function applyLang(lang) {
   const code = translations[lang] ? lang : 'en';
   const t = translations[code];
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    const key = el.getAttribute('data-i18n');
-    if (t[key] !== undefined) el.innerHTML = t[key];
-  });
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const key = el.getAttribute('data-i18n');
+      if (t[key] !== undefined) el.innerHTML = t[key];
+    });
   document.documentElement.lang = langHtml[code] || 'en';
   document.querySelectorAll('.lang-btn').forEach(btn => {
     btn.classList.toggle('active', btn.getAttribute('data-lang') === code);
@@ -1323,20 +1323,20 @@ function setLang(lang) {
 }
 applyLang(detectLang());
 
-function showTab(name) {
+  function showTab(name) {
   ['gui', 'cli', 'merlin'].forEach(t => {
     const el = document.getElementById('tab-' + t);
     if (el) el.classList.toggle('active', t === name);
-  });
+    });
   document.querySelectorAll('.tabs .tab').forEach((btn, i) => {
     btn.classList.toggle('active', ['gui', 'cli', 'merlin'][i] === name);
-  });
-}
+    });
+  }
 
-function copyCode(btn) {
-  const block = btn.parentElement;
+  function copyCode(btn) {
+    const block = btn.parentElement;
   const text = block.innerText.replace(/^Copy\n?/, '').trim();
-  navigator.clipboard.writeText(text).then(() => {
+    navigator.clipboard.writeText(text).then(() => {
     btn.textContent = '✓';
     setTimeout(() => btn.textContent = 'Copy', 1600);
   });

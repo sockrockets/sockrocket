@@ -92,3 +92,5 @@ pub use update::{
     UpdateAvailability, UpdateCheck, check_for_update, compare_versions, download_file,
     merlin_package_asset, preferred_gui_asset, preferred_merlin_cli_asset,
 };
+
+pub mod resources;
