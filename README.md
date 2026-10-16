@@ -1,347 +1,134 @@
 # Sockrocket
 
 <p align="center">
-  <strong><a href="README.md">English</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.zh.md">中文</a></strong>
+  <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket" width="320" />
 </p>
-
+<p align="center"><strong>One Rust proxy engine, from desktop to router.</strong></p>
+<p align="center">Native desktop client · CLI · AsusWRT-Merlin plugin</p>
+<p align="center"><strong>English</strong> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.zh.md">中文</a></p>
 <p align="center">
-  <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket Logo" width="360"/>
+  <a href="https://github.com/sockrockets/sockrocket/releases/latest">Download</a> ·
+  <a href="docs/getting-started.md">Get started</a> ·
+  <a href="docs/merlin.md">Merlin guide</a> ·
+  <a href="https://github.com/sockrockets/sockrocket/issues">Report a bug</a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/sockrockets/sockrocket/actions/workflows/ci.yml"><img src="https://github.com/sockrockets/sockrocket/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
-  <a href="https://github.com/sockrockets/sockrocket/releases"><img src="https://github.com/sockrockets/sockrocket/actions/workflows/release.yml/badge.svg" alt="Release"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"/></a>
-</p>
+Sockrocket brings nodes, subscriptions, routing rules and traffic capture into one client. Its desktop interface follows the grouped layout of macOS System Settings; the CLI and Merlin plugin share the same Rust protocol engine.
 
-**Sockrocket** is a Rust proxy client with a native GUI, a CLI, and a first-class **AsusWRT-Merlin** plugin. One stack from your laptop to the whole LAN.
+> **About the images:** these are design illustrations based on the project's Figma direction, not pixel-exact screenshots of the current release. Every node, subscription and metric is synthetic. Some layouts and interactions differ from the shipping app. No real endpoints, subscription URLs, credentials or personal node details are shown.
 
-<p align="center">
-  <img src="docs/screenshots/app.png" alt="Sockrocket desktop" width="720"/>
-</p>
+![Overview design preview: connection status, traffic and system proxy controls](docs/images/readme/overview.png)
 
----
+## What it does
 
-## Why Sockrocket
+| Capability | Purpose |
+| --- | --- |
+| Six proxy protocols | Shadowsocks, VMess, VLESS, Trojan, TUIC and Hysteria2 |
+| Nodes and subscriptions | Import node links or Clash / V2Ray / sing-box subscriptions; update, search, deduplicate and test latency |
+| Routing | Rule, Global and Direct modes; domain, IP, GeoIP and port rules |
+| Policy groups | Manual selection, URL testing and failover |
+| Traffic capture | System proxy for compatible apps; TUN for broader capture |
+| Connections and logs | Inspect connection state, traffic counters and diagnostic messages |
+| Shared engine | Desktop GUI, CLI and Merlin WebUI |
+| Languages | English, Tiếng Việt and 中文 |
 
-### Advantages
+Protocol combinations have limits: ShadowTLS does not provide UDP; native VMess UDP has a per-packet size limit. See the [protocol guide](docs/protocols.md). Sockrocket does not provide proxy nodes or subscription services.
 
-- **Desktop and router, same protocols** — Shadowsocks, VMess, VLess, Trojan, TUIC, Hysteria2 (Reality, WebSocket, gRPC, ShadowTLS, …). What works in the GUI works on Merlin.
-- **Through-proxy latency** — Node tests measure real exit-side RTT (warm path), not a fake TCP ping to `server:port`. Ranking matches what browsing feels like.
-- **Subscriptions that just work** — Clash / V2Ray / SingBox URLs, auto format detect, update, dedupe.
-- **Routing you can live with** — Domain / GeoIP / CIDR rules; **system proxy** for typical apps; **TUN** when something ignores the OS proxy.
-- **Merlin without a zoo of binaries** — One musl `sockrocket-cli`, Web UI, iptables/DNS helpers, watchdog. Hot-reload node switch without tearing down listeners.
-- **Light, open, private** — Apache-2.0; no account; no telemetry; EN / VI / 中文 UI.
+## Download and connect
 
-### Compared with similar tools
+Choose the matching system and architecture from [GitHub Releases](https://github.com/sockrockets/sockrocket/releases/latest).
 
-Comparisons are about **fit**, not “better at everything”. Features change quickly — verify against current releases.
+| System | Desktop package |
+| --- | --- |
+| macOS · Apple Silicon | `sockrocket-macos-aarch64.dmg` |
+| macOS · Intel | `sockrocket-macos-x86_64.dmg` |
+| Windows · x86_64 | `sockrocket-windows-x86_64.zip` |
+| Linux · x86_64 | `sockrocket-linux-x86_64.tar.gz` |
+| Linux · ARM64 | `sockrocket-linux-aarch64.tar.gz` |
 
-| | Sockrocket | Clash / Meta family | sing-box | Merlin plugins (e.g. fancyss / passwall-style) |
-|--|------------|---------------------|----------|-----------------------------------------------|
-| **Primary UX** | Native GUI + CLI + Merlin Web UI | Config / dashboard clients vary | CLI / 3rd-party UIs | Router Web UI only |
-| **Codebase** | One Rust tree (GUI, CLI, router) | Core + many frontends | Core + ecosystems | Shell + many foreign bins |
-| **Protocols** | SS / VMess / VLess / Trojan / TUIC / Hy2 | Broad (depends on core) | Very broad | Depends on bundled cores |
-| **Latency test** | Through-proxy warm HTTP probe | Often TCP or mixed | Depends on UI | Often TCP / script ping |
-| **Router story** | Official Merlin package, same engine | Usually run core via scripts | Scripts / containers | Mature, often multi-core |
-| **LAN-wide proxy** | Merlin TUN + DNS hijack | Via router install of core | Via router install | Yes (main focus) |
-| **License / model** | Apache-2.0, no SaaS | Open cores; UIs vary | Open | Mostly open / community |
-| **Best when** | You want one product on PC **and** Merlin | You already live in Clash YAML | You need maximum protocol surface | You only care about the router |
+1. Install and open the app. On macOS, drag it into Applications first. On Windows, extract the ZIP; on Linux, follow the package's install or portable-run instructions.
+2. Add your own subscription under **Subscriptions**, or import a link under **Nodes**.
+3. Update the subscription and select a node. Run a latency test if needed.
+4. Click **Connect** in **Overview**, wait for reachability verification, then check the system proxy state.
+5. Enable **TUN** only when broader capture is needed, and complete the operating system's administrator prompt.
 
-**Pick Sockrocket if** you want a single maintained client for daily desktop use *and* Asus Merlin LAN proxy, with honest through-proxy node tests.  
-**Pick Clash Meta / sing-box if** you need a specific ecosystem feature or rule dialect Sockrocket does not cover yet.  
-**Pick classic Merlin suites if** you only run the router and already depend on their UI/scripting.
+Before upgrading, quit the old client and its elevated background instance. Running two versions can occupy the same ports and compete for TUN routes.
 
----
+### Keep sources separate from node selection
 
-## Download (desktop)
+Subscriptions manage where nodes come from; node selection chooses the current exit. Latency tests run through the proxy. Milliseconds describe response latency during the test, not download bandwidth.
 
-[GitHub Releases](https://github.com/sockrockets/sockrocket/releases):
+![Nodes design preview with fictional nodes, subscription sources and latency](docs/images/readme/nodes.png)
 
-| Platform | GUI | CLI |
-|----------|-----|-----|
-| Linux x86_64 | `sockrocket-linux-x86_64.tar.gz` | `sockrocket-cli-linux-x86_64` |
-| Linux aarch64 | `sockrocket-linux-aarch64.tar.gz` | `sockrocket-cli-linux-aarch64` |
-| macOS Intel | `sockrocket-macos-x86_64.dmg` | `sockrocket-cli-macos-x86_64` |
-| macOS Apple Silicon | `sockrocket-macos-aarch64.dmg` | `sockrocket-cli-macos-aarch64` |
-| Windows x86_64 | `sockrocket-windows-x86_64.zip` | `sockrocket-cli-windows-x86_64.exe` |
+### Inspect and edit routing rules
 
-```bash
-# macOS — open the DMG, drag Sockrocket to Applications
-open sockrocket-macos-aarch64.dmg
+Review match conditions, targets and enabled states. Use individual edits, groups and match testing to understand where traffic goes. Rule order and priority affect the result.
 
-# Windows — extract ZIP, run Sockrocket.exe
-# Linux — extract, then install (app menu + icons) or run portable:
-tar xzf sockrocket-linux-x86_64.tar.gz
-cd Sockrocket-*-linux-x86_64
-./install.sh          # or: ./sockrocket
-```
+![Routing design preview showing match conditions, targets and edit actions](docs/images/readme/rules.png)
 
-**macOS Gatekeeper:** Builds are not Apple-notarized unless release signing secrets are configured. If macOS blocks the app:
+### Work with multiple rules as text
 
-```bash
-xattr -cr /Applications/Sockrocket.app
-open /Applications/Sockrocket.app
-```
+Bulk paste and group editing help migrate existing rules. Check parsing, targets and conflict handling before saving. The example domain `example.com` is reserved for documentation.
 
-Or: right-click → **Open** → **Open**. Or System Settings → Privacy & Security → **Open Anyway**.
+![Bulk rule design preview: text, validation and confirmation](docs/images/readme/rules-bulk.png)
 
-Default listeners: **SOCKS5** `127.0.0.1:1080` · **HTTP** `127.0.0.1:1087`
+## System proxy or TUN?
 
----
+| Mode | Use it for | Considerations |
+| --- | --- | --- |
+| System proxy | Browsers and apps that follow OS proxy settings | Some apps ignore these settings |
+| TUN | Broader application traffic capture | Requires administrator privileges and TUN support; stop other TUN / VPN clients first |
+| CLI listener | Terminal tools or manually configured apps | Listens locally by default; configure the calling app |
 
-## Use the GUI
+Default local listeners: SOCKS5 `127.0.0.1:1080` and HTTP `127.0.0.1:1087`. These are loopback listeners, not remote nodes.
 
-1. Start the app.
-2. **Subscriptions** — paste Clash / V2Ray / SingBox URL → Update. Or add a node manually.
-3. **Nodes** — **Test** / **Test all** (through-proxy warm latency), then click a node to select it.
-4. **Connect** — status shows connected; apps use the local proxy.
-5. **Settings** (optional):
-   - **System Proxy** — OS-level proxy for browsers and most apps.
-   - **TUN** — capture traffic from apps that ignore system proxy (needs admin / capability).
-6. **Language** — bottom-left status bar: EN → VI → 中文 (saved).
+## Command line
 
-```bash
-curl -x socks5://127.0.0.1:1080 https://www.google.com -I
-```
+CLI downloads are on the same release page and start with `sockrocket-cli-`.
 
-Tips:
-
-- Prefer **Test all** before picking a node; numbers are comparable warm through-proxy RTT.
-- After switching nodes, wait a moment and re-test if you care about the warm figure.
-- Keep subscriptions updated; stale nodes fail probes and waste time.
-
----
-
-## Use the CLI
-
-```bash
+```sh
 sockrocket-cli --init config.yaml
-# Edit subscriptions: / nodes: / active_node, then:
+# Edit the local config with your own subscription or nodes.
 sockrocket-cli config.yaml
 ```
 
-Stop with `Ctrl+C`. Same ports as the GUI.
+Stop with `Ctrl+C`. See the [configuration reference](docs/configuration.md) for fields and safe examples. Never commit a configuration containing real credentials.
 
-```yaml
-listen_addr: "127.0.0.1"
-socks_port: 1080
-http_port: 1087
-active_node: 0
+## AsusWRT-Merlin
 
-subscriptions:
-  - name: "my-sub"
-    url: "https://example.com/subscribe"
-    format: "auto"    # clash | v2ray | singbox | auto
+The router plugin includes a WebUI, transparent proxy, DNS capture and service checks, sharing the engine across LAN devices.
 
-rules:
-  - rule_type: "geoip"
-    pattern: "CN"
-    target: "direct"
-```
+1. Choose `sockrocket-merlin-<platform>.tar.gz` for the firmware platform and CPU architecture; do not guess from the model name alone.
+2. Follow the [Merlin guide](docs/merlin.md) to configure JFFS / custom scripts and install the package.
+3. Configure subscriptions locally on the router. Verify the node before enabling DNS capture or transparent proxy.
+4. Back up configuration before updates and verify manual stop / network recovery before relying on the setup.
 
-```bash
-curl -x socks5://127.0.0.1:1080 https://www.google.com -I
-curl -x http://127.0.0.1:1087 https://www.google.com -I
-```
-
-Full field reference: [docs/configuration.md](docs/configuration.md).
-
----
-
-## AsusWRT-Merlin (LAN-wide proxy)
-
-Sockrocket on the router proxies **phones, TVs, IoT, guests** — no client on each device. Same protocol engine as desktop.
-
-### What you get
-
-- Transparent proxy (TUN + iptables / policy routing)
-- Optional DNS hijack (dnsmasq → Sockrocket DNS) to reduce pollution / leaks
-- Web UI: nodes, subscriptions, latency test, toggles, logs
-- Watchdog + cron subscription refresh
-- Hot-reload when changing `active_node` (listeners stay up)
-
-```
-LAN clients → iptables / TUN → sockrocket-cli
-            → rules (GeoIP, domain, CIDR) → proxy node or direct
-```
-
-### Requirements
-
-- AsusWRT-Merlin **388.x+** recommended  
-- **JFFS** + **custom scripts** enabled (Administration → System)  
-- Package tag matching your SoC (same naming style as fancyss)
-
-```bash
-uname -m
-# armv7l  → arm / hnd / qca / ipq32
-# aarch64 → hnd_v8 / mtk / ipq64
-```
-
-### Platform packages
-
-| Platform | Package | CPU | SoC family |
-|----------|---------|-----|------------|
-| `arm` | `sockrocket-merlin-arm.tar.gz` | armv7sf | BCM4708/4709 |
-| `hnd` | `sockrocket-merlin-hnd.tar.gz` | armv7hf | BCM675x |
-| `hnd_v8` | `sockrocket-merlin-hnd_v8.tar.gz` | aarch64 | BCM490x / BCM491x |
-| `qca` | `sockrocket-merlin-qca.tar.gz` | armv7hf | IPQ807x |
-| `mtk` | `sockrocket-merlin-mtk.tar.gz` | aarch64 | MT798x |
-| `ipq32` / `ipq64` | `sockrocket-merlin-ipq32\|64.tar.gz` | armv7hf / aarch64 | IPQ53xx |
-
-**Note:** koolshare `fancyss_hnd` covers both 490x and 675x; Sockrocket splits them into `hnd_v8` vs `hnd`. Wrong pick = softcenter reject or “Exec format error”.
-
-```bash
-uname -m
-# armv7l  → arm / hnd / qca / ipq32
-# aarch64 → hnd_v8 / mtk / ipq64
-```
-
-### Model → platform (common Asus Merlin)
-
-Full tables (more SKUs, SoC notes): **[docs/merlin.md](docs/merlin.md)**. Co-branded editions share the base model’s platform.
-
-| Platform | Models (examples) |
-|----------|-------------------|
-| **`hnd_v8`** | RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U_PRO, RAX80, GT-AX11000, GT-AX11000_PRO, RT-AX92U, RT-AX68U, **RT-AX86U**, **RT-AX86U_PRO**, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12 |
-| **`hnd`** | TUF-AX3000 / V2, TUF-AX5400, RT-AX58U / V2, RAX50, RT-AX82U / V2, ZenWiFi XT8 / XD4, RT-AX56U / V2, RT-AX57, RT-AX55 |
-| **`arm`** | RT-AC68U, RT-AC66U_B1, RT-AC1900P, RT-AC87U, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300 |
-| **`qca`** | RT-AX89X / RT-AC89X |
-| **`mtk`** | TUF-AX4200, TUF-AX6000, RT-AX59U, ZenWiFi BD4 |
-| **`ipq32` / `ipq64`** | IPQ53xx boards — choose by `uname -m` (`armv7l` → ipq32, `aarch64` → ipq64) |
-
-### Install
-
-**Option A — Software Center offline install (recommended)**
-
-1. Download the matching `sockrocket-merlin-*.tar.gz` from [GitHub Releases](https://github.com/sockrockets/sockrocket/releases).
-2. Router Web UI → **Software Center** → **Offline install** / upload package.
-3. Select the tar.gz and install.
-4. Open the **Sockrocket** tile, or `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`.
-
-Wrong platform (especially `hnd` vs `hnd_v8`) → softcenter rejects the package or *Exec format error*. Trust `uname -m` and the tables above.
-
-**Option B — SSH (optional)**
-
-```bash
-# From your PC (replace host / package name)
-scp sockrocket-merlin-hnd_v8.tar.gz admin@<router-lan-ip>:/tmp/
-
-ssh admin@<router-lan-ip>
-cd /tmp
-tar -xzf sockrocket-merlin-hnd_v8.tar.gz
-sh sockrocket/install.sh          # or: sh sockrocket/install.sh hnd_v8
-```
-
-Archive root is always `sockrocket/` (module name). Install copies binary, scripts, Web UI, and hooks `services-start`.
-
-### First-time setup (Web UI)
-
-1. Open `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp` (or softcenter entry).
-2. **Subscriptions** — add URL → update → wait for nodes.
-3. **Nodes** — Test all → select a working node.
-4. Enable **transparent proxy** and/or **DNS hijack** as needed.
-5. Confirm phones on Wi‑Fi can reach foreign sites without a local client.
-
-Or edit `/jffs/addons/sockrocket/config.yaml`:
-
-```yaml
-listen_addr: "0.0.0.0"
-socks_port: 1080
-http_port: 1087
-dns_port: 5300
-
-subscriptions:
-  - name: "My subscription"
-    url: "https://example.com/subscribe?token=xxx"
-    format: "auto"
-
-active_node: 0
-
-rules:
-  - rule_type: "ip-cidr"
-    pattern: "192.168.0.0/16"
-    target: "direct"
-  - rule_type: "geoip"
-    pattern: "CN"
-    target: "direct"
-```
-
-### Service control
-
-```bash
+```sh
 /jffs/addons/sockrocket/scripts/sockrocket.sh status
-/jffs/addons/sockrocket/scripts/sockrocket.sh start|stop|restart
-/jffs/addons/sockrocket/scripts/sockrocket.sh log
-/jffs/addons/sockrocket/scripts/sockrocket.sh update-subs
+/jffs/addons/sockrocket/scripts/sockrocket.sh stop
+/jffs/addons/sockrocket/scripts/sockrocket.sh start
 ```
 
-Watchdog (every 5 minutes) and optional daily subscription cron are installed with the plugin.
+Platform selection, service control and recovery: [Merlin guide](docs/merlin.md) · [Technical reference](docs/merlin-reference.md).
 
-### Merlin tips
+## Troubleshooting
 
-- Switching nodes in the UI **hot-reloads** the outbound; avoid full restart unless the binary or listen ports change.
-- Node **Test** uses the same through-proxy warm probe as desktop — comparable across nodes.
-- Keep JFFS free space; rotate logs if you enable verbose tracing.
-- TUN module must load for transparent mode (`ensure-tun` / watchdog helps after reboot).
+| Symptom | Start here |
+| --- | --- |
+| Connect fails to start | Check old background instances, occupied local ports and the error log |
+| TUN will not start | Check administrator approval, driver support and another TUN owning the default route |
+| Connected, but websites fail | Check node reachability, system proxy / TUN, DNS and routing separately |
+| Subscription fails or returns no nodes | Inspect the URL, format, server response and parser result locally |
+| Only some websites fail | Check matched rules, the direct exit and DNS; avoid multiple clients capturing traffic |
 
-### Uninstall
+## Privacy and feedback
 
-```bash
-sh /jffs/addons/sockrocket/uninstall.sh
-```
+All documentation illustrations use fictional data. Before sharing an Issue, log or screenshot, remove full subscription URLs and query strings, server addresses, passwords, UUIDs, tokens, QR codes, personal paths and account details. QR codes and share links can contain complete credentials.
 
-### Merlin troubleshooting
-
-| Symptom | Check |
-|---------|--------|
-| No proxy effect | `sockrocket.sh status`; iptables `SOCKROCKET_*` chains; log |
-| Dead after reboot | TUN loaded? `services-start` contains sockrocket? |
-| Web UI 404 | `/www/ext/sockrocket/sockrocket.asp`, CGI symlink executable |
-| Empty nodes | Subscription URL / update; `config.yaml` `nodes:` |
-| DNS broken on LAN | DNS hijack toggle; `dnsmasq.d/sockrocket.conf`; fail-open if daemon down |
-
-More detail: [docs/merlin.md](docs/merlin.md) · [docs/merlin-reference.md](docs/merlin-reference.md).
-
----
-
-## Community
-
-- **Telegram** (announcements): [t.me/sockrocket](https://t.me/sockrocket)
-- **GitHub Discussions** (Q&A / feedback): [Discussions](https://github.com/sockrockets/sockrocket/discussions)
-- **Issues** (bugs): [Issues](https://github.com/sockrockets/sockrocket/issues)
-
-Please do not post subscription links, tokens, or personal identifiers in public threads.
-
-## Languages
-
-| Where | Switch |
-|-------|--------|
-| README | [English](README.md) · [Tiếng Việt](README.vi.md) · [中文](README.zh.md) |
-| GUI | Bottom-left status bar |
-| Website | Top-right **EN / VI / RU / 中文** |
-
-CLI messages are English.
-
----
-
-## More docs
-
-| Doc | For |
-|-----|-----|
-| [Getting started](docs/getting-started.md) | First-run checklist |
-| [Configuration](docs/configuration.md) | Config fields & routing |
-| [Protocols](docs/protocols.md) | Protocol / transport details |
-| [Merlin](docs/merlin.md) | Router install (short) |
-| [Merlin reference](docs/merlin-reference.md) | Router internals |
-| [Docs index](docs/README.md) | Everything else |
-
----
+- [Issues](https://github.com/sockrockets/sockrocket/issues): bug reports.
+- [Discussions](https://github.com/sockrockets/sockrocket/discussions): questions and usage.
+- [Documentation index](docs/README.md): configuration, protocols, architecture and development.
 
 ## License
 
-[Apache License 2.0](LICENSE)
-
-## AI training
-
-This project **opts out** of use as AI / ML training data. See [`robots.txt`](robots.txt), [`ai.txt`](ai.txt), [`.well-known/tdmrep.json`](.well-known/tdmrep.json), [`.aiignore`](.aiignore).
+[Apache License 2.0](LICENSE). See [ai.txt](ai.txt), [robots.txt](robots.txt) and the [TDM declaration](.well-known/tdmrep.json) for the project's AI / ML training-use statements.
