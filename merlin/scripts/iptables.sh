@@ -17,6 +17,7 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 CHAIN="SOCKROCKET_PREROUTING"
 DNS_CHAIN="SOCKROCKET_DNS"
 MANGLE_CHAIN="SOCKROCKET_MANGLE"
+IPV6_CHAIN="SOCKROCKET_IPV6_GUARD"
 TUN_MARK=0x4765   # 'Ve' in hex
 # Policy-routing table for fwmark 0x4765. NOT table 100: on AsusWRT the
 # rt_tables file aliases table 100 → "wan0" (and 200 → wan1 for dual-WAN
@@ -163,7 +164,69 @@ do_ipset_stop() {
     ok "CN ipset direct removed"
 }
 
+# Merlin transparent routing is IPv4-only. DNS AAAA suppression alone cannot
+# prevent IPv6 literals, cached records or DoH from bypassing that routing.
+# Reject forwarded LAN IPv6 promptly while proxying; applications can retry
+# over IPv4. Router INPUT/OUTPUT and same-bridge LAN traffic stay untouched.
+ipv6_guard_needed() {
+    local mode
+    mode=$(nvram get ipv6_service 2>/dev/null)
+    case "$mode" in ""|disabled) ;; *) return 0 ;; esac
+    ip -6 route show default 2>/dev/null | grep -q . && return 0
+    ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '
+}
+
+ipv6_lan_interface() {
+    local iface
+    iface=$(nvram get lan_ifname 2>/dev/null)
+    iface=${iface:-br0}
+    case "$iface" in *[!a-zA-Z0-9_.:-]*) return 1 ;; esac
+    printf '%s\n' "$iface"
+}
+
+ipv6_guard_stop() {
+    local count=0
+    # Delete only our unqualified jump, including leftovers from old starts.
+    while [ "$count" -lt 32 ] && ip6tables -D FORWARD -j "$IPV6_CHAIN" 2>/dev/null; do
+        count=$((count + 1))
+    done
+    if ip6tables -C FORWARD -j "$IPV6_CHAIN" 2>/dev/null; then
+        err "IPv6 protection cleanup failed; owned FORWARD jump remains"
+        return 1
+    fi
+    ip6tables -F "$IPV6_CHAIN" 2>/dev/null || true
+    ip6tables -X "$IPV6_CHAIN" 2>/dev/null || true
+}
+
+ipv6_guard_start() {
+    ipv6_guard_needed || return 0
+    local iface
+    iface=$(ipv6_lan_interface) || { err "Invalid LAN interface for IPv6 protection"; return 1; }
+    if ! {
+        { ip6tables -N "$IPV6_CHAIN" 2>/dev/null || ip6tables -F "$IPV6_CHAIN"; } &&
+        ip6tables -A "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
+            -j REJECT --reject-with icmp6-adm-prohibited &&
+        ip6tables -I FORWARD 1 -j "$IPV6_CHAIN"
+    }; then
+        ipv6_guard_stop
+        err "IPv6 bypass protection unavailable — transparent proxy NOT enabled"
+        return 1
+    fi
+    ok "IPv4 proxy mode: external LAN IPv6 rejected for IPv4 fallback (restored on stop)"
+}
+
+ipv6_guard_verify() {
+    ipv6_guard_needed || return 0
+    local iface first
+    iface=$(ipv6_lan_interface) || return 1
+    ip6tables -C "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
+        -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || return 1
+    first=$(ip6tables -S FORWARD 2>/dev/null | sed -n '/^-A FORWARD /{p;q;}')
+    [ "$first" = "-A FORWARD -j $IPV6_CHAIN" ]
+}
+
 flush_chains() {
+    ipv6_guard_stop || return 1
     # Flush proxy chains only. NEVER flush SOCKROCKET_DNS here: firewall-start
     # (and every `iptables.sh start`) would wipe LAN :53 REDIRECT and never put
     # it back — devices hard-coded to 8.8.8.8 then get GFW-poisoned answers
@@ -186,7 +249,7 @@ do_start() {
         err "TUN device not found — transparent proxy NOT enabled (start sockrocket-cli with TUN first)"
         return 1
     fi
-    flush_chains
+    flush_chains || return 1
 
     # Strict reverse-path filtering (firmware default: conf/default/rp_filter=1,
     # inherited by sockrocket-tun at creation) drops every packet sockrocket-cli injects into
@@ -304,6 +367,11 @@ do_start() {
         return 1
     fi
 
+    if ! ipv6_guard_start; then
+        flush_chains
+        return 1
+    fi
+
     if ! iptables -t mangle -C PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null \
         && ! iptables -t mangle -A PREROUTING -j "$MANGLE_CHAIN"; then
         flush_chains
@@ -344,6 +412,8 @@ do_dns_stop() {
 
 do_stop() {
     info "Removing transparent proxy rules..."
+    local cleanup_rc=0
+    ipv6_guard_stop || cleanup_rc=1
 
     # TCP rules
     iptables -t nat -D PREROUTING -j "$CHAIN"     2>/dev/null || true
@@ -388,10 +458,16 @@ do_stop() {
     ip route replace unreachable 198.18.0.0/16 2>/dev/null \
         || ip route add unreachable 198.18.0.0/16 2>/dev/null || true
 
+    if [ "$cleanup_rc" != 0 ]; then
+        err "Proxy rules removed with pending IPv6 cleanup"
+        return 1
+    fi
     ok "iptables rules removed"
 }
 
 do_status() {
+    echo "=== IPv6 fallback protection ==="
+    ip6tables -L "$IPV6_CHAIN" -n --line-numbers 2>/dev/null || echo "(not active; IPv6 disabled or proxy stopped)"
     echo "=== $CHAIN (nat) ==="
     iptables -t nat    -L "$CHAIN"     -n --line-numbers 2>/dev/null || echo "(not active)"
     echo ""
@@ -428,6 +504,10 @@ do_verify() {
             errors=$((errors + 1))
         }
     fi
+    ipv6_guard_verify || {
+        err "IPv6 bypass protection missing or superseded"
+        errors=$((errors + 1))
+    }
     [ "$errors" -eq 0 ] && ok "iptables rules verified OK" && return 0
     err "iptables verification FAILED ($errors issue(s))"
     return 1

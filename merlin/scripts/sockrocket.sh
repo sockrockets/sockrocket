@@ -407,7 +407,8 @@ dns_listener_healthy() {
     local dns_port
     dns_port=$(get_config_value dns_port)
     dns_port=${dns_port:-5300}
-    netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" || return 1
+    # A real answer is authoritative; a transient socket-table read must
+    # not classify a responding DNS service as dead.
     "$SOCKROCKET_BIN" --dns-health "$dns_port" >/dev/null 2>&1
 }
 
@@ -830,7 +831,7 @@ restore_direct_network() {
     local restore_rc=0
     # Transparent proxy + DNS NAT (script may already be gone on uninstall)
     if [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ]; then
-        "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1 || true
+        "$SOCKROCKET_DIR/scripts/iptables.sh" stop >> "$SOCKROCKET_LOG" 2>&1 || restore_rc=1
         "$SOCKROCKET_DIR/scripts/iptables.sh" dns-stop >> "$SOCKROCKET_LOG" 2>&1 || true
     else
         iptables -t mangle -D PREROUTING -j SOCKROCKET_MANGLE 2>/dev/null || true
@@ -842,6 +843,13 @@ restore_direct_network() {
         iptables -t nat -D PREROUTING -j SOCKROCKET_PREROUTING 2>/dev/null || true
         iptables -t nat -F SOCKROCKET_PREROUTING 2>/dev/null || true
         iptables -t nat -X SOCKROCKET_PREROUTING 2>/dev/null || true
+        local v6_attempt=0
+        while [ "$v6_attempt" -lt 32 ] && ip6tables -D FORWARD -j SOCKROCKET_IPV6_GUARD 2>/dev/null; do
+            v6_attempt=$((v6_attempt + 1))
+        done
+        if ip6tables -C FORWARD -j SOCKROCKET_IPV6_GUARD 2>/dev/null; then restore_rc=1; fi
+        ip6tables -F SOCKROCKET_IPV6_GUARD 2>/dev/null || true
+        ip6tables -X SOCKROCKET_IPV6_GUARD 2>/dev/null || true
         iptables -D FORWARD -i sockrocket-tun -j ACCEPT 2>/dev/null || true
         ip rule  del fwmark 0x4765 table 5370 2>/dev/null || true
         ip route flush table 5370 2>/dev/null || true
@@ -866,13 +874,12 @@ restore_direct_network() {
     # Drop TUN device left by --tun so no stale routes linger
     ip link del sockrocket-tun 2>/dev/null || true
 
-    # A user stop clears caches, but fault recovery must retain the mapping:
-    # LAN clients may still have Fake-IP answers cached across the supervised
-    # restart. Dropping that map can turn valid cached addresses into failures
-    # (or assign them to a different domain) on the next start.
+    # Restore DNS/routing on every stop, but retain the private Fake-IP map.
+    # LAN clients can keep DNS answers across stop/start, upgrade or reboot;
+    # deleting the map would invalidate or reassign their cached addresses.
+    # This cache does not install any proxy setting and is removed on uninstall.
     if [ -f "$SOCKROCKET_DIR/stopped" ]; then
-        rm -f "$SOCKROCKET_DIR/fakeip.store" "$SOCKROCKET_DIR/fakeip.store.tmp" \
-            "$SOCKROCKET_DIR/tun-routes.yaml" 2>/dev/null || true
+        rm -f "$SOCKROCKET_DIR/tun-routes.yaml" 2>/dev/null || true
     fi
     # SIGHUP clears dnsmasq's cache. Restart above already does that when our
     # snippet was installed; this covers answers left after a crash.
@@ -1285,7 +1292,7 @@ start_daemon_supervised() {
             # Poll death every 1s. Only fail-open on "DNS port lost" after we
             # have observed the port UP at least once — otherwise startup races
             # (TUN/DNS bind takes a few seconds) false-trigger degrade.
-            local dns_seen_up=0
+            local dns_seen_up=0 dns_missing_checks=0
             while kill -0 "$dpid" 2>/dev/null; do
                 if [ -f "$SOCKROCKET_DIR/stopped" ]; then
                     wait "$dpid" 2>/dev/null
@@ -1297,7 +1304,19 @@ start_daemon_supervised() {
                     dns_port=${dns_port:-5300}
                     if netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
                         dns_seen_up=1
+                        dns_missing_checks=0
                     elif [ "$dns_seen_up" = "1" ] && [ ! -f "$DEGRADED_FILE" ]; then
+                        if dns_listener_healthy; then
+                            dns_missing_checks=0
+                        else
+                            dns_missing_checks=$((dns_missing_checks + 1))
+                        fi
+                        # Confirm repeated absence AND failed protocol probes.
+                        # A single netstat miss must not interrupt LAN traffic.
+                        if [ "$dns_missing_checks" -lt 3 ]; then
+                            sleep 1
+                            continue
+                        fi
                         echo "daemon DNS port lost while pid $dpid still alive" > "$DEGRADED_FILE"
                         sh "$SOCKROCKET_DIR/scripts/sockrocket.sh" network-restore >> "$SOCKROCKET_LOG" 2>&1 || true
                         log_error "LAN fail-open: DNS port lost while pid $dpid still alive"

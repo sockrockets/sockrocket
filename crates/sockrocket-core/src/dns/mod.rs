@@ -217,6 +217,9 @@ struct RuntimeDnsCache {
 /// foreground queries.
 #[derive(Clone)]
 pub struct DnsResolver {
+    /// Restrict LAN wire answers to the address family the transparent
+    /// gateway actually forwards. Internal upstream resolution is unaffected.
+    client_ipv4_only: bool,
     config: Arc<DnsConfig>,
     /// LRU cache; bounded to [`DNS_CACHE_MAX_ENTRIES`] by the LRU itself.
     /// Fresh hits only need a read lock (recency is not promoted on read —
@@ -292,6 +295,7 @@ impl DnsResolver {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
+            client_ipv4_only: false,
             config: Arc::new(config),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(DNS_CACHE_MAX_ENTRIES).expect("capacity is non-zero"),
@@ -313,6 +317,12 @@ impl DnsResolver {
             ))),
             server_domains: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Set the client-facing policy for an IPv4-only transparent gateway.
+    /// This does not change internal node resolution or desktop DNS defaults.
+    pub fn set_client_ipv4_only(&mut self, enabled: bool) {
+        self.client_ipv4_only = enabled;
     }
 
     /// Attach the shared proxy-server hostname set. The resolver treats
@@ -906,6 +916,15 @@ pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u
         return build_dns_error_response(query, 1);
     }
     let snapshot = resolver.query_snapshot();
+    if snapshot.client_ipv4_only
+        && parse_dns_query(query).is_ok_and(|(_, qtype)| matches!(qtype, 28 | 65))
+    {
+        // Return successful NODATA, not NXDOMAIN: A lookup must still work.
+        // HTTPS records may carry ipv6hint/alternate endpoints, so let these
+        // clients use conventional A lookup rather than an unusable hint.
+        return build_dns_response_with_ttl(query, &[], 5)
+            .unwrap_or_else(|_| build_dns_error_response(query, 1));
+    }
     match tokio::time::timeout(Duration::from_secs(5), answer_wire(&snapshot, query)).await {
         Ok(Ok(reply)) => reply,
         _ => build_dns_error_response(query, 2),

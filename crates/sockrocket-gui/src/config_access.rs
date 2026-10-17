@@ -26,6 +26,9 @@ fn repair_owned_files_at(home: &Path) -> Result<()> {
         "gui-state.yaml",
         "gui-state.yaml.bak",
         "system-proxy-owner.yaml",
+        "system-proxy-owner.lock",
+        "tun-routes.yaml",
+        "tun-routes.lock",
     ] {
         let path = dir.join(name);
         let metadata = match std::fs::symlink_metadata(&path) {

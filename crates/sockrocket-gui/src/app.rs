@@ -2632,6 +2632,12 @@ impl AppState {
             return;
         }
 
+        if let Err(error) = ensure_network_guardian() {
+            self.tun_status = format!("Network recovery unavailable: {error}");
+            cx.notify();
+            return;
+        }
+
         // Get proxy server host for loop avoidance. Resolution is deferred to
         // the blocking task below — resolve_to_ips does a blocking DNS lookup
         // and must not run on the UI thread.
@@ -5288,7 +5294,7 @@ pub(crate) fn proxy_journal_path() -> Option<PathBuf> {
     gui_state_path().map(|path| path.with_file_name("system-proxy-owner.yaml"))
 }
 
-fn route_journal_path() -> Option<PathBuf> {
+pub(crate) fn route_journal_path() -> Option<PathBuf> {
     gui_state_path().map(|path| path.with_file_name("tun-routes.yaml"))
 }
 
@@ -5304,6 +5310,7 @@ impl Drop for AppState {
 
 fn set_os_proxy(host: &str, port: u16) -> anyhow::Result<()> {
     let path = proxy_journal_path().ok_or_else(|| anyhow::anyhow!("No config directory"))?;
+    ensure_network_guardian()?;
     sockrocket_core::managed_proxy::enable(&path, host, port)
 }
 
@@ -5475,4 +5482,11 @@ pub(crate) fn protocol_note(protocol: &ProxyProtocol) -> &'static str {
         }
         _ => "Select a node to activate it; once active the real Active state is shown.",
     }
+}
+
+fn ensure_network_guardian() -> anyhow::Result<()> {
+    sockrocket_core::network_guardian::ensure(
+        proxy_journal_path().ok_or_else(|| anyhow::anyhow!("No config directory"))?,
+        route_journal_path().ok_or_else(|| anyhow::anyhow!("No config directory"))?,
+    )
 }

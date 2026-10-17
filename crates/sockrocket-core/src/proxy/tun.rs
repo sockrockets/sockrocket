@@ -202,7 +202,7 @@ fn windows_process_alive(pid: u32) -> bool {
     }
 }
 
-fn take_exit_state() -> Option<TunExitState> {
+fn take_exit_state(exited_owner: Option<u32>) -> Option<TunExitState> {
     if let Ok(mut guard) = tun_exit_state().lock()
         && let Some(state) = guard.take()
     {
@@ -228,7 +228,7 @@ fn take_exit_state() -> Option<TunExitState> {
             return None;
         }
     };
-    if foreign_owner_alive(journal.owner_pid) {
+    if exited_owner != Some(journal.owner_pid) && foreign_owner_alive(journal.owner_pid) {
         tracing::info!(
             "TUN routes are still owned by running process {}",
             journal.owner_pid
@@ -261,10 +261,47 @@ fn take_exit_state() -> Option<TunExitState> {
 /// route. Uses synchronous `Command::output()` (no thread spawning) to
 /// ensure commands complete even during process teardown.
 pub fn emergency_restore_routes() {
+    restore_routes_owned(None);
+}
+
+pub(crate) fn restore_routes_after_exit(owner: u32) {
+    restore_routes_owned(Some(owner));
+}
+
+fn restore_routes_owned(owner: Option<u32>) {
+    let path = route_journal_path();
+    let _lock = match path
+        .as_ref()
+        .map(|p| crate::managed_proxy::journal_lock(p))
+        .transpose()
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!("Route recovery lock unavailable: {error}");
+            return;
+        }
+    };
+    if let Some(owner) = owner {
+        let journal = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|text| serde_yaml::from_str::<RouteJournal>(&text).ok());
+        if !journal.is_some_and(|journal| journal.owner_pid == owner) {
+            return;
+        }
+    }
+    emergency_restore_routes_unlocked_for(owner);
+}
+
+fn emergency_restore_routes_unlocked() {
+    emergency_restore_routes_unlocked_for(None);
+}
+
+fn emergency_restore_routes_unlocked_for(exited_owner: Option<u32>) {
     // In-memory state covers this process. A journal covers a previous
     // process that exited without restoring (crash, kill). A live owner is
     // left alone.
-    let Some(state) = take_exit_state() else {
+    let Some(state) = take_exit_state(exited_owner) else {
         return;
     };
 
@@ -1349,6 +1386,10 @@ pub fn setup_tun_routes(
     route_info: &TunRouteInfo,
     proxy_server_ips: &[IpAddr],
 ) -> Result<TunRouteGuard> {
+    let _lock = route_journal_path()
+        .as_ref()
+        .map(|path| crate::managed_proxy::journal_lock(path))
+        .transpose()?;
     // Combine proxy server IPs and DNS server IPs for loop avoidance.
     let (mut bypass_ips, mut bypass_ips_v6) = split_by_family(proxy_server_ips);
     for &ip in DNS_BYPASS_IPS {
@@ -1393,7 +1434,7 @@ pub fn setup_tun_routes(
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let setup: Result<()> = anyhow::bail!("Platform TUN routing unsupported");
     if let Err(error) = setup {
-        emergency_restore_routes();
+        emergency_restore_routes_unlocked();
         return Err(error);
     }
 
@@ -1586,6 +1627,17 @@ pub struct TunRouteGuard {
 impl TunRouteGuard {
     /// Explicitly restore routes.
     pub fn restore(&self) {
+        let _lock = match route_journal_path()
+            .as_ref()
+            .map(|path| crate::managed_proxy::journal_lock(path))
+            .transpose()
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!("Route cleanup lock unavailable: {error}");
+                return;
+            }
+        };
         if self.restored.swap(true, Ordering::Relaxed) {
             return;
         }

@@ -16,6 +16,9 @@ use sockrocket_core::{
 };
 
 fn main() -> Result<()> {
+    if let Some(result) = sockrocket_core::network_guardian::run_if_requested() {
+        return result;
+    }
     // CGI mode: invoked as `sockrocket.cgi` by the router httpd (AsusWRT-Merlin web
     // UI backend), or explicitly as `sockrocket-cli cgi`. Synchronous, no tokio
     // runtime — the router CPU pays for one process spawn per call and
@@ -125,6 +128,12 @@ async fn async_main() -> Result<()> {
     // route. Restore that snapshot before any subscription fetch, which needs
     // a working network.
     if let Some(dir) = Path::new(&config_path).parent() {
+        if setup_routes {
+            sockrocket_core::network_guardian::ensure(
+                dir.join("system-proxy-owner.yaml"),
+                dir.join("tun-routes.yaml"),
+            )?;
+        }
         set_route_journal_path(dir.join("tun-routes.yaml"));
         sockrocket_core::emergency_restore_routes();
     }
@@ -198,6 +207,14 @@ async fn async_main() -> Result<()> {
                 dns_config = sockrocket_core::china_split_dns_config_proxy_tls();
             }
             let mut resolver = DnsResolver::with_config(dns_config);
+            // Merlin owns IPv4 policy routing in iptables.sh, rather than
+            // --tun-routes. Do not advertise unreachable LAN IPv6 endpoints.
+            if enable_tun && !setup_routes {
+                resolver.set_client_ipv4_only(true);
+                tracing::info!(
+                    "LAN DNS: IPv4-only transparent gateway; AAAA and HTTPS hints suppressed"
+                );
+            }
             resolver.set_server_domains(server_domains.clone());
             resolver.follow_runtime(shared_outbound.clone());
             if active_index.is_some() {
@@ -529,7 +546,8 @@ async fn async_main() -> Result<()> {
     config_watcher.shutdown();
 
     // Keep the map across a TUN restart (proxy-off starts a new process).
-    // A full service stop deletes the file after this process exits.
+    // Router stop removes network settings but retains this private cache so
+    // clients with cached Fake-IP DNS answers still work after the next start.
     if let Some(pool) = &fakeip_pool
         && let Err(e) = pool.persist()
     {
@@ -774,9 +792,7 @@ async fn load_config(path: &str) -> Result<AppConfig> {
         let (config, changed) = resolve_config(parsed).await?;
         // Always write the URL list and the nodes together, even when the
         // count is unchanged: a refresh can replace credentials in place.
-        if changed
-            && let Err(e) = persist_merged_nodes(path, &content, &config)
-        {
+        if changed && let Err(e) = persist_merged_nodes(path, &content, &config) {
             tracing::warn!("failed to persist subscription nodes: {e:#}");
         }
         config

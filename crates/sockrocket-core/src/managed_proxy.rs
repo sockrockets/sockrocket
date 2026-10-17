@@ -48,6 +48,7 @@ pub fn enable(path: &Path, host: &str, port: u16) -> Result<()> {
     let _lock = TRANSACTION
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let _process_lock = journal_lock(path)?;
     let current = system_proxy::get_system_proxy()?;
     let previous = match read(path)? {
         Some(journal) if same_proxy(&current, &journal.applied) => {
@@ -81,23 +82,32 @@ pub fn enable(path: &Path, host: &str, port: u16) -> Result<()> {
     crate::config::storage::atomic_write_private(path, &serde_yaml::to_string(&journal)?, false)?;
     // Keep the journal even on OS failure: a platform backend may have applied
     // only part of its changes, and the next recovery must retain evidence.
-    system_proxy::set_system_proxy(host, port)
+    system_proxy::set_system_proxy(host, port)?;
+    anyhow::ensure!(
+        same_proxy(&system_proxy::get_system_proxy()?, &journal.applied),
+        "System proxy change was not confirmed; recovery record retained"
+    );
+    Ok(())
 }
 
 /// Restore only while the observed settings still match our recorded values.
 /// A user/other application change takes precedence over our old snapshot.
 pub fn restore(path: &Path) -> Result<()> {
-    restore_owned(path, false)
+    restore_owned(path, Some(std::process::id()))
 }
 
-fn restore_owned(path: &Path, recover_stale: bool) -> Result<()> {
+fn restore_owned(path: &Path, expected_owner: Option<u32>) -> Result<()> {
     let _lock = TRANSACTION
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let _process_lock = journal_lock(path)?;
     let Some(journal) = read(path)? else {
         return Ok(());
     };
-    if !recover_stale && journal.owner_pid != std::process::id() {
+    if expected_owner.is_some_and(|owner| journal.owner_pid != owner) {
+        return Ok(());
+    }
+    if expected_owner.is_none() && listener_alive(&journal) {
         return Ok(());
     }
     let current = system_proxy::get_system_proxy()?;
@@ -114,6 +124,10 @@ fn restore_owned(path: &Path, recover_stale: bool) -> Result<()> {
         } else {
             system_proxy::clear_system_proxy()?;
         }
+        anyhow::ensure!(
+            same_proxy(&system_proxy::get_system_proxy()?, previous),
+            "System proxy restoration was not confirmed; recovery record retained"
+        );
         Ok(())
     })
 }
@@ -134,25 +148,77 @@ fn restore_record(
 /// Startup recovery must not interfere with a proxy that is still listening
 /// (for example another running instance).
 pub fn recover_if_stale(path: &Path) -> Result<()> {
-    let Some(journal) = read(path)? else {
-        return Ok(());
-    };
+    restore_owned(path, None)
+}
+
+/// Called only after the independent guardian observes its owner's pipe close.
+pub(crate) fn restore_after_exit(path: &Path, owner: u32) -> Result<()> {
+    restore_owned(path, Some(owner))
+}
+
+fn listener_alive(journal: &Journal) -> bool {
     let host = journal.applied.host.as_str();
     if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
-        return Ok(());
+        return true;
     }
-    let ip: std::net::IpAddr = if host == "::1" {
-        "::1".parse()?
+    let ip = if host == "::1" {
+        std::net::Ipv6Addr::LOCALHOST.into()
     } else {
-        "127.0.0.1".parse()?
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     };
-    if std::net::TcpStream::connect_timeout(
+    std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::new(ip, journal.applied.port),
         std::time::Duration::from_millis(150),
     )
-    .is_err()
-    {
-        restore_owned(path, true)?;
+    .is_ok()
+}
+
+pub(crate) fn journal_lock(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    Ok(())
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path.with_extension("lock"))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Recovery lock is not a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.nlink() == 1,
+            "Recovery lock has unexpected hard links"
+        );
+        if let Some(parent) = path.parent() {
+            let owner = std::fs::metadata(parent)?;
+            if metadata.uid() != owner.uid() && unsafe { libc::geteuid() } == 0 {
+                // Use the open descriptor, not a pathname an unprivileged
+                // process could replace between validation and ownership repair.
+                let result = unsafe { libc::fchown(file.as_raw_fd(), owner.uid(), owner.gid()) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+            Err(error) => return Err(anyhow::anyhow!("Proxy recovery lock unavailable: {error}")),
+        }
+    }
 }

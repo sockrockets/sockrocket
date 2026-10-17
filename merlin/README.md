@@ -10,6 +10,7 @@ Transparent proxy integration for **AsusWRT-Merlin** routers.
 - **Node selection** — switch nodes and run latency tests
 - **Modes** — TUN, SOCKS5, or system-style proxy (see `config.yaml`)
 - **Watchdog** — restarts crashed daemon; optional subscription cron
+- **IPv6 policy** — respects firmware IPv6 disable settings. Transparent routing currently uses IPv4; while it is active, LAN DNS omits AAAA and HTTPS endpoint hints, and external forwarded IPv6 from the main LAN is rejected promptly so applications can fall back to IPv4. Same-bridge LAN access and router management are preserved. Stopping or failing open removes only Sockrocket’s IPv6 guard; firmware IPv6 settings are never changed. IPv6-only destinations require leaving transparent mode.
 - **Web UI** — `/ext/sockrocket/sockrocket.asp`
 
 ## Platforms (koolcenter)

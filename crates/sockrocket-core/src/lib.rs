@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dns;
 pub mod managed_proxy;
+pub mod network_guardian;
 pub mod proxy;
 pub mod qr;
 pub mod router;

@@ -275,6 +275,9 @@ fn startup_log(msg: &str) {
 }
 
 fn main() {
+    if let Some(result) = sockrocket_core::network_guardian::run_if_requested() {
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     #[cfg(target_os = "macos")]
     if std::env::args().any(|arg| arg == "--repair-config-permissions") {
         if let Err(error) = config_access::repair_owned_files() {
@@ -331,7 +334,8 @@ fn main() {
     // Register panic hook to clear system proxy even on panic
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        cleanup_on_exit();
+        // The guardian cleans up after exit; synchronous cleanup here can
+        // deadlock when the panicking thread owns a networking mutex.
         // Write crash log to %APPDATA%\sockrocket\crash.log for diagnosis
         if let Some(appdata) = std::env::var_os("APPDATA") {
             let log_path = std::path::PathBuf::from(appdata)
@@ -344,6 +348,7 @@ fn main() {
             let _ = std::fs::write(&log_path, &msg);
         }
         default_panic(info);
+        std::process::exit(1);
     }));
 
     // Create tokio runtime for async proxy/network operations.
