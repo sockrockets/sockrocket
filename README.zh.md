@@ -10,6 +10,7 @@
   <a href="README.md">English</a> · <a href="README.vi.md">Tiếng Việt</a> · <strong>中文</strong>
 </p>
 <p align="center">
+  <a href="https://sockrockets.github.io/sockrocket/">网站</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
   <a href="https://github.com/sockrockets/sockrocket/releases/latest">下载最新版</a> ·
   <a href="docs/getting-started.md">使用指南</a> ·
   <a href="docs/merlin.md">Merlin 路由器</a> ·
@@ -37,6 +38,26 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 协议与传输组合存在能力边界：ShadowTLS 不提供 UDP，VMess 原生 UDP 有单包大小限制。详见[协议说明](docs/protocols.md)。软件不提供代理节点或订阅服务。
 
+## 界面预览：了解日常操作
+
+### 节点与订阅，分开管理
+
+订阅管理来源，节点决定当前出口。延迟测试通过代理执行；毫秒数表示测试时的响应延迟，不代表下载带宽。
+
+![节点设计预览：示例节点、订阅来源和延迟](docs/images/readme/nodes.png)
+
+### 规则可以查看，也可以逐条修改
+
+按匹配条件、出口与启用状态检查规则；需要调整时使用单条编辑、分组管理或匹配测试。规则顺序和优先级会影响最终路由。
+
+![规则列表设计预览：匹配条件、出口与编辑入口](docs/images/readme/rules.png)
+
+### 多条规则，用文本批量处理
+
+批量粘贴与分组编辑适合迁移已有规则。先检查解析结果、目标出口与冲突处理方式，再保存。示例域名使用保留的 `example.com`，不指向个人服务。
+
+![批量规则设计预览：文本编辑、校验与确认](docs/images/readme/rules-bulk.png)
+
 ## 下载与第一次连接
 
 从 [GitHub Releases](https://github.com/sockrockets/sockrocket/releases/latest) 下载适合系统和架构的文件。
@@ -57,23 +78,23 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 升级时先退出旧版本及其管理员后台实例。两个版本同时运行会争用监听端口，也可能重复接管 TUN 路由。
 
-### 节点与订阅，分开管理
 
-订阅管理来源，节点决定当前出口。延迟测试通过代理执行；毫秒数表示测试时的响应延迟，不代表下载带宽。
+## AsusWRT-Merlin
 
-![节点设计预览：示例节点、订阅来源和延迟](docs/images/readme/nodes.png)
+路由器插件提供 WebUI、透明代理、DNS 接管和运行状态检查，让局域网设备共用代理内核。
 
-### 规则可以查看，也可以逐条修改
+1. 按固件平台和 CPU 架构选择 `sockrocket-merlin-<platform>.tar.gz`，不要仅根据机型名称猜测。
+2. 按[Merlin 安装指南](docs/merlin.md)配置 JFFS 与自定义脚本，并安装对应软件包。
+3. 在路由器本机页面配置订阅，先验证节点可用，再开启所需的 DNS / 透明代理功能。
+4. 更新前备份配置；确认手动停止与网络恢复正常后再投入使用。
 
-按匹配条件、出口与启用状态检查规则；需要调整时使用单条编辑、分组管理或匹配测试。规则顺序和优先级会影响最终路由。
+```sh
+/jffs/addons/sockrocket/scripts/sockrocket.sh status
+/jffs/addons/sockrocket/scripts/sockrocket.sh stop
+/jffs/addons/sockrocket/scripts/sockrocket.sh start
+```
 
-![规则列表设计预览：匹配条件、出口与编辑入口](docs/images/readme/rules.png)
-
-### 多条规则，用文本批量处理
-
-批量粘贴与分组编辑适合迁移已有规则。先检查解析结果、目标出口与冲突处理方式，再保存。示例域名使用保留的 `example.com`，不指向个人服务。
-
-![批量规则设计预览：文本编辑、校验与确认](docs/images/readme/rules-bulk.png)
+平台差异、服务控制与故障恢复见 [Merlin 指南](docs/merlin.md)和[技术参考](docs/merlin-reference.md)。
 
 ## 系统代理与 TUN 怎么选
 
@@ -97,23 +118,6 @@ sockrocket-cli config.yaml
 
 用 `Ctrl+C` 停止。完整字段与安全示例见[配置参考](docs/configuration.md)。不要把填入真实凭据后的配置提交到仓库。
 
-## AsusWRT-Merlin
-
-路由器插件提供 WebUI、透明代理、DNS 接管和运行状态检查，让局域网设备共用代理内核。
-
-1. 按固件平台和 CPU 架构选择 `sockrocket-merlin-<platform>.tar.gz`，不要仅根据机型名称猜测。
-2. 按[Merlin 安装指南](docs/merlin.md)配置 JFFS 与自定义脚本，并安装对应软件包。
-3. 在路由器本机页面配置订阅，先验证节点可用，再开启所需的 DNS / 透明代理功能。
-4. 更新前备份配置；确认手动停止与网络恢复正常后再投入使用。
-
-```sh
-/jffs/addons/sockrocket/scripts/sockrocket.sh status
-/jffs/addons/sockrocket/scripts/sockrocket.sh stop
-/jffs/addons/sockrocket/scripts/sockrocket.sh start
-```
-
-平台差异、服务控制与故障恢复见 [Merlin 指南](docs/merlin.md)和[技术参考](docs/merlin-reference.md)。
-
 ## 常见问题
 
 | 现象 | 先检查 |
@@ -123,6 +127,16 @@ sockrocket-cli config.yaml
 | 显示已连接但网页打不开 | 分别检查节点连通性、系统代理 / TUN、DNS 与路由规则 |
 | 订阅失败或没有节点 | 在本机核对地址、格式、服务器响应与解析结果 |
 | 只有部分网站不可达 | 检查命中的规则、直连出口及 DNS，避免多个客户端同时接管 |
+
+## 社区与联系方式
+
+| | |
+| --- | --- |
+| [Telegram · @sockrocket](https://t.me/sockrocket) | 发布公告与项目动态 |
+| [GitHub Discussions](https://github.com/sockrockets/sockrocket/discussions) | 使用问答、功能建议与交流 |
+| [GitHub Issues](https://github.com/sockrockets/sockrocket/issues) | 可复现的缺陷反馈 |
+| [网站](https://sockrockets.github.io/sockrocket/) | 产品介绍、下载与文档 |
+
 
 ## 隐私与反馈
 

@@ -7,6 +7,7 @@
 <p align="center">Ứng dụng desktop native · CLI · Plugin AsusWRT-Merlin</p>
 <p align="center"><a href="README.md">English</a> · <strong>Tiếng Việt</strong> · <a href="README.zh.md">中文</a></p>
 <p align="center">
+  <a href="https://sockrockets.github.io/sockrocket/">Website</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
   <a href="https://github.com/sockrockets/sockrocket/releases/latest">Tải xuống</a> ·
   <a href="docs/getting-started.md">Bắt đầu</a> ·
   <a href="docs/merlin.md">Hướng dẫn Merlin</a> ·
@@ -34,6 +35,26 @@ Sockrocket quản lý node, subscription, quy tắc định tuyến và chế đ
 
 Các tổ hợp giao thức có giới hạn: ShadowTLS không cung cấp UDP; UDP native của VMess có giới hạn kích thước mỗi gói. Xem [hướng dẫn giao thức](docs/protocols.md). Sockrocket không cung cấp node hoặc dịch vụ subscription.
 
+## Giao diện và thao tác
+
+### Quản lý nguồn và chọn node riêng biệt
+
+Subscription quản lý nguồn node; lựa chọn node xác định đường ra hiện tại. Phép đo độ trễ đi qua proxy. Đơn vị mili giây thể hiện độ trễ phản hồi lúc đo, không phải băng thông tải xuống.
+
+![Thiết kế danh sách node với dữ liệu và độ trễ giả](docs/images/readme/nodes.png)
+
+### Xem và chỉnh sửa quy tắc
+
+Kiểm tra điều kiện khớp, đích và trạng thái bật. Dùng chỉnh sửa từng quy tắc, quản lý nhóm và kiểm tra khớp để hiểu đường đi của lưu lượng. Thứ tự và độ ưu tiên ảnh hưởng kết quả.
+
+![Thiết kế danh sách quy tắc và thao tác chỉnh sửa](docs/images/readme/rules.png)
+
+### Chỉnh sửa nhiều quy tắc bằng văn bản
+
+Dán hàng loạt và sửa theo nhóm giúp chuyển quy tắc có sẵn. Kiểm tra kết quả phân tích, đích và cách xử lý xung đột trước khi lưu. Domain `example.com` được dành cho tài liệu.
+
+![Thiết kế dán quy tắc, kiểm tra và xác nhận](docs/images/readme/rules-bulk.png)
+
 ## Tải xuống và kết nối
 
 Chọn hệ điều hành và kiến trúc phù hợp tại [GitHub Releases](https://github.com/sockrockets/sockrocket/releases/latest).
@@ -54,23 +75,23 @@ Chọn hệ điều hành và kiến trúc phù hợp tại [GitHub Releases](ht
 
 Trước khi nâng cấp, thoát bản cũ và tiến trình nền chạy với quyền quản trị. Hai phiên bản chạy cùng lúc có thể tranh chấp cổng và tuyến TUN.
 
-### Quản lý nguồn và chọn node riêng biệt
 
-Subscription quản lý nguồn node; lựa chọn node xác định đường ra hiện tại. Phép đo độ trễ đi qua proxy. Đơn vị mili giây thể hiện độ trễ phản hồi lúc đo, không phải băng thông tải xuống.
+## AsusWRT-Merlin
 
-![Thiết kế danh sách node với dữ liệu và độ trễ giả](docs/images/readme/nodes.png)
+Plugin router cung cấp WebUI, proxy trong suốt, chuyển DNS và kiểm tra dịch vụ cho các thiết bị LAN.
 
-### Xem và chỉnh sửa quy tắc
+1. Chọn `sockrocket-merlin-<platform>.tar.gz` đúng nền tảng firmware và kiến trúc CPU; không chỉ đoán theo tên model.
+2. Làm theo [hướng dẫn Merlin](docs/merlin.md) để cấu hình JFFS / custom scripts và cài gói.
+3. Cấu hình subscription trên router; kiểm tra node trước khi bật chuyển DNS hoặc proxy trong suốt.
+4. Sao lưu cấu hình trước khi cập nhật và kiểm tra thao tác dừng / khôi phục mạng trước khi sử dụng lâu dài.
 
-Kiểm tra điều kiện khớp, đích và trạng thái bật. Dùng chỉnh sửa từng quy tắc, quản lý nhóm và kiểm tra khớp để hiểu đường đi của lưu lượng. Thứ tự và độ ưu tiên ảnh hưởng kết quả.
+```sh
+/jffs/addons/sockrocket/scripts/sockrocket.sh status
+/jffs/addons/sockrocket/scripts/sockrocket.sh stop
+/jffs/addons/sockrocket/scripts/sockrocket.sh start
+```
 
-![Thiết kế danh sách quy tắc và thao tác chỉnh sửa](docs/images/readme/rules.png)
-
-### Chỉnh sửa nhiều quy tắc bằng văn bản
-
-Dán hàng loạt và sửa theo nhóm giúp chuyển quy tắc có sẵn. Kiểm tra kết quả phân tích, đích và cách xử lý xung đột trước khi lưu. Domain `example.com` được dành cho tài liệu.
-
-![Thiết kế dán quy tắc, kiểm tra và xác nhận](docs/images/readme/rules-bulk.png)
+Chi tiết nền tảng, dịch vụ và khôi phục: [Merlin](docs/merlin.md) · [Tài liệu kỹ thuật](docs/merlin-reference.md).
 
 ## Proxy hệ thống hay TUN?
 
@@ -94,23 +115,6 @@ sockrocket-cli config.yaml
 
 Dừng bằng `Ctrl+C`. Xem [tài liệu cấu hình](docs/configuration.md) để biết các trường và ví dụ an toàn. Không commit cấu hình có thông tin xác thực thật.
 
-## AsusWRT-Merlin
-
-Plugin router cung cấp WebUI, proxy trong suốt, chuyển DNS và kiểm tra dịch vụ cho các thiết bị LAN.
-
-1. Chọn `sockrocket-merlin-<platform>.tar.gz` đúng nền tảng firmware và kiến trúc CPU; không chỉ đoán theo tên model.
-2. Làm theo [hướng dẫn Merlin](docs/merlin.md) để cấu hình JFFS / custom scripts và cài gói.
-3. Cấu hình subscription trên router; kiểm tra node trước khi bật chuyển DNS hoặc proxy trong suốt.
-4. Sao lưu cấu hình trước khi cập nhật và kiểm tra thao tác dừng / khôi phục mạng trước khi sử dụng lâu dài.
-
-```sh
-/jffs/addons/sockrocket/scripts/sockrocket.sh status
-/jffs/addons/sockrocket/scripts/sockrocket.sh stop
-/jffs/addons/sockrocket/scripts/sockrocket.sh start
-```
-
-Chi tiết nền tảng, dịch vụ và khôi phục: [Merlin](docs/merlin.md) · [Tài liệu kỹ thuật](docs/merlin-reference.md).
-
 ## Xử lý sự cố
 
 | Hiện tượng | Kiểm tra đầu tiên |
@@ -120,6 +124,16 @@ Chi tiết nền tảng, dịch vụ và khôi phục: [Merlin](docs/merlin.md) 
 | Đã kết nối nhưng không mở được web | Kiểm tra riêng node, proxy hệ thống / TUN, DNS và quy tắc |
 | Subscription lỗi hoặc không có node | Kiểm tra URL, định dạng, phản hồi máy chủ và kết quả phân tích trên máy |
 | Chỉ một số trang bị lỗi | Quy tắc khớp, đường ra Direct, DNS và nhiều client cùng chuyển lưu lượng |
+
+## Cộng đồng & liên hệ
+
+| | |
+| --- | --- |
+| [Telegram · @sockrocket](https://t.me/sockrocket) | Thông báo phát hành và cập nhật |
+| [GitHub Discussions](https://github.com/sockrockets/sockrocket/discussions) | Hỏi đáp và ý tưởng |
+| [GitHub Issues](https://github.com/sockrockets/sockrocket/issues) | Báo lỗi kèm bước tái hiện |
+| [Website](https://sockrockets.github.io/sockrocket/) | Giới thiệu, tải xuống và tài liệu |
+
 
 ## Quyền riêng tư và phản hồi
 

@@ -7,6 +7,7 @@
 <p align="center">Native desktop client · CLI · AsusWRT-Merlin plugin</p>
 <p align="center"><strong>English</strong> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.zh.md">中文</a></p>
 <p align="center">
+  <a href="https://sockrockets.github.io/sockrocket/">Website</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
   <a href="https://github.com/sockrockets/sockrocket/releases/latest">Download</a> ·
   <a href="docs/getting-started.md">Get started</a> ·
   <a href="docs/merlin.md">Merlin guide</a> ·
@@ -34,6 +35,26 @@ Sockrocket brings nodes, subscriptions, routing rules and traffic capture into o
 
 Protocol combinations have limits: ShadowTLS does not provide UDP; native VMess UDP has a per-packet size limit. See the [protocol guide](docs/protocols.md). Sockrocket does not provide proxy nodes or subscription services.
 
+## Interface previews
+
+### Keep sources separate from node selection
+
+Subscriptions manage where nodes come from; node selection chooses the current exit. Latency tests run through the proxy. Milliseconds describe response latency during the test, not download bandwidth.
+
+![Nodes design preview with fictional nodes, subscription sources and latency](docs/images/readme/nodes.png)
+
+### Inspect and edit routing rules
+
+Review match conditions, targets and enabled states. Use individual edits, groups and match testing to understand where traffic goes. Rule order and priority affect the result.
+
+![Routing design preview showing match conditions, targets and edit actions](docs/images/readme/rules.png)
+
+### Work with multiple rules as text
+
+Bulk paste and group editing help migrate existing rules. Check parsing, targets and conflict handling before saving. The example domain `example.com` is reserved for documentation.
+
+![Bulk rule design preview: text, validation and confirmation](docs/images/readme/rules-bulk.png)
+
 ## Download and connect
 
 Choose the matching system and architecture from [GitHub Releases](https://github.com/sockrockets/sockrocket/releases/latest).
@@ -54,23 +75,23 @@ Choose the matching system and architecture from [GitHub Releases](https://githu
 
 Before upgrading, quit the old client and its elevated background instance. Running two versions can occupy the same ports and compete for TUN routes.
 
-### Keep sources separate from node selection
 
-Subscriptions manage where nodes come from; node selection chooses the current exit. Latency tests run through the proxy. Milliseconds describe response latency during the test, not download bandwidth.
+## AsusWRT-Merlin
 
-![Nodes design preview with fictional nodes, subscription sources and latency](docs/images/readme/nodes.png)
+The router plugin includes a WebUI, transparent proxy, DNS capture and service checks, sharing the engine across LAN devices.
 
-### Inspect and edit routing rules
+1. Choose `sockrocket-merlin-<platform>.tar.gz` for the firmware platform and CPU architecture; do not guess from the model name alone.
+2. Follow the [Merlin guide](docs/merlin.md) to configure JFFS / custom scripts and install the package.
+3. Configure subscriptions locally on the router. Verify the node before enabling DNS capture or transparent proxy.
+4. Back up configuration before updates and verify manual stop / network recovery before relying on the setup.
 
-Review match conditions, targets and enabled states. Use individual edits, groups and match testing to understand where traffic goes. Rule order and priority affect the result.
+```sh
+/jffs/addons/sockrocket/scripts/sockrocket.sh status
+/jffs/addons/sockrocket/scripts/sockrocket.sh stop
+/jffs/addons/sockrocket/scripts/sockrocket.sh start
+```
 
-![Routing design preview showing match conditions, targets and edit actions](docs/images/readme/rules.png)
-
-### Work with multiple rules as text
-
-Bulk paste and group editing help migrate existing rules. Check parsing, targets and conflict handling before saving. The example domain `example.com` is reserved for documentation.
-
-![Bulk rule design preview: text, validation and confirmation](docs/images/readme/rules-bulk.png)
+Platform selection, service control and recovery: [Merlin guide](docs/merlin.md) · [Technical reference](docs/merlin-reference.md).
 
 ## System proxy or TUN?
 
@@ -94,23 +115,6 @@ sockrocket-cli config.yaml
 
 Stop with `Ctrl+C`. See the [configuration reference](docs/configuration.md) for fields and safe examples. Never commit a configuration containing real credentials.
 
-## AsusWRT-Merlin
-
-The router plugin includes a WebUI, transparent proxy, DNS capture and service checks, sharing the engine across LAN devices.
-
-1. Choose `sockrocket-merlin-<platform>.tar.gz` for the firmware platform and CPU architecture; do not guess from the model name alone.
-2. Follow the [Merlin guide](docs/merlin.md) to configure JFFS / custom scripts and install the package.
-3. Configure subscriptions locally on the router. Verify the node before enabling DNS capture or transparent proxy.
-4. Back up configuration before updates and verify manual stop / network recovery before relying on the setup.
-
-```sh
-/jffs/addons/sockrocket/scripts/sockrocket.sh status
-/jffs/addons/sockrocket/scripts/sockrocket.sh stop
-/jffs/addons/sockrocket/scripts/sockrocket.sh start
-```
-
-Platform selection, service control and recovery: [Merlin guide](docs/merlin.md) · [Technical reference](docs/merlin-reference.md).
-
 ## Troubleshooting
 
 | Symptom | Start here |
@@ -120,6 +124,16 @@ Platform selection, service control and recovery: [Merlin guide](docs/merlin.md)
 | Connected, but websites fail | Check node reachability, system proxy / TUN, DNS and routing separately |
 | Subscription fails or returns no nodes | Inspect the URL, format, server response and parser result locally |
 | Only some websites fail | Check matched rules, the direct exit and DNS; avoid multiple clients capturing traffic |
+
+## Community & contact
+
+| | |
+| --- | --- |
+| [Telegram · @sockrocket](https://t.me/sockrocket) | Release announcements and project updates |
+| [GitHub Discussions](https://github.com/sockrockets/sockrocket/discussions) | Usage questions and feature ideas |
+| [GitHub Issues](https://github.com/sockrockets/sockrocket/issues) | Reproducible bug reports |
+| [Website](https://sockrockets.github.io/sockrocket/) | Product overview, downloads and docs |
+
 
 ## Privacy and feedback
 
