@@ -9,15 +9,68 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 #[derive(Clone, Copy)]
 pub(super) enum Protocol {
     Hysteria2,
     Tuic,
 }
+// Absorb QUIC bursts without letting a stalled LAN client monopolize RAM.
+// 32 associations share at most 4 MiB of queued payload, plus reassembly.
+const RECEIVE_QUEUE_PACKETS: usize = 64;
+const RECEIVE_QUEUE_BYTES: usize = 128 * 1024;
+struct QueuedDatagram {
+    data: Vec<u8>,
+    _bytes: OwnedSemaphorePermit,
+}
 struct Channel {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<QueuedDatagram>,
+    bytes: Arc<Semaphore>,
+    dropped: u64,
     assembly: Reassembler,
+}
+impl Channel {
+    fn new() -> (Self, mpsc::Receiver<QueuedDatagram>) {
+        let (tx, rx) = mpsc::channel(RECEIVE_QUEUE_PACKETS);
+        (
+            Self {
+                tx,
+                bytes: Arc::new(Semaphore::new(RECEIVE_QUEUE_BYTES)),
+                dropped: 0,
+                assembly: Reassembler {
+                    pending: HashMap::new(),
+                },
+            },
+            rx,
+        )
+    }
+    fn deliver(&mut self, data: Vec<u8>) {
+        let permit = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(data.len().max(1) as u32);
+        let accepted = match permit {
+            Ok(permit) => self
+                .tx
+                .try_send(QueuedDatagram {
+                    data,
+                    _bytes: permit,
+                })
+                .is_ok(),
+            Err(_) => false,
+        };
+        if !accepted && !self.tx.is_closed() {
+            self.dropped = self.dropped.saturating_add(1);
+            // Logarithmic reporting bounds log volume, with no destination,
+            // client address, subscription or packet contents in diagnostics.
+            if self.dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped_packets = self.dropped,
+                    "QUIC UDP receive queue saturated; packets dropped"
+                );
+            }
+        }
+    }
 }
 type Registry = Arc<Mutex<HashMap<u32, Channel>>>;
 pub(super) struct Hub {
@@ -38,14 +91,20 @@ impl Hub {
         let registry = sessions.clone();
         let conn = connection.clone();
         let task = tokio::spawn(async move {
+            let mut batch = 0;
             while let Ok(packet) = conn.read_datagram().await {
                 if let Ok(fragment) = decode(protocol, &packet) {
                     let mut channels = registry.lock().unwrap();
-                    if let Some(channel) = channels.get_mut(&fragment.session)
-                        && let Ok(Some(packet)) = channel.assembly.assemble(fragment)
-                    {
-                        let _ = channel.tx.try_send(packet);
+                    if let Some(channel) = channels.get_mut(&fragment.session) {
+                        if let Ok(Some(packet)) = channel.assembly.assemble(fragment) {
+                            channel.deliver(packet);
+                        }
                     }
+                }
+                batch += 1;
+                if batch == 16 {
+                    batch = 0;
+                    tokio::task::yield_now().await;
                 }
             }
             registry.lock().unwrap().clear();
@@ -68,7 +127,7 @@ impl Hub {
             "Server did not enable QUIC datagrams"
         );
         let address = address(self.protocol, host, port)?;
-        let (tx, rx) = mpsc::channel(2);
+        let (channel, rx) = Channel::new();
         let mut sessions = self.sessions.lock().unwrap();
         ensure!(sessions.len() < 32, "QUIC UDP session limit reached");
         let id = loop {
@@ -80,15 +139,7 @@ impl Hub {
                 break id;
             }
         };
-        sessions.insert(
-            id,
-            Channel {
-                tx,
-                assembly: Reassembler {
-                    pending: HashMap::new(),
-                },
-            },
-        );
+        sessions.insert(id, channel);
         Ok(Box::new(Session {
             hub: self.clone(),
             id,
@@ -103,7 +154,7 @@ struct Session {
     id: u32,
     address: Vec<u8>,
     packet: AtomicU16,
-    received: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    received: tokio::sync::Mutex<mpsc::Receiver<QueuedDatagram>>,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -212,9 +263,12 @@ impl Datagram for Session {
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("UDP association closed"))?;
-            ensure!(packet.len() <= buffer.len(), "UDP receive buffer too small");
-            buffer[..packet.len()].copy_from_slice(&packet);
-            Ok(packet.len())
+            ensure!(
+                packet.data.len() <= buffer.len(),
+                "UDP receive buffer too small"
+            );
+            buffer[..packet.data.len()].copy_from_slice(&packet.data);
+            Ok(packet.data.len())
         })
     }
 }
