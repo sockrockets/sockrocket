@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anyhow::{Context, Result, bail};
 use etherparse::{Icmpv4Header, Icmpv6Header};
 use ipstack::{IpNumber, IpStackConfig, IpStackStream, TcpConfig, TcpOptions};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -20,7 +21,7 @@ use crate::router::Router;
 // ─── Global TUN exit state for emergency cleanup ───
 
 /// Saved state for emergency route restoration when the process exits.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TunExitState {
     scoped_default_v4: bool,
     orig_gateway: Ipv4Addr,
@@ -31,7 +32,7 @@ struct TunExitState {
 }
 
 /// IPv6 half of the saved TUN routing state.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TunV6ExitState {
     /// The host's original IPv6 default gateway (used for bypass routes and,
     /// on macOS, for restoring the original default route).
@@ -56,23 +57,81 @@ fn tun_exit_state() -> &'static std::sync::Mutex<Option<TunExitState>> {
     TUN_EXIT_STATE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Disk copy of [`TunExitState`] so a killed process can still be cleaned up
+/// on the next launch. Memory alone disappears with the process.
+static ROUTE_JOURNAL_PATH: std::sync::OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn route_journal_slot() -> &'static std::sync::Mutex<Option<std::path::PathBuf>> {
+    ROUTE_JOURNAL_PATH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Remember where to store the route snapshot. Call before TUN setup.
+pub fn set_route_journal_path(path: std::path::PathBuf) {
+    if let Ok(mut slot) = route_journal_slot().lock() {
+        *slot = Some(path);
+    }
+}
+
+fn route_journal_path() -> Option<std::path::PathBuf> {
+    route_journal_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct RouteJournal {
+    owner_pid: u32,
+    state: TunExitState,
+}
+
+fn write_route_journal(state: &TunExitState) {
+    let Some(path) = route_journal_path() else {
+        return;
+    };
+    let journal = RouteJournal {
+        owner_pid: std::process::id(),
+        state: state.clone(),
+    };
+    let Ok(text) = serde_yaml::to_string(&journal) else {
+        return;
+    };
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!("failed to create TUN route journal directory: {error}");
+        return;
+    }
+    if let Err(error) = crate::config::storage::atomic_write_private(&path, &text, false) {
+        tracing::warn!("failed to record TUN route ownership: {error:#}");
+    }
+}
+
 fn save_tun_exit_state(
     gateway: Ipv4Addr,
     iface: &str,
     bypass_ips: &[Ipv4Addr],
     v6: Option<TunV6ExitState>,
 ) {
-    if let Ok(mut guard) = tun_exit_state().lock() {
+    let snapshot = if let Ok(mut guard) = tun_exit_state().lock() {
         let scoped_default_v4 = guard.as_ref().is_some_and(|state| {
             state.orig_gateway == gateway && state.orig_iface == iface && state.scoped_default_v4
         });
-        *guard = Some(TunExitState {
+        let state = TunExitState {
             scoped_default_v4,
             orig_gateway: gateway,
             orig_iface: iface.to_string(),
             bypass_ips: bypass_ips.to_vec(),
             v6,
-        });
+        };
+        *guard = Some(state.clone());
+        Some(state)
+    } else {
+        None
+    };
+    if let Some(state) = snapshot {
+        write_route_journal(&state);
     }
 }
 
@@ -80,6 +139,120 @@ fn clear_tun_exit_state() {
     if let Ok(mut guard) = tun_exit_state().lock() {
         *guard = None;
     }
+    if let Some(path) = route_journal_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// True when `pid` still looks like a running Sockrocket process.
+/// A reused pid that belongs to something else is treated as gone so a
+/// crash can still restore routes.
+fn foreign_owner_alive(pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            && output.status.success()
+        {
+            let comm = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            return comm.contains("sockrocket");
+        }
+        return std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(windows)]
+    {
+        return windows_process_alive(pid);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            false
+        } else {
+            CloseHandle(handle);
+            true
+        }
+    }
+}
+
+fn take_exit_state() -> Option<TunExitState> {
+    if let Ok(mut guard) = tun_exit_state().lock()
+        && let Some(state) = guard.take()
+    {
+        return Some(state);
+    }
+    let path = route_journal_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                "could not read TUN route journal {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let journal = match serde_yaml::from_str::<RouteJournal>(&text) {
+        Ok(journal) => journal,
+        Err(error) => {
+            tracing::warn!("discarding unreadable TUN route journal: {error}");
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    if foreign_owner_alive(journal.owner_pid) {
+        tracing::info!(
+            "TUN routes are still owned by running process {}",
+            journal.owner_pid
+        );
+        return None;
+    }
+    // A normal desktop launch can read the recovery record but cannot
+    // change privileged routes. Preserve it for the elevated recovery rather
+    // than deleting the only snapshot after permission-denied commands.
+    #[cfg(unix)]
+    if !unix_is_root() {
+        tracing::warn!(
+            "TUN route recovery requires administrator privileges; recovery record retained"
+        );
+        return None;
+    }
+    #[cfg(windows)]
+    if windows_is_elevated() != Some(true) {
+        tracing::warn!(
+            "TUN route recovery requires administrator privileges; recovery record retained"
+        );
+        return None;
+    }
+    Some(journal.state)
 }
 
 /// Emergency route restoration for use during process exit.
@@ -88,14 +261,11 @@ fn clear_tun_exit_state() {
 /// route. Uses synchronous `Command::output()` (no thread spawning) to
 /// ensure commands complete even during process teardown.
 pub fn emergency_restore_routes() {
-    let state = match tun_exit_state().lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => return,
-    };
-
-    let state = match state {
-        Some(s) => s,
-        None => return, // TUN was not active or already cleaned up
+    // In-memory state covers this process. A journal covers a previous
+    // process that exited without restoring (crash, kill). A live owner is
+    // left alone.
+    let Some(state) = take_exit_state() else {
+        return;
     };
 
     tracing::info!(
@@ -132,6 +302,14 @@ pub fn emergency_restore_routes() {
 
     #[cfg(target_os = "macos")]
     {
+        // Remove the temporary scoped default before restoring the physical
+        // default; deleting it afterwards can remove the restored route.
+        if state.scoped_default_v4 {
+            let _ = run_cmd_sync_strs(
+                "route",
+                &macos_scoped_v4_args("delete", &state.orig_iface, &state.orig_gateway),
+            );
+        }
         let gw = state.orig_gateway.to_string();
         if run_cmd_sync("route", &["-n", "change", "default", &gw]).is_err() {
             let _ = run_cmd_sync("route", &["-n", "delete", "default"]);
@@ -139,12 +317,6 @@ pub fn emergency_restore_routes() {
         }
         for ip in &state.bypass_ips {
             let _ = run_cmd_sync("route", &["-n", "delete", "-host", &ip.to_string()]);
-        }
-        if state.scoped_default_v4 {
-            let _ = run_cmd_sync_strs(
-                "route",
-                &macos_scoped_v4_args("delete", &state.orig_iface, &state.orig_gateway),
-            );
         }
     }
 
@@ -217,6 +389,9 @@ pub fn emergency_restore_routes() {
     // Clear the saved state so we don't restore twice
     clear_tun_exit_state();
     super::outbound_bind::clear_outbound_bind();
+    if let Err(error) = crate::system_proxy::flush_system_dns_cache() {
+        tracing::warn!("DNS cache invalidation after TUN restore failed: {error}");
+    }
 }
 
 /// Run a command synchronously without spawning a thread.
@@ -971,7 +1146,18 @@ fn configure_tun_ipv6(tun_name: &str) -> Option<Ipv6Addr> {
     }
 
     #[cfg(target_os = "linux")]
-    let result = run_cmd_strs("ip", &linux_v6_addr_args(tun_name));
+    let result = {
+        // Merlin may deliberately disable IPv6 on newly created interfaces.
+        // Respect that policy instead of issuing a command known to fail.
+        let disabled =
+            std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{tun_name}/disable_ipv6"))
+                .is_ok_and(|value| value.trim() == "1");
+        if disabled {
+            tracing::info!("TUN IPv6 disabled by system policy; using IPv4-only mode");
+            return None;
+        }
+        run_cmd_strs("ip", &linux_v6_addr_args(tun_name))
+    };
 
     #[cfg(target_os = "macos")]
     let result = run_cmd_strs("ifconfig", &macos_v6_addr_args(tun_name));
@@ -1418,6 +1604,9 @@ impl TunRouteGuard {
         // Clear global state so emergency_restore_routes() is a no-op
         clear_tun_exit_state();
         super::outbound_bind::clear_outbound_bind();
+        if let Err(error) = crate::system_proxy::flush_system_dns_cache() {
+            tracing::warn!("DNS cache invalidation after TUN restore failed: {error}");
+        }
     }
 }
 
@@ -1591,6 +1780,23 @@ fn macos_scoped_v4_args(action: &str, iface: &str, gateway: &Ipv4Addr) -> Vec<St
     ]
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn has_macos_scoped_default(output: &str, iface: &str) -> bool {
+    let interface_matches = output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("interface:")
+            .is_some_and(|value| value.trim() == iface)
+    });
+    let scoped = output.lines().any(|line| {
+        line.trim().strip_prefix("flags:").is_some_and(|flags| {
+            flags
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|flag| flag == "IFSCOPE")
+        })
+    });
+    interface_matches && scoped
+}
+
 #[cfg(target_os = "macos")]
 fn setup_routes_macos(
     route_info: &TunRouteInfo,
@@ -1601,20 +1807,24 @@ fn setup_routes_macos(
     // IP_BOUND_IF sockets need an interface-scoped default after the global
     // default moves to utun. Without it connect() fails with ENETUNREACH.
     let scoped = run_cmd("route", &["-n", "get", "-ifscope", orig_iface, "default"]);
-    let already_present = scoped.as_ref().is_ok_and(|output| {
-        output
-            .lines()
-            .any(|line| line.trim() == format!("interface: {orig_iface}"))
-    });
+    // route get -ifscope can fall back to the unscoped physical default
+    // before TUN starts. That fallback vanishes when the global route moves
+    // to utun, so only an actual IFSCOPE route protects bound direct sockets.
+    let already_present = scoped
+        .as_ref()
+        .is_ok_and(|output| has_macos_scoped_default(output, orig_iface));
     if !already_present {
         run_cmd_strs(
             "route",
             &macos_scoped_v4_args("add", orig_iface, orig_gateway),
         )?;
-        if let Ok(mut state) = tun_exit_state().lock()
-            && let Some(state) = state.as_mut()
-        {
+        let snapshot = tun_exit_state().lock().ok().and_then(|mut guard| {
+            let state = guard.as_mut()?;
             state.scoped_default_v4 = true;
+            Some(state.clone())
+        });
+        if let Some(state) = snapshot {
+            write_route_journal(&state);
         }
     }
     let gw_str = orig_gateway.to_string();
@@ -1648,6 +1858,14 @@ fn setup_routes_macos(
 #[cfg(target_os = "macos")]
 impl TunRouteGuard {
     fn restore_macos(&self) {
+        // Remove the temporary scoped default before restoring the physical
+        // default; deleting it afterwards can remove the restored route.
+        if self.scoped_default_v4 {
+            let _ = run_cmd_strs(
+                "route",
+                &macos_scoped_v4_args("delete", &self.orig_iface, &self.orig_gateway),
+            );
+        }
         let gw_str = self.orig_gateway.to_string();
         // Try change first, then delete+add
         if run_cmd("route", &["-n", "change", "default", &gw_str]).is_err() {
@@ -1656,13 +1874,6 @@ impl TunRouteGuard {
         }
         for ip in &self.bypass_ips {
             let _ = run_cmd("route", &["-n", "delete", "-host", &ip.to_string()]);
-        }
-
-        if self.scoped_default_v4 {
-            let _ = run_cmd_strs(
-                "route",
-                &macos_scoped_v4_args("delete", &self.orig_iface, &self.orig_gateway),
-            );
         }
 
         // IPv6: macOS only tolerates one default route per family, so setup

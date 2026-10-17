@@ -7,6 +7,7 @@
 
 mod app;
 mod components;
+mod config_access;
 mod log_buffer;
 mod theme;
 mod views;
@@ -192,9 +193,15 @@ static ICON_ASSETS: &[(&str, &[u8])] = &[
 /// Best-effort cleanup: clear system proxy and restore TUN routes so the OS
 /// doesn't keep routing traffic to a dead local proxy after the app exits.
 fn cleanup_on_exit() {
-    // 1. Clear system proxy (retry once on failure)
+    // Restore routing first: a stalled OS proxy command must not leave the
+    // default route pointing into a terminating TUN device.
+    sockrocket_core::emergency_restore_routes();
+
+    // Restore a system proxy this process recorded (retry once on failure).
     for attempt in 0..2 {
-        match sockrocket_core::clear_system_proxy() {
+        match app::proxy_journal_path().map_or(Ok(()), |path| {
+            sockrocket_core::managed_proxy::restore(&path)
+        }) {
             Ok(()) => break,
             Err(e) => {
                 let msg = format!("{}", e);
@@ -211,8 +218,11 @@ fn cleanup_on_exit() {
         }
     }
 
-    // 2. Restore TUN routes if they were active
-    sockrocket_core::emergency_restore_routes();
+    // Drop OS resolver answers (Fake-IP or a proxy DNS) even when route and
+    // proxy restoration already tried. Bounded so shutdown cannot hang.
+    if let Err(error) = sockrocket_core::flush_system_dns_cache() {
+        eprintln!("cleanup: failed to flush DNS cache: {error}");
+    }
 
     // 3. Flush the buffered log file (try_lock: a panicking thread may still
     // hold the writer lock — never deadlock the exit path on it).
@@ -265,6 +275,15 @@ fn startup_log(msg: &str) {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if std::env::args().any(|arg| arg == "--repair-config-permissions") {
+        if let Err(error) = config_access::repair_owned_files() {
+            eprintln!("Configuration permission repair failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     startup_log("[1] main() started");
 
     // Set up tracing with both a log file and in-memory capture.
@@ -350,10 +369,20 @@ fn main() {
     let ctrlc_handle = tokio_handle.clone();
     std::thread::spawn(move || {
         ctrlc_handle.block_on(async {
-            if let Ok(()) = tokio::signal::ctrl_c().await {
-                cleanup_on_exit();
-                std::process::exit(0);
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install termination handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
             }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+            cleanup_on_exit();
+            std::process::exit(0);
         });
     });
 

@@ -83,13 +83,7 @@ impl Hysteria2Attempt {
                     e
                 )
             })?;
-        tracing::info!(
-            "Hysteria2 QUIC connection established to {}:{} ({}) alpn='{}'",
-            self.server,
-            self.port,
-            addr,
-            alpn
-        );
+        tracing::info!("Hysteria2 QUIC connection established, ALPN={}", alpn);
         Ok((endpoint, connection))
     }
 }
@@ -179,12 +173,7 @@ impl Hysteria2Outbound {
 
     async fn create_connection(&self) -> Result<(quinn::Endpoint, quinn::Connection)> {
         let addrs = resolve_server_addrs(&self.server, self.port).await?;
-        tracing::debug!(
-            "Hysteria2 resolved {}:{} -> {:?}",
-            self.server,
-            self.port,
-            addrs
-        );
+        tracing::debug!("Hysteria2 server resolution completed");
 
         // Try the remembered working ALPN first, then remaining candidates.
         let mut alpns: Vec<String> = Vec::new();

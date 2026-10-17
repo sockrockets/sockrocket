@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dns;
+pub mod managed_proxy;
 pub mod proxy;
 pub mod qr;
 pub mod router;
@@ -8,7 +9,10 @@ pub mod system_proxy;
 pub mod update;
 
 pub use config::clash::parse_clash_config;
-pub use config::dedup::{dedup_nodes, node_fingerprint, uniquify_node_names};
+pub use config::dedup::{
+    SUB_URL_EXTRA_KEY, apply_subscription_refresh, dedup_nodes, node_fingerprint,
+    remove_subscription_nodes, uniquify_node_names,
+};
 pub use config::export::{SubscriptionFormat, export_clash_config, export_v2ray_base64};
 pub use config::group::{ProbeResult, fallback_pick, resolve_members, url_test_pick};
 pub use config::model::{
@@ -60,8 +64,8 @@ pub use proxy::trojan::TrojanOutbound;
 pub use proxy::tuic::TuicOutbound;
 pub use proxy::tun::{
     TunProxy, TunRouteGuard, TunRouteInfo, emergency_restore_routes, ensure_wintun_dll,
-    resolve_to_ips, resolve_to_ipv4, setup_tun_routes, tun_privileged, tun_requirements,
-    tun_supported, update_tun_bypass_ips, wintun_dll_available,
+    resolve_to_ips, resolve_to_ipv4, set_route_journal_path, setup_tun_routes, tun_privileged,
+    tun_requirements, tun_supported, update_tun_bypass_ips, wintun_dll_available,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use proxy::tun::{relaunch_elevated, relaunch_elevated_and_exit};
@@ -85,8 +89,8 @@ pub use share_server::{
     new_shared_state, start_share_server,
 };
 pub use system_proxy::{
-    DEFAULT_BYPASS, SystemProxyConfig, clear_system_proxy, get_system_proxy, set_system_proxy,
-    set_system_proxy_with_bypass, system_proxy_supported,
+    DEFAULT_BYPASS, SystemProxyConfig, clear_system_proxy, flush_system_dns_cache,
+    get_system_proxy, set_system_proxy, set_system_proxy_with_bypass, system_proxy_supported,
 };
 pub use update::{
     UpdateAvailability, UpdateCheck, check_for_update, compare_versions, download_file,

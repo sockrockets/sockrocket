@@ -1,0 +1,15 @@
+# Local credentials, private runtime state and generated application bundles.
+/.local/
+/target/
+/dist/
+/config.yaml
+/.env
+/.env.*
+!/.env.example
+
+# Editor/OS state and runtime diagnostics may contain private paths or nodes.
+/.cursor/
+.DS_Store
+*.log
+*.core
+*.dmp

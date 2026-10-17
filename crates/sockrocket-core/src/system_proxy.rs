@@ -9,7 +9,7 @@ pub const PLATFORM_BYPASS: &str = "localhost;127.0.0.1;::1;<local>";
 #[cfg(not(target_os = "windows"))]
 pub const PLATFORM_BYPASS: &str = "localhost,127.0.0.1,::1";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SystemProxyConfig {
     pub enabled: bool,
     pub host: String,
@@ -145,7 +145,54 @@ pub fn clear_system_proxy() -> Result<()> {
         bypass: String::new(),
     }
     .set_system_proxy()
-    .context("failed to clear system proxy")
+    .context("failed to clear system proxy")?;
+    if let Err(error) = flush_system_dns_cache() {
+        tracing::warn!("DNS cache invalidation after clearing system proxy failed: {error}");
+    }
+    Ok(())
+}
+
+/// Invalidate OS answers after restoring physical routing. Commands are bounded
+/// so an unresponsive resolver service cannot hang application shutdown.
+pub fn flush_system_dns_cache() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let commands: &[(&str, &[&str])] = &[
+        ("/usr/bin/dscacheutil", &["-flushcache"]),
+        ("/usr/bin/killall", &["-HUP", "mDNSResponder"]),
+    ];
+    #[cfg(target_os = "windows")]
+    let commands: &[(&str, &[&str])] = &[("ipconfig", &["/flushdns"])];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let commands: &[(&str, &[&str])] = &[];
+    let mut failures = Vec::new();
+    for (program, args) in commands {
+        let result = (|| -> Result<()> {
+            let mut child = std::process::Command::new(program)
+                .args(*args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::ensure!(status.success(), "resolver cache command failed: {program}");
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("resolver cache command timed out: {program}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })();
+        if let Err(error) = result {
+            failures.push(error.to_string());
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
 }
 
 fn ensure_supported() -> Result<()> {

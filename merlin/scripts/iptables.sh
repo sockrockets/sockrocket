@@ -279,15 +279,17 @@ do_start() {
         return 1
     fi
 
-    # Fake-IP (198.18/16) fail-fast for unmarked traffic (notably QUIC UDP/443
-    # RETURN above). Marked Fake-IP TCP uses SOCKROCKET_RT_TABLE and never
-    # consults main, so the TUN path stays intact. Use `unreachable` (ICMP)
-    # not `blackhole` (silent) — silent drops make browser/HTTP3 wait minutes
-    # before falling back to TCP. FORWARD REJECT is a belt-and-suspenders
-    # if the route is missing; insert after TUN ACCEPT so it stays #1.
+    # Fake-IP replies injected through TUN need a reverse route back to TUN.
+    # An unreachable route breaks reverse-path validation on Merlin even when
+    # marked outbound packets use our private table. Keep unsupported UDP's
+    # explicit REJECT below rather than rejecting the entire Fake-IP prefix.
     ip route del blackhole 198.18.0.0/16 2>/dev/null || true
-    ip route replace unreachable 198.18.0.0/16 2>/dev/null \
-        || ip route add unreachable 198.18.0.0/16 2>/dev/null || true
+    ip route del unreachable 198.18.0.0/16 2>/dev/null || true
+    if ! ip route replace 198.18.0.0/16 dev "$TUN_DEV"; then
+        flush_chains
+        err "Fake-IP reverse route unavailable"
+        return 1
+    fi
     iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
         -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
     if [ "$udp_supported" != 1 ]; then
@@ -378,11 +380,13 @@ do_stop() {
     ip route flush table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
     ip rule  del fwmark "$TUN_MARK" table 100 2>/dev/null || true
 
-    # Stale Fake-IP (198.18/16) after TUN off: without a route clients hang
-    # until DNS TTL. Blackhole makes them fail fast and re-query (Clash docs
-    # also recommend flushing DNS after leaving fake-ip mode).
-    ip route replace blackhole 198.18.0.0/16 2>/dev/null \
-        || ip route add blackhole 198.18.0.0/16 2>/dev/null || true
+    # Cached Fake-IP answers cannot be routed after TUN is disabled. Return
+    # an explicit unreachable error rather than silently blackholing them.
+    # Full network restore removes this temporary route after DNS unpinning.
+    ip route del 198.18.0.0/16 dev "${TUN_DEV:-sockrocket-tun}" 2>/dev/null || true
+    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
+    ip route replace unreachable 198.18.0.0/16 2>/dev/null \
+        || ip route add unreachable 198.18.0.0/16 2>/dev/null || true
 
     ok "iptables rules removed"
 }
@@ -399,7 +403,8 @@ do_status() {
 }
 
 do_verify() {
-    local errors=0
+    local errors=0 TUN_DEV
+    TUN_DEV=$(detect_tun_dev)
     iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK" || {
         err "SOCKROCKET_MANGLE chain missing or has no MARK rules"
         errors=$((errors + 1))
@@ -412,9 +417,9 @@ do_verify() {
         err "ip rule for fwmark $TUN_MARK missing"
         errors=$((errors + 1))
     }
-    # Fake-IP fail-fast must stay while TUN is up (QUIC→TCP fallback).
-    ip route show 2>/dev/null | grep -Eq "(unreachable|blackhole) 198.18.0.0/16" || {
-        err "Fake-IP unreachable/blackhole 198.18.0.0/16 missing (QUIC fall-back will be slow)"
+    # Check the return route as well as the marked outbound route.
+    ip route show 2>/dev/null | grep -Eq "^198.18.0.0/16 dev $TUN_DEV( |$)" || {
+        err "Fake-IP reverse route to TUN missing"
         errors=$((errors + 1))
     }
     if [ "$(get_conf cn_ipset_direct)" = "true" ]; then

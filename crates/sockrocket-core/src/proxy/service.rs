@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -98,7 +98,8 @@ impl ProxyService {
             self.outbound.clone(),
             self.stats.clone(),
         )
-        .await?;
+        .await
+        .with_context(|| format!("Cannot start SOCKS5 proxy on {listen_addr}:{socks_port}. Close the other proxy instance or change the listening port in Settings"))?;
 
         // Start HTTP proxy server
         let http = HttpProxyServer::bind(
@@ -107,7 +108,8 @@ impl ProxyService {
             self.outbound.clone(),
             self.stats.clone(),
         )
-        .await?;
+        .await
+        .with_context(|| format!("Cannot start HTTP proxy on {listen_addr}:{http_port}. Close the other proxy instance or change the listening port in Settings"))?;
 
         let socks5_rx = shutdown_rx.clone();
         let http_rx = shutdown_rx;

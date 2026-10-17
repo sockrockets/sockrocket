@@ -48,7 +48,11 @@ pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
         .map_err(reqwest::Error::without_url)
         .context("Failed to read subscription body")?;
 
-    parse_subscription_content(&content, &sub.format)
+    let mut nodes = parse_subscription_content(&content, &sub.format)?;
+    // The URL has to travel with the nodes: a later refresh replaces this
+    // source, and a restart has to know which subscription they belong to.
+    super::dedup::tag_subscription_nodes(&mut nodes, &sub.url);
+    Ok(nodes)
 }
 
 /// Parse subscription content with format detection
@@ -181,8 +185,10 @@ fn parse_plain_lines(content: &str) -> Result<Vec<Node>> {
 
         match v2ray::parse_proxy_uri(line) {
             Ok(node) => nodes.push(node),
-            Err(e) => {
-                tracing::debug!("Skipping line: {} ({})", line, e);
+            Err(_) => {
+                // Proxy URIs carry credentials; parser errors can echo them
+                // too. Neither belongs in diagnostic logs.
+                tracing::debug!("Skipping an invalid subscription entry");
             }
         }
     }

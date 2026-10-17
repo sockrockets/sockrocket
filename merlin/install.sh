@@ -466,7 +466,10 @@ merlin_install() {
 
     install_hook "/jffs/scripts/services-start" \
 "[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh api-start
-[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh start
+# Manual stop is persistent user intent; reboot must not silently enable it.
+[ -f /jffs/addons/sockrocket/stopped ] || {
+  [ ! -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] || /jffs/addons/sockrocket/scripts/sockrocket.sh start
+}
 "
 
     # WAN (re)configuration regenerates /tmp/resolv.dnsmasq with the ISP DNS

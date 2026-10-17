@@ -679,6 +679,8 @@ function apiXhr(base, action, data, cb, errCb, timeoutMs) {
 var kscQueue = [];
 var kscBusy = false;
 function apiKsc(action, data, cb, errCb, timeoutMs) {
+  // Stop must remain usable while a subscription fetch is queued/running.
+  if (action === 'stop') return apiKscRequest(action, data, cb, errCb, timeoutMs);
   if (kscQueue.length >= 16) {
     if (errCb) errCb({ error_code: 'busy' });
     return;
@@ -702,12 +704,23 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
   // Full ms timestamp + wide random suffix: the old `Date.now() % 1e9 +
   // random(0..999)` form collided when two requests fired within the same
   // millisecond, making them poll (and possibly read) the same result file.
-  var seq = String(Date.now()) + String(Math.floor(Math.random() * 1000000));
+  var random = new Uint8Array(16);
+  try { window.crypto.getRandomValues(random); }
+  catch (e) {
+    showMsg('A browser with secure random support is required', 'err');
+    if (errCb) errCb({ error_code: 'unsupported_browser' });
+    return;
+  }
+  var seq = Array.prototype.map.call(random, function (b) {
+    return ('0' + b.toString(16)).slice(-2);
+  }).join('');
+  var fields = {};
+  fields['sockrocket_rpc_body_' + seq] = JSON.stringify(data || {});
   var job = {
     id: Math.floor(Math.random() * 999999) + 1,
     method: 'sockrocket_api.sh',
-    params: [action],
-    fields: { sockrocket_rpc_seq: seq, sockrocket_rpc_args: data ? JSON.stringify(data) : '' }
+    params: [action, seq],
+    fields: fields
   };
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/_api/', true);
@@ -757,6 +770,7 @@ function pollKscResult(seq, tries, cb, errCb) {
     if (xhr.status === 200 && t.charAt(0) === '{') {
       try {
         var d = JSON.parse(t);
+        acknowledgeKscResult(seq);
         if (d.error_code || d.error) {
           showMsg('Error: ' + (d.error_message || d.error || d.error_code), 'err');
           if (errCb) errCb(d);
@@ -771,6 +785,19 @@ function pollKscResult(seq, tries, cb, errCb) {
   };
   xhr.ontimeout = xhr.onerror;
   try { xhr.send(null); } catch (e) { setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb); }, 200); }
+}
+
+
+function acknowledgeKscResult(seq) {
+  // Cleanup failures fall back to server expiry and must not hide the answer.
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/_api/', true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.timeout = 5000;
+    xhr.send(JSON.stringify({ id: Math.floor(Math.random() * 999999) + 1,
+      method: 'sockrocket_api.sh', params: ['rpc_ack', seq], fields: {} }));
+  } catch (e) { /* server expiry remains active */ }
 }
 
 function b64utf8(b64) {

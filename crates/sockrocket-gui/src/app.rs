@@ -40,14 +40,13 @@ use sockrocket_core::{
     BatchConflict, ConfigWatchEvent, ConfigWatchHandle, ConfigWatcher, DEFAULT_SHARE_PORT,
     HealthCheckSetup, HealthEvent, Outbound, OutboundFactory, ProbeResult, ProxyMode, ProxyService,
     Router, RoutingOutbound, ShareServer, SharedOutbound, SharedShareState, SubscriptionFormat,
-    SwappableOutbound, TunProxy, clear_system_proxy as clear_os_proxy, config_content_hash,
-    create_outbound, dedup_nodes, fallback_pick, fetch_subscription, format_rule_clash_line,
-    format_rules_export, generate_token, get_system_proxy as get_os_proxy, group_member_indices,
-    local_lan_ip, make_typed_rule, merge_batch_rules, new_shared_state, node_fingerprint,
-    normalize_node_names, parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group,
-    resolve_members, resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group,
-    set_system_proxy as set_os_proxy, setup_tun_routes, start_share_server, system_proxy_supported,
-    uniquify_node_names, url_test_pick,
+    SwappableOutbound, TunProxy, config_content_hash, create_outbound, dedup_nodes, fallback_pick,
+    fetch_subscription, format_rule_clash_line, format_rules_export, generate_token,
+    get_system_proxy as get_os_proxy, group_member_indices, local_lan_ip, make_typed_rule,
+    merge_batch_rules, new_shared_state, node_fingerprint, normalize_node_names,
+    parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group, resolve_members,
+    resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group, setup_tun_routes,
+    start_share_server, system_proxy_supported, uniquify_node_names, url_test_pick,
 };
 
 /// Main application state
@@ -83,6 +82,9 @@ pub struct AppState {
     // Import status
     pub(crate) import_status: String,
     pub(crate) settings_status: String,
+    persistence_error: Option<String>,
+    /// When false, exit must not replace an unreadable config with defaults.
+    persist_on_exit: bool,
     /// Direct download URL from the last successful update check (if any).
     pub(crate) update_download_url: Option<String>,
     pub(crate) rules_status: String,
@@ -122,7 +124,7 @@ pub struct AppState {
     ///
     /// TUN is meant to be a *mode*: once it is on, switching nodes should keep
     /// it on. Wrapping the outbound in a swappable lets a node change call
-    /// `set()` so new connections use the new node immediately â instead of
+    /// `set()` so new connections use the new node immediately — instead of
     /// tearing the TUN device down and rebuilding it (which dropped the default
     /// route and briefly blackholed traffic on every switch).
     pub(crate) tun_swappable: Option<std::sync::Arc<SwappableOutbound>>,
@@ -176,9 +178,9 @@ pub struct AppState {
     // Node search filter
     pub(crate) node_filter: String,
     pub(crate) node_filter_input: Entity<InputState>,
-    // Protocol chip filter â None means "All", Some("ss") etc. restricts to one protocol
+    // Protocol chip filter — None means "All", Some("ss") etc. restricts to one protocol
     pub(crate) protocol_filter: Option<&'static str>,
-    // Tag filter â None means show all nodes, Some(tag) restricts to nodes with that tag
+    // Tag filter — None means show all nodes, Some(tag) restricts to nodes with that tag
     pub(crate) tag_filter: Option<String>,
     // Input for adding a tag to the selected node
     pub(crate) node_tag_input: Entity<InputState>,
@@ -190,7 +192,7 @@ pub struct AppState {
     pub(crate) latency_testing: std::collections::HashSet<usize>,
     // Nodes whose most recent latency test completed with a failure
     pub(crate) latency_failed: std::collections::HashSet<usize>,
-    // Failure category of each failed probe â drives the "Unreachable" reason
+    // Failure category of each failed probe — drives the "Unreachable" reason
     // (timeout / server unreachable / TLS handshake failed / protocol error) shown in rows and panels.
     pub(crate) latency_fail_reason:
         std::collections::HashMap<usize, sockrocket_core::ProbeFailureKind>,
@@ -271,7 +273,7 @@ pub struct AppState {
     pub(crate) _subscriptions: Vec<gpui::Subscription>,
 
     // Proxy groups (user-defined, persisted in gui-state.yaml; members are
-    // node fingerprints â see views/groups.rs)
+    // node fingerprints — see views/groups.rs)
     pub(crate) groups: Vec<ProxyGroupConfig>,
     // Groups page UI state: creation row (name input + type chips), inline
     // rename, per-group "Add Nodes" expander, delete confirm arming.
@@ -428,10 +430,15 @@ impl AppState {
         tokio_handle: tokio::runtime::Handle,
         log_buffer: SharedLogBuffer,
     ) -> Self {
-        let mut persisted = load_gui_state().unwrap_or_else(|| {
+        let loaded = load_gui_state();
+        let config_unavailable =
+            loaded.is_none() && gui_state_path().is_some_and(|path| path.exists());
+        let mut persisted = loaded.unwrap_or_else(|| {
             let default_config = AppConfig::default();
-            // Create default config on first launch
-            let _ = save_gui_state(&default_config, None);
+            // An unreadable existing config must never be replaced with defaults.
+            if gui_state_path().is_some_and(|path| !path.exists()) {
+                let _ = save_gui_state(&default_config, None);
+            }
             default_config
         });
         let locale = sockrocket_gui::i18n::parse_locale(&persisted.locale);
@@ -439,7 +446,7 @@ impl AppState {
         // Startup cleanup of the persisted node list: URL-decode names, drop
         // cross-subscription fingerprint duplicates, and disambiguate display
         // names (names key group membership / selection restore, so they must
-        // be unique). dedup shifts indices â remap active_node by fingerprint.
+        // be unique). dedup shifts indices — remap active_node by fingerprint.
         let active_fp = persisted
             .active_node
             .and_then(|i| persisted.nodes.get(i))
@@ -460,23 +467,22 @@ impl AppState {
 
         // Startup self-heal (a): a previous session that crashed or was killed
         // may have left the OS system proxy pointing at our (now dead) local
-        // listeners, which breaks all browser traffic. Clear it.
+        // listeners, which breaks all browser traffic. Restore only what we
+        // recorded.
         recover_stale_system_proxy(persisted.socks_port, persisted.http_port);
-        // Startup self-heal (b): same crash scenario for TUN routes. The exit
-        // cleanup (main.rs cleanup_on_exit) restores routes on a clean exit,
-        // so leftovers imply a crash. sockrocket-core exposes no stale-route
-        // *detection* API, so we conservatively restore only when the previous
-        // session had TUN enabled; emergency_restore_routes() is a no-op when
-        // there is nothing to restore (main.rs already calls it
-        // unconditionally on every exit).
-        // TODO(core): replace this heuristic with a real check ("default route
-        // points at the TUN gateway while no TUN session is active") once
-        // sockrocket-core exposes one.
-        if persisted.tun_was_enabled {
-            sockrocket_core::emergency_restore_routes();
-            tracing::info!(
-                "startup: restored routes possibly left behind by a crashed TUN session"
-            );
+        // Startup self-heal (b): TUN route ownership is written beside the
+        // config. A clean exit deletes it. If it is still here, the last
+        // process died before cleanup — put the saved gateway back and drop
+        // cached DNS answers. A journal owned by a process that is still
+        // running is left alone.
+        if let Some(path) = route_journal_path() {
+            sockrocket_core::set_route_journal_path(path);
+        }
+        sockrocket_core::emergency_restore_routes();
+        if persisted.tun_was_enabled && route_journal_path().is_some_and(|path| !path.exists()) {
+            if let Err(error) = sockrocket_core::flush_system_dns_cache() {
+                tracing::warn!("startup DNS cache flush failed: {error}");
+            }
         }
         let selected_node = persisted
             .active_node
@@ -658,12 +664,19 @@ impl AppState {
             listen_addr_input,
             socks_port_input,
             http_port_input,
-            import_status: if persisted.nodes.is_empty() {
+            import_status: if config_unavailable {
+                "✗ Saved configuration could not be read. Existing data has been preserved."
+                    .to_string()
+            } else if persisted.nodes.is_empty() {
                 String::new()
             } else {
-                format!("â Loaded {} saved nodes", persisted.nodes.len())
+                format!("✓ Loaded {} saved nodes", persisted.nodes.len())
             },
             settings_status: String::new(),
+            persistence_error: config_unavailable.then(|| {
+                "Saved configuration is unavailable. Existing data has been preserved.".to_string()
+            }),
+            persist_on_exit: !config_unavailable,
             update_download_url: None,
             rules_status: String::new(),
             listen_addr: persisted.listen_addr,
@@ -798,7 +811,7 @@ impl AppState {
     // === UI heartbeat ===
     // 1s tick while the app is alive. Bandwidth is sampled on every tick (so
     // the status bar rates stay current no matter which page is open), but a
-    // repaint is only requested on pages with live data â a 1 fps full rebuild
+    // repaint is only requested on pages with live data — a 1 fps full rebuild
     // of static pages (Nodes/Rules/Settings/...) is pure waste.
     pub(crate) fn start_ui_heartbeat(&mut self, cx: &mut Context<Self>) {
         let handle = self.tokio_handle.clone();
@@ -944,7 +957,7 @@ impl AppState {
         let mut push =
             |kind: &'static str, label: String, hint: String, target: PaletteTarget| -> bool {
                 if !query.is_empty() && !label.to_lowercase().contains(&query) {
-                    return true; // filtered out â keep scanning
+                    return true; // filtered out — keep scanning
                 }
                 emit(kind, label, hint, target)
             };
@@ -1119,7 +1132,7 @@ impl AppState {
     // Group members are node *fingerprints* (sockrocket_core::ProxyGroupConfig);
     // every mutation ends in schedule_persist() so gui-state.yaml stays in
     // sync. Fingerprints that no longer resolve to a node are skipped by
-    // resolve_members() â they stay in config so a later subscription
+    // resolve_members() — they stay in config so a later subscription
     // refresh can resurrect them.
 
     /// Click a member chip: make that node the active outbound and record it
@@ -1338,13 +1351,13 @@ impl AppState {
         }
 
         if self.nodes.is_empty() {
-            self.proxy_status = "No nodes available. Please add a node first.".to_string();
+            self.proxy_status = "✗ No nodes available. Please add a node first.".to_string();
             cx.notify();
             return;
         }
 
         if self.selected_node.is_none() {
-            self.proxy_status = "Please select a node first".to_string();
+            self.proxy_status = "✗ Please select a node on the Nodes page first".to_string();
             cx.notify();
             return;
         }
@@ -1359,11 +1372,11 @@ impl AppState {
         let outbound = match &node {
             Some(n) => match create_outbound(n) {
                 Ok(o) => {
-                    tracing::info!("Proxy outbound: {} (node: {})", o.0.name(), n.name);
+                    tracing::info!("Proxy outbound initialized");
                     o
                 }
                 Err(e) => {
-                    self.proxy_status = format!("â Outbound error: {:#}", e);
+                    self.proxy_status = format!("✗ Outbound error: {:#}", e);
                     cx.notify();
                     return;
                 }
@@ -1459,7 +1472,8 @@ impl AppState {
                     .start(&service_listen_addr, socks_port, http_port)
                     .await
                 {
-                    let _ = ready_tx.send(Err(err.to_string()));
+                    tracing::warn!(error = %err, "Proxy startup failed");
+                    let _ = ready_tx.send(Err(format!("{err:#}")));
                     return Err(err);
                 }
                 if let Some(setup) = health_setup {
@@ -1484,11 +1498,11 @@ impl AppState {
                         this.active_proxy_node = selected_index;
                         // The local listeners are bound, but the node itself is
                         // not verified yet. Do NOT claim "Connected" and do NOT
-                        // enable the system proxy here â both happen only after
+                        // enable the system proxy here — both happen only after
                         // the reachability probe below succeeds, otherwise the
                         // UI would report success (and hijack browser traffic)
                         // while the node cannot actually reach anything.
-                        this.proxy_status = format!("Verifying â {}", node_name);
+                        this.proxy_status = format!("Verifying — {}", node_name);
                         this.proxy_validation_status =
                             "Verifying proxy reachability...".to_string();
                         cx.notify();
@@ -1507,7 +1521,7 @@ impl AppState {
                         this.proxy_stats = None;
                         this.active_proxy_node = None;
                         this.proxy_swappable = None;
-                        this.proxy_status = format!("â Start failed: {:#}", err);
+                        this.proxy_status = format!("✗ Start failed: {:#}", err);
                         this.proxy_validation_status = "Not validated".to_string();
                         cx.notify();
                     })
@@ -1551,16 +1565,16 @@ impl AppState {
                                 }
                                 match proxy_check {
                                     Ok(summary) => {
-                                        // Node verified â only now report
+                                        // Node verified — only now report
                                         // success and hand system traffic to
                                         // the proxy.
                                         this.proxy_status = if direct_mode {
-                                            "Connected â Direct (no proxy)".to_string()
+                                            "Connected — Direct (no proxy)".to_string()
                                         } else {
-                                            format!("Connected â {}", node_name)
+                                            format!("Connected — {}", node_name)
                                         };
                                         this.proxy_validation_status =
-                                            format!("â {}", summary);
+                                            format!("✓ {}", summary);
                                         match set_os_proxy(&this.listen_addr, this.http_port) {
                                             Ok(()) => {
                                                 this.system_proxy_managed_by_app = true;
@@ -1583,9 +1597,9 @@ impl AppState {
                                         // unreachable node (that would break
                                         // all browser traffic).
                                         this.proxy_status =
-                                            format!("â  Unreachable â {}", node_name);
+                                            format!("⚠ Unreachable — {}", node_name);
                                         this.proxy_validation_status =
-                                            format!("â  Reachability check failed â {:#}", err);
+                                            format!("⚠ Reachability check failed — {:#}", err);
                                     }
                                 }
                                 cx.notify();
@@ -1636,8 +1650,8 @@ impl AppState {
                         this.proxy_status = "Disconnected".to_string();
                         this.proxy_validation_status = "Not validated".to_string();
                     }
-                    Ok(Err(e)) => this.proxy_status = format!("â {:#}", e),
-                    Err(e) => this.proxy_status = format!("â Task error: {}", e),
+                    Ok(Err(e)) => this.proxy_status = format!("✗ {:#}", e),
+                    Err(e) => this.proxy_status = format!("✗ Task error: {}", e),
                 }
                 // Persist auto_connect=false after a self-termination too.
                 this.schedule_persist(cx);
@@ -1719,14 +1733,14 @@ impl AppState {
     pub(crate) fn on_health_event(&mut self, event: HealthEvent, cx: &mut Context<Self>) {
         match event {
             HealthEvent::ProbeOk { latency_ms } => {
-                self.health_status = format!("â Node healthy ({} ms)", latency_ms);
+                self.health_status = format!("✓ Node healthy ({} ms)", latency_ms);
             }
             HealthEvent::ProbeFailed {
                 consecutive_failures,
                 error,
             } => {
                 self.health_status = format!(
-                    "â  Health probe failed Ã{} â {}",
+                    "⚠ Health probe failed ×{} — {}",
                     consecutive_failures, error
                 );
             }
@@ -1741,14 +1755,14 @@ impl AppState {
                     node.latency_ms = Some(latency_ms);
                     self.nodes_generation = self.nodes_generation.wrapping_add(1);
                 }
-                self.proxy_status = format!("Connected â {} (auto-switched)", node_name);
+                self.proxy_status = format!("Connected — {} (auto-switched)", node_name);
                 self.health_status =
-                    format!("â Auto-switched to {} ({} ms)", node_name, latency_ms);
+                    format!("✓ Auto-switched to {} ({} ms)", node_name, latency_ms);
                 // Persist the new active node so a restart keeps the healthy one.
                 self.schedule_persist(cx);
             }
             HealthEvent::SwitchFailed { reason } => {
-                self.health_status = format!("â Auto-switch failed: {}", reason);
+                self.health_status = format!("✗ Auto-switch failed: {}", reason);
             }
         }
         cx.notify();
@@ -1789,7 +1803,7 @@ impl AppState {
             // The old TUN must be *fully* stopped before a new one starts:
             // stop_tun() only signals the background task, and `tun_enabled`
             // stays true until route restoration plus wintun teardown finish.
-            // The old budget (20 x 150ms = 3s) was too tight â a slow teardown
+            // The old budget (20 x 150ms = 3s) was too tight — a slow teardown
             // made this loop give up, leaving TUN running with the *previous*
             // node's outbound and bypass routes. The newly selected node's IP
             // then was not exempt, its traffic looped into TUN, and everything
@@ -1829,14 +1843,27 @@ impl AppState {
     // === Import ===
 
     pub(crate) fn import_subscription(&mut self, cx: &mut Context<Self>) {
-        let url = self.import_url_input.read(cx).value().to_string();
+        let url = self.import_url_input.read(cx).value().trim().to_string();
         if url.trim().is_empty() {
-            self.import_status = "â  Please enter a subscription URL".to_string();
+            self.import_status = "⚠ Please enter a subscription URL".to_string();
             cx.notify();
             return;
         }
 
-        self.import_status = "â³ Importing...".to_string();
+        // Save the subscription itself before the network request: a provider
+        // outage must not discard the URL needed to retry after relaunch.
+        if !self.subscriptions.iter().any(|sub| sub.url == url) {
+            self.subscriptions.push(Subscription {
+                name: format!("Sub {}", self.subscriptions.len() + 1),
+                url: url.clone(),
+                format: "auto".to_string(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+            });
+            self.schedule_persist(cx);
+        }
+
+        self.import_status = "⏳ Importing...".to_string();
         cx.notify();
 
         let handle = self.tokio_handle.clone();
@@ -1874,7 +1901,7 @@ impl AppState {
                             });
                         }
                         this.import_status =
-                            format!("â Imported {} nodes (total: {})", count, this.nodes.len());
+                            format!("✓ Imported {} nodes (total: {})", count, this.nodes.len());
                         // Save subscription for auto-refresh (upsert by URL)
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -1895,10 +1922,10 @@ impl AppState {
                         this.schedule_persist(cx);
                     }
                     Ok(Err(e)) => {
-                        this.import_status = format!("â Error: {}", e);
+                        this.import_status = format!("✗ Error: {}", e);
                     }
                     Err(e) => {
-                        this.import_status = format!("â Error: {}", e);
+                        this.import_status = format!("✗ Error: {}", e);
                     }
                 }
                 cx.notify();
@@ -1957,7 +1984,7 @@ impl AppState {
         // No checkbox selection means "export all" (see export_scope_nodes).
         let nodes = self.export_scope_nodes();
         if nodes.is_empty() {
-            self.export_status = "â  No nodes to export".to_string();
+            self.export_status = "⚠ No nodes to export".to_string();
             cx.notify();
             return;
         }
@@ -1965,7 +1992,7 @@ impl AppState {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.export_saved_path = None;
         self.export_status = format!(
-            "â Copied {} node(s) as {} subscription",
+            "✓ Copied {} node(s) as {} subscription",
             nodes.len(),
             self.export_format.as_str()
         );
@@ -1978,7 +2005,7 @@ impl AppState {
         // No checkbox selection means "export all" (see export_scope_nodes).
         let nodes = self.export_scope_nodes();
         if nodes.is_empty() {
-            self.export_status = "â  No nodes to export".to_string();
+            self.export_status = "⚠ No nodes to export".to_string();
             cx.notify();
             return;
         }
@@ -1987,7 +2014,7 @@ impl AppState {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(std::env::temp_dir);
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.export_status = format!("â Save failed: {}", err);
+            self.export_status = format!("✗ Save failed: {}", err);
             cx.notify();
             return;
         }
@@ -2004,11 +2031,11 @@ impl AppState {
             Ok(()) => {
                 self.export_saved_path = Some(path.clone());
                 self.export_status =
-                    format!("â Saved {} node(s) â {}", nodes.len(), path.display());
+                    format!("✓ Saved {} node(s) — {}", nodes.len(), path.display());
             }
             Err(err) => {
                 self.export_saved_path = None;
-                self.export_status = format!("â Save failed: {}", err);
+                self.export_status = format!("✗ Save failed: {}", err);
             }
         }
         cx.notify();
@@ -2017,7 +2044,7 @@ impl AppState {
     /// Remove nodes with identical credentials (protocol + address + port +
     /// password/UUID), keeping the first occurrence. Persisted immediately.
     pub(crate) fn dedup_nodes_action(&mut self, cx: &mut Context<Self>) {
-        // Indices shift after removal â preserve selection by name.
+        // Indices shift after removal — preserve selection by name.
         let selected_name = self
             .selected_node
             .and_then(|i| self.nodes.get(i))
@@ -2039,7 +2066,7 @@ impl AppState {
             active_name.and_then(|name| self.nodes.iter().position(|n| n.name == name));
 
         self.nodes_action_status = if removed > 0 {
-            format!("â Removed {} duplicate(s)", removed)
+            format!("✓ Removed {} duplicate(s)", removed)
         } else {
             "No duplicates found".to_string()
         };
@@ -2081,7 +2108,7 @@ impl AppState {
         let token = self.lan_share_token.clone();
         let state = self.share_state.clone();
         let handle = self.tokio_handle.clone();
-        self.lan_share_status = "â³ Starting...".to_string();
+        self.lan_share_status = "⏳ Starting...".to_string();
         cx.notify();
 
         cx.spawn(async move |weak, cx| {
@@ -2096,19 +2123,19 @@ impl AppState {
                         this.share_server = Some(server);
                         this.lan_share_on = true;
                         this.lan_share_status = if this.lan_ip.is_some() {
-                            format!("â Sharing on LAN port {}", bound)
+                            format!("✓ Sharing on LAN port {}", bound)
                         } else {
                             format!(
-                                "â Sharing on port {} (no LAN IP detected, URL uses 127.0.0.1)",
+                                "✓ Sharing on port {} (no LAN IP detected, URL uses 127.0.0.1)",
                                 bound
                             )
                         };
                     }
                     Ok(Err(err)) => {
-                        this.lan_share_status = format!("â Failed to start: {:#}", err);
+                        this.lan_share_status = format!("✗ Failed to start: {:#}", err);
                     }
                     Err(err) => {
-                        this.lan_share_status = format!("â Failed to start: {}", err);
+                        this.lan_share_status = format!("✗ Failed to start: {}", err);
                     }
                 }
                 cx.notify();
@@ -2159,7 +2186,7 @@ impl AppState {
 
         // Mark as testing; keep the previous latency value visible while the test
         // runs (cleared only if the new test fails).  Clear the failed flag so the
-        // spinner renders instead of "â" while in-flight.
+        // spinner renders instead of "✗" while in-flight.
         self.latency_testing.insert(index);
         self.latency_failed.remove(&index);
         self.latency_fail_reason.remove(&index);
@@ -2195,7 +2222,7 @@ impl AppState {
                     // The HTTP probe runs *through* the proxy, so it is the only
                     // result that proves the node actually works. A TCP ping that
                     // succeeds while the proxy probe fails means the port is
-                    // reachable but the node cannot carry traffic â reporting the
+                    // reachable but the node cannot carry traffic — reporting the
                     // TCP latency there would show a latency number (and imply
                     // "available") for a node that is really unusable. So the
                     // proxy probe result is authoritative; TCP is diagnostic only.
@@ -2247,7 +2274,7 @@ impl AppState {
                         }
                     }
                 }
-                // A latency value changed â re-sort the Nodes page once.
+                // A latency value changed → re-sort the Nodes page once.
                 this.nodes_generation = this.nodes_generation.wrapping_add(1);
                 // Batch test tracking: decrement counter and auto-select best when done
                 if this.pending_latency_batch > 0 {
@@ -2283,13 +2310,13 @@ impl AppState {
                                 }
                             }
                         }
-                        // Always reset the flags when a batch drains â leaving
+                        // Always reset the flags when a batch drains — leaving
                         // auto_select_best set would leak into the next batch.
                         this.auto_select_best = false;
                         this.auto_select_scope = None;
                     }
                 }
-                this.schedule_persist(cx); // debounced: coalesces N node completions â 1 write
+                this.schedule_metadata_persist(cx); // coalesces latency-only updates
                 cx.notify();
             })
             .ok();
@@ -2412,7 +2439,7 @@ impl AppState {
         let http = self.http_port_input.read(cx).value().trim().to_string();
 
         if addr.is_empty() {
-            self.settings_status = "â Listen address cannot be empty".to_string();
+            self.settings_status = "✗ Listen address cannot be empty".to_string();
             cx.notify();
             return;
         }
@@ -2420,7 +2447,7 @@ impl AppState {
         let socks_port = match socks.parse::<u16>() {
             Ok(port) => port,
             Err(_) => {
-                self.settings_status = format!("â Invalid SOCKS5 port: {}", socks);
+                self.settings_status = format!("✗ Invalid SOCKS5 port: {}", socks);
                 cx.notify();
                 return;
             }
@@ -2428,7 +2455,7 @@ impl AppState {
         let http_port = match http.parse::<u16>() {
             Ok(port) => port,
             Err(_) => {
-                self.settings_status = format!("â Invalid HTTP port: {}", http);
+                self.settings_status = format!("✗ Invalid HTTP port: {}", http);
                 cx.notify();
                 return;
             }
@@ -2446,12 +2473,12 @@ impl AppState {
 
         self.settings_status = if changed {
             if self.proxy_running {
-                "â Settings applied. Restarting proxy with new ports.".to_string()
+                "✓ Settings applied. Restarting proxy with new ports.".to_string()
             } else {
-                "â Settings applied".to_string()
+                "✓ Settings applied".to_string()
             }
         } else {
-            "â Settings already up to date".to_string()
+            "✓ Settings already up to date".to_string()
         };
 
         if changed && self.proxy_running {
@@ -2463,7 +2490,7 @@ impl AppState {
     pub(crate) fn enable_system_proxy(&mut self, cx: &mut Context<Self>) {
         match set_os_proxy(&self.listen_addr, self.http_port) {
             Ok(()) => {
-                // We set it, so stop_proxy()/"Disconnect" must clear it â
+                // We set it, so stop_proxy()/"Disconnect" must clear it —
                 // otherwise the system proxy keeps pointing at a dead port.
                 self.system_proxy_managed_by_app = true;
                 self.refresh_system_proxy_status(None, cx);
@@ -2473,7 +2500,14 @@ impl AppState {
     }
 
     pub(crate) fn disable_system_proxy(&mut self, cx: &mut Context<Self>) {
-        match clear_os_proxy() {
+        // This is an explicit user action. Legacy/unmanaged settings may be
+        // disabled here; automatic stop/exit paths only restore owned state.
+        let result = if proxy_journal_path().is_some_and(|path| path.exists()) {
+            clear_os_proxy()
+        } else {
+            sockrocket_core::clear_system_proxy()
+        };
+        match result {
             Ok(()) => {
                 self.system_proxy_managed_by_app = false;
                 self.refresh_system_proxy_status(None, cx);
@@ -2539,7 +2573,7 @@ impl AppState {
             return;
         }
         if !self.proxy_running {
-            self.tun_status = "â  Start proxy first".to_string();
+            self.tun_status = "⚠ Start proxy first".to_string();
             cx.notify();
             return;
         }
@@ -2599,7 +2633,7 @@ impl AppState {
         }
 
         // Get proxy server host for loop avoidance. Resolution is deferred to
-        // the blocking task below â resolve_to_ips does a blocking DNS lookup
+        // the blocking task below — resolve_to_ips does a blocking DNS lookup
         // and must not run on the UI thread.
         let proxy_server_host: Option<String> = self
             .selected_node
@@ -2636,7 +2670,7 @@ impl AppState {
         };
 
         // Wrap in a swappable layer so a later node change can redirect TUN's
-        // outbound with `set()` â keeping TUN (and the default route) up â
+        // outbound with `set()` — keeping TUN (and the default route) up —
         // instead of tearing the device down and rebuilding it.
         let tun_swappable = std::sync::Arc::new(SwappableOutbound::new(final_outbound));
         self.tun_swappable = Some(tun_swappable.clone());
@@ -2665,7 +2699,7 @@ impl AppState {
                         weak.update(cx, |this: &mut AppState, cx| {
                             this.tun_starting = false;
                             this.tun_stop_tx = None;
-                            this.tun_status = format!("â WinTun install failed: {:#}", e);
+                            this.tun_status = format!("❌ WinTun install failed: {:#}", e);
                             cx.notify();
                         })
                         .ok();
@@ -2675,7 +2709,7 @@ impl AppState {
                         weak.update(cx, |this: &mut AppState, cx| {
                             this.tun_starting = false;
                             this.tun_stop_tx = None;
-                            this.tun_status = format!("â WinTun task error: {}", e);
+                            this.tun_status = format!("❌ WinTun task error: {}", e);
                             cx.notify();
                         })
                         .ok();
@@ -2735,7 +2769,7 @@ impl AppState {
                         Ok(Ok(inner)) => inner,
                         Ok(Err(e)) => Err(anyhow::anyhow!("TUN setup task failed: {}", e)),
                         Err(_) => Err(anyhow::anyhow!(
-                            "TUN startup timed out after 30s â the driver may still be \
+                            "TUN startup timed out after 30s — the driver may still be \
                              initializing in the background; wait a moment and try again."
                         )),
                     }
@@ -2747,7 +2781,7 @@ impl AppState {
                     weak.update(cx, |this: &mut AppState, cx| {
                         this.tun_starting = false;
                         this.tun_enabled = true;
-                        this.tun_status = "â TUN active â all traffic proxied".to_string();
+                        this.tun_status = "✅ TUN active — all traffic proxied".to_string();
                         // Persist tun_was_enabled=true for the next launch.
                         this.schedule_persist(cx);
                         cx.notify();
@@ -2777,7 +2811,7 @@ impl AppState {
                     weak.update(cx, |this: &mut AppState, cx| {
                         this.tun_starting = false;
                         this.tun_stop_tx = None;
-                        this.tun_status = format!("â {:#}", e);
+                        this.tun_status = format!("❌ {:#}", e);
                         cx.notify();
                     })
                     .ok();
@@ -2786,7 +2820,7 @@ impl AppState {
                     weak.update(cx, |this: &mut AppState, cx| {
                         this.tun_starting = false;
                         this.tun_stop_tx = None;
-                        this.tun_status = format!("â {:#}", e);
+                        this.tun_status = format!("❌ {:#}", e);
                         cx.notify();
                     })
                     .ok();
@@ -2831,7 +2865,7 @@ impl AppState {
             }
         }
         // Remap index-keyed sets: drop the removed index, shift entries above
-        // it down by one â otherwise latency spinners/fail marks and batch
+        // it down by one — otherwise latency spinners/fail marks and batch
         // checkboxes end up attached to the wrong rows.
         for set in [
             &mut self.latency_testing,
@@ -2872,7 +2906,7 @@ impl AppState {
     pub(crate) fn add_node_from_uri(&mut self, cx: &mut Context<Self>) {
         let uri = self.node_uri_input.read(cx).value().trim().to_string();
         if uri.is_empty() {
-            self.import_status = "â  Please paste a proxy share link".to_string();
+            self.import_status = "⚠ Please paste a proxy share link".to_string();
             cx.notify();
             return;
         }
@@ -2902,16 +2936,16 @@ impl AppState {
         }
 
         self.import_status = if errors.is_empty() {
-            format!("â Added {} node(s) from URI", added)
+            format!("✓ Added {} node(s) from URI", added)
         } else if added > 0 {
             format!(
-                "â Added {} node(s), {} failed: {}",
+                "✓ Added {} node(s), {} failed: {}",
                 added,
                 errors.len(),
                 errors[0]
             )
         } else {
-            format!("â Failed: {}", errors[0])
+            format!("✗ Failed: {}", errors[0])
         };
 
         if added > 0 {
@@ -2932,7 +2966,7 @@ impl AppState {
             .map(|n| n.name.clone());
 
         // Index-keyed probe state (failed marks + reasons, testing spinners)
-        // must follow its node to the new position â capture by fingerprint
+        // must follow its node to the new position — capture by fingerprint
         // before the sort, rebuild after. (Failed nodes sort to the bottom
         // because their latency is None.)
         let fail_state: Vec<(String, sockrocket_core::ProbeFailureKind)> = self
@@ -3003,8 +3037,8 @@ impl AppState {
         let node = self.selected_node.and_then(|i| self.nodes.get(i))?;
         let outbound = match create_outbound(node) {
             Ok(o) => o,
-            Err(e) => {
-                tracing::warn!("cannot build outbound for {}: {:#}", node.name, e);
+            Err(_) => {
+                tracing::warn!("Cannot build outbound for configured node");
                 return None;
             }
         };
@@ -3046,11 +3080,11 @@ impl AppState {
             swappable.set(final_outbound.clone());
             swapped = true;
         }
-        if self.tun_enabled
-            && let Some(swappable) = &self.tun_swappable
-        {
-            swappable.set(final_outbound.clone());
-            swapped = true;
+        if self.tun_enabled {
+            if let Some(swappable) = &self.tun_swappable {
+                swappable.set(final_outbound.clone());
+                swapped = true;
+            }
         }
         if swapped {
             self.active_proxy_node = self.selected_node;
@@ -3080,13 +3114,13 @@ impl AppState {
         self.schedule_persist(cx);
         if self.proxy_running {
             // Prefer swapping the live outbound: it keeps the local listeners
-            // bound and, crucially, keeps TUN up â a full restart would drop
+            // bound and, crucially, keeps TUN up — a full restart would drop
             // the default route on every node change.
             if !self.apply_outbound_hot_swap(cx) {
                 self.restart_proxy_with_current_state(cx);
             }
         } else {
-            // Proxy not running: double-click means "use this node now" â
+            // Proxy not running: double-click means "use this node now" —
             // start the proxy on it.
             self.start_proxy(cx);
         }
@@ -3119,7 +3153,7 @@ impl AppState {
     pub(crate) fn activate_node(&mut self, index: usize, cx: &mut Context<Self>) {
         self.selected_node = Some(index);
 
-        // Already connected to this node â nothing to do.
+        // Already connected to this node — nothing to do.
         if self.proxy_running && self.active_proxy_node == Some(index) {
             cx.notify();
             return;
@@ -3136,7 +3170,14 @@ impl AppState {
         self.start_proxy(cx);
     }
 
-    pub(crate) fn persist_gui_state(&self) {
+    pub(crate) fn persist_gui_state(&mut self) {
+        // An unreadable startup config is not an empty configuration. Even
+        // if permissions are repaired later, reload the saved data before
+        // allowing the temporary UI state to replace it.
+        if !self.persist_on_exit {
+            self.persistence_error = Some("Saved configuration must be reloaded before changes can be saved. Existing data has been preserved.".to_string());
+            return;
+        }
         let config = self.snapshot_config();
 
         // Keep the LAN share server (if running) serving the latest list.
@@ -3144,8 +3185,18 @@ impl AppState {
             state.nodes = self.export_scope_nodes();
         }
 
-        if let Err(err) = save_gui_state(&config, self.config_watch.as_ref()) {
-            tracing::error!("failed to persist GUI state: {}", err);
+        match save_gui_state(&config, self.config_watch.as_ref()) {
+            Ok(()) => {
+                self.persistence_error = None;
+                self.persist_on_exit = true;
+            }
+            Err(err) => {
+                tracing::error!("failed to persist GUI state: {}", err);
+                let message = "Changes could not be saved. Keep the app open to avoid losing unsaved changes.";
+                self.persistence_error = Some(message.to_string());
+                self.settings_status = format!("✗ {message}");
+                self.import_status = format!("✗ {message}");
+            }
         }
     }
 
@@ -3171,10 +3222,17 @@ impl AppState {
         }
     }
 
+    /// Commit user edits before returning to the event loop, so an immediate
+    /// quit or elevation handoff cannot discard subscription URLs or nodes.
+    pub(crate) fn schedule_persist(&mut self, _cx: &mut Context<Self>) {
+        self.nodes_generation = self.nodes_generation.wrapping_add(1);
+        self.persist_gui_state();
+    }
+
     /// Debounced persist: coalesces multiple rapid calls (e.g. batch latency tests)
     /// into a single disk write 500ms after the last call.
-    pub(crate) fn schedule_persist(&mut self, cx: &mut Context<Self>) {
-        // Persisted state changed â invalidate the Nodes page filter/sort cache.
+    fn schedule_metadata_persist(&mut self, cx: &mut Context<Self>) {
+        // Persisted state changed — invalidate the Nodes page filter/sort cache.
         // (Cheap over-invalidation: also fires for rules/subscription edits.)
         self.nodes_generation = self.nodes_generation.wrapping_add(1);
         if self.pending_persist {
@@ -3281,7 +3339,7 @@ impl AppState {
                             }
                             this.refreshing_subscriptions.remove(&sub_index);
                             this.import_status = format!(
-                                "â Refreshed '{}': {} nodes",
+                                "✓ Refreshed '{}': {} nodes",
                                 this.subscriptions
                                     .get(sub_index)
                                     .map(|s| s.name.as_str())
@@ -3311,7 +3369,7 @@ impl AppState {
                     .map(|s| s.name.clone())
                     .unwrap_or_else(|| "subscription".to_string());
                 this.refreshing_subscriptions.remove(&sub_index);
-                this.import_status = format!("â  Refresh failed for '{}': {}", name, last_err);
+                this.import_status = format!("⚠ Refresh failed for '{}': {}", name, last_err);
                 cx.notify();
             })
             .ok();
@@ -3489,16 +3547,18 @@ impl AppState {
             ConfigWatchEvent::ParseError(error) => {
                 // Bad edit on disk: keep running with the current config.
                 self.settings_status =
-                    format!("â  Config file error (kept current settings): {}", error);
+                    format!("⚠ Config file error (kept current settings): {}", error);
                 cx.notify();
             }
             ConfigWatchEvent::Reloaded(reloaded) => {
+                self.persist_on_exit = true;
+                self.persistence_error = None;
                 let new_config = reloaded.config;
                 let restart_fields = reloaded.requires_restart.clone();
 
                 // The node list is replaced wholesale: index-keyed state
                 // (latency spinners/fail marks, batch checkboxes) would point
-                // at the wrong rows â clear it, and restore the selection by
+                // at the wrong rows — clear it, and restore the selection by
                 // name (falling back to the file's active_node).
                 let prev_selected_name = self
                     .selected_node
@@ -3515,7 +3575,7 @@ impl AppState {
 
                 // Runtime-changeable parts take effect immediately.
                 self.nodes = new_config.nodes.clone();
-                // The node list changed wholesale â invalidate the Nodes page
+                // The node list changed wholesale — invalidate the Nodes page
                 // filter/sort cache (keyed on this counter).
                 self.nodes_generation = self.nodes_generation.wrapping_add(1);
                 self.subscriptions = new_config.subscriptions.clone();
@@ -3550,15 +3610,15 @@ impl AppState {
                     });
 
                 if restart_fields.is_empty() {
-                    self.settings_status = "â Config reloaded from disk".to_string();
+                    self.settings_status = "✓ Config reloaded from disk".to_string();
                 } else {
                     // Listen address/ports cannot change while listeners are
-                    // bound â adopt the values for the next start and say so.
+                    // bound — adopt the values for the next start and say so.
                     self.listen_addr = new_config.listen_addr.clone();
                     self.socks_port = new_config.socks_port;
                     self.http_port = new_config.http_port;
                     self.settings_status = format!(
-                        "â  {} changed in config file â restart proxy to apply",
+                        "⚠ {} changed in config file — restart proxy to apply",
                         restart_fields.join(", ")
                     );
                 }
@@ -3617,7 +3677,7 @@ impl AppState {
 
     pub(crate) fn health_config_changed(&mut self, cx: &mut Context<Self>) {
         self.schedule_persist(cx);
-        // The monitor takes its config at spawn time â restart the proxy so
+        // The monitor takes its config at spawn time — restart the proxy so
         // the running monitor picks up the new settings.
         if self.proxy_running {
             self.restart_proxy_with_current_state(cx);
@@ -3685,6 +3745,16 @@ impl Render for AppState {
                 this.palette_move(1, cx);
             }))
             .child(self.render_titlebar(window, cx))
+            .when(self.persistence_error.is_some(), |root| {
+                root.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .bg(rgb(0xffe8e6))
+                        .text_color(rgb(0x9d2924))
+                        .child(self.persistence_error.clone().unwrap_or_default()),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -3719,7 +3789,7 @@ impl AppState {
         // The Nodes table is virtualized (uniform_list) and scrolls
         // internally, which requires a definite height. Children of a
         // page-level scroll container get unbounded height and the list
-        // collapses to zero rows â so the Nodes page opts out of page
+        // collapses to zero rows — so the Nodes page opts out of page
         // scrolling. (Other table pages size to content + page-scroll.)
         let virtualized_page = matches!(active, ActiveView::Nodes);
         let max_w = match active {
@@ -3888,7 +3958,7 @@ impl AppState {
             return;
         }
         let url = self.subscriptions[index].url.clone();
-        // Node indices shift after removal â remember selection by name.
+        // Node indices shift after removal — remember selection by name.
         let selected_name = self
             .selected_node
             .and_then(|i| self.nodes.get(i))
@@ -3928,7 +3998,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Cycle through common refresh intervals: 24h â 12h â 6h â off (0) â 24h
+    /// Cycle through common refresh intervals: 24h → 12h → 6h → off (0) → 24h
     pub(crate) fn cycle_refresh_interval(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(sub) = self.subscriptions.get_mut(index) {
             sub.refresh_interval_hours = match sub.refresh_interval_hours {
@@ -3937,7 +4007,7 @@ impl AppState {
                 2 => 6,
                 6 => 12,
                 12 => 24,
-                _ => 0, // 24 or any custom â Off
+                _ => 0, // 24 or any custom → Off
             };
         }
         self.schedule_persist(cx);
@@ -4131,6 +4201,7 @@ impl AppState {
             return;
         }
 
+        let group = group;
         if group.is_empty() {
             self.rules_status = "⚠ 请先选择或填写分组，再添加规则".into();
             cx.notify();
@@ -5019,7 +5090,7 @@ pub(crate) async fn verify_local_http_proxy(
 
     // Direct mode has no remote node: the local relay forwarding straight to
     // the internet IS the whole outbound. Probing gstatic/cloudflare/dns.google
-    // is meaningless here â on a censored network they are unreachable directly,
+    // is meaningless here — on a censored network they are unreachable directly,
     // which previously made Direct mode always fail validation and left the
     // system proxy unset ("cannot access anything"). The liveness check above
     // is all the confidence Direct mode needs.
@@ -5051,9 +5122,9 @@ pub(crate) async fn verify_local_http_proxy(
             // Any single success counts: proxy is reachable.
             (Ok(s), _, _) | (_, Ok(s), _) | (_, _, Ok(s)) => {
                 return if attempt == 1 {
-                    Ok(format!("Connected â {}", s))
+                    Ok(format!("Connected — {}", s))
                 } else {
-                    Ok(format!("Connected â {} (after retry)", s))
+                    Ok(format!("Connected — {} (after retry)", s))
                 };
             }
             (Err(e1), Err(e2), Err(e3)) => {
@@ -5062,7 +5133,7 @@ pub(crate) async fn verify_local_http_proxy(
                     attempt, e1, e2, e3
                 ));
                 if attempt < 2 {
-                    // Wait briefly before retrying â lets transient proxy
+                    // Wait briefly before retrying — lets transient proxy
                     // warm-up issues resolve without a long global timeout.
                     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                 }
@@ -5108,7 +5179,7 @@ pub(crate) async fn verify_local_http_proxy_once(
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "proxy did not respond within {}s â node may be unreachable or slow",
+                "proxy did not respond within {}s — node may be unreachable or slow",
                 timeout.as_secs()
             )
         })??;
@@ -5126,7 +5197,7 @@ pub(crate) async fn verify_local_http_proxy_once(
     if !status_line.starts_with("HTTP/1.") {
         anyhow::bail!("unexpected proxy response: {}", status_line);
     }
-    // Accept "200" anywhere after the HTTP version â some proxies omit
+    // Accept "200" anywhere after the HTTP version — some proxies omit
     // the trailing space (e.g. "HTTP/1.1 200" without a reason phrase).
     let code = status_line.split(' ').nth(1).unwrap_or_default().trim();
     if code != "200" {
@@ -5187,34 +5258,58 @@ fn migrate_legacy_gui_state() {
 pub(crate) fn load_gui_state() -> Option<AppConfig> {
     migrate_legacy_gui_state();
     let path = gui_state_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&content).ok()
+    if let Err(error) = crate::config_access::ensure_readable(&path) {
+        tracing::error!("Could not restore access to saved configuration: {error}");
+    }
+    match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str(&content).ok())
+    {
+        Some(config) => Some(config),
+        None => {
+            tracing::error!("GUI configuration could not be loaded; trying private backup");
+            let content = std::fs::read_to_string(path.with_extension("yaml.bak")).ok()?;
+            serde_yaml::from_str(&content).ok()
+        }
+    }
 }
 
-/// Startup self-heal: if the OS system proxy still points at this app's local
-/// ports, it is a leftover from a previous session (crash/kill skipped the
-/// exit cleanup) â our proxy is never running this early, so clear it before
-/// the dead listener breaks all browser traffic.
-fn recover_stale_system_proxy(socks_port: u16, http_port: u16) {
-    if !system_proxy_supported() {
-        return;
+/// Restore a recorded proxy takeover only if its local listener is gone.
+/// An unrecorded proxy or another running instance is left untouched.
+fn recover_stale_system_proxy(_socks_port: u16, _http_port: u16) {
+    if let Some(path) = proxy_journal_path() {
+        if let Err(error) = sockrocket_core::managed_proxy::recover_if_stale(&path) {
+            tracing::error!("Could not recover managed system proxy: {error}");
+        }
     }
-    let Ok(proxy) = get_os_proxy() else {
-        return;
-    };
-    let points_at_us = proxy.enabled
-        && (proxy.host == "127.0.0.1" || proxy.host.eq_ignore_ascii_case("localhost"))
-        && (proxy.port == socks_port || proxy.port == http_port);
-    if !points_at_us {
-        return;
+}
+
+pub(crate) fn proxy_journal_path() -> Option<PathBuf> {
+    gui_state_path().map(|path| path.with_file_name("system-proxy-owner.yaml"))
+}
+
+fn route_journal_path() -> Option<PathBuf> {
+    gui_state_path().map(|path| path.with_file_name("tun-routes.yaml"))
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        // Quit can race a debounced write. Flush subscriptions, URLs, and
+        // nodes now so closing the window does not drop the last import.
+        if self.persist_on_exit {
+            self.persist_gui_state();
+        }
     }
-    match clear_os_proxy() {
-        Ok(()) => tracing::warn!(
-            "startup: cleared stale system proxy 127.0.0.1:{} left by a previous session",
-            proxy.port
-        ),
-        Err(err) => tracing::error!("startup: failed to clear stale system proxy: {:#}", err),
-    }
+}
+
+fn set_os_proxy(host: &str, port: u16) -> anyhow::Result<()> {
+    let path = proxy_journal_path().ok_or_else(|| anyhow::anyhow!("No config directory"))?;
+    sockrocket_core::managed_proxy::enable(&path, host, port)
+}
+
+fn clear_os_proxy() -> anyhow::Result<()> {
+    let path = proxy_journal_path().ok_or_else(|| anyhow::anyhow!("No config directory"))?;
+    sockrocket_core::managed_proxy::restore(&path)
 }
 
 pub(crate) fn save_gui_state(
@@ -5225,8 +5320,23 @@ pub(crate) fn save_gui_state(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Refuse to overwrite a file that this process could not load. In
+    // particular a root-owned 0600 file must not become an empty user config.
+    // If the primary is corrupt, preserve the valid backup used for recovery.
+    let backup_existing = if path.exists() {
+        let existing = std::fs::read_to_string(&path)?;
+        if serde_yaml::from_str::<AppConfig>(&existing).is_ok() {
+            true
+        } else {
+            let backup = std::fs::read_to_string(path.with_extension("yaml.bak"))?;
+            serde_yaml::from_str::<AppConfig>(&backup)?;
+            false
+        }
+    } else {
+        false
+    };
     let content = serde_yaml::to_string(config)?;
-    sockrocket_core::config::storage::atomic_write_private(&path, &content, true)?;
+    sockrocket_core::config::storage::atomic_write_private(&path, &content, backup_existing)?;
     // Only suppress content that was actually committed to disk.
     if let Some(handle) = watch {
         handle.note_saved(config, config_content_hash(&content));
@@ -5310,7 +5420,7 @@ pub(crate) fn transport_summary(transport: Option<&TransportConfig>) -> String {
             {
                 parts.push(format!("Server {}", sni));
             }
-            parts.join(" Â· ")
+            parts.join(" · ")
         }
     }
 }

@@ -72,6 +72,60 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+// One bounded maintenance task per API process, including while manually
+// stopped. A failed browser acknowledgement must not retain secrets forever.
+struct RpcResultJanitor(tokio::task::JoinHandle<()>);
+impl Drop for RpcResultJanitor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+fn cleanup_rpc_results(directory: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(nonce) = name
+            .to_str()
+            .and_then(|s| s.strip_prefix("sockrocket_rpc_"))
+            .and_then(|s| s.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let valid = (nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+            || (!nonce.is_empty()
+                && nonce.len() <= 24
+                && nonce.bytes().all(|b| b.is_ascii_digit()));
+        if !valid {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|age| age >= Duration::from_secs(120));
+        if expired {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+fn rpc_result_janitor() -> RpcResultJanitor {
+    RpcResultJanitor(tokio::spawn(async {
+        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let _ = tokio::task::spawn_blocking(|| {
+                cleanup_rpc_results(std::path::Path::new("/tmp/upload"))
+            })
+            .await;
+        }
+    }))
+}
+
 /// Read one HTTP request. Returns None on malformed/oversized input or EOF.
 /// Caps: 16 KB headers, 1 MB body — plenty for save_config payloads.
 pub(super) async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<ApiRequest> {
@@ -189,6 +243,7 @@ pub(super) async fn serve_api_authenticated(port: u16, token: Arc<String>) -> Re
         .await
         .with_context(|| format!("bind API port {port}"))?;
     println!("sockrocket API listening on 127.0.0.1:{port} (authenticated)");
+    let _rpc_results = rpc_result_janitor();
 
     // Cap in-flight CGI handlers. Unbounded accept→spawn_blocking let a
     // Test-all + status polling storm open dozens of threads on a 1-core

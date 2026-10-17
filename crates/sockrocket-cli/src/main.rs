@@ -3,14 +3,16 @@ mod cgi;
 use std::env;
 use std::fs;
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
-    SharedOutbound, SwappableOutbound, TunProxy, create_outbound, fetch_subscription,
-    normalize_node_names, resolve_to_ips, setup_tun_routes, tun_requirements, tun_supported,
+    SharedOutbound, SwappableOutbound, TunProxy, apply_subscription_refresh, create_outbound,
+    fetch_subscription, flush_system_dns_cache, normalize_node_names, resolve_to_ips,
+    set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
 
 fn main() -> Result<()> {
@@ -119,6 +121,13 @@ async fn async_main() -> Result<()> {
     let setup_routes = args.iter().any(|a| a == "--tun-routes");
 
     let config_path = parse_config_path()?;
+    // A previous run may have been killed while it still owned the default
+    // route. Restore that snapshot before any subscription fetch, which needs
+    // a working network.
+    if let Some(dir) = Path::new(&config_path).parent() {
+        set_route_journal_path(dir.join("tun-routes.yaml"));
+        sockrocket_core::emergency_restore_routes();
+    }
     let config = load_config(&config_path)
         .await
         .with_context(|| format!("failed to load config from {}", config_path))?;
@@ -222,8 +231,7 @@ async fn async_main() -> Result<()> {
 
     if let Some(node) = selected {
         tracing::info!(
-            "Sockrocket CLI started with node '{}' ({})",
-            node.name,
+            "Sockrocket CLI started with configured node ({})",
             protocol_name(&node.protocol)
         );
     } else {
@@ -288,8 +296,8 @@ async fn async_main() -> Result<()> {
                             latency_ms,
                         }) => {
                             tracing::info!(
-                                "auto-switched to node '{}' ({} ms)",
-                                node_name,
+                                "auto-switched to node index {} ({} ms)",
+                                node_index,
                                 latency_ms
                             );
                             update_health_state(|s| {
@@ -474,10 +482,6 @@ async fn async_main() -> Result<()> {
                         }
                         match apply_reloaded_config(reloaded.config).await {
                             Ok((new_config, new_index, new_outbound)) => {
-                                let node_name = new_index
-                                    .and_then(|i| new_config.nodes.get(i))
-                                    .map(|n| n.name.clone())
-                                    .unwrap_or_else(|| "direct".to_string());
                                 let dns_config=match read_router_dns_config(&config_path,&new_config.nodes) {
                                     Ok(config)=>config,
                                     Err(error)=>{tracing::error!("DNS config reload rejected: {error:#}");continue;}
@@ -504,9 +508,9 @@ async fn async_main() -> Result<()> {
                                         .await;
                                 }
                                 tracing::info!(
-                                    "config reloaded: {} node(s), active='{}' (listeners unchanged)",
+                                    "config reloaded: {} node(s), active index {:?} (listeners unchanged)",
                                     new_config.nodes.len(),
-                                    node_name
+                                    new_index
                                 );
                             }
                             Err(e) => {
@@ -524,7 +528,8 @@ async fn async_main() -> Result<()> {
     tracing::info!("Shutdown signal received");
     config_watcher.shutdown();
 
-    // Persist Fake-IP map before tearing down so the next --tun start reuses it.
+    // Keep the map across a TUN restart (proxy-off starts a new process).
+    // A full service stop deletes the file after this process exits.
     if let Some(pool) = &fakeip_pool
         && let Err(e) = pool.persist()
     {
@@ -546,9 +551,16 @@ async fn async_main() -> Result<()> {
     }
     service.stop().await;
 
-    // Clean up system proxy and TUN routes
-    let _ = sockrocket_core::clear_system_proxy();
+    // Routes first: a stalled proxy command must not leave traffic pointed at
+    // a TUN device that is about to disappear. Only a proxy this process
+    // recorded is restored — never one the user configured themselves.
     sockrocket_core::emergency_restore_routes();
+    if let Some(dir) = Path::new(&config_path).parent() {
+        let _ = sockrocket_core::managed_proxy::restore(&dir.join("system-proxy-owner.yaml"));
+    }
+    if let Err(error) = flush_system_dns_cache() {
+        tracing::warn!("DNS cache flush on shutdown failed: {error}");
+    }
 
     Ok(())
 }
@@ -758,38 +770,27 @@ async fn load_config(path: &str) -> Result<AppConfig> {
         let mut config = parsed;
         normalize_node_names(&mut config.nodes);
         config
+    } else if has_subscriptions {
+        let (config, changed) = resolve_config(parsed).await?;
+        // Always write the URL list and the nodes together, even when the
+        // count is unchanged: a refresh can replace credentials in place.
+        if changed
+            && let Err(e) = persist_merged_nodes(path, &content, &config)
+        {
+            tracing::warn!("failed to persist subscription nodes: {e:#}");
+        }
+        config
     } else {
-        resolve_config(parsed).await?
+        let mut config = parsed;
+        normalize_node_names(&mut config.nodes);
+        config
     };
-    // Persist subscription-fetched nodes back into the config file so other
-    // consumers that only read the file (e.g. the router Web UI's node list
-    // and active-node index) stay consistent with what sockrocket-cli runs. The
-    // write is Value-level: only the "nodes" key is replaced, every other
-    // (including router-specific) key is preserved verbatim.
-    if has_subscriptions
-        && config.nodes.len() != file_node_count
-        && let Err(e) = persist_merged_nodes(path, &content, &config)
-    {
-        tracing::warn!("failed to persist subscription nodes: {e:#}");
-    }
     Ok(config)
 }
 
-/// Replace only the "nodes" section of the config file with the merged node
-/// list, preserving all other keys (mode, dns_*, comments are lost but
-/// unknown keys survive).
-fn persist_merged_nodes(path: &str, original_content: &str, config: &AppConfig) -> Result<()> {
-    let mut value: serde_yaml::Value = serde_yaml::from_str(original_content)?;
-    if let serde_yaml::Value::Mapping(map) = &mut value {
-        map.insert(
-            serde_yaml::Value::String("nodes".to_string()),
-            serde_yaml::to_value(&config.nodes)?,
-        );
-        let tmp = format!("{path}.tmp");
-        fs::write(&tmp, serde_yaml::to_string(&value)?)?;
-        fs::rename(&tmp, path)?;
-    }
-    Ok(())
+/// Persist the resolved subscription state while retaining router-only keys.
+fn persist_merged_nodes(path: &str, _original_content: &str, config: &AppConfig) -> Result<()> {
+    sockrocket_core::config::storage::write_nodes_and_subscriptions(Path::new(path), config)
 }
 
 /// Merge subscription-fetched nodes into the config and normalize names.
@@ -800,58 +801,43 @@ fn persist_merged_nodes(path: &str, original_content: &str, config: &AppConfig) 
 /// list each time until /jffs fills up. Duplicates (same server/port/
 /// credentials/transport, whatever the display name) collapse to the first
 /// occurrence, which is the older entry.
-async fn resolve_config(mut config: AppConfig) -> Result<AppConfig> {
-    if !config.subscriptions.is_empty() {
-        tracing::info!(
-            "Fetching {} subscription(s) from config",
-            config.subscriptions.len()
-        );
+async fn resolve_config(mut config: AppConfig) -> Result<(AppConfig, bool)> {
+    tracing::info!(
+        "Fetching {} subscription(s) from config",
+        config.subscriptions.len()
+    );
 
-        let mut merged_nodes = config.nodes.clone();
-        for subscription in &config.subscriptions {
-            match fetch_subscription(subscription).await {
-                Ok(mut nodes) => {
-                    if nodes.is_empty() {
-                        tracing::warn!(
-                            "Subscription '{}' fetched OK but produced 0 nodes (check format / content)",
-                            subscription.name
-                        );
-                    } else {
-                        tracing::info!(
-                            "Fetched {} node(s) from subscription '{}'",
-                            nodes.len(),
-                            subscription.name
-                        );
-                    }
-                    merged_nodes.append(&mut nodes);
-                }
-                Err(e) => {
-                    // One bad URL must not prevent the daemon (or other subs) from starting.
-                    tracing::error!(
-                        "failed to fetch subscription '{}': {e:#}",
-                        subscription.name
-                    );
-                }
+    let mut refreshed = Vec::new();
+    for subscription in &config.subscriptions {
+        match fetch_subscription(subscription).await {
+            Ok(nodes) if nodes.is_empty() => {
+                tracing::warn!(
+                    "Subscription '{}' fetched OK but produced 0 nodes (check format / content)",
+                    subscription.name
+                );
+            }
+            Ok(nodes) => {
+                tracing::info!(
+                    "Fetched {} node(s) from subscription '{}'",
+                    nodes.len(),
+                    subscription.name
+                );
+                refreshed.push((subscription.url.clone(), nodes));
+            }
+            Err(e) => {
+                // One bad URL must not prevent the daemon (or other subs) from starting.
+                // Nodes already saved for that URL stay on disk.
+                tracing::error!(
+                    "failed to fetch subscription '{}': {e:#}",
+                    subscription.name
+                );
             }
         }
-
-        let before = merged_nodes.len();
-        let removed = sockrocket_core::dedup_nodes(&mut merged_nodes);
-        if removed > 0 {
-            tracing::info!(
-                "Deduplicated {} node(s) after merging subscriptions ({} → {})",
-                removed,
-                before,
-                merged_nodes.len()
-            );
-        }
-        config.nodes = merged_nodes;
     }
 
-    // Normalize node names (URL decode)
+    let changed = apply_subscription_refresh(&mut config, refreshed);
     normalize_node_names(&mut config.nodes);
-
-    Ok(config)
+    Ok((config, changed))
 }
 
 /// Validate a hot-reloaded config end-to-end (active index, outbound
@@ -951,7 +937,7 @@ async fn collect_proxy_ips(config: &AppConfig, active_index: Option<usize>) -> V
     {
         let resolved = resolve_to_ips(&node.server);
         if resolved.is_empty() {
-            tracing::warn!("Could not resolve proxy server: {}", node.server);
+            tracing::warn!("Could not resolve configured proxy server");
         }
         ips.extend(resolved);
     }

@@ -12,6 +12,87 @@ use std::collections::HashSet;
 
 use super::model::*;
 
+/// `Node.extra` key that records which subscription URL produced the node.
+pub const SUB_URL_EXTRA_KEY: &str = "sub_url";
+
+/// Stamp fetched nodes with the subscription URL they came from so a later
+/// refresh or delete can replace just that source.
+pub fn tag_subscription_nodes(nodes: &mut [Node], url: &str) {
+    for node in nodes {
+        node.extra
+            .insert(SUB_URL_EXTRA_KEY.to_string(), url.to_string());
+    }
+}
+
+/// Replace nodes belonging to subscriptions that just refreshed.
+///
+/// Fresh nodes win fingerprint ties, so an updated password replaces the
+/// saved copy. Hand-added nodes (no subscription tag) and nodes from a
+/// subscription that failed to refresh stay. Returns whether anything was
+/// applied. Also records `last_updated` on the refreshed subscriptions and
+/// keeps `active_node` pointing at the same server when it still exists.
+pub fn apply_subscription_refresh(
+    config: &mut AppConfig,
+    refreshed: Vec<(String, Vec<Node>)>,
+) -> bool {
+    if refreshed.is_empty() {
+        return false;
+    }
+    let active_fp = config
+        .active_node
+        .and_then(|index| config.nodes.get(index))
+        .map(node_fingerprint);
+    let urls: HashSet<String> = refreshed.iter().map(|(url, _)| url.clone()).collect();
+    let mut kept = std::mem::take(&mut config.nodes);
+    kept.retain(|node| match node.extra.get(SUB_URL_EXTRA_KEY) {
+        Some(url) => !urls.contains(url),
+        None => true,
+    });
+    let mut merged = Vec::new();
+    for (url, mut nodes) in refreshed {
+        tag_subscription_nodes(&mut nodes, &url);
+        merged.append(&mut nodes);
+    }
+    merged.append(&mut kept);
+    dedup_nodes(&mut merged);
+    uniquify_node_names(&mut merged);
+    config.nodes = merged;
+    config.active_node = active_fp.and_then(|fingerprint| {
+        config
+            .nodes
+            .iter()
+            .position(|node| node_fingerprint(node) == fingerprint)
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for subscription in &mut config.subscriptions {
+        if urls.contains(&subscription.url) {
+            subscription.last_updated = Some(now);
+        }
+    }
+    true
+}
+
+/// Drop one subscription and the nodes it produced. Untagged nodes stay.
+pub fn remove_subscription_nodes(config: &mut AppConfig, url: &str) {
+    let active_fp = config
+        .active_node
+        .and_then(|index| config.nodes.get(index))
+        .map(node_fingerprint);
+    config
+        .nodes
+        .retain(|node| node.extra.get(SUB_URL_EXTRA_KEY).map(String::as_str) != Some(url));
+    config.subscriptions.retain(|subscription| subscription.url != url);
+    config.active_node = active_fp.and_then(|fingerprint| {
+        config
+            .nodes
+            .iter()
+            .position(|node| node_fingerprint(node) == fingerprint)
+    });
+}
+
 /// Stable fingerprint for a node, covering protocol + address + port +
 /// credentials + transport identity (but not the display name or other
 /// cosmetic metadata).

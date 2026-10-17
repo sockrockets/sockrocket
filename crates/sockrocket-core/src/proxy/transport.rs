@@ -958,11 +958,7 @@ impl ConnFactory for TlsConnFactory {
                     // Retry once with a classic-X25519-only ClientHello, and
                     // remember it so the next connection to this server skips
                     // the doomed first attempt entirely.
-                    tracing::info!(
-                        "REALITY fallback detected for {}:{}, retrying with classic X25519 share",
-                        self.server,
-                        self.port
-                    );
+                    tracing::info!("REALITY fallback detected, retrying with classic X25519 share");
                     if let Some(n) = probe_notify.take() {
                         finish_reality_probe(&self.server, self.port, n, true);
                     } else {

@@ -202,8 +202,8 @@ async fn probe_once(
                         Some(outbound) => {
                             setup.swappable.set(outbound);
                             tracing::info!(
-                                "health check: auto-switched to '{}' ({} ms)",
-                                node.name,
+                                "health check: auto-switched to node index {} ({} ms)",
+                                index,
                                 ms
                             );
                             let _ = events_tx.send(Some(HealthEvent::AutoSwitched {

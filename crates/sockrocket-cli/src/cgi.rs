@@ -268,7 +268,8 @@ fn conf_str(map: &Mapping, key: &str) -> Option<String> {
 fn conf_u16(map: &Mapping, key: &str, default: u16) -> u16 {
     map.get(ykey(key))
         .and_then(|v| v.as_u64())
-        .map(|n| n as u16)
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|port| *port > 0)
         .unwrap_or(default)
 }
 
@@ -364,6 +365,11 @@ fn read_only_action(action: &str) -> bool {
     matches!(
         action,
         "status"
+            | "speedtest"
+            | "speedtest_node"
+            | "ip_check"
+            | "check_update"
+            | "diagnose"
             | "nodes"
             | "log"
             | "config"
@@ -383,7 +389,7 @@ pub use http::{DEFAULT_API_PORT, serve_api};
 // === Actions ===
 
 fn dispatch(action: &str, post: &J) -> J {
-    let _transaction = if read_only_action(action) {
+    let _transaction = if action == "stop" || read_only_action(action) {
         None
     } else {
         match storage::MutationGuard::acquire() {
@@ -506,10 +512,10 @@ fn act_stop() -> J {
         return err_msg(&error.to_string());
     }
     // Belt: if DNS hijack / MARK rules somehow survived stop, force restore.
-    if dnsmasq_hijack_conf().exists()
-        && let Err(error) = run_sh("network-restore")
-    {
-        return err_msg(&error.to_string());
+    if dnsmasq_hijack_conf().exists() {
+        if let Err(error) = run_sh("network-restore") {
+            return err_msg(&error.to_string());
+        }
     }
     let stopped = !is_running();
     let hijack_gone = !dnsmasq_hijack_conf().exists();
@@ -528,7 +534,10 @@ fn act_stop() -> J {
 }
 
 fn act_restart() -> J {
-    if let Err(error) = run_sh("restart") {
+    // An explicit Restart action may start a stopped service. Background
+    // settings updates still use restart and preserve the stopped marker.
+    let action = if is_running() { "restart" } else { "start" };
+    if let Err(error) = run_sh(action) {
         return err_msg(&error.to_string());
     }
     std::thread::sleep(Duration::from_secs(1));
@@ -630,10 +639,10 @@ fn act_save_config(post: &J) -> J {
     {
         return err_msg(&format!("Failed to persist config: {error}"));
     }
-    if is_running()
-        && let Err(error) = run_sh("restart")
-    {
-        return err_msg(&error.to_string());
+    if is_running() {
+        if let Err(error) = run_sh("restart") {
+            return err_msg(&error.to_string());
+        }
     }
     json!({"ok": true, "msg": "Config saved and validated"})
 }
@@ -697,35 +706,31 @@ fn fetch_sub_nodes(
     })
 }
 
-/// Replace the `nodes` key in config.yaml with `existing ∪ extra` (deduped),
-/// preserving every other key. Returns the final node count.
-fn merge_and_persist_nodes(extra: Vec<sockrocket_core::Node>) -> Result<usize, String> {
+/// Write nodes, subscription URLs, and the active index back into config.yaml
+/// without dropping router-only keys. Returns the saved node count.
+fn persist_subscription_state(cfg: &sockrocket_core::AppConfig) -> Result<usize, String> {
+    sockrocket_core::config::storage::write_nodes_and_subscriptions(&conf_path(), cfg)
+        .map_err(|e| format!("Failed to persist config: {e}"))?;
+    Ok(cfg.nodes.len())
+}
+
+fn load_app_config() -> Result<sockrocket_core::AppConfig, String> {
     let content =
         fs::read_to_string(conf_path()).map_err(|e| format!("Failed to read config: {e}"))?;
-    let mut cfg: sockrocket_core::AppConfig =
-        serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))?;
-    cfg.nodes.extend(extra);
-    sockrocket_core::dedup_nodes(&mut cfg.nodes);
-    sockrocket_core::uniquify_node_names(&mut cfg.nodes);
-    let count = cfg.nodes.len();
-    let mut value: Y =
-        serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))?;
-    let Y::Mapping(map) = &mut value else {
-        return Err("Config root is not a mapping".into());
-    };
-    map.insert(
-        ykey("nodes"),
-        serde_yaml::to_value(&cfg.nodes).map_err(|e| format!("Serialize nodes failed: {e}"))?,
-    );
-    let out = serde_yaml::to_string(&value).map_err(|e| format!("Serialize config failed: {e}"))?;
-    sockrocket_core::config::storage::atomic_write_private(&conf_path(), &out, true)
-        .map_err(|e| format!("Failed to persist config: {e}"))?;
-    Ok(count)
+    serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))
 }
 
 fn act_add_sub(post: &J) -> J {
-    let name = post.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let url = post.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let name = post
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let url = post
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let format = post
         .get("format")
         .and_then(|v| v.as_str())
@@ -740,6 +745,20 @@ fn act_add_sub(post: &J) -> J {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
+    if !matches!(format, "auto" | "clash" | "v2ray" | "singbox" | "sing-box") {
+        return err_msg("Unsupported subscription format");
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://"))
+        || url.chars().any(char::is_whitespace)
+    {
+        return err_msg("Subscription URL must be HTTP or HTTPS without whitespace");
+    }
+    if seq
+        .iter()
+        .any(|item| item.get(ykey("url")).and_then(Y::as_str) == Some(url))
+    {
+        return err_msg("This subscription already exists; update the existing entry");
+    }
     seq.push(sub_entry(name, url, format));
     map.insert(ykey("subscriptions"), Y::Sequence(seq));
     if let Err(e) = save_conf(&map) {
@@ -756,14 +775,22 @@ fn act_add_sub(post: &J) -> J {
         }),
         Ok(nodes) => {
             let fetched = nodes.len();
-            match merge_and_persist_nodes(nodes) {
+            let saved = (|| {
+                let mut cfg = load_app_config()?;
+                sockrocket_core::apply_subscription_refresh(
+                    &mut cfg,
+                    vec![(url.to_string(), nodes)],
+                );
+                persist_subscription_state(&cfg)
+            })();
+            match saved {
                 Ok(total) => {
                     if let Err(error) = run_sh("restart") {
                         return err_msg(&error.to_string());
                     }
                     json!({
                         "ok": true,
-                        "msg": format!("Parsed {fetched} node(s) (total {total}); restarting…"),
+                        "msg": format!("Parsed {fetched} node(s) (total {total}); settings applied"),
                         "node_count": total
                     })
                 }
@@ -789,19 +816,15 @@ fn act_del_sub(post: &J) -> J {
     else {
         return err_msg("Invalid parameters");
     };
-    let Ok(mut map) = load_conf() else {
+    let Ok(mut cfg) = load_app_config() else {
         return err_msg("Config file not found");
     };
-    let mut seq = match map.remove(ykey("subscriptions")) {
-        Some(Y::Sequence(s)) => s,
-        _ => Vec::new(),
+    let Some(url) = cfg.subscriptions.get(index).map(|sub| sub.url.clone()) else {
+        return err_msg("Subscription index out of range");
     };
-    if index < seq.len() {
-        seq.remove(index);
-    }
-    map.insert(ykey("subscriptions"), Y::Sequence(seq));
-    match save_conf(&map) {
-        Ok(()) => json!({"ok": true, "msg": "Subscription deleted"}),
+    sockrocket_core::remove_subscription_nodes(&mut cfg, &url);
+    match persist_subscription_state(&cfg) {
+        Ok(_) => json!({"ok": true, "msg": "Subscription deleted"}),
         Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
     }
 }
@@ -855,7 +878,7 @@ fn act_update_subs() -> J {
         return err_msg("No subscriptions configured");
     }
 
-    let mut all = Vec::new();
+    let mut refreshed = Vec::new();
     let mut errors = Vec::new();
     for s in &subs {
         let get = |k: &str| match s.get(ykey(k)) {
@@ -875,12 +898,12 @@ fn act_update_subs() -> J {
             Ok(nodes) if nodes.is_empty() => {
                 errors.push(format!("'{name}': parsed 0 nodes"));
             }
-            Ok(mut nodes) => all.append(&mut nodes),
+            Ok(nodes) => refreshed.push((url, nodes)),
             Err(e) => errors.push(format!("'{name}': {e}")),
         }
     }
 
-    if all.is_empty() {
+    if refreshed.is_empty() {
         let detail = if errors.is_empty() {
             "no nodes returned".into()
         } else {
@@ -893,8 +916,13 @@ fn act_update_subs() -> J {
         });
     }
 
-    let fetched = all.len();
-    match merge_and_persist_nodes(all) {
+    let fetched: usize = refreshed.iter().map(|(_, nodes)| nodes.len()).sum();
+    let saved = (|| {
+        let mut cfg = load_app_config()?;
+        sockrocket_core::apply_subscription_refresh(&mut cfg, refreshed);
+        persist_subscription_state(&cfg)
+    })();
+    match saved {
         Ok(total) => {
             if let Err(error) = run_sh("restart") {
                 return err_msg(&error.to_string());
@@ -906,7 +934,7 @@ fn act_update_subs() -> J {
             };
             json!({
                 "ok": true,
-                "msg": format!("Updated {fetched} node(s) (total {total}); restarting…{warn}"),
+                "msg": format!("Updated {fetched} node(s) (total {total}); settings applied{warn}"),
                 "node_count": total
             })
         }
@@ -1091,7 +1119,11 @@ fn act_add_node(post: &J) -> J {
     };
     let name = get("name");
     let server = get("server");
-    let port = post.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let port = post
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .and_then(|port| u16::try_from(port).ok())
+        .unwrap_or(0);
     let password = get("password");
     let uuid = get("uuid");
     let cipher = get("cipher");
@@ -1208,10 +1240,10 @@ fn act_set_mode(post: &J) -> J {
     map.insert(ykey("mode"), Y::String(mode.to_string()));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": "Mode set; takes effect after restart"})
         }
@@ -1712,10 +1744,10 @@ fn act_set_direct_server(post: &J) -> J {
     map.insert(ykey("dns_direct_server"), Y::String(server.to_string()));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": format!("DNS server updated to {server}; takes effect after restart")})
         }
@@ -1974,10 +2006,10 @@ fn act_add_rule(post: &J) -> J {
         Ok(()) => {
             // The TUN-side rule override reads the router built at daemon
             // start, so rules need a full restart to take effect there.
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": format!("Added {rule_type} {pattern} -> {target} (takes effect after service restart)")})
         }
@@ -2007,10 +2039,10 @@ fn act_del_rule(post: &J) -> J {
     map.insert(ykey("rules"), Y::Sequence(seq));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": "Deleted (takes effect after service restart)"})
         }
@@ -2057,10 +2089,10 @@ fn act_move_rule(post: &J) -> J {
     map.insert(ykey("rules"), Y::Sequence(seq));
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": "Order updated (takes effect after service restart)"})
         }
@@ -2143,10 +2175,10 @@ fn act_batch_add_rules(post: &J) -> J {
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             let mut msg = format!(
                 "Batch: +{} added, {} replaced, {} duplicates (from {} parsed)",
@@ -2185,10 +2217,10 @@ fn act_apply_rule_scene(post: &J) -> J {
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({
                 "ok": true,
@@ -2238,10 +2270,10 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({
                 "ok": true,
@@ -2355,10 +2387,10 @@ fn act_replace_rule_group(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": format!("Saved group ({n} rule(s))")})
         }
@@ -2385,10 +2417,10 @@ fn act_delete_rule_group(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
+            if is_running() {
+                if let Err(error) = run_sh("restart") {
+                    return err_msg(&error.to_string());
+                }
             }
             json!({"ok": true, "msg": format!("Removed {removed} rule(s) from group")})
         }
@@ -2466,35 +2498,53 @@ fn act_apply_update() -> J {
     }
 
     let bin = sockrocket_dir().join("sockrocket-cli");
-    let was_running = is_running();
-    if was_running && let Err(error) = run_sh("stop") {
-        return err_msg(&error.to_string());
+    // Stage on the destination filesystem before stopping anything. A full
+    // JFFS must leave the old executable intact (also avoids ETXTBSY while
+    // this API process is executing that file).
+    let staged = bin.with_file_name(format!("sockrocket-cli.update-{}", rand::random::<u64>()));
+    let prepare = (|| -> std::io::Result<()> {
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&staged)?;
+        let mut input = fs::File::open(&dest)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepare {
+        let _ = fs::remove_file(&staged);
+        return err_msg(&format!("Cannot stage update; installed program unchanged: {error}"));
     }
-    // Preserve mode bits when possible.
-    let mode = fs::metadata(&bin).ok().map(|m| m.permissions());
-    if let Err(e) = fs::copy(&dest, &bin) {
-        let _ = fs::remove_file(&dest);
-        if was_running && let Err(error) = run_sh("start") {
+    let was_running = is_running();
+    if was_running {
+        if let Err(error) = run_sh("stop") {
+            let _ = fs::remove_file(&staged);
             return err_msg(&error.to_string());
         }
-        return err_msg(&format!("Failed to replace binary: {e}"));
+    }
+    // Only rename touches the installed executable; failed staging and failed
+    // rename both preserve it. The download in the temporary directory is
+    // removed only after installation succeeds.
+    if let Err(error) = fs::rename(&staged, &bin) {
+        let _ = fs::remove_file(&staged);
+        if was_running {
+            let _ = run_sh("start");
+        }
+        return err_msg(&format!("Failed to install update; previous binary retained: {error}"));
     }
     let _ = fs::remove_file(&dest);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = mode.unwrap_or_else(|| fs::Permissions::from_mode(0o755));
-        let mut p = perms;
-        p.set_mode(p.mode() | 0o111);
-        let _ = fs::set_permissions(&bin, p);
-    }
     // Record package version for the Web UI.
     let _ = fs::write(
         sockrocket_dir().join("version"),
         format!("{}\n", check.latest),
     );
-    if was_running && let Err(error) = run_sh("start") {
-        return err_msg(&error.to_string());
+    if was_running {
+        if let Err(error) = run_sh("start") {
+            return err_msg(&error.to_string());
+        }
     }
     // Restart API after the HTTP response is flushed — killing ourselves
     // mid-write drops the WebUI reply.
