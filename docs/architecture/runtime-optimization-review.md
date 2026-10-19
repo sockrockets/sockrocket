@@ -1,0 +1,67 @@
+# Runtime optimization review
+
+This review covers listener ownership, subscriptions, desktop recovery, TUN resource limits, caches, connection pools, health checks, observability, and protocol coverage. The changes below are local candidates, not a claim that every issue has been eliminated. No live network configuration or running application was changed during this review.
+
+## Implemented candidates
+
+| Priority | Area | Confirmed weakness | Change |
+| --- | --- | --- | --- |
+| P1 | Listener lifecycle | HTTP/SOCKS handlers were detached from their listener and could survive Stop | Own handlers in a JoinSet; cancel and join children when stopping or failing |
+| P1 | Admission | Local proxy listeners accepted unlimited connection tasks | Share a memory-tier semaphore across HTTP/SOCKS listeners; release slots through RAII, including cancellation |
+| P1 | Handshakes | Partial HTTP headers and SOCKS negotiation could wait indefinitely | Apply a ten-second negotiation deadline; established transfers are not subject to that deadline |
+| P1 | Runtime state | Listener failure could leave the service reporting Connected | Publish listener errors, stop the peer listener, and observe failure in CLI and desktop owners; desktop reuses its existing proxy cleanup and TUN-stop path |
+| P1 | Statistics | Failed/cancelled connections could remain marked active; insertion could race record finalization | Finalize records with ownership guards; compute ring offsets under the insertion lock |
+| P1 | Subscription memory | Downloads buffered an unlimited body before parsing | Check declared length and streamed bytes against an 8 MiB body limit, including chunked responses |
+| P1 | Subscription retention | An empty successful response could replace saved nodes with nothing | Reject empty fetched results and ignore empty refresh batches in the shared merge operation |
+| P1 | Subscription concurrency | Refresh results used an old list index after subscription deletion/reordering | Track in-flight refreshes by source URL, resolve the current row at completion, and discard success for a deleted source |
+| P2 | Selection | Display-name changes during refresh could lose active/selected references | Restore desktop node selection by the existing stable fingerprint |
+| P2 | Desktop input | Byte truncation could panic on a non-ASCII subscription URL; large refresh intervals could overflow | Truncate at character boundaries and use saturating interval conversion |
+| P2 | Cache residency | Expired server-address entries stayed resident without a capacity limit | Evict expired entries on insertion and cap the cache at 1,024 entries, evicting the oldest entry when full |
+| P2 | Pre-connect work | Connection-pool factories had no pool-level deadline | Bound foreground and background factory calls with the common upstream connection deadline |
+| P2 | Probe fan-out | Automatic failover created one live probe task per candidate node | Schedule at most four live candidate probes and continue cancellation through the existing health-monitor shutdown path |
+| P1 | Privacy | Plain HTTP forwarding retained Proxy-Authorization and logged full query paths | Remove proxy credentials before forwarding to origins and omit URL paths/queries from that debug event |
+| P2 | Cache privacy | REALITY fallback endpoints were persisted through a non-atomic ordinary write | Use the existing atomic private-file writer rather than an ordinary temporary-file write |
+
+The subscription limit bounds downloaded body bytes, not the entire parser's memory footprint. Four concurrent failover probes trade lower peak load for a longer full scan on large subscriptions. The address cache is bounded and expiry-aware, not a full adaptive DNS cache. These distinctions matter when measuring results.
+
+## P1/P2 follow-up implementation
+
+All rows below describe local source changes. Platform acceptance and router soak testing remain separate release gates.
+
+| Priority | Area | Implemented behavior | Focused evidence |
+| --- | --- | --- | --- |
+| P1 | TUN backpressure | Packet queues charge payload plus metadata against per-flow 64 KiB and global 8 MiB budgets. Bulk traffic cannot consume the final eighth reserved for DNS/control packets. Acceptance is bounded, with a separate 32-entry DNS queue and reserved session capacity. | Saturated bulk queues retain DNS admission and DNS packet delivery; queue credits return on cancellation. |
+| P1 | TCP receive ownership | Advertised receive windows account for application-queued data. Byte and chunk limits bound small-segment metadata too; receiver consumption reopens the window. Unordered and unacknowledged packet maps are bounded by count. | Slow-consumer byte integrity and zero-window/reopen checks; tiny-segment checks; existing FIN/reset/relay lifecycle cases. |
+| P1 | Queue scheduling | Blocked producers register only with the exhausted budget. Weak waiter ownership prevents cancelled task retention; round-robin wakeups avoid waking every flow on each dequeued packet. Device EOF/errors and a ten-second device-write stall terminate the stack instead of leaving an apparently live accept loop. | Credit release, cancellation, wakeup and lifecycle regressions. |
+| P1 | macOS proxy restoration | A versioned journal stores stable network-service IDs and exact HTTP, HTTPS, SOCKS and bypass values separately. Protocol groups restore only while their applied values still match. Other proxy/PAC/authentication fields and subsequent external edits remain intact. An originally absent empty proxy dictionary is removed. Writes are committed and verified before deleting the journal. | Pure ownership and journal round-trip cases; native compilation. No live system preferences were changed. |
+| P1 | Recovery authorization | macOS recovery authorization is transferred to the independent guardian over its inherited private pipe and acknowledged before takeover; it is never persisted or placed in arguments/logs. Root-owned guardians retain their existing recovery path. Authorization failure retains the recovery journal. | Compile validation. Force quit, authorization expiry and real service-switch acceptance are still required on an isolated setup. |
+| P2 | Traffic accounting | HTTP, SOCKS and TUN use incremental totals; recent rows show live bytes. Cancellation retains transferred bytes, and finalization does not double count them. Recent metadata remains capped at 120 rows. Completed and interrupted flow totals are separate. | Live/cancelled tunnel accounting, listener-stop and TUN relay checks. |
+| P2 | Plain HTTP | Hyper HTTP/1 parses every request, including subsequent requests to different authorities. Request/response bodies stream with framing and backpressure; hop-by-hop and proxy credential headers are removed, origin Host is regenerated, and requested upgrades preserve buffered bytes. Upstream drivers/tunnels belong to the accepted connection. | Different-authority keep-alive, chunked body, upgrade, privacy and stop-with-active-tunnel cases. |
+| P2 | SOCKS UDP | UDP ASSOCIATE belongs to its TCP control connection, validates the peer IP, pins the client port and rejects fragments. Each association has at most 16 destination flows; the process has at most 128 live UDP destination flows. Connect/send/idle waits are bounded. Closing TCP cancels destinations. | Loopback UDP request/reply and control-close cases. BIND remains explicitly unsupported. |
+| P2 | Capability reporting | Desktop settings and the capability document identify supported inbounds and partial features. Oversized TUN UDP writes fail explicitly rather than turning one datagram into silently truncated/partial writes. | Desktop compilation and datagram regressions. Full IPv6 transparent routing and UDP fragmentation are not advertised as complete. |
+| P2 | Subscription provenance | Deduplication combines source memberships and preserves independently imported manual copies. Refresh/delete removes only the affected memberships. Source URL and credential fingerprint remain stable identities across display-name changes; changing a source URL is a new source. Desktop and CLI reuse the merge operation. | Shared-source deletion, manual-copy retention and deleted-during-fetch cases. |
+| P2 | Durable refresh | Shared configuration transactions lock read/merge/commit, re-read current sources after downloads, discard deleted-source results and preserve unrelated router fields. Failover persistence resolves node identity against the current list instead of saving an obsolete index. Private atomic replacement remains the commit mechanism. | Core and CLI configuration regressions and private-file reopen checks. |
+| P2 | Desktop persistence | One background writer coalesces immutable snapshots. Only one UI acknowledgement waiter runs at a time. Normal quit and elevation handoff wait for durable completion with a bounded barrier; acknowledgements suppress file-watch reload only after commit. Save failure preserves the previous file and is surfaced in the UI. | A thousand rapid snapshots, failed-save recovery and a final quit-barrier snapshot using a temporary-file harness. |
+| P2 | Health coverage | Existing process/DNS/outbound checks are supplemented with anonymous TUN packet/receive occupancy, TCP states, closing age, admission rejection and relay completion counters. LAN reachability is explicitly unverified without a LAN probe. Failover has four live probes and a twenty-second total search budget, ordering known latencies first. | Regression checks and ARM64 compilation; no router/LAN acceptance or long soak performed for this candidate. |
+
+The packet budget is not a total process RSS limit: live relay buffers, bounded TCP state and protocol libraries also use memory. TCP application queues use the configured receive-byte cap plus a 64-chunk cap; default receive capacity is 16 KiB per flow. The stack bounds regular session entries at 1,024 with additional DNS headroom. These limits complement the memory-tier TUN admission quota.
+
+Normal quit can wait for persistence; an operating-system kill cannot run the UI's quit callback. The guardian handles network restoration independently, while the latest acknowledged configuration remains durable. Immediate force kill before an asynchronous save acknowledgement cannot guarantee the newest edit was committed. Real authorization expiry, simultaneous external proxy edits, Wi-Fi/Ethernet switching and host restart require isolated platform acceptance before a release claim.
+
+See [network capabilities](network-capabilities.md) for explicit protocol boundaries. A capability can remain unsupported without being reported as a successful connection.
+
+## Reference implementations and rationale
+
+- [Mihomo TCP lifecycle](https://github.com/MetaCubeX/mihomo/blob/Meta/tunnel/tunnel.go): scoped inbound and outbound cleanup. Its queue capacity is not equivalent to a global active-flow cap.
+- [Mihomo proxy providers](https://wiki.metacubex.one/config/proxy-providers/): provider download limits, source configuration and health-check controls. Its documented size limit is configurable and defaults to unlimited; the 8 MiB limit here is this project's conservative body budget, not a copied default.
+- [sing-box listen options](https://sing-box.sagernet.org/configuration/shared/listen/): explicit listener/network controls. The project should expose a truthful platform capability matrix instead of implicit behavior.
+- [Tokio JoinSet](https://docs.rs/tokio/latest/tokio/task/struct.JoinSet.html) and [Semaphore](https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html): structured task ownership and shared admission permits. Application shutdown still has to join cancelled tasks; merely allocating a semaphore is not cleanup.
+- [Tokio bidirectional relay](https://docs.rs/tokio/latest/tokio/io/fn.copy_bidirectional.html): independent half-close semantics. The preceding TCP repair uses this behavior; that repair is separate from the candidates in this review.
+
+## Validation and release boundaries
+
+Final local validation: **459 tests passed** — 379 core unit tests, 40 CLI/API tests, 2 vendored queue tests and 38 integration scenarios. Integration coverage includes live/cancelled traffic accounting, packet-budget saturation with DNS headroom, 500 UDP session replacements, subscription ownership/limits, a thousand queued persistence snapshots, HTTP framing/upgrades, UDP association ownership, and 20 TCP lifecycle/backpressure scenarios. Desktop compilation and the ARM64 musl release build both passed. The build retains pre-existing dependency warnings; no claim of warning-free dependencies is made.
+
+No live desktop quit/force-quit, system preferences mutation, router deployment/restart, throughput benchmark or extended fault-injection soak is part of this source-review run. Windows-specific locking has source/conditional compilation review but no Windows runner execution here. This is a verified local candidate, not a claim of complete operating-system or protocol coverage.
+
+Before release, validate stop/restart with active relays, subscriptions with thousands of nodes, mixed domestic/international video traffic, slow consumers, and proxy recovery on isolated network services. Keep raw logs, personal subscriptions, node credentials, local deployment artifacts and local-only test additions outside the publication set. Do not publish a release or move a tag solely because compilation passes.

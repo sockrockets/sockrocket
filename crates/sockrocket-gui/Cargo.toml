@@ -1,0 +1,32 @@
+[package]
+name = "sockrocket-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sockrocket_gui"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "sockrocket"
+path = "src/main.rs"
+# Unit tests for pure logic live in sockrocket-core / the thin lib (i18n); compiling
+# this GPUI binary in test mode overflows rustc's stack (macro expansion).
+test = false
+
+[build-dependencies]
+# Windows: embed .ico into the executable
+winresource = "0.1"
+
+[dependencies]
+sockrocket-core = { workspace = true }
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,9 @@
+{
+  "list": [
+    {
+      "path": "/",
+      "tdm-reservation": true,
+      "comment": "Sockrocket opts out of text and data mining for AI model training."
+    }
+  ]
+}

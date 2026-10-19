@@ -1,0 +1,46 @@
+name: Update repo About
+
+# Sets repository description, homepage, and topics.
+# Requires Actions → General → Workflow permissions = Read and write.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  about:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update description, homepage, topics
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DESC='Cross-platform Rust proxy client — native GUI, CLI & AsusWRT-Merlin plugin. SS / VMess / VLess / Trojan / TUIC / Hysteria2.'
+          HOME_URL='https://sockrockets.github.io/sockrocket/'
+
+          echo "Patching description + homepage..."
+          if gh api -X PATCH "repos/${{ github.repository }}" \
+            -f description="$DESC" \
+            -f homepage="$HOME_URL"; then
+            echo "Description OK"
+          else
+            echo "::warning::Could not patch description (need broader token / workflow write permission)"
+          fi
+
+          echo "Setting topics..."
+          if gh api -X PUT "repos/${{ github.repository }}/topics" \
+            -H "Accept: application/vnd.github+json" \
+            --input - <<'EOF'
+          {"names":["proxy","rust","gui","shadowsocks","vmess","vless","trojan","hysteria2","tuic","asuswrt-merlin","socks5","transparent-proxy"]}
+          EOF
+          then
+            echo "Topics OK"
+          else
+            echo "::warning::Could not set topics"
+            exit 1
+          fi
+
+          gh api "repos/${{ github.repository }}" --jq '{description,homepage,topics}'

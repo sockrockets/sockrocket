@@ -1,0 +1,163 @@
+# Sockrocket
+
+<p align="center">
+  <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket" width="320" />
+</p>
+<p align="center"><strong>One Rust proxy engine, from desktop to router.</strong></p>
+<p align="center">Native desktop client · CLI · AsusWRT-Merlin plugin</p>
+<p align="center"><strong>English</strong> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.zh.md">中文</a></p>
+<p align="center">
+  <a href="https://sockrockets.github.io/sockrocket/">Website</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
+  <a href="https://github.com/sockrockets/sockrocket/releases/latest">Download</a> ·
+  <a href="docs/getting-started.md">Get started</a> ·
+  <a href="docs/merlin.md">Merlin guide</a> ·
+  <a href="https://github.com/sockrockets/sockrocket/issues">Report a bug</a>
+</p>
+
+Sockrocket brings nodes, subscriptions, routing rules and traffic capture into one client. Its desktop interface follows the grouped layout of macOS System Settings; the CLI and Merlin plugin share the same Rust protocol engine.
+
+> **About the images:** desktop illustrations follow the project's Figma direction and use synthetic data; released layouts may differ. The Merlin image is a sanitized capture of the actual management interface, with nodes, addresses, SSIDs and credentials hidden before export.
+
+![Overview design preview: connection status, traffic and system proxy controls](docs/images/readme/overview.png)
+
+## What it does
+
+| Capability | Purpose |
+| --- | --- |
+| Native protocols | Shadowsocks, VMess, VLESS, Trojan, TUIC, Hysteria2, AnyTLS and WireGuard |
+| Nodes and subscriptions | Import node links or Clash / V2Ray / sing-box subscriptions; update, search, deduplicate and test latency |
+| Routing | Rule, Global and Direct modes; domain, IP, GeoIP and port rules |
+| Policy groups | Manual selection, URL testing and failover |
+| Traffic capture | System proxy for compatible apps; TUN for broader capture |
+| Connections and logs | Inspect connection state, traffic counters and diagnostic messages |
+| Shared engine | Desktop GUI, CLI and Merlin WebUI |
+| Languages | English, Tiếng Việt and 中文 |
+
+Protocol combinations have limits: ShadowTLS does not provide UDP; native VMess and WireGuard UDP have per-packet size limits. Vision and gRPC/XHTTP are not implemented and fail explicitly. See the [protocol guide](docs/protocols.md). Sockrocket does not provide proxy nodes or subscription services.
+
+## New protocols: AnyTLS and WireGuard
+
+> **Version scope:** these capabilities describe the current source. Packages on GitHub Releases follow their respective release notes.
+
+| Protocol | Capabilities | Current limits |
+| --- | --- | --- |
+| AnyTLS v2 | Native TLS, session reuse, TCP and UDP-over-TCP v2; share link, Clash and sing-box import | Certificates verified by default; UDP is carried over TCP |
+| WireGuard | Native userspace TCP / UDP, preshared keys and tunnel DNS; single-peer profile, Clash and sing-box import | One peer per node; UDP must fit the MTU; no IP fragmentation or profile scripts |
+
+Desktop, CLI and Merlin share these implementations and existing local configuration persistence. The WireGuard protocol path creates no additional OS interface and changes no system routes or DNS settings; application-level TUN capture is controlled separately. Both protocols have passed interoperability tests against independent servers.
+
+See the [protocol guide](docs/protocols.md) for formats, limits and the remaining Vision and gRPC/XHTTP work.
+
+## Interface previews
+
+### Keep sources separate from node selection
+
+Subscriptions manage where nodes come from; node selection chooses the current exit. Latency tests run through the proxy. Milliseconds describe response latency during the test, not download bandwidth.
+
+![Nodes design preview with fictional nodes, subscription sources and latency](docs/images/readme/nodes.png)
+
+### Inspect and edit routing rules
+
+Review match conditions, targets and enabled states. Use individual edits, groups and match testing to understand where traffic goes. Rule order and priority affect the result.
+
+![Routing design preview showing match conditions, targets and edit actions](docs/images/readme/rules.png)
+
+### Work with multiple rules as text
+
+Bulk paste and group editing help migrate existing rules. Check parsing, targets and conflict handling before saving. The example domain `example.com` is reserved for documentation.
+
+![Bulk rule design preview: text, validation and confirmation](docs/images/readme/rules-bulk.png)
+
+## Download and connect
+
+Choose the matching system and architecture from [GitHub Releases](https://github.com/sockrockets/sockrocket/releases/latest).
+
+| System | Desktop package |
+| --- | --- |
+| macOS · Apple Silicon | `sockrocket-macos-aarch64.dmg` |
+| macOS · Intel | `sockrocket-macos-x86_64.dmg` |
+| Windows · x86_64 | `sockrocket-windows-x86_64.zip` |
+| Linux · x86_64 | `sockrocket-linux-x86_64.tar.gz` |
+| Linux · ARM64 | `sockrocket-linux-aarch64.tar.gz` |
+
+1. Install and open the app. On macOS, drag it into Applications first. On Windows, extract the ZIP; on Linux, follow the package's install or portable-run instructions.
+2. Add your own subscription under **Subscriptions**, or import a link under **Nodes**.
+3. Update the subscription and select a node. Run a latency test if needed.
+4. Click **Connect** in **Overview**, wait for reachability verification, then check the system proxy state.
+5. Enable **TUN** only when broader capture is needed, and complete the operating system's administrator prompt.
+
+Before upgrading, quit the old client and its elevated background instance. Running two versions can occupy the same ports and compete for TUN routes.
+
+## AsusWRT-Merlin
+
+The router plugin includes a WebUI, transparent proxy, DNS capture and service checks, sharing the engine across LAN devices.
+
+![Actual Merlin management interface with nodes, addresses, SSIDs and credentials hidden](docs/images/readme/merlin.jpg)
+
+*Sanitized interface capture. Runtime metrics reflect the capture time, not live status.*
+
+1. Choose `sockrocket-merlin-<platform>.tar.gz` for the firmware platform and CPU architecture; do not guess from the model name alone.
+2. Follow the [Merlin guide](docs/merlin.md) to configure JFFS / custom scripts and install the package.
+3. Configure subscriptions locally on the router. Verify the node before enabling DNS capture or transparent proxy.
+4. Back up configuration before updates and verify manual stop / network recovery before relying on the setup.
+
+```sh
+/jffs/addons/sockrocket/scripts/sockrocket.sh status
+/jffs/addons/sockrocket/scripts/sockrocket.sh stop
+/jffs/addons/sockrocket/scripts/sockrocket.sh start
+```
+
+Platform selection, service control and recovery: [Merlin guide](docs/merlin.md) · [Technical reference](docs/merlin-reference.md).
+
+## System proxy or TUN?
+
+| Mode | Use it for | Considerations |
+| --- | --- | --- |
+| System proxy | Browsers and apps that follow OS proxy settings | Some apps ignore these settings |
+| TUN | Broader application traffic capture | Requires administrator privileges and TUN support; stop other TUN / VPN clients first |
+| CLI listener | Terminal tools or manually configured apps | Listens locally by default; configure the calling app |
+
+Default local listeners: SOCKS5 `127.0.0.1:1080` and HTTP `127.0.0.1:1087`. These are loopback listeners, not remote nodes.
+
+## Command line
+
+CLI downloads are on the same release page and start with `sockrocket-cli-`.
+
+```sh
+sockrocket-cli --init config.yaml
+# Edit the local config with your own subscription or nodes.
+sockrocket-cli config.yaml
+```
+
+Stop with `Ctrl+C`. See the [configuration reference](docs/configuration.md) for fields and safe examples. Never commit a configuration containing real credentials.
+
+## Troubleshooting
+
+| Symptom | Start here |
+| --- | --- |
+| Connect fails to start | Check old background instances, occupied local ports and the error log |
+| TUN will not start | Check administrator approval, driver support and another TUN owning the default route |
+| Connected, but websites fail | Check node reachability, system proxy / TUN, DNS and routing separately |
+| Subscription fails or returns no nodes | Inspect the URL, format, server response and parser result locally |
+| Only some websites fail | Check matched rules, the direct exit and DNS; avoid multiple clients capturing traffic |
+
+## Community & contact
+
+| | |
+| --- | --- |
+| [Telegram · @sockrocket](https://t.me/sockrocket) | Release announcements and project updates |
+| [GitHub Discussions](https://github.com/sockrockets/sockrocket/discussions) | Usage questions and feature ideas |
+| [GitHub Issues](https://github.com/sockrockets/sockrocket/issues) | Reproducible bug reports |
+| [Website](https://sockrockets.github.io/sockrocket/) | Product overview, downloads and docs |
+
+## Privacy and feedback
+
+Desktop design illustrations use fictional data; the Merlin capture is sanitized before export. Before sharing an Issue, log or screenshot, remove full subscription URLs and query strings, server addresses, passwords, UUIDs, tokens, QR codes, personal paths and account details. QR codes and share links can contain complete credentials.
+
+- [Issues](https://github.com/sockrockets/sockrocket/issues): bug reports.
+- [Discussions](https://github.com/sockrockets/sockrocket/discussions): questions and usage.
+- [Documentation index](docs/README.md): configuration, protocols, architecture and development.
+
+## License
+
+[Apache License 2.0](LICENSE). See [ai.txt](ai.txt), [robots.txt](robots.txt) and the [TDM declaration](.well-known/tdmrep.json) for the project's AI / ML training-use statements.

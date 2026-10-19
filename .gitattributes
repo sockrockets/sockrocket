@@ -1,0 +1,29 @@
+# Shell scripts run on the router's busybox and in WSL/Linux: a CRLF line
+# ending makes busybox report `$'\r': command not found` and abort, so the
+# working tree must stay LF regardless of the developer's core.autocrlf.
+*.sh   text eol=lf
+*.cgi  text eol=lf
+
+# Config/template files are also consumed verbatim by the firmware.
+*.conf        text eol=lf
+*.template    text eol=lf
+config.yaml*  text eol=lf
+
+# Web UI pages are HTML/JS served as-is.
+*.asp  text eol=lf
+
+# Rust and docs are LF everywhere anyway; pin them so a Windows checkout
+# cannot reintroduce CRLF into fixtures the tests compare byte-for-byte.
+*.rs   text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Binary artifacts must never be normalized.
+*.gz   binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.dll  binary
+*.so   binary

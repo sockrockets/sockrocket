@@ -1,0 +1,112 @@
+name: Seed welcome Discussion
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  discussions: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create welcome discussion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          NAME="${{ github.event.repository.name }}"
+
+          META=$(gh api graphql -f query='
+            query($owner:String!,$name:String!){
+              repository(owner:$owner,name:$name){
+                id
+                discussionCategories(first:20){nodes{id name}}
+              }
+            }' -f owner="$OWNER" -f name="$NAME")
+
+          REPO_ID=$(echo "$META" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["repository"]["id"])')
+          CAT_ID=$(echo "$META" | python3 -c '
+          import sys,json
+          nodes=json.load(sys.stdin)["data"]["repository"]["discussionCategories"]["nodes"]
+          ann=next((n["id"] for n in nodes if n["name"]=="Announcements"), None)
+          print(ann or nodes[0]["id"])
+          ')
+
+          BODY=$(cat <<'EOF'
+          ## Welcome / 欢迎
+
+          Sockrocket is an open-source Rust proxy client (GUI + CLI + AsusWRT-Merlin plugin).
+
+          Sockrocket 是开源 Rust 代理客户端（桌面 GUI / CLI + 华硕梅林插件）。
+
+          ### Links
+
+          | | |
+          |--|--|
+          | Releases | https://github.com/sockrockets/sockrocket/releases/tag/v0.1.0 |
+          | Website | https://sockrockets.github.io/sockrocket/ |
+          | Merlin guide | https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md |
+          | Telegram | https://t.me/sockrocket |
+          | Issues | https://github.com/sockrockets/sockrocket/issues |
+
+          ### Where to post / 发帖去哪
+
+          - **Q&A** — install / config / Merlin platform questions（安装、配置、机型包）
+          - **Ideas** — feature requests（功能建议）
+          - **Issues** — bugs and regressions（缺陷请用 Issues）
+
+          ### Merlin quick tip
+
+          Software Center → **Offline install** → upload matching `sockrocket-merlin-*.tar.gz`.  
+          Check `uname -m`: **`hnd`** (BCM675x) vs **`hnd_v8`** (BCM490x/491x) is the most common mistake.
+
+          ### Please don’t
+
+          Do not post subscription URLs, tokens, or personal identifiers in public threads.  
+          请勿公开粘贴订阅链接、token 或个人信息。
+          EOF
+          )
+
+          # Dedent body for GraphQL
+          BODY=$(echo "$BODY" | sed 's/^          //')
+
+          # Skip if a welcome post already exists
+          EXISTING=$(gh api graphql -f query='
+            query($owner:String!,$name:String!){
+              repository(owner:$owner,name:$name){
+                discussions(first:20){nodes{id title url}}
+              }
+            }' -f owner="$OWNER" -f name="$NAME")
+          if echo "$EXISTING" | grep -q 'Welcome — Sockrocket'; then
+            echo "Welcome discussion already exists"
+            echo "$EXISTING" | python3 -c 'import sys,json
+          for n in json.load(sys.stdin)["data"]["repository"]["discussions"]["nodes"]:
+            if "Welcome" in n["title"]:
+              print(n["url"]); break'
+            exit 0
+          fi
+
+          CREATE=$(gh api graphql -f query='
+            mutation($repo:ID!,$category:ID!,$title:String!,$body:String!){
+              createDiscussion(input:{repositoryId:$repo,categoryId:$category,title:$title,body:$body}){
+                discussion{id url number}
+              }
+            }' -f repo="$REPO_ID" -f category="$CAT_ID" \
+              -f title='Welcome — Sockrocket v0.1.0 / 欢迎' \
+              -f body="$BODY")
+
+          echo "$CREATE"
+          DID=$(echo "$CREATE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["createDiscussion"]["discussion"]["id"])')
+          URL=$(echo "$CREATE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["createDiscussion"]["discussion"]["url"])')
+
+          gh api graphql -f query='
+            mutation($id:ID!){
+              updateDiscussion(input:{discussionId:$id,pinned:true}){
+                discussion{url isPinned}
+              }
+            }' -f id="$DID" || true
+
+          echo "Created: $URL"

@@ -1,0 +1,530 @@
+#!/bin/sh
+# Sockrocket iptables transparent proxy rules for AsusWRT-Merlin
+#
+# TCP mode : REDIRECT → HTTP proxy port
+# UDP mode : ip route → TUN device (when TUN device exists)
+# DNS mode : redirect LAN port 53 → Sockrocket DNS port
+#
+# Usage: iptables.sh {start|stop|restart|status|verify}
+
+SOCKROCKET_DIR="/jffs/addons/sockrocket"
+SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
+
+# Service environments (API bridge, init hooks) may have a minimal PATH
+# without /usr/sbin — ipset/iptables live there. Pin it explicitly.
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+CHAIN="SOCKROCKET_PREROUTING"
+DNS_CHAIN="SOCKROCKET_DNS"
+MANGLE_CHAIN="SOCKROCKET_MANGLE"
+IPV6_CHAIN="SOCKROCKET_IPV6_GUARD"
+TUN_MARK=0x4765   # 'Ve' in hex
+# Policy-routing table for fwmark 0x4765. NOT table 100: on AsusWRT the
+# rt_tables file aliases table 100 → "wan0" (and 200 → wan1 for dual-WAN
+# failover), and firmware WAN events rewrite/flush that table — silently
+# destroying our `default dev sockrocket-tun` route (and conversely, our stop-path
+# `ip route flush table 100` would wipe the firmware's WAN routes). 5370
+# is unused firmware space ("Sockrocket" roughly spelled on a phone keypad).
+SOCKROCKET_RT_TABLE=5370
+
+# Kernel ipset holding the curated China IPv4 ranges (sockrocket-cli
+# --dump-cn-cidrs). When the `cn_ipset_direct` config toggle is on, LAN
+# packets whose destination is in this set RETURN from SOCKROCKET_MANGLE before
+# the MARK rules — domestic traffic keeps hardware NAT and never enters
+# the userspace TUN stack. Trade-off: domain-based user rules no longer
+# apply to destinations that resolve into the CN ranges (TUN never sees
+# those flows), which is why this is an opt-in toggle.
+IPSET_NAME="sockrocket_cn"
+
+# Read port from config dynamically (called at runtime, not parse time)
+get_conf() { grep "^${1}:" "$SOCKROCKET_CONF" 2>/dev/null | awk '{print $2}' | head -1 | tr -d '"'; }
+
+CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+info()  { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${CYAN}[Sockrocket-iptables] %s${NC}\n" "$*"; }
+ok()    { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${GREEN}[Sockrocket-iptables] ✓ %s${NC}\n" "$*"; }
+err()   { logger -t sockrocket-iptables -p daemon.err "$*"; printf "${RED}[Sockrocket-iptables] ✗ %s${NC}\n" "$*" >&2; }
+
+# LAN subnet from nvram. NOTE: `nvram get <key>` exits 0 even when the key
+# is unset and prints an empty string, so an `|| echo default` fallback does
+# NOT catch the empty case — an empty value would compute LAN_SUBNET as
+# 0.0.0.0/0 and mark ALL forwarded traffic into the TUN. Validate instead.
+_valid_ip4() {
+    case "$1" in *.*.*.*) ;; *) return 1 ;; esac
+    case "$1" in *[!0-9.]*|*..*|.*|*.) return 1 ;; esac
+    return 0
+}
+ROUTER_IP=$(nvram get lan_ipaddr 2>/dev/null)
+LAN_NETMASK=$(nvram get lan_netmask 2>/dev/null)
+_valid_ip4 "$ROUTER_IP"   || ROUTER_IP="192.168.1.1"
+_valid_ip4 "$LAN_NETMASK" || LAN_NETMASK="255.255.255.0"
+
+_ip2int() { echo "$1" | awk -F. '{print ($1*16777216)+($2*65536)+($3*256)+$4}'; }
+_int2cidr() {
+    # Octet-wise CIDR conversion — safe on 32-bit shells. The old shift loop
+    # (`bit=2147483648; bit>>=1`) overflows to a negative number in busybox
+    # ash and never reaches 0, spinning forever at script parse time.
+    local IFS=.
+    set -- $1
+    local cidr=0 o
+    for o in "$1" "$2" "$3" "$4"; do
+        case "$o" in
+            255) cidr=$((cidr+8)) ;;
+            254) cidr=$((cidr+7)) ;;
+            252) cidr=$((cidr+6)) ;;
+            248) cidr=$((cidr+5)) ;;
+            240) cidr=$((cidr+4)) ;;
+            224) cidr=$((cidr+3)) ;;
+            192) cidr=$((cidr+2)) ;;
+            128) cidr=$((cidr+1)) ;;
+            0)   ;;
+            *)   echo 24; return ;;  # non-contiguous mask: sane default
+        esac
+    done
+    echo "$cidr"
+}
+_network() {
+    local ip_int mask_int net a b c d
+    ip_int=$(_ip2int "$1"); mask_int=$(_ip2int "$2")
+    net=$((ip_int & mask_int))
+    a=$(( (net>>24)&255 )); b=$(( (net>>16)&255 ))
+    c=$(( (net>>8)&255  )); d=$(( net&255 ))
+    echo "$a.$b.$c.$d"
+}
+LAN_SUBNET="$(_network "$ROUTER_IP" "$LAN_NETMASK")/$(_int2cidr "$LAN_NETMASK")"
+
+detect_tun_dev() {
+    # Only ever the device sockrocket-cli itself creates. A generic "tun[0-9]" probe
+    # would happily match an OpenVPN/other-VPN device and then route the whole
+    # LAN into it — silently breaking connectivity through someone else's
+    # tunnel. If Sockrocket's own device is absent, report failure and let the caller
+    # skip transparent proxying.
+    if ip link show sockrocket-tun >/dev/null 2>&1; then
+        echo "sockrocket-tun"
+        return 0
+    fi
+    # Fallback for older builds that used the kernel-assigned tun0 name, but
+    # only when that device carries Sockrocket's gateway address — an OpenVPN device
+    # would not.
+    if ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2"; then
+        echo "tun0"
+        return 0
+    fi
+    return 1
+}
+
+# Load (or reload) the CN ipset and insert the bypass rule into SOCKROCKET_MANGLE
+# just before the first MARK rule. Idempotent: safe to call standalone
+# (`ipset-on`) while the chain is live, or from do_start on a fresh chain.
+do_ipset_start() {
+    # NOTE: probe ipset by invoking it — this router's minimal busybox sh
+    # (as spawned by the API bridge) lacks the `command` builtin, so the
+    # usual `command -v ipset` guard fails with 127 even when ipset exists.
+    ipset list >/dev/null 2>&1 || { err "ipset not available"; return 1; }
+    # ALWAYS recreate. `ipset create -exist` keeps the previous maxelem; an
+    # older 4096-cap set silently truncated the expanded CN list (~6k+) and
+    # CN destinations fell through to MARK → proxy.
+    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    if ! ipset create "$IPSET_NAME" hash:net family inet hashsize 4096 maxelem 32768 2>/dev/null; then
+        err "failed to create $IPSET_NAME"
+        return 1
+    fi
+    # One atomic restore instead of thousands of individual `ipset add` forks.
+    if ! "$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null \
+        | awk '{print "add '"$IPSET_NAME"' " $1}' \
+        | ipset restore 2>/dev/null; then
+        err "failed to populate $IPSET_NAME"
+        ipset destroy "$IPSET_NAME" 2>/dev/null || true
+        return 1
+    fi
+    local loaded want
+    loaded=$(ipset list "$IPSET_NAME" 2>/dev/null | grep -c '^[0-9]')
+    want=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null | wc -l)
+    want=$(echo "$want" | tr -d ' ')
+    if [ -n "$want" ] && [ "$want" -gt 0 ] && [ "$loaded" -lt "$want" ]; then
+        err "CN ipset truncated ($loaded/$want) — check maxelem"
+        return 1
+    fi
+    local mark_line
+    mark_line=$(iptables -t mangle -L "$MANGLE_CHAIN" --line-numbers -n 2>/dev/null \
+        | awk '/MARK/{print $1; exit}')
+    if [ -n "$mark_line" ]; then
+        iptables -t mangle -I "$MANGLE_CHAIN" "$mark_line" \
+            -m set --match-set "$IPSET_NAME" dst -j RETURN
+    else
+        iptables -t mangle -A "$MANGLE_CHAIN" \
+            -m set --match-set "$IPSET_NAME" dst -j RETURN
+    fi
+    ok "CN ipset direct applied ($IPSET_NAME, $loaded ranges)"
+}
+
+do_ipset_stop() {
+    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    ok "CN ipset direct removed"
+}
+
+# Merlin transparent routing is IPv4-only. DNS AAAA suppression alone cannot
+# prevent IPv6 literals, cached records or DoH from bypassing that routing.
+# Reject forwarded LAN IPv6 promptly while proxying; applications can retry
+# over IPv4. Router INPUT/OUTPUT and same-bridge LAN traffic stay untouched.
+ipv6_guard_needed() {
+    local mode
+    mode=$(nvram get ipv6_service 2>/dev/null)
+    case "$mode" in ""|disabled) ;; *) return 0 ;; esac
+    ip -6 route show default 2>/dev/null | grep -q . && return 0
+    ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '
+}
+
+ipv6_lan_interface() {
+    local iface
+    iface=$(nvram get lan_ifname 2>/dev/null)
+    iface=${iface:-br0}
+    case "$iface" in *[!a-zA-Z0-9_.:-]*) return 1 ;; esac
+    printf '%s\n' "$iface"
+}
+
+ipv6_guard_stop() {
+    local count=0
+    # Delete only our unqualified jump, including leftovers from old starts.
+    while [ "$count" -lt 32 ] && ip6tables -D FORWARD -j "$IPV6_CHAIN" 2>/dev/null; do
+        count=$((count + 1))
+    done
+    if ip6tables -C FORWARD -j "$IPV6_CHAIN" 2>/dev/null; then
+        err "IPv6 protection cleanup failed; owned FORWARD jump remains"
+        return 1
+    fi
+    ip6tables -F "$IPV6_CHAIN" 2>/dev/null || true
+    ip6tables -X "$IPV6_CHAIN" 2>/dev/null || true
+}
+
+ipv6_guard_start() {
+    ipv6_guard_needed || return 0
+    local iface
+    iface=$(ipv6_lan_interface) || { err "Invalid LAN interface for IPv6 protection"; return 1; }
+    if ! {
+        { ip6tables -N "$IPV6_CHAIN" 2>/dev/null || ip6tables -F "$IPV6_CHAIN"; } &&
+        ip6tables -A "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
+            -j REJECT --reject-with icmp6-adm-prohibited &&
+        ip6tables -I FORWARD 1 -j "$IPV6_CHAIN"
+    }; then
+        ipv6_guard_stop
+        err "IPv6 bypass protection unavailable — transparent proxy NOT enabled"
+        return 1
+    fi
+    ok "IPv4 proxy mode: external LAN IPv6 rejected for IPv4 fallback (restored on stop)"
+}
+
+ipv6_guard_verify() {
+    ipv6_guard_needed || return 0
+    local iface first
+    iface=$(ipv6_lan_interface) || return 1
+    ip6tables -C "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
+        -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || return 1
+    first=$(ip6tables -S FORWARD 2>/dev/null | sed -n '/^-A FORWARD /{p;q;}')
+    [ "$first" = "-A FORWARD -j $IPV6_CHAIN" ]
+}
+
+flush_chains() {
+    ipv6_guard_stop || return 1
+    # Flush proxy chains only. NEVER flush SOCKROCKET_DNS here: firewall-start
+    # (and every `iptables.sh start`) would wipe LAN :53 REDIRECT and never put
+    # it back — devices hard-coded to 8.8.8.8 then get GFW-poisoned answers
+    # until a full Sockrocket restart. DNS NAT is managed solely by dns-start /
+    # dns-stop / do_stop.
+    iptables -t nat -D PREROUTING -j SOCKROCKET_PREROUTING 2>/dev/null || true
+    iptables -t nat -F SOCKROCKET_PREROUTING 2>/dev/null || true
+    iptables -t nat -X SOCKROCKET_PREROUTING 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -j SOCKROCKET_MANGLE 2>/dev/null || true
+    iptables -t mangle -F SOCKROCKET_MANGLE 2>/dev/null || true
+    iptables -t mangle -X SOCKROCKET_MANGLE 2>/dev/null || true
+    info "Flushed existing Sockrocket proxy iptables chains"
+}
+
+do_start() {
+    # No-op cleanly when TUN is absent (firewall-start after reboot before the
+    # daemon is up). Do not flush anything in that case — preserves DNS NAT.
+    TUN_DEV=$(detect_tun_dev)
+    if [ -z "$TUN_DEV" ]; then
+        err "TUN device not found — transparent proxy NOT enabled (start sockrocket-cli with TUN first)"
+        return 1
+    fi
+    flush_chains || return 1
+
+    # Strict reverse-path filtering (firmware default: conf/default/rp_filter=1,
+    # inherited by sockrocket-tun at creation) drops every packet sockrocket-cli injects into
+    # the TUN: the packet's source is a public internet IP whose main-table
+    # route points out the WAN, not the TUN, so the kernel discards it and the
+    # whole LAN sees ERR_CONNECTION_TIMED_OUT with the proxy otherwise healthy.
+    # Loose mode (2) accepts sources reachable via ANY interface — exactly the
+    # TUN reinjection case. Effective rp_filter is max(all, iface), so fix
+    # conf/all too when it is strict.
+    # NOTE: write /proc directly — minimal busybox builds (Merlin) have no
+    # `sysctl` applet, so `sysctl -w ... || true` fails SILENTLY and leaves
+    # strict filtering in place (this exact bug blackholed the LAN once).
+    # sockrocket-cli also relaxes rp_filter itself right after creating the device;
+    # this is belt-and-braces for older binaries.
+    if [ -w "/proc/sys/net/ipv4/conf/$TUN_DEV/rp_filter" ]; then
+        echo 2 > "/proc/sys/net/ipv4/conf/$TUN_DEV/rp_filter" 2>/dev/null || true
+    fi
+    if [ "$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)" = "1" ]; then
+        echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || true
+    fi
+
+    info "Setting up transparent proxy rules (fwmark → $TUN_DEV)..."
+    info "LAN: $LAN_SUBNET  mark=$TUN_MARK"
+
+    if ! iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null \
+        && ! iptables -t mangle -F "$MANGLE_CHAIN"; then
+        err "Cannot create TUN mark chain"
+        return 1
+    fi
+    local dest proto
+    for dest in "$ROUTER_IP" 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 \
+        100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A "$MANGLE_CHAIN" -d "$dest" -j RETURN || {
+            flush_chains
+            return 1
+        }
+    done
+    # Capture QUIC only when the active node has a real datagram transport.
+    local udp_supported=0
+    if "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
+        udp_supported=1
+    else
+        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p udp --dport 443 -j RETURN || {
+            flush_chains
+            return 1
+        }
+    fi
+    # Optional: CN-range bypass BEFORE the MARK rules (hardware NAT for
+    # domestic traffic). Gated by the cn_ipset_direct config toggle.
+    if [ "$(get_conf cn_ipset_direct)" = "true" ]; then
+        do_ipset_start
+    fi
+    # Mark all other LAN-originated TCP+UDP; policy routing sends them into TUN.
+    for proto in tcp udp; do
+        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p "$proto" \
+            -j MARK --set-mark "$TUN_MARK" || {
+                flush_chains
+                return 1
+            }
+    done
+    # Stage routing before exposing MARK rules to LAN packets. Repeated
+    # firewall/WAN events must not accumulate identical policy rules.
+    if ! ip route replace default dev "$TUN_DEV" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; then
+        flush_chains
+        err "TUN route setup failed — LAN marking remains disabled"
+        return 1
+    fi
+    if ! ip rule show 2>/dev/null | grep -Eq "fwmark ${TUN_MARK}(/0xffffffff)? .*lookup ${SOCKROCKET_RT_TABLE}([[:space:]]|$)"; then
+        if ! ip rule add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; then
+            flush_chains
+            err "TUN policy rule setup failed — LAN marking remains disabled"
+            return 1
+        fi
+    fi
+
+
+    # Return-path forwarding: replies sockrocket-cli injects into the TUN (src =
+    # public internet IP, dst = LAN client) traverse the filter FORWARD
+    # chain, whose Merlin default ends in DROP after a `DROP state INVALID`
+    # rule. They normally pass via the ESTABLISHED accept — but conntrack
+    # entries expire while the userspace ipstack keeps long-lived sessions
+    # (its own timeout is longer), and every reply after expiry is INVALID
+    # and dropped: the flow hangs mid-transfer with no RST either way.
+    # Accept everything out of the TUN explicitly; the daemon only injects
+    # packets for flows it accepted, so this grants no new reachability.
+    if ! iptables -C FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null \
+        && ! iptables -I FORWARD 1 -i "$TUN_DEV" -j ACCEPT; then
+        flush_chains
+        err "TUN return-path forwarding unavailable"
+        return 1
+    fi
+
+    # Fake-IP replies injected through TUN need a reverse route back to TUN.
+    # An unreachable route breaks reverse-path validation on Merlin even when
+    # marked outbound packets use our private table. Keep unsupported UDP's
+    # explicit REJECT below rather than rejecting the entire Fake-IP prefix.
+    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
+    ip route del unreachable 198.18.0.0/16 2>/dev/null || true
+    if ! ip route replace 198.18.0.0/16 dev "$TUN_DEV"; then
+        flush_chains
+        err "Fake-IP reverse route unavailable"
+        return 1
+    fi
+    iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+        -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    if [ "$udp_supported" != 1 ]; then
+        iptables -I FORWARD 1 -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+            -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
+    fi
+    # Keep TUN return-path ACCEPT at the very top (above Fake-IP REJECT).
+    iptables -D FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null || true
+    if ! iptables -I FORWARD 1 -i "$TUN_DEV" -j ACCEPT; then
+        flush_chains
+        err "TUN return-path reordering failed"
+        return 1
+    fi
+
+    if ! ipv6_guard_start; then
+        flush_chains
+        return 1
+    fi
+
+    if ! iptables -t mangle -C PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null \
+        && ! iptables -t mangle -A PREROUTING -j "$MANGLE_CHAIN"; then
+        flush_chains
+        err "TUN mark-chain attach failed"
+        return 1
+    fi
+
+    ok "Transparent proxy applied (LAN TCP+UDP → $TUN_DEV)"
+}
+
+# DNS hijack: force ALL LAN DNS queries (any destination — many devices and
+# DHCP setups hard-code public resolvers like 8.8.8.8, whose UDP answers the
+# GFW poisons on the wire) into the router's own dnsmasq, which does the
+# china-split via Sockrocket's DNS listener. Without this, only clients that
+# voluntarily query the router get clean answers.
+# Router-originated queries traverse OUTPUT, not PREROUTING, so dnsmasq's own
+# upstreams (direct server + Sockrocket listener) are never looped back.
+do_dns_start() {
+    if ! {
+        { iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || iptables -t nat -F "$DNS_CHAIN"; } &&
+        iptables -t nat -A "$DNS_CHAIN" -d "$ROUTER_IP" -j RETURN &&
+        iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p udp --dport 53 -j REDIRECT --to-ports 53 &&
+        iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p tcp --dport 53 -j REDIRECT --to-ports 53 &&
+        { iptables -t nat -C PREROUTING -j "$DNS_CHAIN" 2>/dev/null ||
+          iptables -t nat -A PREROUTING -j "$DNS_CHAIN"; }
+    }; then
+        do_dns_stop
+        return 1
+    fi
+    ok "DNS hijack applied (LAN :53 → router dnsmasq)"
+}
+
+do_dns_stop() {
+    iptables -t nat -D PREROUTING -j "$DNS_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$DNS_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$DNS_CHAIN" 2>/dev/null || true
+}
+
+do_stop() {
+    info "Removing transparent proxy rules..."
+    local cleanup_rc=0
+    ipv6_guard_stop || cleanup_rc=1
+
+    # TCP rules
+    iptables -t nat -D PREROUTING -j "$CHAIN"     2>/dev/null || true
+    iptables -t nat -F "$CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$CHAIN" 2>/dev/null || true
+
+    # DNS rules
+    do_dns_stop
+
+    # UDP/mangle rules
+    iptables -t mangle -D PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -F "$MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$MANGLE_CHAIN" 2>/dev/null || true
+
+    # TUN return-path forward accept (see do_start). Also clear the legacy
+    # tun0 rule older builds may have installed.
+    iptables -D FORWARD -i sockrocket-tun -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i tun0 -j ACCEPT 2>/dev/null || true
+    # Fake-IP QUIC fail-fast reject (see do_start).
+    iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+        -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+
+    # CN ipset bypass (may be absent — destroy is idempotent)
+    do_ipset_stop 2>/dev/null || true
+
+    # ip rule / route for our private table only.
+    #
+    # NEVER `ip route flush table 100`: on AsusWRT table 100 is aliased to
+    # wan0 (dual-WAN uses 200 → wan1). Flushing it kills the firmware's WAN
+    # default route. Older Sockrocket builds may still have left an ip *rule*
+    # pointing at table 100 — delete that rule alone and leave wan0 routes
+    # untouched.
+    ip rule  del fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
+    ip route flush table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
+    ip rule  del fwmark "$TUN_MARK" table 100 2>/dev/null || true
+
+    # Cached Fake-IP answers cannot be routed after TUN is disabled. Return
+    # an explicit unreachable error rather than silently blackholing them.
+    # Full network restore removes this temporary route after DNS unpinning.
+    ip route del 198.18.0.0/16 dev "${TUN_DEV:-sockrocket-tun}" 2>/dev/null || true
+    ip route del blackhole 198.18.0.0/16 2>/dev/null || true
+    ip route replace unreachable 198.18.0.0/16 2>/dev/null \
+        || ip route add unreachable 198.18.0.0/16 2>/dev/null || true
+
+    if [ "$cleanup_rc" != 0 ]; then
+        err "Proxy rules removed with pending IPv6 cleanup"
+        return 1
+    fi
+    ok "iptables rules removed"
+}
+
+do_status() {
+    echo "=== IPv6 fallback protection ==="
+    ip6tables -L "$IPV6_CHAIN" -n --line-numbers 2>/dev/null || echo "(not active; IPv6 disabled or proxy stopped)"
+    echo "=== $CHAIN (nat) ==="
+    iptables -t nat    -L "$CHAIN"     -n --line-numbers 2>/dev/null || echo "(not active)"
+    echo ""
+    echo "=== $DNS_CHAIN (nat) ==="
+    iptables -t nat    -L "$DNS_CHAIN" -n --line-numbers 2>/dev/null || echo "(not active)"
+    echo ""
+    echo "=== $MANGLE_CHAIN (mangle) ==="
+    iptables -t mangle -L "$MANGLE_CHAIN" -n --line-numbers 2>/dev/null || echo "(not active)"
+}
+
+do_verify() {
+    local errors=0 TUN_DEV
+    TUN_DEV=$(detect_tun_dev)
+    iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK" || {
+        err "SOCKROCKET_MANGLE chain missing or has no MARK rules"
+        errors=$((errors + 1))
+    }
+    iptables -t mangle -C PREROUTING -j SOCKROCKET_MANGLE 2>/dev/null || {
+        err "SOCKROCKET_MANGLE jump not in PREROUTING chain"
+        errors=$((errors + 1))
+    }
+    ip rule 2>/dev/null | grep -q "fwmark $TUN_MARK" || {
+        err "ip rule for fwmark $TUN_MARK missing"
+        errors=$((errors + 1))
+    }
+    # Check the return route as well as the marked outbound route.
+    ip route show 2>/dev/null | grep -Eq "^198.18.0.0/16 dev $TUN_DEV( |$)" || {
+        err "Fake-IP reverse route to TUN missing"
+        errors=$((errors + 1))
+    }
+    if [ "$(get_conf cn_ipset_direct)" = "true" ]; then
+        iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "match-set $IPSET_NAME" || {
+            err "cn_ipset_direct enabled but $IPSET_NAME bypass rule missing"
+            errors=$((errors + 1))
+        }
+    fi
+    ipv6_guard_verify || {
+        err "IPv6 bypass protection missing or superseded"
+        errors=$((errors + 1))
+    }
+    [ "$errors" -eq 0 ] && ok "iptables rules verified OK" && return 0
+    err "iptables verification FAILED ($errors issue(s))"
+    return 1
+}
+
+case "$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; do_start ;;
+    dns-start) do_dns_start ;;
+    dns-stop)  do_dns_stop ;;
+    ipset-on)  do_ipset_start ;;
+    ipset-off) do_ipset_stop ;;
+    status)  do_status ;;
+    verify)  do_verify ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|dns-start|dns-stop|ipset-on|ipset-off|status|verify}"
+        exit 1
+        ;;
+esac

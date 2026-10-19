@@ -1,0 +1,32 @@
+name: Cleanup release
+
+# PAT often cannot delete releases; GITHUB_TOKEN in Actions can.
+# Deletes a release by tag (tag itself is kept) so a re-tag can republish assets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to delete (tag ref is kept)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete release ${{ inputs.tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag=false --repo "${{ github.repository }}"
+            echo "Deleted release $TAG"
+          else
+            echo "No release $TAG"
+          fi
