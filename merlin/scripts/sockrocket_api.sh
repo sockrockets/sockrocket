@@ -53,11 +53,13 @@ for n in $slots; do
     fi
     if mkdir "$slot" 2>/dev/null; then SLOT="$slot"; echo $$ > "$slot/pid"; break; fi
 done
+# The dbus body is a new request; inherited HTTP CONTENT_LENGTH must not
+# truncate its JSON when forwarding to the CGI backend.
 if [ -z "$SLOT" ]; then
     printf '{"error":"Router busy; retry shortly","error_code":"busy"}' > "$TEMP"
 elif [ ! -x "$SOCKROCKET_BIN" ]; then
     printf '{"error":"sockrocket-cli not installed"}' > "$TEMP"
-elif printf '%s' "$ARGS" | SOCKROCKET_LOCAL_RPC=1 REQUEST_METHOD=POST QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi > "$RAW" 2>/dev/null; then
+elif printf '%s' "$ARGS" | SOCKROCKET_LOCAL_RPC=1 REQUEST_METHOD=POST CONTENT_LENGTH= QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi > "$RAW" 2>/dev/null; then
     sed '1,3d' "$RAW" > "$TEMP"
     [ -s "$TEMP" ] || printf '{"error":"Empty backend response"}' > "$TEMP"
 else

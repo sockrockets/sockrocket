@@ -438,6 +438,11 @@ body.bg {min-width:0!important}
           <div class="rows" id="sr-sub-list"><div class="hint">正在加载…</div></div>
           <div class="hint">更新失败时保留现有节点。订阅地址默认隐藏，请勿分享包含地址的截图。</div>
         </div>
+        <div class="card" id="sr-sub-diagnostic" hidden>
+          <h3>订阅失败诊断</h3><p class="hint">以下信息不包含订阅地址、节点凭证或个人路径，可复制用于反馈。</p>
+          <pre class="rule-preview" id="sr-sub-diagnostic-text"></pre>
+          <button type="button" class="btn btn-sm" onclick="copySubscriptionDiagnostic()">复制脱敏诊断</button>
+        </div>
       </div>
 
       <!-- ── Page: Routing rules ─────────────────────────────────────── -->
@@ -1456,15 +1461,70 @@ function copySubUrl(i) {
 }
 var subscriptionPending = false, subscriptionJobId = null, subscriptionJobTimer = null;
 var subscriptionJobChecked = false, subscriptionJobSnapshot = null;
+var subscriptionAwaitingLaunch = false, subscriptionLaunchError = null, subscriptionMissingPolls = 0;
+var subscriptionDiagnostic = '';
 function subscriptionBusy(on) { subscriptionPending = on; srElement('sub-add').disabled = on; srElement('sub-update').disabled = on; }
 function scheduleSubscriptionPoll() {
   clearTimeout(subscriptionJobTimer);
   subscriptionJobTimer = setTimeout(function () { pollSubscriptionJob(subscriptionJobId); }, 2000);
 }
+function subscriptionErrorText(d, fallback) {
+  var text = d && (d.msg || d.error_message || d.error || d.error_code) || fallback;
+  if (d && d.stage) text += ' [' + d.stage + (d.cause ? ': ' + d.cause : '') + ']';
+  if (d && d.error_code) text += '\n错误码：' + d.error_code;
+  if (d && typeof d.os_error === 'number') text += '\n系统错误码：' + d.os_error;
+  if (d && d.hint) text += '\n建议：' + d.hint;
+  return text;
+}
+function showSubscriptionDiagnostic(d, jobId) {
+  d = d || {};
+  var stages = {prepare_directory:'准备数据目录',lock_job:'获取任务锁',save_request:'保存订阅请求',save_job:'保存任务状态',resolve_worker:'定位后台程序',spawn_worker:'启动后台进程',fetching:'下载订阅',applying:'保存并应用配置'};
+  var causes = {PermissionDenied:'权限不足',AlreadyExists:'路径已被其他文件占用',NotADirectory:'数据路径不是目录',IsADirectory:'文件路径实际为目录',NotFound:'程序或路径缺失',StorageFull:'存储空间不足',ReadOnlyFilesystem:'文件系统只读',WouldBlock:'资源暂被占用',Unsupported:'操作或文件系统能力不支持',Other:'系统调用失败'};
+  var codes = ['subscription_start_failed','subscription_job_not_found','subscription_worker_exited','timeout','network_error','http_error','parse_error','busy','dispatch_error'];
+  var code = codes.indexOf(d.error_code) >= 0 ? d.error_code : 'subscription_failed';
+  var reason = causes[d.cause] || (code === 'timeout' ? '请求超时' : code === 'network_error' ? '无法连接插件接口' : code === 'busy' ? '接口正在处理其他请求' : '订阅任务未完成，请结合阶段与日志排查');
+  var hint = d.cause === 'PermissionDenied' ? '检查插件数据目录及程序权限，保留已有配置。' : d.cause === 'StorageFull' || d.os_error === 28 || d.os_error === 122 ? '检查并释放路由器存储空间。' : d.cause === 'ReadOnlyFilesystem' || d.os_error === 30 ? '检查存储挂载及文件系统错误。' : '请反馈错误码、失败阶段和对应时间的脱敏日志。';
+  var status = /\bHTTP(?:\/\d(?:\.\d)?)?\s+([1-5]\d{2})\b/.exec(String(d.msg || d.error || ''));
+  if (status) {
+    reason = '订阅服务器返回 HTTP ' + status[1];
+    hint = /^(401|403)$/.test(status[1]) ? '核对订阅权限、有效期及服务端访问限制。' : status[1] === '429' ? '服务端限制请求频率，请稍后重试。' : '核对订阅服务器状态及链接有效性。';
+  }
+  // Only allowlisted metadata enters the copyable report. Raw messages may
+  // contain server content or personal paths and are deliberately excluded.
+  var lines = ['错误码：' + code,'失败阶段：' + (stages[d.stage] || '未确认'),'原因：' + reason];
+  if (typeof d.os_error === 'number' && isFinite(d.os_error)) lines.push('系统错误码：' + d.os_error);
+  if (/^[0-9a-f]{32}$/.test(jobId || '')) lines.push('任务 ID：' + jobId);
+  lines.push('建议：' + hint);
+  subscriptionDiagnostic = lines.join('\n');
+  srElement('sub-diagnostic-text').textContent = subscriptionDiagnostic;
+  srElement('sub-diagnostic').hidden = false;
+}
+function copySubscriptionDiagnostic() { srCopyText(subscriptionDiagnostic, '已复制脱敏诊断'); }
+function failSubscriptionJob(d, fallback) {
+  showSubscriptionDiagnostic(d, subscriptionJobId);
+  clearTimeout(subscriptionJobTimer);
+  subscriptionBusy(false); subscriptionJobId = null; subscriptionJobSnapshot = null;
+  subscriptionAwaitingLaunch = false;
+  srShowMsg(subscriptionErrorText(d, fallback), 'err');
+}
+function subscriptionJobMissing() {
+  if (subscriptionAwaitingLaunch && ++subscriptionMissingPolls < 4) {
+    srShowMsg('启动结果尚未确认，正在核对同一任务；输入内容已保留。', 'info');
+    scheduleSubscriptionPoll(); return;
+  }
+  failSubscriptionJob(subscriptionLaunchError, '未能确认订阅任务，请刷新列表后重试；输入内容已保留。');
+}
 function acceptSubscriptionJob(d) {
-  if (d.ok === false) { subscriptionBusy(false); subscriptionJobId = null; subscriptionJobSnapshot = null; toastResp(d); return; }
-  var job = d.job;
-  if (!job) { subscriptionBusy(false); subscriptionJobSnapshot = null; srShowMsg('未发现后台订阅任务，请刷新列表后重试。', 'info'); return; }
+  if (d && d.ok === false) {
+    if (d.error_code === 'subscription_job_not_found') subscriptionJobMissing();
+    else failSubscriptionJob(d, '订阅任务失败；输入内容已保留。');
+    return;
+  }
+  var job = d && d.job;
+  if (!job || !job.id || (job.state !== 'running' && job.state !== 'finished')) {
+    subscriptionJobMissing(); return;
+  }
+  subscriptionAwaitingLaunch = false; subscriptionLaunchError = null; subscriptionMissingPolls = 0;
   subscriptionJobId = job.id;
   if (job.state === 'running') {
     subscriptionBusy(true);
@@ -1482,12 +1542,13 @@ function acceptSubscriptionJob(d) {
     }
   }
   subscriptionJobSnapshot = null;
-  toastResp(result); srLoadSubs(); srLoadNodes(); refreshStatus();
+  if (result.ok === false) { showSubscriptionDiagnostic(result, job.id); srShowMsg(subscriptionErrorText(result, '订阅任务失败'), 'err'); }
+  else { srElement('sub-diagnostic').hidden = true; toastResp(result); }
+  srLoadSubs(); srLoadNodes(); refreshStatus();
 }
 function pollSubscriptionJob(id) {
-  srApi('subscription_job', id ? {id:id} : {}, acceptSubscriptionJob, function () {
-    // A missed response is not a failed job. Recover its ID from the backend
-    // even if the original launch response was lost.
+  srApi('subscription_job', id ? {id:id} : {}, acceptSubscriptionJob, function (error) {
+    if (error && error.error_code === 'subscription_job_not_found') { subscriptionJobMissing(); return; }
     srShowMsg('暂时无法读取订阅进度，正在重试；刷新页面也可继续查看。', 'info');
     scheduleSubscriptionPoll();
   }, 12000);
@@ -1496,18 +1557,34 @@ function restoreSubscriptionJob() {
   if (subscriptionJobChecked) return;
   subscriptionJobChecked = true;
   srApi('subscription_job', {}, function (d) {
-    if (d.ok !== false && d.job && d.job.state === 'running' && !subscriptionPending) acceptSubscriptionJob(d);
+    if (d.ok !== false && d.job && !subscriptionPending) {
+      if (d.job.state === 'running') acceptSubscriptionJob(d);
+      else if (d.job.result && d.job.result.ok === false) showSubscriptionDiagnostic(d.job.result, d.job.id);
+    }
   }, function () { subscriptionJobChecked = false; }, 12000);
 }
 function startSubscriptionJob(action, body) {
+  var random = new Uint8Array(16);
+  try { window.crypto.getRandomValues(random); }
+  catch (error) { failSubscriptionJob(null, '浏览器无法生成安全任务 ID，请使用现代浏览器。'); return; }
+  subscriptionJobId = Array.prototype.map.call(random, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  subscriptionAwaitingLaunch = true; subscriptionLaunchError = null; subscriptionMissingPolls = 0;
   subscriptionBusy(true);
   srShowMsg('正在启动后台订阅任务…', 'info');
-  srApi('subscription_start', {action:action,body:body}, function (d) {
-    if (d.existing) subscriptionJobSnapshot = null;
+  srApi('subscription_start', {request_id:subscriptionJobId,action:action,body:body}, function (d) {
+    if (d && d.existing) subscriptionJobSnapshot = null;
+    if (!d || (!d.job && d.ok !== false)) {
+      subscriptionLaunchError = {msg:'后台未返回有效任务，可能是页面与后端版本不一致。'};
+      pollSubscriptionJob(subscriptionJobId); return;
+    }
     acceptSubscriptionJob(d);
-  }, function () {
+  }, function (error) {
+    if (error && error.error_code === 'subscription_start_failed') {
+      failSubscriptionJob(error, '订阅后台启动失败；输入内容已保留。'); return;
+    }
+    subscriptionLaunchError = error || {msg:'订阅启动请求未收到响应。'};
     srShowMsg('正在确认后台订阅任务状态…', 'info');
-    pollSubscriptionJob(null);
+    pollSubscriptionJob(subscriptionJobId);
   }, 12000);
 }
 function addSub() {

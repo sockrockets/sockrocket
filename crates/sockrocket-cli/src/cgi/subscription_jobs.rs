@@ -155,15 +155,55 @@ fn trim_history() {
         let _ = fs::remove_file(root().join(format!("{id}.input")));
     }
 }
+fn launch_hint(error: Option<&std::io::Error>, stage: &str) -> &'static str {
+    if let Some(error) = error {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return "检查插件数据目录及程序的读写、执行权限；不要删除已有订阅配置。";
+        }
+        match error.raw_os_error() {
+            Some(28 | 122) => return "检查路由器存储空间及配额，释放空间后重试。",
+            Some(30) => return "插件存储处于只读状态，请检查存储挂载和文件系统错误。",
+            _ => {}
+        }
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::IsADirectory
+        ) {
+            return "插件数据路径的文件类型异常，请保留现有配置并核对安装目录。";
+        }
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return "检查插件程序和数据目录是否完整，必要时重新安装同版本完整安装包。";
+        }
+    }
+    if stage == "lock_job" {
+        "任务锁暂不可用，请等待其他任务结束后重试；若持续出现，请反馈错误码。"
+    } else {
+        "请保留此错误的阶段、错误类型及系统错误码，并检查路由器系统日志。"
+    }
+}
 pub(super) fn start(post: &J) -> J {
     let action = post["action"].as_str().unwrap_or("");
     if !matches!(action, "add_sub" | "update_subs") {
         return err_msg("Invalid subscription job action");
     }
+    let requested_id = post.get("request_id").and_then(J::as_str);
+    if post.get("request_id").is_some() && !requested_id.is_some_and(valid) {
+        return err_msg("Invalid subscription request ID");
+    }
+    let mut stage = "prepare_directory";
+    let mut created_id = None;
     let launch = (|| -> Result<J> {
         directory()?;
+        stage = "lock_job";
         let _job_lock =
             sockrocket_core::config::storage::MutationGuard::acquire(&root().join("active.json"))?;
+        if let Some(id) = requested_id
+            && path(id).exists()
+        {
+            return Ok(json!({"ok":true,"job":load(id)?,"existing":true}));
+        }
         if let Some(id) = active()
             && let Ok(state) = load(&id)
             && state["state"] == "running"
@@ -171,17 +211,23 @@ pub(super) fn start(post: &J) -> J {
             return Ok(json!({"ok":true,"job":state,"existing":true}));
         }
         trim_history();
-        let id = rand::random::<[u8; 16]>()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let id = requested_id.map(str::to_owned).unwrap_or_else(|| {
+            rand::random::<[u8; 16]>()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        });
         let state = json!({"id":id,"state":"running","stage":"queued","completed":0,"total":0,"created":now(),"pid":0});
+        stage = "save_request";
+        created_id = Some(id.clone());
         write(
             &root().join(format!("{id}.input")),
             &json!({"action":action,"body":post.get("body").unwrap_or(&J::Null)}),
         )?;
+        stage = "save_job";
         write(&path(&id), &state)?;
         write(&root().join("active.json"), &json!({"id":id}))?;
+        stage = "resolve_worker";
         let mut command = Command::new(env::current_exe()?);
         command
             .args(["--subscription-worker", &id])
@@ -193,9 +239,10 @@ pub(super) fn start(post: &J) -> J {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        stage = "spawn_worker";
         match command.spawn() {
             Ok(mut child) => {
-                std::thread::spawn(move || {
+                let _ = std::thread::Builder::new().spawn(move || {
                     let _ = child.wait();
                 });
             }
@@ -208,9 +255,31 @@ pub(super) fn start(post: &J) -> J {
         }
         Ok(json!({"ok":true,"job":state}))
     })();
-    launch.unwrap_or_else(|_| {
-        err_msg("Cannot start subscription job; existing settings were retained")
+    launch.unwrap_or_else(|error| {
+        let io = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+        let result = json!({"ok":false,"error_code":"subscription_start_failed",
+            "msg":"Cannot start subscription job; existing settings were retained",
+            "stage":stage,"cause":io.map(|error|format!("{:?}",error.kind())),
+            "os_error":io.and_then(std::io::Error::raw_os_error),"hint":launch_hint(io,stage)});
+        if let Some(id) = created_id {
+            // Nothing after a successful spawn can return Err. Clean up only
+            // requests owned by this failed launch, never a replayed job.
+            let _ = fs::remove_file(root().join(format!("{id}.input")));
+            if path(&id).exists() {
+                let _ = write(
+                    &path(&id),
+                    &json!({"id":id,"state":"finished","stage":"finished","result":result}),
+                );
+            }
+        }
+        result
     })
+}
+fn not_found() -> J {
+    json!({"ok":false,"error_code":"subscription_job_not_found",
+        "msg":"Subscription job has not been created or its result is no longer available"})
 }
 pub(super) fn status(post: &J) -> J {
     let id = post
@@ -222,6 +291,12 @@ pub(super) fn status(post: &J) -> J {
     let Some(id) = id else {
         return json!({"ok":true,"job":null});
     };
+    if !valid(&id) {
+        return err_msg("Invalid subscription job ID");
+    }
+    if !path(&id).exists() {
+        return not_found();
+    }
     let Ok(_job_lock) =
         sockrocket_core::config::storage::MutationGuard::acquire(&root().join("active.json"))
     else {
