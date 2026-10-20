@@ -7,7 +7,7 @@ function fixture() {
   const requests=[], timers=new Map(), elements={}, messages=[], copied=[]; let next=0;
   const element=id => elements[id] ||= {value:({'sub-name':'fixture','sub-url':'https://example.invalid/subscription','sub-format':'auto'})[id] || '',disabled:false};
   const context=vm.createContext({srElement:element, srApi:(...args)=>requests.push(args),
-    window:{crypto:webcrypto}, Uint8Array,
+    window:{crypto:webcrypto}, Uint8Array, URL,
     srCopyText:(text)=>copied.push(text), srShowMsg:(message)=>messages.push(message), toastResp(){}, srLoadNodes(){}, refreshStatus(){},
     setTimeout(cb){const id=++next;timers.set(id,cb);return id;},clearTimeout:id=>timers.delete(id),
     SR_STATE:{},SR_PAGE_LOADED:{},srEsc:value=>value});
@@ -66,3 +66,29 @@ diagnostic.context.copySubscriptionDiagnostic();
 assert.match(diagnostic.copied[0],/权限不足/);assert.match(diagnostic.copied[0],/系统错误码：13/);
 assert.doesNotMatch(diagnostic.copied[0],/secret-token|example.invalid|private.path/);
 console.log('PASS: persistent diagnostic, actionable reason, error code and private-field exclusion');
+
+const oldDuplicate=fixture();oldDuplicate.context.showSubscriptionDiagnostic({ok:false,msg:'This subscription already exists; update the existing entry'},'a'.repeat(32));
+oldDuplicate.context.copySubscriptionDiagnostic();
+assert.match(oldDuplicate.copied[0],/subscription_exists/);
+assert.match(oldDuplicate.copied[0],/校验订阅/);
+assert.match(oldDuplicate.copied[0],/全部更新/);
+const oldParse=fixture();oldParse.context.showSubscriptionDiagnostic({ok:false,msg:'Subscription saved, but fetch/parse failed: No valid proxy nodes found in subscription'},'a'.repeat(32));
+oldParse.context.copySubscriptionDiagnostic();assert.match(oldParse.copied[0],/subscription_no_valid_nodes/);
+assert.match(oldParse.copied[0],/解析订阅节点/);
+console.log('PASS: historical duplicate/empty imports retain actionable reasons without private messages');
+
+const optional=fixture();optional.element('sub-name').value='';optional.context.addSub();
+assert.equal(optional.request('subscription_start')[1].body.name,'');
+const badUrl=fixture();badUrl.element('sub-url').value='https://';badUrl.context.addSub();
+assert.equal(badUrl.requests.length,0,'invalid URLs must not launch or save a subscription');
+const notes=fixture();notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_browser_fingerprint_hint','https://example.invalid/private-token']});
+assert.equal(notes.element('sub-notes').hidden,false);
+assert.match(notes.element('sub-notes-text').textContent,/不用于模拟/);
+assert.doesNotMatch(notes.element('sub-notes-text').textContent,/private-token/);
+notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_chrome_quic_profile']});
+assert.equal(notes.element('sub-notes').hidden,false);
+assert.match(notes.element('sub-notes-text').textContent,/已启用 Chrome 115/);
+assert.match(notes.element('sub-notes-text').textContent,/不模拟 ALPS/);
+notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:[]});
+assert.equal(notes.element('sub-notes').hidden,true);
+console.log('PASS: optional names, invalid-address rejection and informational compatibility notes');

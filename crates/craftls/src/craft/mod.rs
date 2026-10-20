@@ -704,7 +704,9 @@ impl Fingerprint {
                 | ClientExtension::SupportedVersions(_)
                 | ClientExtension::Cookie(_)
                 | ClientExtension::EarlyData
-                | ClientExtension::CompressCertificate(_) => {
+                | ClientExtension::CompressCertificate(_)
+                | ClientExtension::TransportParameters(_)
+                | ClientExtension::TransportParametersDraft(_) => {
                     ext_store.insert(ext.get_type().get_u16(), ext);
                 }
                 _ => (),
@@ -815,6 +817,12 @@ pub struct FingerprintBuilder {
 }
 
 impl FingerprintBuilder {
+    /// Keep the caller's protocol version policy (for TLS-1.3-only QUIC).
+    pub fn preserve_protocol_versions(mut self) -> Self {
+        self.override_version = false;
+        self
+    }
+
     /// Disables the overriding of the ALPN settings.
     /// Use this option when working with HTTP clients, such as `hyper`, that internally manage
     /// ALPN settings; they may raise issues if ALPN is set externally. While this option skips

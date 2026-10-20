@@ -94,6 +94,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sh tests/integration/merlin_stability_test.sh
 
+      - name: Merlin package upgrades and software-center transport tests
+        if: runner.os == 'Linux'
+        run: |
+          python3 tests/integration/merlin_install_test.py
+          python3 tests/integration/merlin_rpc_test.py
+          node tests/integration/webui_transport_test.cjs
+          node tests/integration/webui_subscription_jobs_test.cjs
+
       # ── Build ──────────────────────────────────────────────────────────────
       - name: Build (CLI)
         run: cargo build --package sockrocket-cli ${{ runner.os == 'Windows' && '--release' || '' }} --target ${{ matrix.target }}

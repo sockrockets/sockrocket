@@ -41,6 +41,7 @@ struct Hysteria2Attempt {
     server: String,
     port: u16,
     sni: String,
+    chrome_fingerprint: bool,
 }
 
 impl Hysteria2Attempt {
@@ -55,7 +56,14 @@ impl Hysteria2Attempt {
         } else {
             "[::]:0".parse()?
         };
-        let mut endpoint = super::quic_conn::client_endpoint(bind_addr)?;
+        let mut endpoint = super::quic_conn::client_endpoint_with_config(
+            bind_addr,
+            if self.chrome_fingerprint {
+                super::quic_fingerprint::endpoint_config()
+            } else {
+                quinn::EndpointConfig::default()
+            },
+        )?;
         endpoint.set_default_client_config(client_config.clone());
 
         let connecting = endpoint
@@ -99,6 +107,7 @@ pub struct Hysteria2Outbound {
     sni: String,
     skip_cert_verify: bool,
     certificate_pin: Option<[u8; 32]>,
+    chrome_fingerprint: bool,
     down_bps: u64,
     upload: Option<Arc<super::hysteria2_bandwidth::Budget>>,
     fast_open: bool,
@@ -140,10 +149,24 @@ impl Hysteria2Outbound {
             .unwrap_or(server)
             .to_string();
         let skip_cert_verify = tls_config.map(|t| t.skip_cert_verify).unwrap_or(false);
+        let chrome_fingerprint = tls_config
+            .and_then(|t| t.fingerprint.as_deref())
+            .or_else(|| extra.get(HY2_CLIENT_FP_HINT).map(String::as_str))
+            .is_some_and(super::quic_fingerprint::is_chrome);
         let alpn_candidates = tls_config
             .and_then(|t| t.alpn.as_ref())
             .cloned()
-            .unwrap_or_else(|| vec!["hysteria".to_string(), "h3".to_string()]);
+            .unwrap_or_else(|| {
+                if chrome_fingerprint {
+                    vec!["h3".to_string()]
+                } else {
+                    vec!["hysteria".to_string(), "h3".to_string()]
+                }
+            });
+        anyhow::ensure!(
+            !chrome_fingerprint || alpn_candidates.iter().all(|p| p == "h3"),
+            "Chrome QUIC fingerprint requires ALPN h3"
+        );
 
         anyhow::ensure!(
             !alpn_candidates.is_empty()
@@ -166,6 +189,7 @@ impl Hysteria2Outbound {
             password: password.to_string(),
             sni,
             skip_cert_verify,
+            chrome_fingerprint,
             certificate_pin: extra
                 .get(TLS_CERT_PIN)
                 .map(|p| parse_tuic_certificate_pin(p))
@@ -182,7 +206,12 @@ impl Hysteria2Outbound {
 
     /// Build a QUIC client config (TLS + transport) for a given ALPN.
     fn build_client_config(&self, alpn: &str) -> Result<quinn::ClientConfig> {
-        let mut client_config = build_quic_client_config_pinned(
+        let config_builder = if self.chrome_fingerprint {
+            super::quic_fingerprint::client_config
+        } else {
+            build_quic_client_config_pinned
+        };
+        let mut client_config = config_builder(
             self.skip_cert_verify,
             &[alpn.to_string()],
             self.certificate_pin,
@@ -197,6 +226,9 @@ impl Hysteria2Outbound {
         ));
         transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
         transport.send_window(16 * 1024 * 1024);
+        if self.chrome_fingerprint {
+            super::quic_fingerprint::transport_config(&mut transport);
+        }
         client_config.transport_config(Arc::new(transport));
         Ok(client_config)
     }
@@ -255,6 +287,7 @@ impl Hysteria2Outbound {
             server: self.server.clone(),
             port: self.port,
             sni: self.sni.clone(),
+            chrome_fingerprint: self.chrome_fingerprint,
         };
         attempt.try_addr(addr, client_config, alpn).await
     }
@@ -317,6 +350,7 @@ impl Hysteria2Outbound {
                     server: self.server.clone(),
                     port: self.port,
                     sni: self.sni.clone(),
+                    chrome_fingerprint: self.chrome_fingerprint,
                 };
                 let alpn = alpn.clone();
                 set.spawn(async move {
@@ -385,6 +419,7 @@ impl Hysteria2Outbound {
                 server: self.server.clone(),
                 port: self.port,
                 sni: self.sni.clone(),
+                chrome_fingerprint: self.chrome_fingerprint,
             };
             let cfg = client_config.clone();
             let alpn = alpn.to_string();
@@ -708,6 +743,51 @@ mod tests {
         assert_eq!(outbound.server, "server.com");
         assert_eq!(outbound.port, 443);
         assert_eq!(outbound.sni, "server.com");
+    }
+
+    #[test]
+    fn chrome_profile_accepts_new_and_legacy_saved_settings_and_preserves_native_default() {
+        use crate::config::v2ray::HY2_CLIENT_FP_HINT;
+        let legacy =
+            std::collections::HashMap::from([(HY2_CLIENT_FP_HINT.into(), "chrome".into())]);
+        let outbound =
+            Hysteria2Outbound::new_options("example.invalid", 443, "synthetic", None, &legacy)
+                .unwrap();
+        assert!(outbound.chrome_fingerprint);
+        assert_eq!(outbound.alpn_candidates, ["h3"]);
+        let tls = TlsConfig {
+            sni: None,
+            skip_cert_verify: false,
+            alpn: Some(vec!["hysteria".into()]),
+            fingerprint: Some("chrome".into()),
+        };
+        assert!(Hysteria2Outbound::new("example.invalid", 443, "synthetic", Some(&tls)).is_err());
+
+        let tls = TlsConfig {
+            sni: None,
+            skip_cert_verify: false,
+            alpn: None,
+            fingerprint: Some("chrome115".into()),
+        };
+        let outbound =
+            Hysteria2Outbound::new("example.invalid", 443, "synthetic", Some(&tls)).unwrap();
+        assert!(outbound.chrome_fingerprint);
+        let tls = TlsConfig {
+            fingerprint: Some("none".into()),
+            ..tls
+        };
+        let outbound = Hysteria2Outbound::new_options(
+            "example.invalid",
+            443,
+            "synthetic",
+            Some(&tls),
+            &legacy,
+        )
+        .unwrap();
+        assert!(
+            !outbound.chrome_fingerprint,
+            "an explicit selection overrides legacy metadata"
+        );
     }
 
     #[test]

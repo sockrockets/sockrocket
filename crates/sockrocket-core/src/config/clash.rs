@@ -341,6 +341,9 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
         }
     }
     let transport = build_transport(proxy)?;
+    if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
+        super::v2ray::validate_hysteria2_profile(transport.as_ref().and_then(|t| t.tls.as_ref()))?;
+    }
 
     Ok(Node {
         name: super::model::decode_display_name(&proxy.name),

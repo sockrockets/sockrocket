@@ -12,11 +12,18 @@ use anyhow::Result;
 /// Bind QUIC's own UDP socket before handing it to the transport runtime.
 /// Endpoint::client alone follows the TUN default route after a node switch.
 pub(super) fn client_endpoint(address: SocketAddr) -> Result<quinn::Endpoint> {
+    client_endpoint_with_config(address, quinn::EndpointConfig::default())
+}
+
+pub(super) fn client_endpoint_with_config(
+    address: SocketAddr,
+    config: quinn::EndpointConfig,
+) -> Result<quinn::Endpoint> {
     let socket = std::net::UdpSocket::bind(address)?;
     super::outbound_bind::apply_to_std_udp_socket(&socket, address.is_ipv6())?;
     socket.set_nonblocking(true)?;
     Ok(quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
+        config,
         None,
         socket,
         Arc::new(quinn::TokioRuntime),

@@ -11,6 +11,7 @@ pub mod outbound_bind;
 pub mod pool;
 pub mod quic_conn;
 mod quic_datagram;
+mod quic_fingerprint;
 pub mod relay;
 pub mod routing;
 pub mod service;

@@ -86,6 +86,7 @@ struct SingBoxReality {
 
 #[derive(Debug, Deserialize)]
 struct SingBoxUtls {
+    enabled: Option<bool>,
     fingerprint: Option<String>,
 }
 
@@ -236,6 +237,9 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
         );
     }
     let transport = build_singbox_transport(ob)?;
+    if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
+        super::v2ray::validate_hysteria2_profile(transport.as_ref().and_then(|t| t.tls.as_ref()))?;
+    }
 
     let name = if ob.tag.is_empty() {
         format!("{}-{}:{}", ob.outbound_type, ob.server, ob.server_port)
@@ -294,7 +298,11 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
                 public_key,
                 short_id: reality.short_id.clone().unwrap_or_default(),
                 sni: tls.server_name.clone(),
-                client_fingerprint: tls.utls.as_ref().and_then(|u| u.fingerprint.clone()),
+                client_fingerprint: tls
+                    .utls
+                    .as_ref()
+                    .filter(|u| u.enabled != Some(false))
+                    .and_then(|u| u.fingerprint.clone()),
                 skip_cert_verify: tls.insecure,
             }),
         }));
@@ -322,7 +330,12 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
             sni: tls_cfg.and_then(|t| t.server_name.clone()),
             skip_cert_verify: tls_cfg.map(|t| t.insecure).unwrap_or(false),
             alpn: tls_cfg.and_then(|t| t.alpn.clone()),
-            fingerprint: tls_cfg.and_then(|t| t.utls.as_ref().and_then(|u| u.fingerprint.clone())),
+            fingerprint: tls_cfg.and_then(|t| {
+                t.utls
+                    .as_ref()
+                    .filter(|u| u.enabled != Some(false))
+                    .and_then(|u| u.fingerprint.clone())
+            }),
         })
     } else {
         None
@@ -355,6 +368,32 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_utls_does_not_activate_a_quic_profile() {
+        for enabled in [false, true] {
+            let content = serde_json::json!({"outbounds":[{"type":"hysteria2","tag":"synthetic","server":"example.invalid","server_port":443,"password":"synthetic","tls":{"enabled":true,"utls":{"enabled":enabled,"fingerprint":"chrome"}}}]}).to_string();
+            let nodes = parse_singbox_config(&content).unwrap();
+            assert_eq!(
+                nodes[0]
+                    .transport
+                    .as_ref()
+                    .unwrap()
+                    .tls
+                    .as_ref()
+                    .unwrap()
+                    .fingerprint
+                    .as_deref(),
+                enabled.then_some("chrome")
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_quic_profile_is_skipped_before_saving() {
+        let content = serde_json::json!({"outbounds":[{"type":"hysteria2","tag":"synthetic","server":"example.invalid","server_port":443,"password":"synthetic","tls":{"enabled":true,"alpn":["hysteria"],"utls":{"enabled":true,"fingerprint":"chrome"}}}]}).to_string();
+        assert!(parse_singbox_config(&content).unwrap().is_empty());
+    }
 
     #[test]
     fn unsupported_tls_security_constraints_fail_closed_even_when_insecure() {

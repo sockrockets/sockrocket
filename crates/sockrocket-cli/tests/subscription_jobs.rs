@@ -1,4 +1,5 @@
 //! Real CGI/worker processes with a loopback-only subscription server.
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -131,7 +132,7 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
         released.store(true, Ordering::SeqCst);
         release.expect("test must release HTTP body after launch and duplicate responses");
         // Synthetic public documentation endpoint/credentials only.
-        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@example.invalid:8388#fixture";
+        let body = "hy2://synthetic@example.invalid:443?fp=chrome#fixture";
         write!(
             connection,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -142,7 +143,7 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
     });
     let launch = fixture.call(
         "subscription_start",
-        json!({"action":"add_sub","body":{"name":"fixture","url":endpoint,"format":"auto"}}),
+        json!({"action":"add_sub","body":{"url":endpoint,"format":""}}),
     );
     assert_eq!(launch["ok"], true);
     assert!(
@@ -175,6 +176,20 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
     let finished = fixture.finish(id);
     assert_eq!(finished["result"]["ok"], true, "{finished}");
     assert_eq!(finished["result"]["node_count"], 1);
+    assert_eq!(
+        finished["result"]["compatibility_notes"],
+        json!(["hysteria2_chrome_quic_profile"])
+    );
+    assert!(
+        !finished["result"]["msg"]
+            .as_str()
+            .unwrap()
+            .contains("warnings")
+    );
+    assert_eq!(
+        fixture.call("subscriptions", json!({}))["subs"][0]["name"],
+        "订阅 1"
+    );
     assert!(fixture.0.join("stopped").exists());
     assert!(
         !fixture.0.join("lifecycle-called").exists(),
@@ -275,8 +290,7 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
                     .nth(1)
                     .unwrap()
                     .trim_start_matches('/');
-                let body =
-                    format!("ss://YWVzLTEyOC1nY206Zml4dHVyZQ@new-{index}.invalid:8388#new-{index}");
+                let body = format!("hy2://synthetic@new-{index}.invalid:443?fp=chrome#new-{index}");
                 write!(
                     connection,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -309,6 +323,12 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
                 "partial refresh reports warnings"
             );
             assert_eq!(job["result"]["node_count"], 4);
+            assert_eq!(
+                job["result"]["compatibility_notes"],
+                json!(["hysteria2_chrome_quic_profile"])
+            );
+            assert_eq!(job["result"]["warnings"].as_array().unwrap().len(), 1);
+            assert_eq!(job["result"]["skipped_subscriptions"], 1);
             break;
         }
         assert!(Instant::now() < deadline);
@@ -338,70 +358,83 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
 #[test]
 #[cfg(unix)]
 fn firmware_bridge_ignores_inherited_content_length_for_nested_job_body() {
-    let fixture = Fixture::new();
-    let tools = fixture.0.join("bridge-tools");
-    fs::create_dir_all(&tools).unwrap();
-    let body = json!({"request_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","action":"add_sub","body":{"name":"fixture 配置","url":"http://127.0.0.1:9/fixture","format":"auto"}});
-    let nonce = "a".repeat(32);
-    fs::write(
-        fixture.0.join(format!("sockrocket_rpc_body_{nonce}")),
-        body.to_string(),
-    )
-    .unwrap();
-    let dbus = tools.join("dbus");
-    fs::write(&dbus, "#!/bin/sh\ncase \"$1\" in get) cat \"$SOCKROCKET_DIR/$2\";; remove) rm -f \"$SOCKROCKET_DIR/$2\";; esac\n").unwrap();
-    let curl = tools.join("curl");
-    fs::write(&curl, "#!/bin/sh\nexit 0\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&dbus, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
-    let script = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../merlin/scripts/sockrocket_api.sh"),
-    )
-    .unwrap()
-    .replace(". /koolshare/scripts/base.sh", "ID=$1");
-    let bridge = fixture.0.join("bridge.sh");
-    fs::write(&bridge, script).unwrap();
-    let upload = fixture.0.join("upload");
-    let path = std::env::join_paths(
-        std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let result = Command::new("sh")
-        .arg(bridge)
-        .args(["123456", "subscription_start", &nonce])
-        .env("SOCKROCKET_DIR", &fixture.0)
-        .env("SOCKROCKET_BIN", env!("CARGO_BIN_EXE_sockrocket-cli"))
-        .env("SOCKROCKET_RPC_UPLOAD_DIR", &upload)
-        .env("SOCKROCKET_RPC_RUNTIME_DIR", fixture.0.join("rpc"))
-        .env("CONTENT_LENGTH", "2")
-        .env("GATEWAY_INTERFACE", "CGI/1.1")
-        .env("PATH", path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let tools = fixture.0.join("bridge-tools");
+        fs::create_dir_all(&tools).unwrap();
+        let body = json!({"request_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","action":"add_sub","body":{"name":"fixture 配置","url":"http://127.0.0.1:9/fixture","format":"auto"}});
+        let nonce = "a".repeat(32);
+        fs::write(
+            fixture.0.join(format!(
+                "sockrocket_rpc_{}_{nonce}",
+                if encoded { "b64" } else { "body" }
+            )),
+            if encoded {
+                // Softcenter escapes field quotes and backslashes before dbus.
+                B64.encode(body.to_string())
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+            } else {
+                body.to_string()
+            },
+        )
         .unwrap();
-    assert!(result.success());
-    let launch: Value = serde_json::from_slice(
-        &fs::read(upload.join(format!("sockrocket_rpc_{nonce}.json"))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        launch["ok"], true,
-        "firmware body must not be truncated: {launch}"
-    );
-    assert_eq!(launch["job"]["id"], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let finished = fixture.finish(&launch["job"]["id"]);
-    assert_eq!(
-        finished["result"]["ok"], false,
-        "unreachable fixture must finish with download failure"
-    );
-    let saved = fixture.call("subscriptions", json!({}));
-    assert_eq!(
-        saved["subs"].as_array().unwrap().len(),
-        1,
-        "body and URL must reach the real backend"
-    );
+        let dbus = tools.join("dbus");
+        fs::write(&dbus, "#!/bin/sh\ncase \"$1\" in get) cat \"$SOCKROCKET_DIR/$2\";; remove) rm -f \"$SOCKROCKET_DIR/$2\";; esac\n").unwrap();
+        let curl = tools.join("curl");
+        fs::write(&curl, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dbus, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../merlin/scripts/sockrocket_api.sh"),
+        )
+        .unwrap()
+        .replace(". /koolshare/scripts/base.sh", "ID=$1");
+        let bridge = fixture.0.join("bridge.sh");
+        fs::write(&bridge, script).unwrap();
+        let upload = fixture.0.join("upload");
+        let path = std::env::join_paths(
+            std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let result = Command::new("sh")
+            .arg(bridge)
+            .args(["123456", "subscription_start", &nonce])
+            .env("SOCKROCKET_DIR", &fixture.0)
+            .env("SOCKROCKET_BIN", env!("CARGO_BIN_EXE_sockrocket-cli"))
+            .env("SOCKROCKET_RPC_UPLOAD_DIR", &upload)
+            .env("SOCKROCKET_RPC_RUNTIME_DIR", fixture.0.join("rpc"))
+            .env("CONTENT_LENGTH", "2")
+            .env("GATEWAY_INTERFACE", "CGI/1.1")
+            .env("PATH", path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(result.success());
+        let launch: Value = serde_json::from_slice(
+            &fs::read(upload.join(format!("sockrocket_rpc_{nonce}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            launch["ok"], true,
+            "firmware body must not be truncated: {launch}"
+        );
+        assert_eq!(launch["job"]["id"], "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let finished = fixture.finish(&launch["job"]["id"]);
+        assert_eq!(
+            finished["result"]["ok"], false,
+            "unreachable fixture must finish with download failure"
+        );
+        let saved = fixture.call("subscriptions", json!({}));
+        assert_eq!(
+            saved["subs"].as_array().unwrap().len(),
+            1,
+            "body and URL must reach the real backend"
+        );
+        assert_eq!(saved["subs"][0]["name"], body["body"]["name"]);
+    }
 }
 
 #[test]
@@ -472,4 +505,93 @@ fn failed_job_publication_removes_private_request_and_finishes_owned_job() {
             .len(),
         0
     );
+}
+
+#[test]
+fn malformed_cgi_requests_return_safe_diagnostics_without_dispatch() {
+    fn request(body: &[u8], length: Option<usize>, encoded: bool) -> Value {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sockrocket-cli"));
+        command
+            .arg("cgi")
+            .env("REQUEST_METHOD", "POST")
+            .env("QUERY_STRING", "action=version")
+            .env("SOCKROCKET_LOCAL_RPC", "1")
+            .env(
+                "SOCKROCKET_RPC_ENCODING",
+                if encoded { "base64" } else { "raw" },
+            )
+            .env(
+                "CONTENT_LENGTH",
+                length.map(|n| n.to_string()).unwrap_or_default(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(body).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert!(
+            out.stderr.is_empty(),
+            "request contents must not enter stderr"
+        );
+        let text = String::from_utf8(out.stdout).unwrap();
+        serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap()
+    }
+    let payload =
+        json!({"name":"示例 \" \\ 配置","url":"https://example.invalid/private-token"}).to_string();
+    assert_eq!(
+        request(B64.encode(&payload).as_bytes(), None, true)["version"],
+        format!("sockrocket-cli {}", env!("CARGO_PKG_VERSION"))
+    );
+    let escaped = payload.replace('\\', "\\\\").replace('"', "\\\"");
+    let invalid = request(escaped.as_bytes(), None, false);
+    assert_eq!(invalid["cause"], "InvalidJson");
+    assert_eq!(invalid["stage"], "parse_request");
+    assert!(!invalid.to_string().contains("private-token"));
+    assert_eq!(request(b"not:base64", None, true)["cause"], "InvalidBase64");
+    assert_eq!(request(&[255], None, false)["cause"], "InvalidUtf8");
+    assert_eq!(request(b"{}", Some(3), false)["cause"], "UnexpectedEof");
+    assert_eq!(
+        request(b"", Some(1024 * 1024 + 1), false)["error_code"],
+        "request_body_too_large"
+    );
+    // Encoded and decoded sizes are independently bounded, including padding.
+    let oversized = B64.encode(vec![b' '; 1024 * 1024 + 1]);
+    assert_eq!(
+        request(oversized.as_bytes(), None, true)["cause"],
+        "TooLarge"
+    );
+}
+
+#[test]
+fn invalid_addresses_are_skipped_without_losing_existing_nodes_or_reporting_success() {
+    let fixture = Fixture::new();
+    let mut config = sockrocket_core::AppConfig::default();
+    config.subscriptions = vec!["not-an-address", "file:///synthetic-profile"]
+        .into_iter()
+        .map(|url| sockrocket_core::Subscription {
+            name: "fixture".into(),
+            url: url.into(),
+            format: "auto".into(),
+            last_updated: None,
+            refresh_interval_hours: 24,
+        })
+        .collect();
+    config.nodes = vec![
+        sockrocket_core::config::v2ray::parse_ss_uri(
+            "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@old.invalid:8388#old",
+        )
+        .unwrap(),
+    ];
+    let file = fixture.0.join("config.yaml");
+    fs::write(&file, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let before = fs::read(&file).unwrap();
+    let launch = fixture.call("subscription_start", json!({"action":"update_subs"}));
+    let result = fixture.finish(&launch["job"]["id"])["result"].clone();
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error_code"], "subscription_update_failed");
+    assert_eq!(result["skipped_subscriptions"], 2);
+    assert_eq!(result["node_count"], 1);
+    assert_eq!(fs::read(&file).unwrap(), before);
 }

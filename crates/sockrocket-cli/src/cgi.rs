@@ -69,23 +69,37 @@ pub fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let body = if env::var("REQUEST_METHOD").as_deref() == Ok("POST") {
-        read_post_body()?
+    let post = if method == "POST" {
+        read_post_body().and_then(|body| {
+            if body.is_empty() {
+                Ok(J::Null)
+            } else {
+                serde_json::from_str(&body).map_err(|error| {
+                    let mut out = request_error(
+                        "request_body_invalid",
+                        "InvalidJson",
+                        "Request JSON is invalid; refresh the page after installing the complete plugin package",
+                    );
+                    out["stage"] = json!("parse_request");
+                    out["line"] = json!(error.line());
+                    out["column"] = json!(error.column());
+                    out
+                })
+            }
+        })
     } else {
-        // Allow POST-style calls in `sockrocket-cli cgi` testing mode via stdin? No —
-        // actions that need a body also work without one (they error cleanly).
-        String::new()
-    };
-    let post: J = if body.is_empty() {
-        J::Null
-    } else {
-        serde_json::from_str(&body)?
+        Ok(J::Null)
     };
 
+    // Parsing failures need the same JSON envelope as action failures. Do not
+    // propagate them to main(), where stderr is discarded by firmware RPC.
+    let out = match post {
+        Ok(post) => dispatch(&action, &post),
+        Err(error) => error,
+    };
     println!("Content-Type: application/json");
     println!("Cache-Control: no-cache");
     println!();
-    let out = dispatch(&action, &post);
     println!(
         "{}",
         serde_json::to_string(&out).unwrap_or_else(|_| "{}".into())
@@ -111,29 +125,76 @@ fn query_param(name: &str) -> Option<String> {
 
 const MAX_CGI_BODY: u64 = 1024 * 1024; // 1 MiB — same cap as the HTTP API bridge
 
-fn read_post_body() -> Result<String> {
-    let mut buf = String::new();
-    match env::var("CONTENT_LENGTH")
+fn request_error(code: &str, cause: &str, message: &str) -> J {
+    json!({"ok":false,"error_code":code,"stage":"read_request","cause":cause,
+        "error":message,"hint":"通过软件中心安装完整插件包后刷新页面；勿单独替换脚本或二进制。"})
+}
+
+fn read_post_body() -> std::result::Result<String, J> {
+    let encoded = env::var("SOCKROCKET_LOCAL_RPC").as_deref() == Ok("1")
+        && env::var("SOCKROCKET_RPC_ENCODING").as_deref() == Ok("base64");
+    let limit = if encoded {
+        MAX_CGI_BODY.div_ceil(3) * 4
+    } else {
+        MAX_CGI_BODY
+    };
+    let length = env::var("CONTENT_LENGTH")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(len) if len > MAX_CGI_BODY => {
-            anyhow::bail!("POST body too large (max {MAX_CGI_BODY} bytes)");
-        }
-        Some(len) if len > 0 => {
-            let mut take = std::io::stdin().take(len);
-            take.read_to_string(&mut buf)?;
-        }
-        _ => {
-            // No Content-Length (koolcenter dbus bridge): read to EOF with a hard cap.
-            let mut take = std::io::stdin().take(MAX_CGI_BODY + 1);
-            take.read_to_string(&mut buf)?;
-            if buf.len() as u64 > MAX_CGI_BODY {
-                anyhow::bail!("POST body too large (max {MAX_CGI_BODY} bytes)");
-            }
+        .filter(|len| *len > 0);
+    let too_large = || {
+        let mut error = request_error(
+            "request_body_too_large",
+            "TooLarge",
+            "Request body exceeds the 1 MiB decoded limit",
+        );
+        error["hint"] = json!("缩小单次提交内容后重试。");
+        error
+    };
+    if length.is_some_and(|len| len > limit) {
+        return Err(too_large());
+    }
+    // No Content-Length on dbus RPC: read to EOF with an encoded-size cap.
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .take(length.unwrap_or(limit + 1))
+        .read_to_end(&mut buf)
+        .map_err(|error| {
+            request_error(
+                "request_body_read_failed",
+                &format!("{:?}", error.kind()),
+                "Cannot read request body",
+            )
+        })?;
+    if buf.len() as u64 > limit {
+        return Err(too_large());
+    }
+    if length.is_some_and(|len| len != buf.len() as u64) {
+        return Err(request_error(
+            "request_body_invalid",
+            "UnexpectedEof",
+            "Request body was truncated",
+        ));
+    }
+    if encoded {
+        buf = B64.decode(&buf).map_err(|_| {
+            request_error(
+                "request_body_invalid",
+                "InvalidBase64",
+                "Request body encoding is invalid",
+            )
+        })?;
+        if buf.len() as u64 > MAX_CGI_BODY {
+            return Err(too_large());
         }
     }
-    Ok(buf)
+    String::from_utf8(buf).map_err(|_| {
+        request_error(
+            "request_body_invalid",
+            "InvalidUtf8",
+            "Request body is not valid UTF-8",
+        )
+    })
 }
 
 // === Paths ===
@@ -750,9 +811,12 @@ fn act_add_sub(post: &J) -> J {
     let format = post
         .get("format")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or("auto");
-    if name.is_empty() || url.is_empty() {
-        return err_msg("Name and URL must not be empty");
+    if sockrocket_core::config::subscription::validate_subscription_url(url).is_err() {
+        return json!({"ok":false,"error_code":"subscription_url_invalid","stage":"validate_subscription",
+            "cause":"InvalidUrl","msg":"订阅地址无效，未保存。","hint":"填写完整的 http 或 https 订阅地址；名称和格式可以留空。"});
     }
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
@@ -767,18 +831,28 @@ fn act_add_sub(post: &J) -> J {
     ) {
         return err_msg("Unsupported subscription format");
     }
-    if !(url.starts_with("https://") || url.starts_with("http://"))
-        || url.chars().any(char::is_whitespace)
-    {
-        return err_msg("Subscription URL must be HTTP or HTTPS without whitespace");
-    }
     if seq
         .iter()
         .any(|item| item.get(ykey("url")).and_then(Y::as_str) == Some(url))
     {
-        return err_msg("This subscription already exists; update the existing entry");
+        return json!({"ok":false,"error_code":"subscription_exists","stage":"validate_subscription",
+            "cause":"DuplicateSubscription","msg":"该订阅已存在，请更新已有订阅。",
+            "hint":"在“我的订阅”中点击“全部更新”，无需重复添加；不会覆盖已有节点。"});
     }
-    seq.push(sub_entry(name, url, format));
+    let name = if name.is_empty() {
+        let used: std::collections::HashSet<_> = seq
+            .iter()
+            .filter_map(|entry| entry.get(ykey("name")).and_then(Y::as_str))
+            .collect();
+        let mut number = seq.len() + 1;
+        while used.contains(format!("订阅 {number}").as_str()) {
+            number += 1;
+        }
+        format!("订阅 {number}")
+    } else {
+        name.to_owned()
+    };
+    seq.push(sub_entry(&name, url, format));
     map.insert(ykey("subscriptions"), Y::Sequence(seq));
     if let Err(e) = save_conf(&map) {
         return json!({"ok": false, "msg": format!("Save failed: {e}")});
@@ -787,7 +861,7 @@ fn act_add_sub(post: &J) -> J {
     // Fetch + parse here (not only on restart) so the Web UI can show a real
     // error instead of "saved but still 0 nodes" after a silent background fail.
     subscription_jobs::progress(0, 1, "fetching");
-    match fetch_sub_nodes(name, url, format) {
+    match fetch_sub_nodes(&name, url, format) {
         Ok(report) if report.nodes.is_empty() => json!({
             "ok": false,
             "msg": "Subscription saved, but parsed 0 nodes — check URL / format (try auto, clash, or v2ray)",
@@ -795,13 +869,11 @@ fn act_add_sub(post: &J) -> J {
         }),
         Ok(report) => {
             let warning = if report.skipped_entries > 0 {
-                format!(
-                    "; {} URI entries were not imported (unsupported options or invalid entries)",
-                    report.skipped_entries
-                )
+                format!("；{} 条无效或不兼容的节点未导入", report.skipped_entries)
             } else {
                 String::new()
             };
+            let compatibility_notes = report.compatibility_notes;
             subscription_jobs::progress(1, 1, "applying");
             let nodes = report.nodes;
             let fetched = nodes.len();
@@ -820,8 +892,9 @@ fn act_add_sub(post: &J) -> J {
                     }
                     json!({
                         "ok": true,
-                        "msg": format!("Parsed {fetched} node(s) (total {total}); settings applied{warning}"),
-                        "node_count": total
+                        "msg": format!("已导入 {fetched} 个节点，共 {total} 个，设置已应用{warning}"),
+                        "node_count": total,
+                        "compatibility_notes": compatibility_notes
                     })
                 }
                 Err(e) => json!({
@@ -910,6 +983,8 @@ fn act_update_subs() -> J {
 
     let mut refreshed = Vec::new();
     let mut errors = Vec::new();
+    let mut compatibility_notes = Vec::new();
+    let mut skipped_subscriptions = 0usize;
     for (position, s) in subs.iter().enumerate() {
         subscription_jobs::progress(position, subs.len(), "fetching");
         let get = |k: &str| match s.get(ykey(k)) {
@@ -922,14 +997,21 @@ fn act_update_subs() -> J {
             f if f.is_empty() => "auto".into(),
             f => f,
         };
-        if url.is_empty() {
+        if sockrocket_core::config::subscription::validate_subscription_url(&url).is_err() {
+            skipped_subscriptions += 1;
+            errors.push(format!(
+                "第 {} 个订阅地址无效，已跳过并保留已有节点",
+                position + 1
+            ));
             continue;
         }
         match fetch_sub_nodes(&name, &url, &format) {
             Ok(report) if report.nodes.is_empty() => {
+                skipped_subscriptions += 1;
                 errors.push(format!("'{name}': parsed 0 nodes"));
             }
             Ok(report) => {
+                compatibility_notes.extend(report.compatibility_notes);
                 if report.skipped_entries > 0 {
                     errors.push(format!(
                         "{} URI entries were not imported (unsupported options or invalid entries)",
@@ -938,7 +1020,13 @@ fn act_update_subs() -> J {
                 }
                 refreshed.push((url, report.nodes));
             }
-            Err(e) => errors.push(format!("'{name}': {e}")),
+            Err(e) => {
+                skipped_subscriptions += 1;
+                errors.push(format!(
+                    "第 {} 个订阅下载或解析失败，已跳过：{e}",
+                    position + 1
+                ));
+            }
         }
     }
 
@@ -950,8 +1038,11 @@ fn act_update_subs() -> J {
         };
         return json!({
             "ok": false,
+            "error_code":"subscription_update_failed",
+            "stage":"fetching",
             "msg": format!("Update failed — {detail}"),
-            "node_count": 0
+            "skipped_subscriptions": skipped_subscriptions,
+            "node_count": conf_seq(&map, "nodes").len()
         });
     }
 
@@ -970,12 +1061,17 @@ fn act_update_subs() -> J {
             let warn = if errors.is_empty() {
                 String::new()
             } else {
-                format!(" (warnings: {})", errors.join("; "))
+                format!("（部分内容未更新：{}）", errors.join("; "))
             };
+            compatibility_notes.sort_unstable();
+            compatibility_notes.dedup();
             json!({
                 "ok": true,
-                "msg": format!("Updated {fetched} node(s) (total {total}); settings applied{warn}"),
-                "node_count": total
+                "msg": format!("已更新 {fetched} 个节点，共 {total} 个，设置已应用{warn}"),
+                "node_count": total,
+                "compatibility_notes": compatibility_notes,
+                "skipped_subscriptions": skipped_subscriptions,
+                "warnings": errors
             })
         }
         Err(e) => json!({"ok": false, "msg": format!("Fetched nodes but save failed: {e}")}),
@@ -3200,11 +3296,14 @@ mod tests {
     fn duplicate_subscription_and_invalid_input_leave_config_unchanged() {
         let env = TestEnv::new(SAMPLE);
         let before = fs::read(env.dir.join("config.yaml")).unwrap();
+        let duplicate = act_add_sub(&json!({"name":"duplicate", "url":"https://example.com/sub"}));
+        assert_eq!(duplicate["error_code"], "subscription_exists");
+        assert_eq!(duplicate["stage"], "validate_subscription");
         for body in [
             json!({"name":"duplicate", "url":"https://example.com/sub"}),
             json!({"name":"bad", "url":"file:///private/config", "format":"auto"}),
             json!({"name":"bad", "url":"https://example.com/sub2", "format":"invalid"}),
-            json!({"name":"   ", "url":"https://example.com/sub2"}),
+            json!({"name":"   ", "url":"https://"}),
         ] {
             assert_eq!(act_add_sub(&body)["ok"], false);
             assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), before);

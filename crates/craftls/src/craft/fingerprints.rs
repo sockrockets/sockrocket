@@ -450,3 +450,61 @@ pub static FIREFOX_105_EXT: Vec<ExtensionSpec> = {
 };
 
 define_fingerprint!(FIREFOX_105 { &FIREFOX_105_EXT, &FIREFOX_105_CIPHERS });
+
+/// Chrome 115's QUIC TLS-1.3 ClientHello baseline. This is deliberately
+/// separate from the TCP profile: no TLS 1.2, session ID, or TCP GREASE.
+/// Reference: refraction-networking/uquic, QUICChrome_115.
+#[dynamic]
+pub static CHROME_115_QUIC: Fingerprint = Fingerprint {
+    extensions: &CHROME_115_QUIC_EXT,
+    cipher: &[
+        GreaseOrCipher::T(CipherSuite::TLS13_AES_128_GCM_SHA256),
+        GreaseOrCipher::T(CipherSuite::TLS13_AES_256_GCM_SHA384),
+        GreaseOrCipher::T(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
+    ],
+    shuffle_extensions: true,
+};
+
+#[dynamic]
+static CHROME_115_QUIC_EXT: Vec<ExtensionSpec> = {
+    use ExtensionSpec::*;
+    use KeepExtension::*;
+    vec![
+        Keep(Must(ExtensionType::TransportParameters)),
+        // ALPS is not advertised: the HTTP/3 driver does not implement its
+        // settings exchange. Advertising an unimplemented TLS feature can
+        // break servers that negotiate it; this is a documented baseline.
+        Craft(CraftExtension::CompressCert(&[
+            crate::CertificateCompressionAlgorithm::Brotli,
+        ])),
+        Craft(CraftExtension::KeyShare(&[GreaseOrCurve::T(
+            NamedGroup::X25519,
+        )])),
+        Rustls(ClientExtension::SignatureAlgorithms(vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA1,
+        ])),
+        Keep(Must(ExtensionType::ServerName)),
+        Craft(CraftExtension::SupportedCurves(&[
+            GreaseOrCurve::T(NamedGroup::X25519),
+            GreaseOrCurve::T(NamedGroup::secp256r1),
+            GreaseOrCurve::T(NamedGroup::secp384r1),
+        ])),
+        Rustls(ClientExtension::PresharedKeyModes(vec![
+            PSKKeyExchangeMode::PSK_DHE_KE,
+        ])),
+        Craft(CraftExtension::Protocols(&[b"h3"])),
+        Craft(CraftExtension::SupportedVersions(&[GreaseOrVersion::T(
+            ProtocolVersion::TLSv1_3,
+        )])),
+        // HelloRetryRequest must keep its authenticated cookie and key share.
+        Keep(Optional(ExtensionType::Cookie)),
+    ]
+};

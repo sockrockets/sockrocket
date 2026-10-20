@@ -189,6 +189,26 @@ info "/jffs partition OK"
 check_deps
 
 # ── Update-only mode ───────────────────────────────────────────────────────────
+# Stage beside the destination and rename: cp over a running Linux executable
+# fails with ETXTBSY (the API stays up independently of the proxy).
+install_binary() {
+    local pending="$SOCKROCKET_BIN.install-new"
+    if ! xcp "$BINARY" "$pending" || ! chmod 700 "$pending"; then
+        rm -f "$pending" 2>/dev/null
+        err "Could not stage the bundled binary; existing binary retained"
+    fi
+    local version
+    version=$("$pending" --version 2>/dev/null) || version=""
+    case "$version" in
+        'sockrocket-cli '*) ;;
+        *) rm -f "$pending"; err "Bundled binary cannot run on this platform; existing binary retained" ;;
+    esac
+    if ! mv -f "$pending" "$SOCKROCKET_BIN"; then
+        rm -f "$pending" 2>/dev/null
+        err "Could not publish the bundled binary; existing binary retained"
+    fi
+}
+
 if [ "$UPDATE_ONLY" = "true" ]; then
     info "Update mode: replacing binary only (config preserved)..."
     [ -d "$SOCKROCKET_DIR" ] || err "Sockrocket is not installed. Run without --update first."
@@ -196,7 +216,7 @@ if [ "$UPDATE_ONLY" = "true" ]; then
     PID="$(read_first_line "$SOCKROCKET_DIR/sockrocket.pid")"
     [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && WAS_RUNNING=true
     [ "$WAS_RUNNING" = "true" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" stop 2>/dev/null || true
-    xcp "$BINARY" "$SOCKROCKET_BIN" && chmod +x "$SOCKROCKET_BIN" 2>/dev/null
+    install_binary
     ok "Binary updated: $("$SOCKROCKET_BIN" --version 2>/dev/null || echo 'version unknown')"
     # Restart the API bridge too if it is running — it still holds the old binary
     [ -f "$SOCKROCKET_DIR/sockrocket-api.pid" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart 2>/dev/null || true
@@ -216,7 +236,7 @@ install_common_files() {
     fi
 
     info "Installing sockrocket-cli binary..."
-    xcp "$BINARY" "$SOCKROCKET_BIN" && chmod +x "$SOCKROCKET_BIN" 2>/dev/null
+    install_binary
     ok "Binary installed: $("$SOCKROCKET_BIN" --version 2>/dev/null || echo 'version unknown')"
 
     info "Installing control scripts..."
@@ -320,17 +340,18 @@ install_hook() {
 post_install_start() {
     [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ] || return 0
     info "Starting API bridge (service continues in background)..."
-    "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-start >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 || true
+    "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 || true
     sleep 1
 
     (
         trap '' HUP INT TERM
         sleep 1
-        SOCKROCKET_FAST_START=1 "$SOCKROCKET_SCRIPTS/sockrocket.sh" start
+        # restart loads the new binary and respects an existing manual Stop.
+        SOCKROCKET_FAST_START=1 "$SOCKROCKET_SCRIPTS/sockrocket.sh" restart
     ) >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 </dev/null &
 
     if have cru; then
-        cru a SockrocketBoot "*/2 * * * * SOCKROCKET_FAST_START=1 $SOCKROCKET_SCRIPTS/sockrocket.sh api-start; SOCKROCKET_FAST_START=1 $SOCKROCKET_SCRIPTS/sockrocket.sh start; cru d SockrocketBoot" 2>/dev/null || true
+        cru a SockrocketBoot "*/2 * * * * SOCKROCKET_FAST_START=1 $SOCKROCKET_SCRIPTS/sockrocket.sh api-start; SOCKROCKET_FAST_START=1 $SOCKROCKET_SCRIPTS/sockrocket.sh restart; cru d SockrocketBoot" 2>/dev/null || true
     fi
 
     local api_ok=0

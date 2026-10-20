@@ -311,6 +311,29 @@ pub(crate) const TLS_CERT_PIN: &str = "tls_certificate_sha256";
 pub(crate) const HY2_UP: &str = "hysteria2_up_mbps";
 pub(crate) const HY2_DOWN: &str = "hysteria2_down_mbps";
 pub(crate) const HY2_FAST_OPEN: &str = "hysteria2_fast_open";
+// Legacy storage key: keep reading it so saved imports gain the implementation.
+pub(crate) const HY2_CLIENT_FP_HINT: &str = "hysteria2_client_fingerprint_hint";
+
+pub(crate) fn hysteria2_fingerprint(node: &Node) -> Option<&str> {
+    node.transport
+        .as_ref()
+        .and_then(|t| t.tls.as_ref())
+        .and_then(|t| t.fingerprint.as_deref())
+        .or_else(|| node.extra.get(HY2_CLIENT_FP_HINT).map(String::as_str))
+}
+
+pub(crate) fn validate_hysteria2_profile(tls: Option<&TlsConfig>) -> Result<()> {
+    if let Some(tls) = tls
+        && matches!(tls.fingerprint.as_deref(), Some("chrome" | "chrome115"))
+    {
+        anyhow::ensure!(
+            tls.alpn.as_ref().is_none_or(|values| !values.is_empty()
+                && values.iter().all(|value| value == "h3")),
+            "Chrome QUIC fingerprint requires ALPN h3"
+        );
+    }
+    Ok(())
+}
 
 fn import_tls_pin(
     params: &HashMap<String, String>,
@@ -528,6 +551,7 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
                     | "upmbps"
                     | "downmbps"
                     | "fastopen"
+                    | "fp"
             ),
             "Unsupported Hysteria2 option; obfuscation and port hopping were not silently ignored"
         );
@@ -540,6 +564,27 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
     }
     let mut extra = HashMap::new();
     import_tls_pin(&params, &mut extra)?;
+    // Browser profile and certificate pin are separate settings. Chrome uses
+    // the versioned QUIC profile; other recognized hints retain an explicit
+    // compatibility note until their own QUIC profiles are implemented.
+    if let Some(fp) = params.get("fp").filter(|fp| !fp.is_empty()) {
+        anyhow::ensure!(
+            matches!(
+                fp.as_str(),
+                "chrome"
+                    | "chrome115"
+                    | "firefox"
+                    | "safari"
+                    | "ios"
+                    | "edge"
+                    | "random"
+                    | "randomized"
+                    | "none"
+            ),
+            "Unsupported Hysteria2 browser fingerprint hint; certificate pins require pinSHA256"
+        );
+        extra.insert(HY2_CLIENT_FP_HINT.into(), fp.clone());
+    }
     for (query, field) in [("upmbps", HY2_UP), ("downmbps", HY2_DOWN)] {
         if let Some(value) = params.get(query) {
             extra.insert(field.into(), super::bandwidth::canonical_mbps(value)?);
@@ -553,6 +598,17 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         extra.insert(
             HY2_FAST_OPEN.into(),
             query_truthy(&params, "fastopen").to_string(),
+        );
+    }
+    if params
+        .get("fp")
+        .is_some_and(|fp| matches!(fp.as_str(), "chrome" | "chrome115"))
+    {
+        anyhow::ensure!(
+            params
+                .get("alpn")
+                .is_none_or(|alpn| alpn.split(',').all(|p| p.trim() == "h3")),
+            "Chrome QUIC fingerprint requires ALPN h3"
         );
     }
     let server = parsed
@@ -583,7 +639,7 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
                         .map(str::to_owned)
                         .collect()
                 }),
-                fingerprint: None,
+                fingerprint: params.get("fp").filter(|v| !v.is_empty()).cloned(),
             }),
             ws: None,
             reality: None,
@@ -1358,6 +1414,9 @@ pub fn node_to_share_uri(node: &Node) -> String {
                     extra_params.push(format!("{query}={}", urlencoding::encode(value)));
                 }
             }
+            if let Some(fp) = hysteria2_fingerprint(node) {
+                extra_params.push(format!("fp={}", urlencoding::encode(fp)));
+            }
             if let Some(alpn) = node
                 .transport
                 .as_ref()
@@ -1445,6 +1504,60 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn hysteria_quic_profile_preserves_security_and_roundtrips() {
+        let uri = "hy2://synthetic@vpn.example.invalid:443?security=tls&sni=tls.example.invalid&alpn=h3&fp=chrome";
+        let node = parse_hysteria2_uri(uri).unwrap();
+        assert_eq!(
+            node.extra.get(HY2_CLIENT_FP_HINT).map(String::as_str),
+            Some("chrome")
+        );
+        assert!(
+            !node
+                .transport
+                .as_ref()
+                .unwrap()
+                .tls
+                .as_ref()
+                .unwrap()
+                .skip_cert_verify
+        );
+        let exported = node_to_share_uri(&node);
+        let imported = parse_hysteria2_uri(&exported).unwrap();
+        assert_eq!(
+            imported.extra.get(HY2_CLIENT_FP_HINT),
+            node.extra.get(HY2_CLIENT_FP_HINT)
+        );
+        assert!(
+            parse_hysteria2_uri(&uri.replace("fp=chrome", &format!("fp={}", "ab".repeat(32))))
+                .is_err()
+        );
+        assert!(parse_hysteria2_uri(&format!("{uri}&obfs=salamander")).is_err());
+        assert!(parse_hysteria2_uri(&uri.replace("alpn=h3", "alpn=hysteria")).is_err());
+        assert!(parse_hysteria2_uri(&uri.replace("fp=chrome", "fp=chrome115")).is_ok());
+        let exported = super::super::export::export_clash_config(std::slice::from_ref(&node));
+        let restored = super::super::clash::parse_clash_config(&exported).unwrap();
+        assert_eq!(hysteria2_fingerprint(&restored[0]), Some("chrome"));
+        let incompatible = exported.replace("h3", "hysteria");
+        assert!(
+            super::super::clash::parse_clash_config(&incompatible)
+                .unwrap()
+                .is_empty()
+        );
+        let mut legacy = node.clone();
+        legacy
+            .transport
+            .as_mut()
+            .unwrap()
+            .tls
+            .as_mut()
+            .unwrap()
+            .fingerprint = None;
+        let legacy_export = super::super::export::export_clash_config(&[legacy]);
+        let restored = super::super::clash::parse_clash_config(&legacy_export).unwrap();
+        assert_eq!(hysteria2_fingerprint(&restored[0]), Some("chrome"));
     }
 
     #[test]

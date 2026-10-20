@@ -55,6 +55,7 @@ shadowsocks = { version = "1", default-features = false, features = [
     "aead-cipher-2022",
 ] }
 quinn = "0.11"
+quinn-proto = { version = "0.11.17", default-features = false }
 sysproxy = "0.3.0"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"

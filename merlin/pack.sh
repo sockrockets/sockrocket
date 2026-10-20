@@ -75,7 +75,14 @@ pack_one() {
            "$pkg/scripts/sockrocket_api.sh"
 
   local tarball="sockrocket-merlin-${platform}.tar.gz"
-  tar -C "$work" -czf "$OUT_DIR/$tarball" sockrocket
+  # Local macOS packages must not include AppleDouble metadata or the build
+  # user's account name in archive headers. GNU/BSD tar use different flags.
+  if tar --version 2>/dev/null | grep -q bsdtar; then
+    COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname root --gname root \
+      -C "$work" -czf "$OUT_DIR/$tarball" sockrocket
+  else
+    tar --owner=0 --group=0 --numeric-owner -C "$work" -czf "$OUT_DIR/$tarball" sockrocket
+  fi
   rm -rf "$work"
   echo "built $OUT_DIR/$tarball"
 }

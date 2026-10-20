@@ -71,3 +71,25 @@ Tests do not require personal subscriptions, node credentials or changes to host
 References: [Xray Vision implementation](https://github.com/XTLS/Xray-core/blob/main/proxy/proxy.go), [AnyTLS protocol](https://github.com/anytls/anytls-go/blob/main/docs/protocol.md), [UoT v2](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/), [WireGuard endpoint format](https://sing-box.sagernet.org/configuration/endpoint/wireguard/), [BoringTun](https://github.com/cloudflare/boringtun).
 
 TUIC share links accept `insecure`, `allow_insecure` and `allowInsecure` aliases. A `pcs` pin is a SHA-256 hash of the leaf certificate in hexadecimal (optional colon/hyphen separators). When present, that exact leaf and its TLS handshake signature must verify, even if insecure mode is also selected. Pins survive local saves, share links and Clash exports. The pin is stored as `extra.tuic_certificate_sha256` in native node configurations.
+
+## QUIC handshake profiles
+
+Hysteria2 `fp=chrome` (alias `fp=chrome115`) enables a native Rust Chrome 115
+**baseline** handshake profile with ALPN `h3`. It changes the actual TLS 1.3
+cipher/extension order, X25519 key share, Brotli certificate compression,
+source/destination connection ID lengths and shuffled QUIC transport parameters
+(including GREASE). It preserves certificate verification and leaf pins. Existing
+saved Chrome hints are recognized; Clash `client-fingerprint`, enabled sing-box
+`tls.utls.fingerprint` and share-link
+export/import preserve the choice. Other browser hints remain metadata and are
+reported separately; absent/`none` fingerprints use the original QUIC stack.
+
+This profile does **not** reproduce ALPS, Chrome's Initial packet number/framing,
+HTTP/3 request behavior, or later Chrome releases. ALPS and 0-RTT are not
+advertised: the HTTP/3 driver does not implement their authenticated settings
+exchange. Quinn continues to handle loss recovery and key updates. Profile flow
+control matches the limits actually enforced by the transport; receive burst
+buffering is kept separate from individual DATAGRAM frame limits.
+
+References: [uQUIC's versioned Chrome profiles](https://github.com/refraction-networking/uquic/blob/master/u_parrot.go)
+and [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html).

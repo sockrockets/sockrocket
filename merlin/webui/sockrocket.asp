@@ -415,11 +415,11 @@ body.bg {min-width:0!important}
         <div class="card">
           <h3>添加订阅</h3>
           <div class="form-grid adaptive-form" style="grid-template-columns: minmax(120px,1fr) minmax(160px,2fr) 110px auto">
-            <div class="fg"><label for="sr-sub-name">名称</label><input type="text" id="sr-sub-name" placeholder="例如：订阅 A"></div>
-            <div class="fg"><label for="sr-sub-url">订阅地址</label><input type="url" autocomplete="off" spellcheck="false" id="sr-sub-url" placeholder="https://..."></div>
-            <div class="fg"><label>格式</label>
+            <div class="fg"><label for="sr-sub-name">名称（选填）</label><input type="text" id="sr-sub-name" placeholder="留空自动命名"></div>
+            <div class="fg"><label for="sr-sub-url">订阅地址（必填）</label><input type="url" required aria-required="true" autocomplete="off" spellcheck="false" id="sr-sub-url" placeholder="https://..."></div>
+            <div class="fg"><label for="sr-sub-format">格式（选填）</label>
               <select id="sr-sub-format">
-                <option value="auto" selected>auto</option>
+                <option value="auto" selected>自动识别</option>
                 <option value="clash">clash</option>
                 <option value="v2ray">v2ray (URI / base64)</option>
                 <option value="singbox">sing-box</option>
@@ -428,6 +428,7 @@ body.bg {min-width:0!important}
             </div>
             <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" id="sr-sub-add" onclick="addSub()">添加</button></div>
           </div>
+          <p class="hint">只需填写订阅地址。名称留空自动命名，格式默认自动识别；批量更新会跳过错误地址并保留对应的已有节点。</p>
         </div>
         <div class="card">
           <div class="toolbar">
@@ -438,6 +439,10 @@ body.bg {min-width:0!important}
           <div class="rows" id="sr-sub-list"><div class="hint">正在加载…</div></div>
           <div class="hint">更新失败时保留现有节点。订阅地址默认隐藏，请勿分享包含地址的截图。</div>
         </div>
+        <details class="card" id="sr-sub-notes" hidden>
+          <summary>兼容说明</summary>
+          <p class="hint" id="sr-sub-notes-text"></p>
+        </details>
         <div class="card" id="sr-sub-diagnostic" hidden>
           <h3>订阅失败诊断</h3><p class="hint">以下信息不包含订阅地址、节点凭证或个人路径，可复制用于反馈。</p>
           <pre class="rule-preview" id="sr-sub-diagnostic-text"></pre>
@@ -737,7 +742,9 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
     return ('0' + b.toString(16)).slice(-2);
   }).join('');
   var fields = {};
-  fields['sockrocket_rpc_body_' + seq] = JSON.stringify(data || {});
+  // Softcenter may shell-escape JSON quotes stored in fields. Encode UTF-8
+  // before dispatch so Chinese names, URLs and rule text arrive byte-for-byte.
+  fields['sockrocket_rpc_b64_' + seq] = utf8b64(JSON.stringify(data || {}));
   var job = {
     id: Math.floor(Math.random() * 999999) + 1,
     method: 'sockrocket_api.sh',
@@ -1464,26 +1471,59 @@ var subscriptionJobChecked = false, subscriptionJobSnapshot = null;
 var subscriptionAwaitingLaunch = false, subscriptionLaunchError = null, subscriptionMissingPolls = 0;
 var subscriptionDiagnostic = '';
 function subscriptionBusy(on) { subscriptionPending = on; srElement('sub-add').disabled = on; srElement('sub-update').disabled = on; }
+function renderSubscriptionNotes(result) {
+  var notes = result && result.compatibility_notes;
+  var hint = Array.isArray(notes) && notes.indexOf('hysteria2_browser_fingerprint_hint') >= 0;
+  // Older saved jobs embedded the metadata-only note in their success message.
+  if (!hint && result && result.ok !== false) hint = String(result.msg || '').indexOf('Hysteria2 uses native QUIC TLS; browser fingerprint hints were retained as metadata') >= 0;
+  var chrome = Array.isArray(notes) && notes.indexOf('hysteria2_chrome_quic_profile') >= 0;
+  var text = [];
+  if (chrome) text.push('已启用 Chrome 115 基线 QUIC 握手模拟（fp=chrome / chrome115，ALPN h3），包含 TLS 指纹、连接 ID 和传输参数。此基线不模拟 ALPS、浏览器 HTTP/3 请求及首包分帧；证书校验保持原样。');
+  if (hint) text.push('其他浏览器指纹提示已保留，但不用于模拟对应浏览器的 QUIC 指纹；证书校验保持原样。');
+  srElement('sub-notes-text').textContent = text.join(' ');
+  srElement('sub-notes').hidden = !text.length;
+}
 function scheduleSubscriptionPoll() {
   clearTimeout(subscriptionJobTimer);
   subscriptionJobTimer = setTimeout(function () { pollSubscriptionJob(subscriptionJobId); }, 2000);
 }
+function normalizeSubscriptionError(d) {
+  // Jobs saved by older packages only contain msg. Recognize exact safe
+  // reasons so refreshing the UI can explain those historical failures too.
+  if (d && (d.error_code === 'subscription_exists' || d.msg === 'This subscription already exists; update the existing entry')) {
+    return {ok:false,error_code:'subscription_exists',stage:'validate_subscription',cause:'DuplicateSubscription',msg:'该订阅已存在，请更新已有订阅。',hint:'在“我的订阅”中点击“全部更新”，无需重复添加。'};
+  }
+  if (d && !d.error_code && /No valid proxy nodes found in subscription|Subscription contains no usable nodes/.test(String(d.msg || ''))) {
+    return {ok:false,error_code:'subscription_no_valid_nodes',stage:'parse_subscription',cause:'NoValidNodes',msg:'订阅已下载，但没有解析出可用节点。',hint:'核对订阅格式及节点参数兼容性；现有节点会保留。'};
+  }
+  return d;
+}
 function subscriptionErrorText(d, fallback) {
+  d = normalizeSubscriptionError(d);
   var text = d && (d.msg || d.error_message || d.error || d.error_code) || fallback;
   if (d && d.stage) text += ' [' + d.stage + (d.cause ? ': ' + d.cause : '') + ']';
   if (d && d.error_code) text += '\n错误码：' + d.error_code;
   if (d && typeof d.os_error === 'number') text += '\n系统错误码：' + d.os_error;
+  if (d && typeof d.exit_code === 'number') text += '\n进程退出码：' + d.exit_code;
   if (d && d.hint) text += '\n建议：' + d.hint;
   return text;
 }
 function showSubscriptionDiagnostic(d, jobId) {
-  d = d || {};
-  var stages = {prepare_directory:'准备数据目录',lock_job:'获取任务锁',save_request:'保存订阅请求',save_job:'保存任务状态',resolve_worker:'定位后台程序',spawn_worker:'启动后台进程',fetching:'下载订阅',applying:'保存并应用配置'};
-  var causes = {PermissionDenied:'权限不足',AlreadyExists:'路径已被其他文件占用',NotADirectory:'数据路径不是目录',IsADirectory:'文件路径实际为目录',NotFound:'程序或路径缺失',StorageFull:'存储空间不足',ReadOnlyFilesystem:'文件系统只读',WouldBlock:'资源暂被占用',Unsupported:'操作或文件系统能力不支持',Other:'系统调用失败'};
-  var codes = ['subscription_start_failed','subscription_job_not_found','subscription_worker_exited','timeout','network_error','http_error','parse_error','busy','dispatch_error'];
+  d = normalizeSubscriptionError(d) || {};
+  var stages = {read_request:'读取接口请求',parse_request:'解析接口请求',invoke_backend:'调用后端程序',prepare_directory:'准备数据目录',lock_job:'获取任务锁',save_request:'保存订阅请求',save_job:'保存任务状态',resolve_worker:'定位后台程序',spawn_worker:'启动后台进程',fetching:'下载订阅',applying:'保存并应用配置'};
+  var causes = {InvalidBase64:'请求编码无效',InvalidUtf8:'请求不是有效 UTF-8 文本',InvalidJson:'请求 JSON 无效或被软件中心转义',UnexpectedEof:'请求内容被截断',TooLarge:'请求内容超过大小限制',PermissionDenied:'权限不足',AlreadyExists:'路径已被其他文件占用',NotADirectory:'数据路径不是目录',IsADirectory:'文件路径实际为目录',NotFound:'程序或路径缺失',StorageFull:'存储空间不足',ReadOnlyFilesystem:'文件系统只读',WouldBlock:'资源暂被占用',Unsupported:'操作或文件系统能力不支持',Other:'系统调用失败'};
+  var codes = ['request_body_invalid','request_body_too_large','request_body_read_failed','backend_failed','backend_unavailable','backend_empty_response','subscription_start_failed','subscription_job_not_found','subscription_worker_exited','timeout','network_error','http_error','parse_error','busy','dispatch_error'];
+  stages.validate_subscription = '校验订阅'; stages.parse_subscription = '解析订阅节点';
+  causes.DuplicateSubscription = '该订阅地址已存在'; causes.NoValidNodes = '返回内容没有可用节点或包含不兼容参数'; causes.InvalidUrl = '订阅地址格式无效';
+  codes.push('subscription_exists','subscription_no_valid_nodes','subscription_url_invalid','subscription_update_failed');
   var code = codes.indexOf(d.error_code) >= 0 ? d.error_code : 'subscription_failed';
   var reason = causes[d.cause] || (code === 'timeout' ? '请求超时' : code === 'network_error' ? '无法连接插件接口' : code === 'busy' ? '接口正在处理其他请求' : '订阅任务未完成，请结合阶段与日志排查');
   var hint = d.cause === 'PermissionDenied' ? '检查插件数据目录及程序权限，保留已有配置。' : d.cause === 'StorageFull' || d.os_error === 28 || d.os_error === 122 ? '检查并释放路由器存储空间。' : d.cause === 'ReadOnlyFilesystem' || d.os_error === 30 ? '检查存储挂载及文件系统错误。' : '请反馈错误码、失败阶段和对应时间的脱敏日志。';
+  if (d.stage === 'parse_request' || d.stage === 'read_request' || d.stage === 'invoke_backend') hint = d.cause === 'TooLarge' ? '缩小单次提交内容后重试。' : '通过软件中心安装完整插件包后刷新页面；反馈错误码与进程退出码。';
+  if (code === 'subscription_exists') hint = '在“我的订阅”中点击“全部更新”，无需重复添加。';
+  if (code === 'subscription_no_valid_nodes') hint = '核对订阅格式及节点参数兼容性；现有节点会保留。';
+  if (code === 'subscription_url_invalid') hint = '填写完整的 http 或 https 订阅地址；名称和格式可以留空。';
+  if (code === 'subscription_update_failed') { reason = '所有订阅均未更新，原有节点已保留'; hint = '核对错误地址、服务端状态及节点参数兼容性后重试。'; }
   var status = /\bHTTP(?:\/\d(?:\.\d)?)?\s+([1-5]\d{2})\b/.exec(String(d.msg || d.error || ''));
   if (status) {
     reason = '订阅服务器返回 HTTP ' + status[1];
@@ -1493,6 +1533,7 @@ function showSubscriptionDiagnostic(d, jobId) {
   // contain server content or personal paths and are deliberately excluded.
   var lines = ['错误码：' + code,'失败阶段：' + (stages[d.stage] || '未确认'),'原因：' + reason];
   if (typeof d.os_error === 'number' && isFinite(d.os_error)) lines.push('系统错误码：' + d.os_error);
+  if (typeof d.exit_code === 'number' && isFinite(d.exit_code)) lines.push('进程退出码：' + d.exit_code);
   if (/^[0-9a-f]{32}$/.test(jobId || '')) lines.push('任务 ID：' + jobId);
   lines.push('建议：' + hint);
   subscriptionDiagnostic = lines.join('\n');
@@ -1542,6 +1583,7 @@ function acceptSubscriptionJob(d) {
     }
   }
   subscriptionJobSnapshot = null;
+  renderSubscriptionNotes(result);
   if (result.ok === false) { showSubscriptionDiagnostic(result, job.id); srShowMsg(subscriptionErrorText(result, '订阅任务失败'), 'err'); }
   else { srElement('sub-diagnostic').hidden = true; toastResp(result); }
   srLoadSubs(); srLoadNodes(); refreshStatus();
@@ -1560,6 +1602,7 @@ function restoreSubscriptionJob() {
     if (d.ok !== false && d.job && !subscriptionPending) {
       if (d.job.state === 'running') acceptSubscriptionJob(d);
       else if (d.job.result && d.job.result.ok === false) showSubscriptionDiagnostic(d.job.result, d.job.id);
+      else if (d.job.result) renderSubscriptionNotes(d.job.result);
     }
   }, function () { subscriptionJobChecked = false; }, 12000);
 }
@@ -1590,8 +1633,12 @@ function startSubscriptionJob(action, body) {
 function addSub() {
   if (subscriptionPending) return;
   var data = {name:srElement('sub-name').value.trim(),url:srElement('sub-url').value.trim(),format:srElement('sub-format').value};
+  if (!data.url) { srShowMsg('请填写订阅地址（必填）。', 'err'); return; }
   if (!/^https?:\/\//i.test(data.url)) { srShowMsg('请输入 http 或 https 订阅地址', 'err'); return; }
-  if (!data.name || !data.url) { srShowMsg('名称和订阅地址不能为空', 'err'); return; }
+  try {
+    var parsed = new URL(data.url);
+    if (!parsed.hostname || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) throw new Error('invalid URL');
+  } catch (error) { srShowMsg('订阅地址无效，请填写完整的 http 或 https 地址。', 'err'); return; }
   subscriptionJobSnapshot = data;
   startSubscriptionJob('add_sub', data);
 }

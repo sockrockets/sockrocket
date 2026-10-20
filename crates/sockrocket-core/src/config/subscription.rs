@@ -23,6 +23,20 @@ pub const SUB_FETCH_TIMEOUT_SECS: u64 = 30;
 /// Bound decoded response bytes before parsing or allocating node structures.
 pub const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 
+/// Validate before saving or attempting a download. Errors contain no URL.
+pub fn validate_subscription_url(input: &str) -> Result<()> {
+    anyhow::ensure!(
+        !input.is_empty() && !input.chars().any(char::is_whitespace),
+        "Subscription URL must be HTTP or HTTPS without whitespace"
+    );
+    let url = url::Url::parse(input).map_err(|_| anyhow::anyhow!("Invalid subscription URL"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "Subscription URL requires an HTTP or HTTPS host"
+    );
+    Ok(())
+}
+
 /// Fetch a subscription URL and parse it into nodes
 pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
     Ok(fetch_subscription_report(sub).await?.nodes)
@@ -32,9 +46,12 @@ pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
 pub struct SubscriptionFetchReport {
     pub nodes: Vec<Node>,
     pub skipped_entries: usize,
+    /// Stable informational codes, distinct from failed or skipped entries.
+    pub compatibility_notes: Vec<&'static str>,
 }
 
 pub async fn fetch_subscription_report(sub: &Subscription) -> Result<SubscriptionFetchReport> {
+    validate_subscription_url(&sub.url)?;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(SUB_FETCH_TIMEOUT_SECS))
@@ -84,9 +101,24 @@ pub async fn fetch_subscription_report(sub: &Subscription) -> Result<Subscriptio
     // source, and a restart has to know which subscription they belong to.
     super::dedup::tag_subscription_nodes(&mut nodes, &sub.url);
     let skipped_entries = uri_entry_count(&content).saturating_sub(nodes.len());
+    let mut compatibility_notes = Vec::new();
+    for node in &nodes {
+        if !matches!(node.protocol, ProxyProtocol::Hysteria2 { .. }) {
+            continue;
+        }
+        let note = match v2ray::hysteria2_fingerprint(node) {
+            Some("chrome" | "chrome115") => "hysteria2_chrome_quic_profile",
+            Some("none" | "") | None => continue,
+            Some(_) => "hysteria2_browser_fingerprint_hint",
+        };
+        if !compatibility_notes.contains(&note) {
+            compatibility_notes.push(note);
+        }
+    }
     Ok(SubscriptionFetchReport {
         nodes,
         skipped_entries,
+        compatibility_notes,
     })
 }
 
@@ -276,6 +308,29 @@ fn parse_plain_lines(content: &str) -> Result<Vec<Node>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_urls_require_http_host_and_do_not_echo_private_inputs() {
+        for url in [
+            "https://example.invalid/sub?token=synthetic",
+            "http://127.0.0.1:1234/fixture",
+            "HTTPS://example.invalid/sub",
+        ] {
+            assert!(validate_subscription_url(url).is_ok());
+        }
+        for url in [
+            "",
+            "https://",
+            "not-a-url",
+            "file:///synthetic-private-profile",
+            "https://example.invalid/private token",
+        ] {
+            let error = validate_subscription_url(url).unwrap_err().to_string();
+            assert!(
+                !error.contains("synthetic-private-profile") && !error.contains("private token")
+            );
+        }
+    }
 
     #[test]
     fn import_diagnostics_count_uri_entries_without_config_urls() {
