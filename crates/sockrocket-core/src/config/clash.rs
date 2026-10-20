@@ -4,6 +4,26 @@ use std::collections::HashMap;
 
 use super::model::*;
 
+fn deserialize_bandwidth<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            let text = match value {
+                serde_yaml::Value::String(s) => s,
+                serde_yaml::Value::Number(n) => n.to_string(),
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "Bandwidth must be a number or string",
+                    ));
+                }
+            };
+            super::bandwidth::canonical_mbps(&text).map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
 /// Clash YAML configuration top-level structure
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -67,8 +87,12 @@ struct ClashProxy {
     #[serde(rename = "plugin-opts")]
     plugin_opts: Option<serde_yaml::Value>,
     // Hysteria2 bandwidth
+    #[serde(default, deserialize_with = "deserialize_bandwidth")]
     up: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_bandwidth")]
     down: Option<String>,
+    #[serde(rename = "fast-open")]
+    fast_open: Option<bool>,
     // Hysteria2 obfuscation (salamander). Parsed so we can *reject* obfs
     // nodes explicitly instead of silently importing a node that cannot
     // connect.
@@ -295,15 +319,26 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
 
     let mut extra = HashMap::new();
     if let Some(pin) = &proxy.fingerprint {
-        anyhow::ensure!(
-            proxy.proxy_type == "tuic",
-            "Certificate pinning is only supported for TUIC here"
-        );
+        let key = match proxy.proxy_type.as_str() {
+            "tuic" => super::v2ray::TUIC_CERT_PIN,
+            "hysteria2" | "hy2" | "anytls" => super::v2ray::TLS_CERT_PIN,
+            _ => anyhow::bail!("Certificate pinning unsupported for this protocol"),
+        };
         let pin = super::v2ray::parse_tuic_certificate_pin(pin)?;
-        extra.insert(
-            super::v2ray::TUIC_CERT_PIN.to_string(),
-            pin.iter().map(|b| format!("{b:02x}")).collect(),
-        );
+        extra.insert(key.into(), pin.iter().map(|b| format!("{b:02x}")).collect());
+    }
+    if matches!(proxy.proxy_type.as_str(), "hysteria2" | "hy2") {
+        for (value, key) in [
+            (&proxy.up, super::v2ray::HY2_UP),
+            (&proxy.down, super::v2ray::HY2_DOWN),
+        ] {
+            if let Some(value) = value {
+                extra.insert(key.into(), super::bandwidth::canonical_mbps(value)?);
+            }
+        }
+        if let Some(value) = proxy.fast_open {
+            extra.insert(super::v2ray::HY2_FAST_OPEN.into(), value.to_string());
+        }
     }
     let transport = build_transport(proxy)?;
 
@@ -576,6 +611,25 @@ proxies:
         assert_eq!(nodes[1].port, 8388);
     }
 
+    #[test]
+    fn numeric_and_unit_bandwidths_preserve_hysteria_nodes() {
+        let yaml = r#"proxies:
+  - {name: integer, type: hysteria2, server: example.invalid, port: 443, password: fixture, up: 10, down: 20}
+  - {name: decimal, type: hysteria2, server: example.invalid, port: 443, password: fixture, up: 0.5, down: "100 Kbps"}
+  - {name: units, type: hysteria2, server: example.invalid, port: 443, password: fixture, up: "1 Gbps", down: "1 bps"}
+  - {name: invalid, type: hysteria2, server: example.invalid, port: 443, password: fixture, up: true}
+"#;
+        let nodes = parse_clash_config(yaml).unwrap();
+        assert_eq!(nodes.len(), 3);
+        for (node, up, down) in [
+            (&nodes[0], "10", "20"),
+            (&nodes[1], "0.5", "0.1"),
+            (&nodes[2], "1000", "0.000008"),
+        ] {
+            assert_eq!(node.extra[super::super::v2ray::HY2_UP], up);
+            assert_eq!(node.extra[super::super::v2ray::HY2_DOWN], down);
+        }
+    }
     #[test]
     fn test_parse_clash_meta_subscription() {
         // Real-world Clash Meta subscription format with:

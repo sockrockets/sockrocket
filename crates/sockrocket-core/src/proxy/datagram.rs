@@ -27,10 +27,18 @@ impl Datagram for UdpSocket {
 }
 
 pub(super) async fn connect_direct(host: &str, port: u16) -> Result<BoxDatagram> {
-    let addr = tokio::net::lookup_host((host, port))
-        .await?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No UDP destination address"))?;
+    // A device direct rule may restore a Fake-IP to its domain. On Merlin
+    // the OS resolver can return that token again; use the same bootstrap
+    // path as direct TCP and never send UDP back into the fake-address pool.
+    let resolved = if let Some(ips) = super::transport::resolve_server_ips(host).await {
+        ips.into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect::<Vec<_>>()
+    } else {
+        tokio::net::lookup_host((host, port)).await?.collect()
+    };
+    let addr=resolved.into_iter().find(|addr| !matches!(addr.ip(),std::net::IpAddr::V4(ip) if crate::dns::fakeip::is_fake_ip(ip)))
+        .ok_or_else(|| anyhow::anyhow!("No real UDP destination address (Fake-IP cannot be dialed directly)"))?;
     let socket = UdpSocket::bind(if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -115,5 +123,13 @@ mod tests {
             let n = client.recv(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], packet);
         }
+    }
+}
+
+#[cfg(test)]
+mod fake_direct_tests {
+    #[tokio::test]
+    async fn direct_udp_rejects_unrestored_fake_addresses() {
+        assert!(super::connect_direct("198.18.0.42", 443).await.is_err());
     }
 }

@@ -18,6 +18,8 @@
 
 mod http;
 mod storage;
+mod subscription_jobs;
+pub use subscription_jobs::worker as subscription_worker;
 
 use std::env;
 use std::fs;
@@ -377,6 +379,7 @@ fn read_only_action(action: &str) -> bool {
             | "config"
             | "version"
             | "subscriptions"
+            | "subscription_job"
             | "stats"
             | "node_details"
             | "sysinfo"
@@ -393,14 +396,15 @@ pub use http::{DEFAULT_API_PORT, serve_api};
 // === Actions ===
 
 fn dispatch(action: &str, post: &J) -> J {
-    let _transaction = if action == "stop" || read_only_action(action) {
-        None
-    } else {
-        match storage::MutationGuard::acquire() {
-            Ok(guard) => Some(guard),
-            Err(e) => return err_msg(&format!("Configuration transaction failed: {e}")),
-        }
-    };
+    let _transaction =
+        if matches!(action, "stop" | "subscription_start") || read_only_action(action) {
+            None
+        } else {
+            match storage::MutationGuard::acquire() {
+                Ok(guard) => Some(guard),
+                Err(e) => return err_msg(&format!("Configuration transaction failed: {e}")),
+            }
+        };
     dispatch_inner(action, post)
 }
 
@@ -417,6 +421,8 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "save_config" => act_save_config(post),
         "version" => json!({"version": version_string()}),
         "subscriptions" => act_subscriptions(),
+        "subscription_start" => subscription_jobs::start(post),
+        "subscription_job" => subscription_jobs::status(post),
         "add_sub" => act_add_sub(post),
         "del_sub" => act_del_sub(post),
         "rename_sub" => act_rename_sub(post),
@@ -686,7 +692,7 @@ fn fetch_sub_nodes(
     name: &str,
     url: &str,
     format: &str,
-) -> Result<Vec<sockrocket_core::Node>, String> {
+) -> Result<sockrocket_core::config::subscription::SubscriptionFetchReport, String> {
     let sub = sockrocket_core::Subscription {
         name: name.to_string(),
         url: url.to_string(),
@@ -700,7 +706,12 @@ fn fetch_sub_nodes(
         .map_err(|e| format!("Failed to start fetch runtime: {e}"))?;
     let timeout = Duration::from_secs(sockrocket_core::SUB_FETCH_TIMEOUT_SECS);
     rt.block_on(async {
-        match tokio::time::timeout(timeout, sockrocket_core::fetch_subscription(&sub)).await {
+        match tokio::time::timeout(
+            timeout,
+            sockrocket_core::config::subscription::fetch_subscription_report(&sub),
+        )
+        .await
+        {
             Ok(Ok(nodes)) => Ok(nodes),
             Ok(Err(e)) => Err(format!("{e:#}")),
             Err(_) => Err(format!(
@@ -750,7 +761,10 @@ fn act_add_sub(post: &J) -> J {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
-    if !matches!(format, "auto" | "clash" | "v2ray" | "singbox" | "sing-box") {
+    if !matches!(
+        format,
+        "auto" | "clash" | "v2ray" | "singbox" | "sing-box" | "base64"
+    ) {
         return err_msg("Unsupported subscription format");
     }
     if !(url.starts_with("https://") || url.starts_with("http://"))
@@ -772,13 +786,24 @@ fn act_add_sub(post: &J) -> J {
 
     // Fetch + parse here (not only on restart) so the Web UI can show a real
     // error instead of "saved but still 0 nodes" after a silent background fail.
+    subscription_jobs::progress(0, 1, "fetching");
     match fetch_sub_nodes(name, url, format) {
-        Ok(nodes) if nodes.is_empty() => json!({
+        Ok(report) if report.nodes.is_empty() => json!({
             "ok": false,
             "msg": "Subscription saved, but parsed 0 nodes — check URL / format (try auto, clash, or v2ray)",
             "node_count": 0
         }),
-        Ok(nodes) => {
+        Ok(report) => {
+            let warning = if report.skipped_entries > 0 {
+                format!(
+                    "; {} URI entries were not imported (unsupported options or invalid entries)",
+                    report.skipped_entries
+                )
+            } else {
+                String::new()
+            };
+            subscription_jobs::progress(1, 1, "applying");
+            let nodes = report.nodes;
             let fetched = nodes.len();
             let saved = (|| {
                 let mut cfg = load_app_config()?;
@@ -795,7 +820,7 @@ fn act_add_sub(post: &J) -> J {
                     }
                     json!({
                         "ok": true,
-                        "msg": format!("Parsed {fetched} node(s) (total {total}); settings applied"),
+                        "msg": format!("Parsed {fetched} node(s) (total {total}); settings applied{warning}"),
                         "node_count": total
                     })
                 }
@@ -885,7 +910,8 @@ fn act_update_subs() -> J {
 
     let mut refreshed = Vec::new();
     let mut errors = Vec::new();
-    for s in &subs {
+    for (position, s) in subs.iter().enumerate() {
+        subscription_jobs::progress(position, subs.len(), "fetching");
         let get = |k: &str| match s.get(ykey(k)) {
             Some(Y::String(v)) => v.clone(),
             _ => String::new(),
@@ -900,10 +926,18 @@ fn act_update_subs() -> J {
             continue;
         }
         match fetch_sub_nodes(&name, &url, &format) {
-            Ok(nodes) if nodes.is_empty() => {
+            Ok(report) if report.nodes.is_empty() => {
                 errors.push(format!("'{name}': parsed 0 nodes"));
             }
-            Ok(nodes) => refreshed.push((url, nodes)),
+            Ok(report) => {
+                if report.skipped_entries > 0 {
+                    errors.push(format!(
+                        "{} URI entries were not imported (unsupported options or invalid entries)",
+                        report.skipped_entries
+                    ));
+                }
+                refreshed.push((url, report.nodes));
+            }
             Err(e) => errors.push(format!("'{name}': {e}")),
         }
     }
@@ -921,6 +955,7 @@ fn act_update_subs() -> J {
         });
     }
 
+    subscription_jobs::progress(subs.len(), subs.len(), "applying");
     let fetched: usize = refreshed.iter().map(|(_, nodes)| nodes.len()).sum();
     let saved = (|| {
         let mut cfg = load_app_config()?;
@@ -1897,6 +1932,11 @@ fn valid_rule_pattern(rule_type: &str, pattern: &str) -> std::result::Result<Str
 
 fn yaml_to_routing_rule(r: &Y) -> Option<sockrocket_core::RoutingRule> {
     Some(sockrocket_core::RoutingRule {
+        source: r
+            .get(ykey("source"))
+            .and_then(Y::as_str)
+            .unwrap_or("")
+            .to_string(),
         name: r
             .get(ykey("name"))
             .and_then(|v| v.as_str())
@@ -1927,6 +1967,9 @@ fn yaml_to_routing_rule(r: &Y) -> Option<sockrocket_core::RoutingRule> {
 
 fn routing_rule_to_yaml(r: sockrocket_core::RoutingRule) -> Y {
     let mut entry = Mapping::new();
+    if !r.source.is_empty() {
+        entry.insert(ykey("source"), Y::String(r.source));
+    }
     if !r.name.is_empty() {
         entry.insert(ykey("name"), Y::String(r.name));
     }
@@ -1967,6 +2010,14 @@ fn rule_kind(rule_type: &str) -> &str {
     }
 }
 
+fn requested_rule_source(post: &J, default: &str) -> std::result::Result<String, String> {
+    let value = match post.get("source") {
+        None => default,
+        Some(value) => value.as_str().ok_or("来源必须是 IP 地址或 CIDR 字符串")?,
+    };
+    sockrocket_core::router::normalize_rule_source(value)
+}
+
 fn requested_rule_priority(post: &J, default: i32) -> std::result::Result<i32, &'static str> {
     match post.get("priority") {
         None => Ok(default),
@@ -1978,7 +2029,7 @@ fn requested_rule_priority(post: &J, default: i32) -> std::result::Result<i32, &
 }
 
 fn rule_edit_snapshot(rule: &sockrocket_core::RoutingRule) -> J {
-    json!({"name":rule.name,"group":rule.group,"rule_type":rule.rule_type,
+    json!({"source":rule.source,"name":rule.name,"group":rule.group,"rule_type":rule.rule_type,
         "pattern":rule.pattern,"target":rule.target,"priority":rule.priority,"enabled":rule.enabled})
 }
 
@@ -1997,6 +2048,7 @@ fn act_get_rules() -> J {
         .map(|(i, r)| {
             json!({
                 "index": i,
+                "source": r.source,
                 "name": r.name,
                 "group": r.group,
                 "rule_type": r.rule_type,
@@ -2037,16 +2089,24 @@ fn act_add_rule(post: &J) -> J {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
+    let source = match requested_rule_source(post, "") {
+        Ok(value) => value,
+        Err(error) => return err_msg(&error),
+    };
     // Duplicate check: same type+pattern already present.
     let dup = seq.iter().any(|r| {
         r.get(ykey("rule_type")).and_then(|v| v.as_str()) == Some(rule_type)
             && r.get(ykey("pattern")).and_then(|v| v.as_str()) == Some(pattern.as_str())
+            && r.get(ykey("source")).and_then(Y::as_str).unwrap_or("") == source
     });
     if dup {
         return json!({"ok": false, "msg": format!("Rule already exists: {rule_type} {pattern}")});
     }
 
     let mut entry = Mapping::new();
+    if !source.is_empty() {
+        entry.insert(ykey("source"), Y::String(source));
+    }
     let name = post
         .get("name")
         .and_then(|v| v.as_str())
@@ -2131,16 +2191,24 @@ fn act_update_rule(post: &J) -> J {
             Ok(p) => p,
             Err(e) => return err_msg(&e),
         };
+    let source = match requested_rule_source(post, &old.source) {
+        Ok(value) => value,
+        Err(error) => return err_msg(&error),
+    };
     if rules.iter().enumerate().any(|(i, r)| {
-        i != index && rule_kind(&r.rule_type) == rule_kind(typ) && r.pattern == pattern
+        i != index
+            && rule_kind(&r.rule_type) == rule_kind(typ)
+            && r.pattern == pattern
+            && r.source == source
     }) {
-        return err_msg("相同类型和匹配内容的规则已存在");
+        return err_msg("相同来源、类型和匹配内容的规则已存在");
     }
     let priority = match requested_rule_priority(post, old.priority) {
         Ok(n) => n,
         Err(e) => return err_msg(e),
     };
     let mut updated = old.clone();
+    updated.source = source;
     updated.priority = priority;
     updated.rule_type = typ.to_string();
     updated.pattern = pattern;
@@ -2242,9 +2310,18 @@ fn act_move_rule(post: &J) -> J {
             Some("final" | "match")
         )
     };
+    let phase = |r: &Y| {
+        u8::from(
+            r.get(ykey("source"))
+                .and_then(Y::as_str)
+                .unwrap_or("")
+                .is_empty(),
+        ) * 2
+            + u8::from(final_rule(r))
+    };
     indexed.sort_by(|a, b| {
-        final_rule(&a.1)
-            .cmp(&final_rule(&b.1))
+        phase(&a.1)
+            .cmp(&phase(&b.1))
             .then_with(|| {
                 let priority = |r: &Y| r.get(ykey("priority")).and_then(Y::as_i64).unwrap_or(0);
                 priority(&b.1).cmp(&priority(&a.1))
@@ -2260,8 +2337,8 @@ fn act_move_rule(post: &J) -> J {
     if other < 0 || other as usize >= seq.len() {
         return err_msg("Already at edge");
     }
-    if final_rule(&seq[index]) != final_rule(&seq[other as usize]) {
-        return err_msg("最终规则必须位于国内直连之后，不能跨阶段移动");
+    if phase(&seq[index]) != phase(&seq[other as usize]) {
+        return err_msg("设备规则、全局规则和最终兜底不能跨阶段移动");
     }
     seq.swap(index, other as usize);
     // Keep YAML priority aligned with list order (same as desktop GUI).
@@ -2319,7 +2396,8 @@ fn act_batch_add_rules(post: &J) -> J {
         let head = l.split([',', ' ', ':']).next().unwrap_or("");
         matches!(
             head.to_ascii_uppercase().as_str(),
-            "DOMAIN"
+            "SOURCE"
+                | "DOMAIN"
                 | "DOMAIN-SUFFIX"
                 | "DOMAIN-KEYWORD"
                 | "IP-CIDR"
@@ -2364,8 +2442,18 @@ fn act_batch_add_rules(post: &J) -> J {
         Ok(n) => n,
         Err(e) => return err_msg(e),
     };
+    let source = match requested_rule_source(post, "") {
+        Ok(value) => value,
+        Err(error) => return err_msg(&error),
+    };
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
+        if post.get("source").is_some() {
+            if !rule.source.is_empty() && rule.source != source {
+                return err_msg("每行 SOURCE 与所选来源不一致；未保存任何更改");
+            }
+            rule.source.clone_from(&source);
+        }
         rule.priority = if post.get("priority").is_some() {
             priority
         } else {
@@ -2374,6 +2462,7 @@ fn act_batch_add_rules(post: &J) -> J {
                 .find(|r| {
                     rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
                         && r.pattern == rule.pattern
+                        && r.source == rule.source
                 })
                 .map_or(0, |r| r.priority)
         };
@@ -2547,7 +2636,8 @@ fn act_replace_rule_group(post: &J) -> J {
             let head = l.split([',', ' ', ':']).next().unwrap_or("");
             matches!(
                 head.to_ascii_uppercase().as_str(),
-                "DOMAIN"
+                "SOURCE"
+                    | "DOMAIN"
                     | "DOMAIN-SUFFIX"
                     | "DOMAIN-KEYWORD"
                     | "IP-CIDR"
@@ -2607,11 +2697,25 @@ fn act_replace_rule_group(post: &J) -> J {
             return err_msg("分组规则已变化，请刷新后重新编辑");
         }
     }
+    let common_source = if members.iter().all(|r| r.source == members[0].source) {
+        members[0].source.as_str()
+    } else {
+        ""
+    };
+    let source = match requested_rule_source(post, common_source) {
+        Ok(value) => value,
+        Err(error) => return err_msg(&error),
+    };
     let default_enabled = members.iter().any(|r| r.enabled);
     let default_priority = members[0].priority;
     for rule in &mut incoming {
+        if post.get("source").is_some() || rule.source.is_empty() {
+            rule.source.clone_from(&source);
+        }
         let previous = members.iter().find(|r| {
-            rule_kind(&r.rule_type) == rule_kind(&rule.rule_type) && r.pattern == rule.pattern
+            rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
+                && r.pattern == rule.pattern
+                && r.source == rule.source
         });
         if post.get("enabled").is_none() {
             rule.enabled = previous.map_or(default_enabled, |r| r.enabled);
@@ -3286,12 +3390,12 @@ dns_direct_domains:
         let _env = TestEnv::new(SAMPLE);
         // Unreachable URL: entry is still saved; sync fetch reports failure.
         let r = act_add_sub(
-            &json!({"name": "Sub 2", "url": "https://127.0.0.1:1/s", "format": "clash"}),
+            &json!({"name": "Sub 2", "url": "https://127.0.0.1:1/s", "format": "base64"}),
         );
         assert!(r.get("msg").and_then(|v| v.as_str()).is_some());
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
         assert_eq!(subs.len(), 2);
-        assert_eq!(subs[1]["format"], J::from("clash"));
+        assert_eq!(subs[1]["format"], J::from("base64"));
         assert_eq!(subs[1]["name"], J::from("Sub 2"));
         let r = act_del_sub(&json!({"index": 0}));
         assert_eq!(r["ok"], J::Bool(true));
@@ -3425,6 +3529,62 @@ dns_direct_domains:
         assert_eq!(act_get_direct_domains()["server"], J::from("223.5.5.5"));
         let r = act_set_direct_server(&json!({"server": "999.1.1.1"}));
         assert_eq!(r["ok"], J::Bool(false));
+    }
+
+    #[test]
+    fn device_rule_crud_batch_and_group_edit_preserve_sources() {
+        let _env = TestEnv::new(SAMPLE);
+        for (source, target) in [
+            ("192.0.2.10", "proxy"),
+            ("192.0.2.20", "direct"),
+            ("", "reject"),
+        ] {
+            let result = act_add_rule(
+                &json!({"source":source,"group":"Devices","rule_type":"domain-suffix","pattern":"video.invalid","target":target}),
+            );
+            assert_eq!(result["ok"], true, "{result}");
+        }
+        let saved = fs::read_to_string(conf_path()).unwrap();
+        for bad in [json!("192.0.2.1/33"), json!("phone.local"), json!(123)] {
+            assert_eq!(
+                act_add_rule(
+                    &json!({"source":bad,"rule_type":"final","pattern":"*","target":"direct"})
+                )["ok"],
+                false
+            );
+            assert_eq!(fs::read_to_string(conf_path()).unwrap(), saved);
+        }
+        let exported = act_export_rules()["text"].as_str().unwrap().to_string();
+        assert!(exported.contains("SOURCE,192.0.2.10/32,"));
+        let result = act_replace_rule_group(
+            &json!({"group":"Devices","text":exported,"rule_type":"domain-suffix","target":"proxy"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(act_get_rules()["rules"].as_array().unwrap().len(), 3);
+        let mut expected = act_get_rules()["rules"][0].clone();
+        expected.as_object_mut().unwrap().remove("index");
+        let result = act_update_rule(
+            &json!({"index":0,"expected":expected,"rule_type":"domain-suffix","pattern":"video.invalid","target":"direct","source":"2001:db8:1::1234/64"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(act_get_rules()["rules"][0]["source"], "2001:db8:1::/64");
+        let before = fs::read_to_string(conf_path()).unwrap();
+        let result = act_batch_add_rules(
+            &json!({"source":"192.0.2.10","text":"SOURCE,192.0.2.20/32,DOMAIN-SUFFIX,other.invalid,PROXY"}),
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(fs::read_to_string(conf_path()).unwrap(), before);
+        assert_eq!(
+            act_batch_add_rules(
+                &json!({"text":"SOURCE,192.0.2.30,DOMAIN-SUFFIX,video.invalid,REJECT"})
+            )["ok"],
+            true
+        );
+        let cfg =
+            sockrocket_core::AppConfig::from_yaml_str(&fs::read_to_string(conf_path()).unwrap())
+                .unwrap();
+        assert_eq!(cfg.rules.len(), 4);
+        assert!(cfg.rules.iter().any(|r| r.source == "192.0.2.30/32"));
     }
 
     #[test]

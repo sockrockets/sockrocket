@@ -240,10 +240,31 @@ test_policy_routing_staged_and_idempotent() {
     check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'UDP-capable nodes capture QUIC'
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'native fake-IP UDP is not rejected'
     : > "$SANDBOX/kernel.calls"
-    printf '#!/bin/sh\nexit 1\n' > "$SOCKROCKET_DIR/sockrocket-cli"
+    printf '#!/bin/sh\n[ "$1" = --dump-rule-sources ] && exit 0\nexit 1\n' > "$SOCKROCKET_DIR/sockrocket-cli"
     do_start
     check 1 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls")" 'unsupported UDP retains safe fallback'
     check 1 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls")" 'unsupported fake-IP UDP fails fast'
+    # Device policies must reach userspace before CN bypass or QUIC fallback.
+    LAN_SUBNET="192.0.2.0/24"
+    : > "$SANDBOX/kernel.calls"
+    printf '#!/bin/sh\ncase "$1" in --dump-rule-sources) printf "192.0.2.10/32\\n192.0.2.0/24\\n";; *) exit 1;; esac\n' > "$SOCKROCKET_DIR/sockrocket-cli"
+    do_ipset_start() { iptables -t mangle -A "$MANGLE_CHAIN" -m set --match-set sockrocket_cn dst -j RETURN; }
+    printf '\ncn_ipset_direct: true\n' >> "$SOCKROCKET_CONF"
+    do_start
+    check 4 "$(grep -c '^-*iptables -t mangle -A SOCKROCKET_DEVICES -s ' "$SANDBOX/kernel.calls")" 'both TCP and UDP device scopes marked'
+    check 2 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD -s .* -j RETURN' "$SANDBOX/kernel.calls")" 'device direct UDP reaches core despite a stream-only node'
+    check 1 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD -s .* -d 198.18.0.0/16 -p udp -j REJECT' "$SANDBOX/kernel.calls")" 'other clients retain fake-UDP fast rejection'
+    device_line=$(awk '/-A SOCKROCKET_MANGLE -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
+    cn_line=$(awk '/--match-set sockrocket_cn dst/{print NR;exit}' "$SANDBOX/kernel.calls")
+    udp_line=$(awk '/--dport 443 -j RETURN/{print NR;exit}' "$SANDBOX/kernel.calls")
+    [ "$device_line" -lt "$cn_line" ] && [ "$device_line" -lt "$udp_line" ] || { echo 'device policies bypassed' >&2;exit 1; }
+    flush_chains
+    check 2 "$(grep -c -- '-X SOCKROCKET_DEVICES' "$SANDBOX/kernel.calls")" 'device chain removed on rebuild and explicit cleanup'
+    : > "$SANDBOX/kernel.calls"
+    printf '#!/bin/sh\nexit 1\n' > "$SOCKROCKET_DIR/sockrocket-cli"
+    if do_start; then echo 'invalid source export hidden' >&2;exit 1;fi
+    check 0 "$(grep -c -- '-A PREROUTING -j SOCKROCKET_MANGLE' "$SANDBOX/kernel.calls" || true)" 'source validation failure never attaches LAN marks'
+
 }
 
 test_startup_failure_never_enables_dns() {

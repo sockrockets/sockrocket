@@ -33,7 +33,7 @@ Sockrocket brings nodes, subscriptions, routing rules and traffic capture into o
 | Shared engine | Desktop GUI, CLI and Merlin WebUI |
 | Languages | English, Tiếng Việt and 中文 |
 
-Protocol combinations have limits: ShadowTLS does not provide UDP; native VMess and WireGuard UDP have per-packet size limits. Vision and gRPC/XHTTP are not implemented and fail explicitly. See the [protocol guide](docs/protocols.md). Sockrocket does not provide proxy nodes or subscription services.
+Protocol combinations have limits: ShadowTLS does not provide UDP; native VMess and WireGuard UDP have per-packet size limits. VLESS Vision supports TLS 1.3/REALITY over TCP and XUDP; the standard flow rejects UDP/443. gRPC/XHTTP are not implemented and fail explicitly. See the [protocol guide](docs/protocols.md). Sockrocket does not provide proxy nodes or subscription services.
 
 ## New protocols: AnyTLS and WireGuard
 
@@ -46,7 +46,7 @@ Protocol combinations have limits: ShadowTLS does not provide UDP; native VMess 
 
 Desktop, CLI and Merlin share these implementations and existing local configuration persistence. The WireGuard protocol path creates no additional OS interface and changes no system routes or DNS settings; application-level TUN capture is controlled separately. Both protocols have passed interoperability tests against independent servers.
 
-See the [protocol guide](docs/protocols.md) for formats, limits and the remaining Vision and gRPC/XHTTP work.
+See the [protocol guide](docs/protocols.md) for formats, limits and the remaining gRPC/XHTTP work.
 
 ## Interface previews
 

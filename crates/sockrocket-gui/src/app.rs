@@ -4156,12 +4156,12 @@ fn lines_look_clash_typed(text: &str) -> bool {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .take(3)
         .any(|l| {
             let head = l.split([',', ' ', ':']).next().unwrap_or("");
             matches!(
                 head.to_ascii_uppercase().as_str(),
-                "DOMAIN"
+                "SOURCE"
+                    | "DOMAIN"
                     | "DOMAIN-SUFFIX"
                     | "DOMAIN-KEYWORD"
                     | "IP-CIDR"
@@ -4269,6 +4269,11 @@ impl AppState {
                     return;
                 }
             };
+            new_rule.source = self
+                .rules
+                .get(edit_idx)
+                .map(|r| r.source.clone())
+                .unwrap_or_default();
             new_rule.enabled = enabled;
             new_rule.priority = priority;
             if edit_idx < self.rules.len() {
@@ -4308,13 +4313,14 @@ impl AppState {
             if self
                 .rules
                 .iter()
-                .any(|r| matches!(r.rule_type.as_str(), "match" | "final"))
+                .any(|r| r.source.is_empty() && matches!(r.rule_type.as_str(), "match" | "final"))
             {
                 self.rules_status = "⚠ FINAL 规则已存在".into();
                 cx.notify();
                 return;
             }
             self.rules.push(RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: group.clone(),
                 rule_type: "match".into(),
@@ -4398,11 +4404,11 @@ impl AppState {
         };
         new_rule.priority = priority;
 
-        if let Some(existing) = self
-            .rules
-            .iter()
-            .find(|r| r.rule_type == new_rule.rule_type && r.pattern == new_rule.pattern)
-        {
+        if let Some(existing) = self.rules.iter().find(|r| {
+            r.rule_type == new_rule.rule_type
+                && r.pattern == new_rule.pattern
+                && r.source == new_rule.source
+        }) {
             self.rules_status = format!(
                 "⚠ 已存在：{} {} → {}",
                 existing.rule_type, existing.pattern, existing.target
@@ -4581,13 +4587,14 @@ impl AppState {
             if self
                 .rules
                 .iter()
-                .any(|r| matches!(r.rule_type.as_str(), "match" | "final"))
+                .any(|r| r.source.is_empty() && matches!(r.rule_type.as_str(), "match" | "final"))
             {
                 self.rules_status = "⚠ FINAL 规则已存在".into();
                 cx.notify();
                 return;
             }
             self.rules.push(RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: group.to_string(),
                 rule_type: "match".into(),
@@ -4626,11 +4633,11 @@ impl AppState {
         };
         new_rule.priority = priority;
 
-        if let Some(existing) = self
-            .rules
-            .iter()
-            .find(|r| r.rule_type == new_rule.rule_type && r.pattern == new_rule.pattern)
-        {
+        if let Some(existing) = self.rules.iter().find(|r| {
+            r.rule_type == new_rule.rule_type
+                && r.pattern == new_rule.pattern
+                && r.source == new_rule.source
+        }) {
             self.rules_status = format!(
                 "⚠ 已存在：{} {} → {}",
                 existing.rule_type, existing.pattern, existing.target
@@ -4711,6 +4718,12 @@ impl AppState {
         let text = self.rule_batch_input.read(cx).value().to_string();
         let target = self.rule_target_sel.clone();
         let parsed = parse_batch_rules_in_group(&text, &target, &group);
+        if let Some(error) = parsed.errors.first() {
+            self.rules_status =
+                format!("✗ 第 {} 行：{}；未保存任何更改", error.line, error.message);
+            cx.notify();
+            return;
+        }
         if parsed.rules.is_empty() {
             let msg = parsed
                 .errors
@@ -4727,7 +4740,7 @@ impl AppState {
         }
         let has_match = incoming
             .iter()
-            .any(|r| matches!(r.rule_type.as_str(), "match" | "final"));
+            .any(|r| r.source.is_empty() && matches!(r.rule_type.as_str(), "match" | "final"));
         if has_match
             && self.rules.iter().any(|r| {
                 !same_rule_group(&r.group, &group)
@@ -4787,6 +4800,7 @@ impl AppState {
         // Add the built-in China direct ruleset as explicit rules
         let china_rules = vec![
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "geoip".into(),
@@ -4796,6 +4810,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4805,6 +4820,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4814,6 +4830,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4823,6 +4840,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4832,6 +4850,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4841,6 +4860,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4850,6 +4870,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4859,6 +4880,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4868,6 +4890,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -4877,6 +4900,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "ip-cidr".into(),
@@ -4886,6 +4910,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "ip-cidr".into(),
@@ -4895,6 +4920,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "ip-cidr".into(),
@@ -4904,6 +4930,7 @@ impl AppState {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "match".into(),

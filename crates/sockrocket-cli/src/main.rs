@@ -23,6 +23,13 @@ fn main() -> Result<()> {
     // UI backend), or explicitly as `sockrocket-cli cgi`. Synchronous, no tokio
     // runtime — the router CPU pays for one process spawn per call and
     // nothing more.
+    if env::args().nth(1).as_deref() == Some("--subscription-worker") {
+        return cgi::subscription_worker(
+            &env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("Subscription job ID required"))?,
+        );
+    }
     if cgi::is_cgi() {
         return cgi::run();
     }
@@ -88,6 +95,28 @@ async fn async_main() -> Result<()> {
     if args.iter().any(|a| a == "--dump-cn-cidrs") {
         for cidr in sockrocket_core::china_ipv4_cidrs() {
             println!("{cidr}");
+        }
+        return Ok(());
+    }
+
+    // Validated IPv4 source networks needing userspace policy before CN bypass.
+    if let Some(index) = args.iter().position(|arg| arg == "--dump-rule-sources") {
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
+        if config.proxy_mode == ProxyMode::Rule {
+            let sources: std::collections::BTreeSet<_> = config
+                .rules
+                .iter()
+                .filter(|rule| {
+                    rule.enabled && !rule.source.is_empty() && !rule.source.contains(':')
+                })
+                .map(|rule| rule.source.as_str())
+                .collect();
+            for source in sources {
+                println!("{source}");
+            }
         }
         return Ok(());
     }
@@ -950,7 +979,7 @@ fn build_outbound(
 
 /// Router for the configured [`ProxyMode`].
 ///
-/// - **Rule**: user rules (by priority), then built-in China-direct, with the
+/// - **Rule**: device rules/finals, global rules, then China-direct, with the
 ///   in-binary GeoIP DB. Empty `rules` still yields China-direct.
 /// - **Global** / **Direct**: no router (Global dials the active node; Direct
 ///   uses a direct outbound in [`build_outbound`]).

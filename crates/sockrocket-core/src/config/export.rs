@@ -222,6 +222,9 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             put(&mut m, "udp", Value::Bool(config.udp));
         }
         ProxyProtocol::AnyTls { password, udp } => {
+            if let Some(pin) = node.extra.get(super::v2ray::TLS_CERT_PIN) {
+                put(&mut m, "fingerprint", s(pin));
+            }
             put(&mut m, "password", s(password));
             put(&mut m, "udp", Value::Bool(*udp));
             if let Some(tls) = node.transport.as_ref().and_then(|t| t.tls.as_ref()) {
@@ -305,6 +308,20 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             apply_ws_and_tls(&mut m, node, "sni");
         }
         ProxyProtocol::Hysteria2 { password, udp } => {
+            if let Some(pin) = node.extra.get(super::v2ray::TLS_CERT_PIN) {
+                put(&mut m, "fingerprint", s(pin));
+            }
+            for (key, field) in [
+                (super::v2ray::HY2_UP, "up"),
+                (super::v2ray::HY2_DOWN, "down"),
+            ] {
+                if let Some(value) = node.extra.get(key) {
+                    put(&mut m, field, s(value));
+                }
+            }
+            if let Some(value) = node.extra.get(super::v2ray::HY2_FAST_OPEN) {
+                put(&mut m, "fast-open", Value::Bool(value == "true"));
+            }
             put(&mut m, "password", s(password));
             // mihomo defaults `udp` to true for most protocols; always write
             // it explicitly so importing clients see the intended value.

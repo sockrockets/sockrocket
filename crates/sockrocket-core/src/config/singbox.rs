@@ -72,6 +72,8 @@ struct SingBoxTls {
     disable_sni: bool,
     utls: Option<SingBoxUtls>,
     reality: Option<SingBoxReality>,
+    #[serde(default, flatten)]
+    extensions: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +227,14 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
         other => anyhow::bail!("Unsupported sing-box outbound type: {}", other),
     };
 
+    if let Some(tls) = &ob.tls {
+        // Unknown TLS controls can strengthen authentication (pinning, custom
+        // trust, mTLS, ECH, version bounds). Never turn them into weaker TLS.
+        anyhow::ensure!(
+            tls.extensions.is_empty(),
+            "Unsupported sing-box TLS option; security constraints were not discarded"
+        );
+    }
     let transport = build_singbox_transport(ob)?;
 
     let name = if ob.tag.is_empty() {
@@ -345,6 +355,30 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_tls_security_constraints_fail_closed_even_when_insecure() {
+        for key in [
+            "certificate_public_key_sha256",
+            "certificate_sha256",
+            "certificate",
+            "certificate_path",
+            "client_certificate",
+            "client_key",
+            "min_version",
+            "max_version",
+            "ech",
+        ] {
+            let mut tls = serde_json::json!({"enabled":true,"insecure":true});
+            tls[key] = serde_json::json!(["synthetic-value"]);
+            let value = serde_json::json!({"type":"anytls","server":"vpn.example.invalid","server_port":443,"password":"synthetic-only","tls":tls});
+            let result = parse_singbox_outbound(&value.to_string());
+            assert!(
+                result.is_err(),
+                "security constraint {key} must not be dropped"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_singbox_tuic() {

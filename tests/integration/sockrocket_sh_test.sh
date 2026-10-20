@@ -53,6 +53,7 @@ make_fake_bin() {
     [ -x /bin/sleep ] && sleep_bin=/bin/sleep
     cat > "$SOCKROCKET_DIR/sockrocket-cli" <<SH
 #!/bin/sh
+case "\$1" in --dns-health) "$SANDBOX/stub/netstat" | grep -q 5300; exit \$?;; --supports-udp|--dump-rule-sources|--dump-cn-cidrs) exit 0;; esac
 mkdir -p "$PROC_FAKE/\$\$" 2>/dev/null
 echo "sockrocket-cli" > "$PROC_FAKE/\$\$/comm" 2>/dev/null
 exec "$sleep_bin" 300
@@ -288,8 +289,8 @@ test_stop_running_cleans_up() {
         "$(grep -c '^iptables.sh stop' "$SANDBOX/iptables.calls")"
     assert "mangle chain torn down" "gone" \
         "$([ -f "$SANDBOX/mangle_chain" ] && echo present || echo gone)"
-    # Both SockrocketSubUpdate and SockrocketWatchdog are deleted �?two separate cru calls.
-    assert "cron entries removed" "2" \
+    # Subscription, watchdog and obsolete boot jobs must all be removed.
+    assert "cron entries removed" "3" \
         "$(grep -c '^cru d' "$SANDBOX/cru.calls")"
     teardown
 }
@@ -424,13 +425,11 @@ test_ensure_tun_insmod_fallback() {
     assert "insmod fallback was used" "1" "$(wc -l < "$SANDBOX/insmod.calls" | tr -d ' ')"
     assert "insmod path uses uname -r" "1" \
         "$(grep -c '/lib/modules/9\.9\.9-test/kernel/drivers/net/tun\.ko' "$SANDBOX/insmod.calls")"
-    assert "success path logged" "1" "$(grep -c 'TUN device ready' "$SANDBOX/logger.calls")"
+    assert "TUN device marker created" "present" "$([ -e "$SANDBOX/tun_dev" ] && echo present || echo absent)"
     teardown
 }
 
-# ensure_tun: all three levels fail -> the dispatch branch logs "TUN
-# unavailable". The subcommand itself always exits 0 (`|| true` in the
-# dispatch branch), so the failure path is asserted via the logger stub.
+# ensure_tun propagates an unavailable device as a nonzero exit status.
 test_ensure_tun_total_failure() {
     printf '\n[9] ensure_tun: all fallbacks fail -> returns non-zero\n'
     setup
@@ -440,7 +439,8 @@ test_ensure_tun_total_failure() {
         chmod +x "$SANDBOX/stub/$c"
     done
     run_SOCKROCKET_SH "ensure-tun"
-    assert "failure path logged" "1" "$(grep -c 'TUN unavailable' "$SANDBOX/logger.calls")"
+    result=$?
+    assert "TUN setup failure propagated" "1" "$result"
     teardown
 }
 
@@ -517,7 +517,7 @@ test_proxy_off_keeps_daemon() {
 
 # Legacy config (no toggle keys, mode: tun) derives both true.
 test_legacy_mode_tun_derives_both_on() {
-    printf '\n[14] legacy config: mode=tun derives both toggles true\n'
+    printf '\n[14] legacy config: mode=tun retains transparent routing, DNS stays opt-in\n'
     setup
     grep -v "^transparent_proxy:\|^dns_hijack:" "$SOCKROCKET_DIR/config.yaml" > "$SOCKROCKET_DIR/c2" && mv "$SOCKROCKET_DIR/c2" "$SOCKROCKET_DIR/config.yaml"
     sed -i 's/^mode:.*/mode: "tun"/' "$SOCKROCKET_DIR/config.yaml"
@@ -527,7 +527,7 @@ test_legacy_mode_tun_derives_both_on() {
     rm -f "$DNS_DIR/sockrocket.conf"
     run_sockrocket start
     assert "iptables start invoked" "1" "$(grep -c '^iptables.sh start' "$SANDBOX/iptables.calls")"
-    assert "dns hijack written" "present" "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo gone)"
+    assert "legacy DNS remains opt-in" "gone" "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo gone)"
     teardown
 }
 

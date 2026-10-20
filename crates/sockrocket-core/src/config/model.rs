@@ -488,11 +488,18 @@ fn default_format() -> String {
 /// Routing rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
+    /// Optional client IP/CIDR. Empty means all clients. Not a MAC address.
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "deserialize_rule_source"
+    )]
+    pub source: String,
     /// Optional display name (e.g. app or purpose). Empty when unset.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Display group (e.g. "跨境", "国内直连"). Empty = ungrouped.
-    /// Matching order is still global by priority/list — group is UI only.
+    /// Group is UI-only; source scope and priority determine matching order.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
     /// Rule type: "domain", "domain-suffix", "domain-keyword", "ip-cidr",
@@ -509,6 +516,13 @@ pub struct RoutingRule {
     /// priority keep their list order (stable). Default `0`.
     #[serde(default)]
     pub priority: i32,
+}
+
+fn deserialize_rule_source<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    crate::router::normalize_rule_source(&value).map_err(serde::de::Error::custom)
 }
 
 fn default_true() -> bool {

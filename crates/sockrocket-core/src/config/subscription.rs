@@ -25,6 +25,16 @@ pub const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Fetch a subscription URL and parse it into nodes
 pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
+    Ok(fetch_subscription_report(sub).await?.nodes)
+}
+
+/// Safe import diagnostics: counts only, never subscription entries or credentials.
+pub struct SubscriptionFetchReport {
+    pub nodes: Vec<Node>,
+    pub skipped_entries: usize,
+}
+
+pub async fn fetch_subscription_report(sub: &Subscription) -> Result<SubscriptionFetchReport> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(SUB_FETCH_TIMEOUT_SECS))
@@ -73,7 +83,43 @@ pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
     // The URL has to travel with the nodes: a later refresh replaces this
     // source, and a restart has to know which subscription they belong to.
     super::dedup::tag_subscription_nodes(&mut nodes, &sub.url);
-    Ok(nodes)
+    let skipped_entries = uri_entry_count(&content).saturating_sub(nodes.len());
+    Ok(SubscriptionFetchReport {
+        nodes,
+        skipped_entries,
+    })
+}
+
+fn uri_entry_count(content: &str) -> usize {
+    let count = |text: &str| {
+        text.lines()
+            .filter(|line| {
+                let line = line.trim();
+                !line.starts_with('#') && line.contains("://")
+            })
+            .count()
+    };
+    let content = content.trim_start_matches('\u{feff}').trim();
+    match detect_format(content) {
+        SubFormat::PlainLines => count(content),
+        SubFormat::Base64Lines => {
+            let clean: String = content
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            let decoded = general_purpose::STANDARD
+                .decode(&clean)
+                .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&clean))
+                .or_else(|_| general_purpose::URL_SAFE.decode(&clean))
+                .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&clean));
+            decoded
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|text| detect_format(text) == SubFormat::PlainLines)
+                .map_or(0, |text| count(&text))
+        }
+        _ => 0,
+    }
 }
 
 /// Parse subscription content with format detection
@@ -162,9 +208,9 @@ fn looks_like_base64(content: &str) -> bool {
     }
 
     // Base64 characters only
-    clean
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    clean.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
+    })
 }
 
 /// Decode Base64 content and parse each line as a proxy URI
@@ -232,6 +278,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn import_diagnostics_count_uri_entries_without_config_urls() {
+        let lines = "# comment\nss://example.invalid\nunsupported://example.invalid\n";
+        assert_eq!(uri_entry_count(lines), 2);
+        assert_eq!(uri_entry_count(&general_purpose::STANDARD.encode(lines)), 2);
+        assert_eq!(
+            uri_entry_count("proxies: []\nurl: https://example.invalid"),
+            0
+        );
+    }
+
+    #[test]
     fn test_detect_clash_format() {
         let content = "proxies:\n  - name: test\n    type: ss";
         assert_eq!(detect_format(content), SubFormat::Clash);
@@ -254,6 +311,20 @@ mod tests {
         let plain = "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#test\n";
         let encoded = general_purpose::STANDARD.encode(plain);
         assert_eq!(detect_format(&encoded), SubFormat::Base64Lines);
+    }
+
+    #[test]
+    fn auto_detects_url_safe_base64() {
+        let content = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@192.0.2.1:8388#示例节点🿿";
+        for encoded in [
+            general_purpose::URL_SAFE.encode(content),
+            general_purpose::URL_SAFE_NO_PAD.encode(content),
+        ] {
+            assert!(encoded.contains('-') || encoded.contains('_'));
+            assert_eq!(detect_format(&encoded), SubFormat::Base64Lines);
+            let nodes = parse_subscription_content(&encoded, "auto").unwrap();
+            assert_eq!(nodes.len(), 1);
+        }
     }
 
     #[test]

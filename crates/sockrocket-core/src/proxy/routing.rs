@@ -7,6 +7,36 @@ use anyhow::Result;
 use super::connector::{BoxProxyStream, Outbound, SharedOutbound};
 use crate::router::{RouteAction, Router};
 
+// Context is scoped to one accepted connection, survives executor migration,
+// and is never inherited by detached DNS/health tasks or read from HTTP headers.
+tokio::task_local! { static CLIENT_SOURCE: Option<std::net::IpAddr>; }
+tokio::task_local! { static TUN_DESTINATION: (Option<std::net::IpAddr>, bool); }
+pub(crate) fn tun_destination() -> (Option<std::net::IpAddr>, bool) {
+    TUN_DESTINATION
+        .try_with(|context| *context)
+        .unwrap_or((None, false))
+}
+pub(crate) async fn with_tun_destination<F: Future>(
+    ip: Option<std::net::IpAddr>,
+    domestic: bool,
+    future: F,
+) -> F::Output {
+    TUN_DESTINATION.scope((ip, domestic), future).await
+}
+pub(crate) fn client_source() -> Option<std::net::IpAddr> {
+    CLIENT_SOURCE.try_with(|ip| *ip).ok().flatten()
+}
+pub(crate) async fn with_client_source<F: Future>(
+    ip: Option<std::net::IpAddr>,
+    future: F,
+) -> F::Output {
+    let ip = ip.map(|ip| match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    });
+    CLIENT_SOURCE.scope(ip, future).await
+}
+
 /// Shared immutable rule snapshots for long-lived listeners. Never hold the
 /// lock across an await; accepted streams retain their own snapshot.
 #[derive(Clone)]
@@ -155,5 +185,89 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("rejected"));
+    }
+}
+
+#[cfg(test)]
+mod device_ingress_tests {
+    use super::*;
+    use crate::proxy::{ProxyStats, http::HttpProxyServer, socks5::Socks5Server};
+    use crate::{RoutingRule, rule_mode_ruleset};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn actual_http_socks_and_udp_use_socket_source_instead_of_destination_only() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let scoped = RoutingRule {
+            source: "127.0.0.1/32".into(),
+            name: String::new(),
+            group: String::new(),
+            rule_type: "final".into(),
+            pattern: "*".into(),
+            target: "reject".into(),
+            enabled: true,
+            priority: 0,
+        };
+        let policy = Arc::new(Router::new(rule_mode_ruleset(&[scoped])));
+        let outbound = SharedOutbound(Arc::new(RoutingOutbound::new(
+            policy,
+            SharedOutbound::direct(),
+        )));
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let http = HttpProxyServer::bind("127.0.0.1", 0, outbound.clone(), ProxyStats::default())
+            .await
+            .unwrap();
+        let port = http.local_port();
+        let http_task = tokio::spawn(http.run(rx.clone()));
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 502"));
+        let socks = Socks5Server::bind("127.0.0.1", 0, outbound.clone(), ProxyStats::default())
+            .await
+            .unwrap();
+        let port = socks.local_port();
+        let socks_task = tokio::spawn(socks.run(rx));
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut hello = [0; 2];
+        client.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend(target_addr.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut response = [0; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_exact(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response[1], 4);
+        with_client_source(Some("127.0.0.1".parse().unwrap()), async {
+            assert!(outbound.0.connect_datagram("127.0.0.1", 53).await.is_err());
+        })
+        .await;
+        assert!(outbound.0.connect_datagram("127.0.0.1", 53).await.is_ok());
+        stop.send(true).unwrap();
+        http_task.await.unwrap().unwrap();
+        socks_task.await.unwrap().unwrap();
     }
 }

@@ -203,8 +203,36 @@ pub fn node_fingerprint(node: &Node) -> String {
             serde_json::to_string(&node.transport).unwrap_or_default()
         ),
         ProxyProtocol::Trojan { password, .. } => format!("trojan|{}", password),
-        ProxyProtocol::Hysteria2 { password, .. } => format!("hy2|{}", password),
-        ProxyProtocol::AnyTls { password, .. } => format!("anytls|{}", password),
+        ProxyProtocol::Hysteria2 { password, .. } => format!(
+            "hy2|{}|{}|{}|{}|{}|{}",
+            password,
+            node.extra
+                .get(super::v2ray::TLS_CERT_PIN)
+                .map(String::as_str)
+                .unwrap_or(""),
+            node.extra
+                .get(super::v2ray::HY2_UP)
+                .map(String::as_str)
+                .unwrap_or(""),
+            node.extra
+                .get(super::v2ray::HY2_DOWN)
+                .map(String::as_str)
+                .unwrap_or(""),
+            node.extra
+                .get(super::v2ray::HY2_FAST_OPEN)
+                .map(String::as_str)
+                .unwrap_or(""),
+            serde_json::to_string(&node.transport).unwrap_or_default()
+        ),
+        ProxyProtocol::AnyTls { password, .. } => format!(
+            "anytls|{}|{}|{}",
+            password,
+            node.extra
+                .get(super::v2ray::TLS_CERT_PIN)
+                .map(String::as_str)
+                .unwrap_or(""),
+            serde_json::to_string(&node.transport).unwrap_or_default()
+        ),
     };
 
     format!(

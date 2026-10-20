@@ -30,6 +30,7 @@ struct Client {
     server: String,
     port: u16,
     tls: TlsConfig,
+    connector: craft_tls::TlsConnector,
     password: [u8; 32],
     padding: Arc<Mutex<Padding>>,
     idle: Mutex<Vec<Session>>,
@@ -55,6 +56,16 @@ impl AnyTlsOutbound {
         tls: Option<&TlsConfig>,
         keep_idle: bool,
     ) -> Result<Self> {
+        Self::new_pinned(server, port, password, tls, keep_idle, None)
+    }
+    pub(crate) fn new_pinned(
+        server: &str,
+        port: u16,
+        password: &str,
+        tls: Option<&TlsConfig>,
+        keep_idle: bool,
+        pin: Option<[u8; 32]>,
+    ) -> Result<Self> {
         ensure!(
             !server.is_empty() && port != 0 && !password.is_empty(),
             "AnyTLS requires an endpoint and password"
@@ -69,6 +80,7 @@ impl AnyTlsOutbound {
             client: Arc::new(Client {
                 server: server.into(),
                 port,
+                connector: transport::build_tls_connector_pinned(Some(&tls), pin),
                 tls,
                 password: Sha256::digest(password.as_bytes()).into(),
                 padding: Arc::new(Mutex::new(Padding::default())),
@@ -188,8 +200,15 @@ impl Client {
             .clone()
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("AnyTLS global capacity reached"))?;
-        let mut raw =
-            transport::connect_with_tls(&self.server, self.port, Some(&self.tls), true).await?;
+        let mut raw = transport::connect_with_connector(
+            &self.server,
+            self.port,
+            &self.connector,
+            self.tls.sni.as_deref().unwrap_or(&self.server),
+            true,
+            Duration::from_secs(15),
+        )
+        .await?;
         let pad = self
             .padding
             .lock()

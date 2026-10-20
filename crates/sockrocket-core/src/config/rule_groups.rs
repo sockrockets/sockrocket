@@ -134,6 +134,7 @@ mod tests {
 
     fn r(group: &str, pattern: &str) -> RoutingRule {
         RoutingRule {
+            source: String::new(),
             name: String::new(),
             group: group.into(),
             rule_type: "domain-suffix".into(),

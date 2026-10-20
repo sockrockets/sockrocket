@@ -31,7 +31,8 @@ SOCKROCKET_RT_TABLE=5370
 # --dump-cn-cidrs). When the `cn_ipset_direct` config toggle is on, LAN
 # packets whose destination is in this set RETURN from SOCKROCKET_MANGLE before
 # the MARK rules — domestic traffic keeps hardware NAT and never enters
-# the userspace TUN stack. Trade-off: domain-based user rules no longer
+# the userspace TUN stack. Sources with device rules are marked before this
+# bypass. Trade-off: global domain-based user rules no longer
 # apply to destinations that resolve into the CN ranges (TUN never sees
 # those flows), which is why this is an opt-in toggle.
 IPSET_NAME="sockrocket_cn"
@@ -238,6 +239,11 @@ flush_chains() {
     iptables -t mangle -D PREROUTING -j SOCKROCKET_MANGLE 2>/dev/null || true
     iptables -t mangle -F SOCKROCKET_MANGLE 2>/dev/null || true
     iptables -t mangle -X SOCKROCKET_MANGLE 2>/dev/null || true
+    iptables -D FORWARD -j SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -F SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -t mangle -F SOCKROCKET_DEVICES 2>/dev/null || true
+    iptables -t mangle -X SOCKROCKET_DEVICES 2>/dev/null || true
     info "Flushed existing Sockrocket proxy iptables chains"
 }
 
@@ -287,6 +293,33 @@ do_start() {
             return 1
         }
     done
+    # Only selected LAN sources bypass kernel CN acceleration and reach the
+    # device-aware router. Private/router destinations remain excluded above.
+    local device_sources device_source device_proto
+    device_sources=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-rule-sources "$SOCKROCKET_CONF" 2>/dev/null) || {
+        flush_chains
+        err "Cannot validate device rule sources; transparent proxy not attached"
+        return 1
+    }
+    if [ -n "$device_sources" ]; then
+        if ! iptables -t mangle -N SOCKROCKET_DEVICES 2>/dev/null \
+            && ! iptables -t mangle -F SOCKROCKET_DEVICES; then
+            flush_chains
+            return 1
+        fi
+        for device_source in $device_sources; do
+            for device_proto in tcp udp; do
+                iptables -t mangle -A SOCKROCKET_DEVICES -s "$device_source" -p "$device_proto" \
+                    -j MARK --set-mark "$TUN_MARK" || { flush_chains; return 1; }
+            done
+        done
+        if ! iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -j SOCKROCKET_DEVICES \
+            || ! iptables -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$TUN_MARK" -j RETURN; then
+            flush_chains
+            return 1
+        fi
+    fi
+
     # Capture QUIC only when the active node has a real datagram transport.
     local udp_supported=0
     if "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
@@ -356,8 +389,21 @@ do_start() {
     iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
         -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
     if [ "$udp_supported" != 1 ]; then
-        iptables -I FORWARD 1 -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
-            -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
+        if [ -n "$device_sources" ]; then
+            # Device direct/reject decisions do not depend on the selected
+            # node supporting UDP. Let those sources reach the core; other
+            # clients retain the existing fast Fake-IP UDP rejection.
+            iptables -N SOCKROCKET_UDP_GUARD 2>/dev/null || iptables -F SOCKROCKET_UDP_GUARD || { flush_chains; return 1; }
+            for device_source in $device_sources; do
+                iptables -A SOCKROCKET_UDP_GUARD -s "$device_source" -j RETURN || { flush_chains; return 1; }
+            done
+            iptables -A SOCKROCKET_UDP_GUARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+                -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
+            iptables -I FORWARD 1 -j SOCKROCKET_UDP_GUARD || { flush_chains; return 1; }
+        else
+            iptables -I FORWARD 1 -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+                -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
+        fi
     fi
     # Keep TUN return-path ACCEPT at the very top (above Fake-IP REJECT).
     iptables -D FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null || true
@@ -427,6 +473,11 @@ do_stop() {
     iptables -t mangle -D PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null || true
     iptables -t mangle -F "$MANGLE_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$MANGLE_CHAIN" 2>/dev/null || true
+    iptables -D FORWARD -j SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -F SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -t mangle -F SOCKROCKET_DEVICES 2>/dev/null || true
+    iptables -t mangle -X SOCKROCKET_DEVICES 2>/dev/null || true
 
     # TUN return-path forward accept (see do_start). Also clear the legacy
     # tun0 rule older builds may have installed.

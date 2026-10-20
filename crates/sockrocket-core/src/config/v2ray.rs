@@ -307,13 +307,45 @@ pub fn parse_ss_uri(uri: &str) -> Result<Node> {
     })
 }
 
+pub(crate) const TLS_CERT_PIN: &str = "tls_certificate_sha256";
+pub(crate) const HY2_UP: &str = "hysteria2_up_mbps";
+pub(crate) const HY2_DOWN: &str = "hysteria2_down_mbps";
+pub(crate) const HY2_FAST_OPEN: &str = "hysteria2_fast_open";
+
+fn import_tls_pin(
+    params: &HashMap<String, String>,
+    extra: &mut HashMap<String, String>,
+) -> Result<()> {
+    let mut selected = None;
+    for key in ["pcs", "pinSHA256"] {
+        if let Some(value) = params.get(key) {
+            let pin = parse_tuic_certificate_pin(value)?;
+            anyhow::ensure!(
+                selected.is_none_or(|old| old == pin),
+                "Conflicting certificate pins"
+            );
+            selected = Some(pin);
+        }
+    }
+    if let Some(pin) = selected {
+        extra.insert(
+            TLS_CERT_PIN.into(),
+            pin.iter().map(|b| format!("{b:02x}")).collect(),
+        );
+    }
+    if let Some(security) = params.get("security") {
+        anyhow::ensure!(security == "tls", "This protocol requires TLS security");
+    }
+    Ok(())
+}
+
 pub(crate) const TUIC_CERT_PIN: &str = "tuic_certificate_sha256";
 
 pub(crate) fn parse_tuic_certificate_pin(value: &str) -> Result<[u8; 32]> {
     let hex: String = value.chars().filter(|c| *c != ':' && *c != '-').collect();
     anyhow::ensure!(
         hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
-        "Invalid TUIC certificate SHA-256 pin"
+        "Invalid certificate SHA-256 pin"
     );
     let mut pin = [0u8; 32];
     for (i, byte) in pin.iter_mut().enumerate() {
@@ -486,7 +518,16 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         anyhow::ensure!(
             matches!(
                 key.as_ref(),
-                "sni" | "insecure" | "allowInsecure" | "pinSHA256"
+                "sni"
+                    | "insecure"
+                    | "allowInsecure"
+                    | "pinSHA256"
+                    | "pcs"
+                    | "security"
+                    | "alpn"
+                    | "upmbps"
+                    | "downmbps"
+                    | "fastopen"
             ),
             "Unsupported Hysteria2 option; obfuscation and port hopping were not silently ignored"
         );
@@ -497,10 +538,23 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
             "Duplicate Hysteria2 option"
         );
     }
-    anyhow::ensure!(
-        !params.contains_key("pinSHA256"),
-        "Hysteria2 certificate pinning is not implemented"
-    );
+    let mut extra = HashMap::new();
+    import_tls_pin(&params, &mut extra)?;
+    for (query, field) in [("upmbps", HY2_UP), ("downmbps", HY2_DOWN)] {
+        if let Some(value) = params.get(query) {
+            extra.insert(field.into(), super::bandwidth::canonical_mbps(value)?);
+        }
+    }
+    if let Some(value) = params.get("fastopen") {
+        anyhow::ensure!(
+            matches!(value.as_str(), "0" | "1" | "false" | "true"),
+            "Invalid Hysteria2 fastopen"
+        );
+        extra.insert(
+            HY2_FAST_OPEN.into(),
+            query_truthy(&params, "fastopen").to_string(),
+        );
+    }
     let server = parsed
         .host_str()
         .context("Missing Hysteria2 host")?
@@ -522,7 +576,13 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
                 sni: params.get("sni").cloned(),
                 skip_cert_verify: query_truthy(&params, "insecure")
                     || query_truthy(&params, "allowInsecure"),
-                alpn: None,
+                alpn: params.get("alpn").map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                }),
                 fingerprint: None,
             }),
             ws: None,
@@ -530,7 +590,7 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         }),
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
@@ -568,11 +628,21 @@ pub fn parse_anytls_uri(uri: &str) -> Result<Node> {
         anyhow::ensure!(
             matches!(
                 key.as_str(),
-                "peer" | "sni" | "insecure" | "allowInsecure" | "alpn" | "fp"
+                "peer"
+                    | "sni"
+                    | "insecure"
+                    | "allowInsecure"
+                    | "alpn"
+                    | "fp"
+                    | "security"
+                    | "pcs"
+                    | "pinSHA256"
             ),
             "Unsupported AnyTLS URI option"
         );
     }
+    let mut extra = HashMap::new();
+    import_tls_pin(&params, &mut extra)?;
     Ok(Node {
         name: decode_fragment_name(parsed.fragment()).unwrap_or_else(|| "AnyTLS".into()),
         server,
@@ -597,7 +667,7 @@ pub fn parse_anytls_uri(uri: &str) -> Result<Node> {
         }),
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
@@ -1109,6 +1179,9 @@ pub fn node_to_share_uri(node: &Node) -> String {
                     params.push(format!("fp={}", urlencoding::encode(fp)));
                 }
             }
+            if let Some(pin) = node.extra.get(TLS_CERT_PIN) {
+                params.push(format!("pcs={pin}"));
+            }
             format!(
                 "anytls://{}@{}?{}#{}",
                 urlencoding::encode(password),
@@ -1275,16 +1348,33 @@ pub fn node_to_share_uri(node: &Node) -> String {
             if skip {
                 extra_params.push("insecure=1".to_string());
             }
+            for (field, query) in [
+                (TLS_CERT_PIN, "pinSHA256"),
+                (HY2_UP, "upmbps"),
+                (HY2_DOWN, "downmbps"),
+                (HY2_FAST_OPEN, "fastopen"),
+            ] {
+                if let Some(value) = node.extra.get(field) {
+                    extra_params.push(format!("{query}={}", urlencoding::encode(value)));
+                }
+            }
+            if let Some(alpn) = node
+                .transport
+                .as_ref()
+                .and_then(|t| t.tls.as_ref())
+                .and_then(|t| t.alpn.as_ref())
+            {
+                extra_params.push(format!("alpn={}", urlencoding::encode(&alpn.join(","))));
+            }
             let qs = if extra_params.is_empty() {
                 String::new()
             } else {
                 format!("?{}", extra_params.join("&"))
             };
             format!(
-                "hy2://{}@{}:{}{}#{}",
+                "hy2://{}@{}{}#{}",
                 urlencoding::encode(password),
-                node.server,
-                node.port,
+                crate::proxy::transport::format_host_port(&node.server, node.port),
                 qs,
                 name_enc
             )
@@ -1295,6 +1385,67 @@ pub fn node_to_share_uri(node: &Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hysteria_and_anytls_parameters_survive_share_yaml_clash_and_dedup() {
+        let pin = "ab".repeat(32);
+        for link in [
+            format!(
+                "hy2://synthetic@vpn.example.invalid:443?security=tls&insecure=1&pinSHA256={pin}&sni=tls.example.invalid&alpn=h3&upmbps=10&downmbps=20&fastopen=1"
+            ),
+            format!(
+                "anytls://synthetic@vpn.example.invalid:443?security=tls&insecure=1&pcs={pin}&sni=tls.example.invalid&alpn=h2"
+            ),
+        ] {
+            let node = parse_proxy_uri(&link).unwrap();
+            assert_eq!(node.extra[TLS_CERT_PIN], pin);
+            let shared = parse_proxy_uri(&node_to_share_uri(&node)).unwrap();
+            let persisted: Node =
+                serde_yaml::from_str(&serde_yaml::to_string(&node).unwrap()).unwrap();
+            let clash = super::super::clash::parse_clash_config(&crate::export_clash_config(&[
+                node.clone(),
+            ]))
+            .unwrap();
+            assert_eq!(clash.len(), 1);
+            for restored in [shared, persisted, clash[0].clone()] {
+                assert_eq!(restored.extra, node.extra);
+                assert_eq!(
+                    serde_json::to_value(restored.transport).unwrap(),
+                    serde_json::to_value(&node.transport).unwrap()
+                );
+            }
+            let mut changed = node.clone();
+            changed.extra.insert(TLS_CERT_PIN.into(), "cd".repeat(32));
+            assert_ne!(
+                super::super::dedup::node_fingerprint(&node),
+                super::super::dedup::node_fingerprint(&changed)
+            );
+            assert!(parse_proxy_uri(&link.replace(&pin, "invalid")).is_err());
+            assert!(parse_proxy_uri(&link.replace("security=tls", "security=none")).is_err());
+        }
+    }
+
+    #[test]
+    fn hysteria_parameters_reject_invalid_and_conflicting_values() {
+        let prefix = "hy2://synthetic@vpn.example.invalid:443?";
+        for query in [
+            "upmbps=-1",
+            "downmbps=nan",
+            "upmbps=1000001",
+            "fastopen=maybe",
+            "alpn=h3&alpn=hysteria",
+        ] {
+            assert!(parse_hysteria2_uri(&format!("{prefix}{query}")).is_err());
+        }
+        assert!(
+            parse_hysteria2_uri(&format!(
+                "{prefix}pcs={}&pinSHA256={}",
+                "ab".repeat(32),
+                "cd".repeat(32)
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_parse_vmess_uri() {

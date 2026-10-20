@@ -85,6 +85,54 @@ Reload after edits:
 /jffs/addons/sockrocket/scripts/sockrocket.sh reload
 ```
 
+## Subscription compatibility
+
+Use **auto** for format detection; explicit **base64** is also accepted by the router API. Failed refreshes retain the saved URL and existing nodes. URI-list imports report the number of skipped entries. The Web UI starts one background job and polls its progress; closing or refreshing the page does not cancel it. Duplicate launches resume the active job. A failed download or worker exit reports a result without discarding saved subscriptions. Progress and job history stay in a private directory; request files are removed once claimed and at most eight job results are retained. An explicit manual Stop is preserved when the job finishes.
+
+Hysteria2 share links support `security=tls`, `sni`, `insecure`, `alpn`, `pinSHA256` (or `pcs`), `upmbps`, `downmbps`, and `fastopen`. Bandwidth values accept non-negative decimal numbers (Mbps by default) and `bps`/`Kbps`/`Mbps`/`Gbps` suffixes; Clash numeric YAML fields are accepted too. Values round up to whole bytes per second and are bounded to 1,000,000 Mbps; 0 selects automatic/unlimited behavior. Upload payloads share one budget across TCP/UDP sessions using a token bucket with up to 16 KiB of initial credit and cancellation refunds. A UDP packet larger than the bucket charges debt that subsequent sends must repay. QUIC uses BBR, and download capacity is advertised to the server using `Hysteria-CC-RX`. Fast Open permits writes before the destination response; reads still validate that response and its timeout.
+
+AnyTLS accepts `security=tls` and SHA-256 certificate pins through `pcs` or `pinSHA256`. A pin always checks the leaf certificate, including when `insecure=1`; a mismatch fails closed. Pins, Hysteria2 bandwidth and Fast Open settings survive saved configuration, share-link and Clash export/import. Conflicting pins and malformed parameters are rejected. Hysteria2 obfuscation and port hopping remain unsupported.
+
+sing-box TLS settings that cannot yet be enforced, including `certificate_public_key_sha256` (SPKI pins), custom trust certificates, client certificates, ECH and version constraints, cause the node to be rejected. They are never silently dropped, including with `insecure=true`. This differs from the supported leaf-certificate pins in URI/Clash imports.
+
+VLESS `xtls-rprx-vision` runs natively over TLS 1.3 or REALITY/TCP, including Vision padding and independent read/write raw-copy transitions. Non-HTTPS UDP uses XUDP through the Vision connection; the standard flow rejects UDP/443 to permit client TCP fallback. Unknown flows and Vision over WebSocket are rejected. The reference interoperability test covers ordinary TCP, TLS 1.3 data transfer, half-close and UDP without changing host routes.
+
+**Exit proxy**, available at the top of every plugin page, runs the normal service stop/cleanup path and preserves subscriptions and rules.
+
+## Per-device routing
+
+In **Routing rules**, set **Device source IP / subnet** to a client's fixed DHCP address, or a CIDR network for a device group. Leave it empty for a global rule. The destination condition still applies: two clients can send the same video domain to different actions (`proxy`, `direct`, or `reject`). A device-scoped final rule applies to the remaining traffic from that device.
+
+In rule mode, matching order is:
+
+1. Enabled device destination rules, then device final rules.
+2. Global destination rules.
+3. Built-in domestic / private-network direct routing.
+4. Global final rules, or default proxy.
+
+Within each phase, higher priority wins; ties keep configuration order. Overlapping source networks do not automatically prefer the longest prefix. Global and direct modes bypass this policy entirely.
+
+For example, replace the documentation-only address below with the device's actual fixed LAN IP:
+
+```yaml
+rules:
+  - source: "192.0.2.10/32"
+    group: "Living room TV"
+    rule_type: "domain-suffix"
+    pattern: "video.example.invalid"
+    target: "proxy"
+    enabled: true
+    priority: 100
+```
+
+Settings survive service and router restarts. Applying changes restarts the service; existing hardware-accelerated direct sessions may require reconnecting the client application. Bulk add accepts a shared source selector; native export preserves different selectors with `SOURCE,192.0.2.10/32,DOMAIN-SUFFIX,video.example.invalid,PROXY`. This prefix is Sockrocket syntax, not a portable Clash rule. Group editing retains the prefix; remove a device restriction with the individual rule editor by clearing its source.
+
+The flow overview can preview a client's IP locally without changing configuration. It includes applicable overlapping subnets and shows where a device final rule stops evaluation.
+
+Merlin's transparent path currently captures the main IPv4 LAN. Router/private destinations keep the existing kernel bypass; forwarded IPv6 remains subject to the existing IPv6 guard. IPv6 source matching is available in the core for supported ingress paths and does not enable IPv6 transparent interception on Merlin. HTTP/SOCKS identify the socket peer; NAT or an intermediate proxy can hide the original device. MAC discovery, per-device DNS resolvers, and different proxy nodes per device are not included. DNS/ICMP handling is unchanged; these are routing policies, not a replacement for router firewall access controls.
+
+CN hardware bypass remains enabled for other clients. Sources with device policies enter the userspace router before the CN bypass, so the policy is not silently skipped. Enabling many such devices can increase router CPU load.
+
 ## Service commands
 
 ```sh

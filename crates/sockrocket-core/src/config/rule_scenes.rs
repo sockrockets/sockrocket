@@ -67,6 +67,7 @@ const SCENES: [RuleScene; 2] = [
 
 fn rule(rule_type: &str, pattern: &str, target: &str) -> RoutingRule {
     RoutingRule {
+        source: String::new(),
         name: String::new(),
         group: String::new(),
         rule_type: rule_type.into(),

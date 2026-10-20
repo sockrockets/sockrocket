@@ -17,7 +17,7 @@ Object.assign(translations.en, {
  anytlsDetail:'TCP and UDP interoperability verified against an independent server.',
  wireguardDescription:'A native userspace tunnel with one peer per node. Supports preshared keys, DNS inside the tunnel and WireGuard profile import.',
  wireguardDetail:'No additional OS interface; UDP payloads must fit the tunnel MTU.',
- protocolLimits:'Compatibility: Vision and gRPC / XHTTP are not implemented and fail explicitly. WireGuard does not yet support multiple peers, IP fragmentation or profile scripts.',
+ protocolLimits:'Compatibility: VLESS Vision supports TLS 1.3 / REALITY over TCP and XUDP (standard flow excludes UDP/443). gRPC / XHTTP remain unsupported and fail explicitly. WireGuard does not yet support multiple peers, IP fragmentation or profile scripts.',
  protocolGuide:'Full protocol and transport guide ↗'
 });
 Object.assign(translations.vi, {
@@ -31,7 +31,7 @@ Object.assign(translations.vi, {
  anytlsDetail:'Đã kiểm tra tương thích TCP và UDP với máy chủ độc lập.',
  wireguardDescription:'Đường hầm native trong tiến trình, mỗi node có một peer. Hỗ trợ khóa chia sẻ trước, DNS trong đường hầm và nhập tệp cấu hình WireGuard.',
  wireguardDetail:'Không tạo thêm giao diện mạng hệ thống; gói UDP phải nằm trong MTU của đường hầm.',
- protocolLimits:'Giới hạn: Vision và gRPC / XHTTP chưa được triển khai và sẽ bị từ chối rõ ràng. WireGuard chưa hỗ trợ nhiều peer, phân mảnh IP hoặc script cấu hình.',
+ protocolLimits:'Giới hạn: VLESS Vision hỗ trợ TLS 1.3 / REALITY qua TCP và XUDP (flow tiêu chuẩn chặn UDP/443). gRPC / XHTTP chưa được triển khai và sẽ bị từ chối rõ ràng. WireGuard chưa hỗ trợ nhiều peer, phân mảnh IP hoặc script cấu hình.',
  protocolGuide:'Hướng dẫn giao thức và transport đầy đủ ↗'
 });
 const elements = [...document.querySelectorAll('[data-t]')];

@@ -74,24 +74,37 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                 );
             }
             Ok(SharedOutbound(Arc::new(
-                super::anytls::AnyTlsOutbound::new(
+                super::anytls::AnyTlsOutbound::new_pinned(
                     &node.server,
                     node.port,
                     password,
                     node.transport.as_ref().and_then(|t| t.tls.as_ref()),
                     warm_pool,
+                    node.extra
+                        .get(crate::config::v2ray::TLS_CERT_PIN)
+                        .map(|p| crate::config::v2ray::parse_tuic_certificate_pin(p))
+                        .transpose()?,
                 )?,
             )))
         }
         ProxyProtocol::VLess { uuid, flow, .. } => {
-            anyhow::ensure!(
-                flow.as_deref().is_none_or(str::is_empty),
-                "VLESS flow is not implemented; refusing to connect without the requested flow"
-            );
-            let out = if warm_pool {
-                VlessOutbound::new(&node.server, node.port, uuid, node.transport.as_ref())?
-            } else {
-                VlessOutbound::new_unwarmed(&node.server, node.port, uuid, node.transport.as_ref())?
+            let out = match flow.as_deref().filter(|value| !value.is_empty()) {
+                Some(super::vision::FLOW) => VlessOutbound::new_vision(
+                    &node.server,
+                    node.port,
+                    uuid,
+                    node.transport.as_ref(),
+                )?,
+                Some(_) => anyhow::bail!("Unsupported VLESS flow"),
+                None if warm_pool => {
+                    VlessOutbound::new(&node.server, node.port, uuid, node.transport.as_ref())?
+                }
+                None => VlessOutbound::new_unwarmed(
+                    &node.server,
+                    node.port,
+                    uuid,
+                    node.transport.as_ref(),
+                )?,
             };
             Ok(SharedOutbound(Arc::new(out)).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }
@@ -207,7 +220,13 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
 
         ProxyProtocol::Hysteria2 { password, .. } => {
             let tls_config = node.transport.as_ref().and_then(|t| t.tls.as_ref());
-            let out = Hysteria2Outbound::new(&node.server, node.port, password, tls_config)?;
+            let out = Hysteria2Outbound::new_options(
+                &node.server,
+                node.port,
+                password,
+                tls_config,
+                &node.extra,
+            )?;
             Ok(SharedOutbound(Arc::new(out)))
         }
     }
@@ -217,6 +236,20 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
 mod tests {
     use super::*;
     use crate::config::model::{TlsConfig, TransportConfig, TransportType};
+
+    #[test]
+    fn vision_requires_native_tls_and_rejects_unknown_flows() {
+        let prefix = "vless://00000000-0000-0000-0000-000000000001@vpn.example.invalid:443?";
+        for (query, accepted) in [
+            ("security=tls&type=tcp&flow=xtls-rprx-vision", true),
+            ("security=tls&type=tcp&flow=unrecognized-flow", false),
+            ("security=tls&type=ws&flow=xtls-rprx-vision", false),
+            ("security=none&type=tcp&flow=xtls-rprx-vision", false),
+        ] {
+            let node = crate::parse_vless_uri(&format!("{prefix}{query}")).unwrap();
+            assert_eq!(create_outbound_unwarmed(&node).is_ok(), accepted);
+        }
+    }
 
     #[test]
     fn test_create_vless_outbound() {

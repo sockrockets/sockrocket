@@ -19,7 +19,7 @@ dns_direct_server: "114.114.114.114"   # DNS server for direct domains (China IS
 mode: "tun"
 
 # Routing mode (same as Mac client titlebar):
-#   rule   — custom rules, then built-in China-direct (geoip:CN), then Final
+#   rule   — device rules/finals, global rules, China-direct, global Final
 #   global — all traffic via the active node
 #   direct — no proxy
 proxy_mode: "rule"
@@ -170,3 +170,8 @@ rules:
 
 # -- Startup options -----------------------------------------------------------
 # auto_update_subscriptions: true   # Fetch latest subscriptions on startup
+
+# A rule can optionally include source: "192.0.2.10/32" (documentation address;
+# replace with a fixed DHCP client IP). Empty/omitted source means global.
+# Device rules apply before global rules; a device final only covers that source.
+# source: "192.0.2.0/24" groups clients by IPv4 network, not by MAC address.

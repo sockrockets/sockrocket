@@ -496,11 +496,23 @@ async fn resolve_via_bootstrap_dns(host: &str) -> Option<Vec<IpAddr>> {
 /// and store the result — avoids rebuilding root cert store and
 /// ClientConfig on every connection.
 pub fn build_tls_connector(config: Option<&TlsConfig>) -> TlsConnector {
+    build_tls_connector_pinned(config, None)
+}
+
+pub(crate) fn build_tls_connector_pinned(
+    config: Option<&TlsConfig>,
+    pin: Option<[u8; 32]>,
+) -> TlsConnector {
     let skip_verify = config.map(|c| c.skip_cert_verify).unwrap_or(false);
     let alpn = config.and_then(|c| c.alpn.as_ref());
     let fp_name = config.and_then(|c| c.fingerprint.as_deref());
 
-    let base_config = if skip_verify {
+    let base_config = if let Some(pin) = pin {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTlsVerifier(pin)))
+            .with_no_client_auth()
+    } else if skip_verify {
         ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
@@ -690,6 +702,61 @@ pub async fn connect_with_tls_timeout(
     }
 }
 
+#[derive(Debug)]
+struct PinnedTlsVerifier([u8; 32]);
+impl craft_tls::rustls::client::danger::ServerCertVerifier for PinnedTlsVerifier {
+    fn verify_server_cert(
+        &self,
+        cert: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<craft_tls::rustls::client::danger::ServerCertVerified, craft_tls::rustls::Error>
+    {
+        use sha2::{Digest, Sha256};
+        if Sha256::digest(cert.as_ref()).as_slice() != self.0 {
+            return Err(craft_tls::rustls::Error::General(
+                "TLS certificate pin mismatch".into(),
+            ));
+        }
+        Ok(craft_tls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &craft_tls::rustls::DigitallySignedStruct,
+    ) -> Result<craft_tls::rustls::client::danger::HandshakeSignatureValid, craft_tls::rustls::Error>
+    {
+        craft_tls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &craft_tls::rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &craft_tls::rustls::DigitallySignedStruct,
+    ) -> Result<craft_tls::rustls::client::danger::HandshakeSignatureValid, craft_tls::rustls::Error>
+    {
+        craft_tls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &craft_tls::rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<craft_tls::rustls::SignatureScheme> {
+        craft_tls::rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Certificate verifier that accepts all certificates (for skip_cert_verify).
 #[derive(Debug)]
 pub(crate) struct InsecureVerifier;
@@ -854,6 +921,59 @@ impl TlsConnFactory {
             transport.and_then(|t| t.reality.as_ref()),
             ws,
         )
+    }
+
+    pub(super) async fn connect_vision(
+        &self,
+    ) -> Result<craft_tls::client::TlsStream<super::vision::RecordIo<TcpStream>>> {
+        anyhow::ensure!(
+            self.use_tls && self.ws.is_none(),
+            "Vision requires native TLS or REALITY over TCP"
+        );
+        if let Some(error) = &self.reality_error {
+            anyhow::bail!("REALITY configuration error: {error}");
+        }
+        let classic = self.reality_classic_connector.is_some()
+            && server_needs_classic_reality(&self.server, self.port);
+        let connector = if classic {
+            self.reality_classic_connector
+                .as_ref()
+                .unwrap_or(&self.connector)
+        } else {
+            self.reality_connector.as_ref().unwrap_or(&self.connector)
+        };
+        let connect = |connector: TlsConnector| async move {
+            let tcp = connect_tcp(
+                &format_host_port(&self.server, self.port),
+                DEFAULT_CONNECT_TIMEOUT,
+            )
+            .await?;
+            let name = ServerName::try_from(self.sni.clone())
+                .map_err(|_| anyhow::anyhow!("Invalid Vision TLS server name"))?;
+            let stream = tokio::time::timeout(
+                DEFAULT_CONNECT_TIMEOUT,
+                connector.connect(name, super::vision::RecordIo::new(tcp)),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Vision outer TLS handshake timed out"))??;
+            anyhow::ensure!(
+                stream.get_ref().1.protocol_version()
+                    == Some(craft_tls::rustls::ProtocolVersion::TLSv1_3),
+                "Vision requires outer TLS 1.3"
+            );
+            Ok::<_, anyhow::Error>(stream)
+        };
+        match connect(connector.clone()).await {
+            Err(error)
+                if !classic
+                    && self.reality_classic_connector.is_some()
+                    && format!("{error:#}").contains("Ed25519 SPKI not found") =>
+            {
+                mark_server_needs_classic_reality(&self.server, self.port);
+                connect(self.reality_classic_connector.as_ref().unwrap().clone()).await
+            }
+            result => result,
+        }
     }
 
     fn build(
@@ -1273,5 +1393,31 @@ mod resource_bound_review {
         );
         cache.insert("fresh.example.org", vec![], now + Duration::from_secs(120));
         assert_eq!(cache.entries.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod certificate_pin_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[test]
+    fn pinned_tls_verifier_rejects_wrong_pin_and_ca_pin() {
+        let leaf = CertificateDer::from(vec![1, 2, 3]);
+        let ca = CertificateDer::from(vec![4, 5, 6]);
+        let name = ServerName::try_from("example.invalid").unwrap();
+        let now = UnixTime::since_unix_epoch(Duration::ZERO);
+        let correct = PinnedTlsVerifier(Sha256::digest(leaf.as_ref()).into());
+        assert!(
+            correct
+                .verify_server_cert(&leaf, &[ca.clone()], &name, &[], now)
+                .is_ok()
+        );
+        let wrong = PinnedTlsVerifier(Sha256::digest(ca.as_ref()).into());
+        assert!(
+            wrong
+                .verify_server_cert(&leaf, &[ca], &name, &[], now)
+                .is_err()
+        );
+        assert!(!correct.supported_verify_schemes().is_empty());
     }
 }

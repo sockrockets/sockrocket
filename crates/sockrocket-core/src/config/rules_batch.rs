@@ -200,7 +200,16 @@ fn split_line_and_name(raw: &str) -> (&str, String) {
 }
 
 /// One Clash-style line: `TYPE,pattern,TARGET` or `MATCH,TARGET`.
+/// Destination CSV with a native SOURCE prefix when the rule is device-scoped.
 pub fn format_rule_clash_line(rule: &RoutingRule) -> String {
+    let line = format_rule_destination_line(rule);
+    if rule.source.is_empty() {
+        line
+    } else {
+        format!("SOURCE,{},{}", rule.source, line)
+    }
+}
+fn format_rule_destination_line(rule: &RoutingRule) -> String {
     let typ = export_type(&rule.rule_type);
     if matches!(rule.rule_type.as_str(), "match" | "final") {
         format!("{},{}", typ, export_target(&rule.target))
@@ -209,7 +218,7 @@ pub fn format_rule_clash_line(rule: &RoutingRule) -> String {
     }
 }
 
-/// Serialize rules to a Clash-compatible line format suitable for re-import.
+/// Export destination rules as Clash lines; device scopes use the native SOURCE prefix.
 pub fn format_rules_export(rules: &[RoutingRule]) -> String {
     use crate::config::rule_groups::group_rules_for_display;
     let mut lines = Vec::with_capacity(rules.len() + 4);
@@ -250,10 +259,9 @@ pub fn merge_batch_rules(
     let mut stats = BatchMergeStats::default();
     // Insert newest-first among the batch so the first pasted line stays highest.
     for rule in incoming.into_iter().rev() {
-        if let Some(pos) = existing
-            .iter()
-            .position(|e| e.rule_type == rule.rule_type && e.pattern == rule.pattern)
-        {
+        if let Some(pos) = existing.iter().position(|e| {
+            e.rule_type == rule.rule_type && e.pattern == rule.pattern && e.source == rule.source
+        }) {
             match conflict {
                 BatchConflict::Skip => stats.skipped += 1,
                 BatchConflict::Replace => {
@@ -282,6 +290,29 @@ pub fn merge_batch_rules(
 }
 
 fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, String> {
+    if line
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case("SOURCE,"))
+    {
+        let mut parts = line.splitn(3, ',');
+        parts.next();
+        let scope = parts.next().unwrap_or("");
+        let rest = parts
+            .next()
+            .ok_or("SOURCE requires an address and a complete rule")?;
+        if rest
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("SOURCE,"))
+        {
+            return Err("Nested SOURCE is not supported".into());
+        }
+        let mut rule = parse_clash_line(rest)?;
+        rule.source = crate::router::normalize_rule_source(scope)?;
+        if rule.source.is_empty() {
+            return Err("SOURCE requires an IP address or network".into());
+        }
+        return Ok(rule);
+    }
     // Clash CSV: TYPE,value,action  or MATCH,action
     if line.contains(',') {
         return parse_clash_line(line);
@@ -417,6 +448,7 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
         other => return Err(format!("Unsupported rule type '{other}'")),
     };
     Ok(RoutingRule {
+        source: String::new(),
         name: String::new(),
         group: String::new(),
         rule_type: if rule_type == "port" {
@@ -590,6 +622,7 @@ mod tests {
     #[test]
     fn merge_skips_duplicates() {
         let mut existing = vec![RoutingRule {
+            source: String::new(),
             name: String::new(),
             group: String::new(),
             rule_type: "domain-suffix".into(),
@@ -629,6 +662,7 @@ mod tests {
     #[test]
     fn format_clash_line_variants() {
         let domain = RoutingRule {
+            source: String::new(),
             name: String::new(),
             group: String::new(),
             rule_type: "geoip".into(),
@@ -639,6 +673,7 @@ mod tests {
         };
         assert_eq!(format_rule_clash_line(&domain), "GEOIP,CN,DIRECT");
         let fin = RoutingRule {
+            source: String::new(),
             name: String::new(),
             group: String::new(),
             rule_type: "match".into(),
@@ -654,6 +689,7 @@ mod tests {
     fn export_roundtrip_clash() {
         let rules = vec![
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -663,6 +699,7 @@ mod tests {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "match".into(),

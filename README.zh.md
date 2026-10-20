@@ -36,7 +36,7 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 | 多端复用 | 桌面 GUI、CLI 与 Merlin WebUI，共用 Rust 内核 |
 | 多语言 | 中文、English、Tiếng Việt |
 
-协议与传输组合存在能力边界：ShadowTLS 不提供 UDP，VMess 原生 UDP 和 WireGuard UDP 有单包大小限制；Vision、gRPC/XHTTP 尚未实现，相关配置会明确拒绝。详见[协议说明](docs/protocols.md)。软件不提供代理节点或订阅服务。
+协议与传输组合存在能力边界：ShadowTLS 不提供 UDP，VMess 原生 UDP 和 WireGuard UDP 有单包大小限制；VLESS Vision 支持 TLS 1.3/REALITY TCP 与 XUDP，标准 flow 拒绝 UDP/443；gRPC/XHTTP 尚未实现，相关配置会明确拒绝。详见[协议说明](docs/protocols.md)。软件不提供代理节点或订阅服务。
 
 ## 新增协议：AnyTLS 与 WireGuard
 
@@ -49,7 +49,7 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 桌面端、CLI 和 Merlin 复用同一实现，节点与订阅沿用本机配置持久化。WireGuard 协议本身不创建额外系统网卡，也不修改系统路由或 DNS；应用的 TUN 接管由独立设置控制。两种协议均已通过独立服务端互通测试。
 
-详细格式、限制及尚未实现的 Vision、gRPC/XHTTP 见[协议说明](docs/protocols.md)。
+详细格式、限制及尚未实现的 gRPC/XHTTP 见[协议说明](docs/protocols.md)。
 
 ## 界面预览：了解日常操作
 

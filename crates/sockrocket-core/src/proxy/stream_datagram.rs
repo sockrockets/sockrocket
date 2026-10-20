@@ -13,6 +13,7 @@ use tokio::{
 #[derive(Clone)]
 pub(super) enum Framing {
     Length16,
+    Xudp(Vec<u8>),
     Trojan(Vec<u8>),
     NativeChunks(usize),
 }
@@ -22,6 +23,7 @@ pub(super) struct StreamDatagram {
     task: tokio::task::JoinHandle<()>,
     framing: Framing,
     poisoned: AtomicBool,
+    request_started: AtomicBool,
 }
 impl Drop for StreamDatagram {
     fn drop(&mut self) {
@@ -48,6 +50,7 @@ impl StreamDatagram {
             task,
             framing,
             poisoned: AtomicBool::new(false),
+            request_started: AtomicBool::new(false),
         })
     }
 }
@@ -68,6 +71,17 @@ impl Datagram for StreamDatagram {
             );
             match &self.framing {
                 Framing::Length16 => writer.write_u16(packet.len() as u16).await?,
+                Framing::Xudp(address) => {
+                    writer.write_u16((5 + address.len()) as u16).await?;
+                    let status = if self.request_started.swap(true, Ordering::SeqCst) {
+                        2
+                    } else {
+                        1
+                    };
+                    writer.write_all(&[0, 0, status, 1, 2]).await?;
+                    writer.write_all(address).await?;
+                    writer.write_u16(packet.len() as u16).await?;
+                }
                 Framing::Trojan(address) => {
                     writer.write_all(address).await?;
                     writer.write_u16(packet.len() as u16).await?;
@@ -107,6 +121,42 @@ async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R, frame: &Framing) -> R
         };
         reader.read_exact(&mut vec![0; count + 2]).await?;
     }
+    if let Framing::Xudp(_) = frame {
+        loop {
+            let size = reader.read_u16().await? as usize;
+            ensure!((4..=512).contains(&size), "Invalid XUDP header length");
+            let mut header = vec![0; size];
+            reader.read_exact(&mut header).await?;
+            ensure!(header[..2] == [0, 0], "Unexpected XUDP session");
+            ensure!(
+                matches!(header[2], 2..=4) && header[3] & !3 == 0 && header[3] & 2 == 0,
+                "XUDP session closed or invalid status"
+            );
+            ensure!(header[2] != 3, "XUDP session ended");
+            if size > 4 {
+                ensure!(size >= 8 && header[4] == 2, "Invalid XUDP address");
+                let address = &header[5..];
+                let length = match address[2] {
+                    1 => 7,
+                    3 => 19,
+                    2 => {
+                        ensure!(address.len() >= 4, "Invalid XUDP domain");
+                        4 + address[3] as usize
+                    }
+                    _ => bail!("Invalid XUDP address family"),
+                };
+                ensure!(address.len() == length, "Invalid XUDP address length");
+            }
+            if header[3] & 1 == 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let size = reader.read_u16().await? as usize;
+            let mut packet = vec![0; size];
+            reader.read_exact(&mut packet).await?;
+            return Ok(packet);
+        }
+    }
     if let Framing::NativeChunks(max) = frame {
         let mut packet = vec![0; *max + 16];
         let size = reader.read(&mut packet).await?;
@@ -127,6 +177,39 @@ async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R, frame: &Framing) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn xudp_preserves_payload_and_rejects_invalid_control_headers() {
+        let framing = Framing::Xudp(vec![0, 53, 1, 127, 0, 0, 1]);
+        let wire = [0, 4, 0, 0, 2, 1, 0, 3, 1, 2, 3];
+        assert_eq!(
+            read_packet(&mut &wire[..], &framing).await.unwrap(),
+            vec![1, 2, 3]
+        );
+        for invalid in [
+            &[0, 3, 0, 0, 2][..],
+            &[0, 4, 0, 1, 2, 1, 0, 0],
+            &[0, 4, 0, 0, 3, 0],
+            &[0, 4, 0, 0, 2, 3],
+            &[0, 4, 0, 0, 2, 1, 0, 2, 1],
+        ] {
+            assert!(read_packet(&mut &invalid[..], &framing).await.is_err());
+        }
+        let (client, mut peer) = tokio::io::duplex(64);
+        let client = StreamDatagram::boxed(Box::new(client), framing);
+        for status in [1, 2] {
+            client.send(b"packet").await.unwrap();
+            assert_eq!(peer.read_u16().await.unwrap(), 12);
+            let mut header = [0; 12];
+            peer.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..5], &[0, 0, status, 1, 2]);
+            assert_eq!(&header[5..], &[0, 53, 1, 127, 0, 0, 1]);
+            assert_eq!(peer.read_u16().await.unwrap(), 6);
+            let mut payload = [0; 6];
+            peer.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"packet");
+        }
+    }
+
     #[tokio::test]
     async fn framed_protocols_preserve_messages_and_empty_payloads() {
         for framing in [

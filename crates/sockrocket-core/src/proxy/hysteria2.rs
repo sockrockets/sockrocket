@@ -17,7 +17,7 @@ use crate::config::model::TlsConfig;
 
 use super::connector::{BoxProxyStream, Outbound};
 use super::quic_conn::{
-    QuicConnectionState, build_quic_client_config, ensure_quic_crypto_provider,
+    QuicConnectionState, build_quic_client_config_pinned, ensure_quic_crypto_provider,
     resolve_server_addrs,
 };
 
@@ -98,6 +98,10 @@ pub struct Hysteria2Outbound {
     password: String,
     sni: String,
     skip_cert_verify: bool,
+    certificate_pin: Option<[u8; 32]>,
+    down_bps: u64,
+    upload: Option<Arc<super::hysteria2_bandwidth::Budget>>,
+    fast_open: bool,
     /// ALPN candidates tried in order. The official Hysteria2 server requires
     /// "hysteria", but some widely deployed panels only accept "h3" — once a
     /// candidate succeeds it is remembered to skip the search on reconnects.
@@ -114,6 +118,23 @@ impl Hysteria2Outbound {
         password: &str,
         tls_config: Option<&TlsConfig>,
     ) -> Result<Self> {
+        Self::new_options(server, port, password, tls_config, &Default::default())
+    }
+    pub(crate) fn new_options(
+        server: &str,
+        port: u16,
+        password: &str,
+        tls_config: Option<&TlsConfig>,
+        extra: &std::collections::HashMap<String, String>,
+    ) -> Result<Self> {
+        use crate::config::v2ray::*;
+        let bandwidth = |key| -> Result<u64> {
+            extra
+                .get(key)
+                .map(|v| crate::config::bandwidth::parse_mbps(v))
+                .transpose()
+                .map(|value| value.unwrap_or(0))
+        };
         let sni = tls_config
             .and_then(|t| t.sni.as_deref())
             .unwrap_or(server)
@@ -124,6 +145,19 @@ impl Hysteria2Outbound {
             .cloned()
             .unwrap_or_else(|| vec!["hysteria".to_string(), "h3".to_string()]);
 
+        anyhow::ensure!(
+            !alpn_candidates.is_empty()
+                && alpn_candidates
+                    .iter()
+                    .all(|value| !value.is_empty() && value.len() <= 255),
+            "Invalid Hysteria2 ALPN"
+        );
+        anyhow::ensure!(
+            extra
+                .get(HY2_FAST_OPEN)
+                .is_none_or(|value| matches!(value.as_str(), "true" | "false")),
+            "Invalid Hysteria2 fast-open option"
+        );
         ensure_quic_crypto_provider();
 
         Ok(Self {
@@ -132,6 +166,13 @@ impl Hysteria2Outbound {
             password: password.to_string(),
             sni,
             skip_cert_verify,
+            certificate_pin: extra
+                .get(TLS_CERT_PIN)
+                .map(|p| parse_tuic_certificate_pin(p))
+                .transpose()?,
+            down_bps: bandwidth(HY2_DOWN)?,
+            upload: super::hysteria2_bandwidth::Budget::new(bandwidth(HY2_UP)?),
+            fast_open: extra.get(HY2_FAST_OPEN).is_some_and(|v| v == "true"),
             alpn_candidates,
             working_alpn: std::sync::Mutex::new(None),
             conn_state: QuicConnectionState::new(),
@@ -141,8 +182,11 @@ impl Hysteria2Outbound {
 
     /// Build a QUIC client config (TLS + transport) for a given ALPN.
     fn build_client_config(&self, alpn: &str) -> Result<quinn::ClientConfig> {
-        let mut client_config =
-            build_quic_client_config(self.skip_cert_verify, &[alpn.to_string()])?;
+        let mut client_config = build_quic_client_config_pinned(
+            self.skip_cert_verify,
+            &[alpn.to_string()],
+            self.certificate_pin,
+        )?;
 
         // Transport config: BBR congestion control for Hysteria2
         let mut transport = quinn::TransportConfig::default();
@@ -377,7 +421,7 @@ impl Hysteria2Outbound {
             .method("POST")
             .uri("https://hysteria/auth")
             .header("Hysteria-Auth", &self.password)
-            .header("Hysteria-CC-RX", "0")
+            .header("Hysteria-CC-RX", self.down_bps.to_string())
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build auth request: {}", e))?;
 
@@ -417,7 +461,7 @@ impl Outbound for Hysteria2Outbound {
             let mut last_err = anyhow::anyhow!("Hysteria2: no connection attempt made");
             for attempt in 1u8..=2 {
                 let conn = self.get_connection().await?;
-                let (mut send, mut recv) = match conn.open_bi().await {
+                let (mut send, recv) = match conn.open_bi().await {
                     Ok(pair) => pair,
                     Err(e) => {
                         last_err = anyhow::anyhow!(
@@ -443,27 +487,19 @@ impl Outbound for Hysteria2Outbound {
                 write_varint(&mut send, 0).await?; // no padding
                 send.flush().await?;
 
-                // Read the server's TCPResponse (present in full on both
-                // success and failure — verified against live servers).
-                let (status, msg) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    read_tcp_response(&mut recv),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("Hysteria2 TCPResponse timeout"))??;
-
-                if status == 0x01 {
-                    bail!(
-                        "Hysteria2 TCP connect to {} rejected by server: {}",
-                        addr_str,
-                        msg
-                    );
-                }
-
-                tracing::debug!("Hysteria2 TCP connect to {} ({})", addr_str, msg);
-
-                let stream = Hy2BidiStream { send, recv };
-                return Ok(Box::new(stream) as BoxProxyStream);
+                // Fast-open writes may proceed while the response is pending.
+                // Reads always consume/validate the complete response first.
+                let response = Box::pin(await_tcp_response(recv));
+                let reader = if self.fast_open {
+                    Hy2Reader::Waiting(response)
+                } else {
+                    Hy2Reader::Ready(response.await?)
+                };
+                let stream = Hy2BidiStream { send, recv: reader };
+                return Ok(super::hysteria2_bandwidth::stream(
+                    Box::new(stream),
+                    &self.upload,
+                ));
             }
             Err(last_err)
         })
@@ -484,7 +520,8 @@ impl Outbound for Hysteria2Outbound {
                     super::quic_datagram::Protocol::Hysteria2,
                 ));
             }
-            hub.as_ref().unwrap().associate(&host, port)
+            let datagram = hub.as_ref().unwrap().associate(&host, port)?;
+            Ok(super::hysteria2_bandwidth::datagram(datagram, &self.upload))
         })
     }
 
@@ -496,7 +533,12 @@ impl Outbound for Hysteria2Outbound {
 /// Combined bidirectional QUIC stream for Hysteria2.
 struct Hy2BidiStream {
     send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    recv: Hy2Reader,
+}
+enum Hy2Reader {
+    Ready(quinn::RecvStream),
+    Waiting(Pin<Box<dyn Future<Output = io::Result<quinn::RecvStream>> + Send>>),
+    Failed,
 }
 
 impl AsyncRead for Hy2BidiStream {
@@ -505,7 +547,21 @@ impl AsyncRead for Hy2BidiStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.get_mut().recv).poll_read(cx, buf) {
+        let this = self.get_mut();
+        if let Hy2Reader::Waiting(response) = &mut this.recv {
+            match response.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(recv)) => this.recv = Hy2Reader::Ready(recv),
+                Poll::Ready(Err(error)) => {
+                    this.recv = Hy2Reader::Failed;
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
+        let Hy2Reader::Ready(recv) = &mut this.recv else {
+            return Poll::Ready(Err(io::Error::other("Hysteria2 handshake failed")));
+        };
+        match Pin::new(recv).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
@@ -546,6 +602,23 @@ impl AsyncWrite for Hy2BidiStream {
 impl Unpin for Hy2BidiStream {}
 
 // --- Protocol helpers ---
+
+async fn await_tcp_response<R: AsyncRead + Unpin>(mut recv: R) -> io::Result<R> {
+    let (status, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_tcp_response(&mut recv),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Hysteria2 TCPResponse timeout"))?
+    .map_err(io::Error::other)?;
+    if status != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "Hysteria2 destination rejected",
+        ));
+    }
+    Ok(recv)
+}
 
 /// Upper bound for the TCPResponse message string; anything larger is a
 /// protocol violation, not a message to buffer.
@@ -647,6 +720,32 @@ mod tests {
         };
         let outbound = Hysteria2Outbound::new("server.com", 443, "pass", Some(&tls)).unwrap();
         assert_eq!(outbound.sni, "custom.sni.com");
+    }
+
+    #[tokio::test]
+    async fn fast_open_reader_strips_response_and_preserves_payload() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let response = await_tcp_response(client);
+        server.write_all(&[0, 0, 0, b'o', b'k']).await.unwrap();
+        let mut client = response.await.unwrap();
+        let mut bytes = [0; 2];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_open_reader_times_out_and_rejects_denied_destinations() {
+        let (client, _server) = tokio::io::duplex(1024);
+        assert_eq!(
+            await_tcp_response(client).await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let (client, mut server) = tokio::io::duplex(1024);
+        server.write_all(&[1, 0, 0]).await.unwrap();
+        assert_eq!(
+            await_tcp_response(client).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
     }
 
     /// Regression: a TCPResponse message longer than 4096 bytes must be read

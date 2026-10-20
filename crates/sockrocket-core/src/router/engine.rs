@@ -38,11 +38,14 @@ pub enum MatchRule {
     DstPort { min: u16, max: u16 },
     /// Match all (catch-all rule)
     MatchAll,
+    /// TUN DNS mapping already identified this destination as domestic.
+    DomesticHint,
 }
 
 /// A single rule with its action.
 #[derive(Debug, Clone)]
 pub struct RuleEntry {
+    pub source: Option<(IpAddr, u8)>,
     pub rule: MatchRule,
     pub action: RouteAction,
 }
@@ -69,7 +72,11 @@ impl RuleSet {
 
     /// Add a rule to the set.
     pub fn add_rule(&mut self, rule: MatchRule, action: RouteAction) {
-        self.rules.push(RuleEntry { rule, action });
+        self.rules.push(RuleEntry {
+            source: None,
+            rule,
+            action,
+        });
     }
 
     /// Build from config RoutingRules. Disabled rules are skipped.
@@ -125,9 +132,25 @@ impl RuleSet {
                 }
             };
 
-            set.add_rule(rule, action);
+            let source = if r.source.is_empty() {
+                None
+            } else {
+                let Ok(normalized) = normalize_rule_source(&r.source) else {
+                    continue;
+                };
+                parse_cidr(&normalized)
+            };
+            set.rules.push(RuleEntry {
+                source,
+                rule,
+                action,
+            });
         }
         set
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.rules.extend(other.rules);
     }
 
     pub fn rules(&self) -> &[RuleEntry] {
@@ -155,6 +178,15 @@ fn cache_key(host: &str, port: u16) -> String {
     format!("{host_part}:{port}")
 }
 
+fn client_cache_key(host: &str, port: u16) -> String {
+    let source = crate::proxy::routing::client_source();
+    let hint = crate::proxy::routing::tun_destination();
+    if source.is_none() && hint == (None, false) {
+        return cache_key(host, port);
+    }
+    format!("{source:?}|{hint:?}|{}", cache_key(host, port))
+}
+
 /// Router evaluates rules against connection targets.
 pub struct Router {
     rules: RuleSet,
@@ -178,10 +210,19 @@ impl Router {
         self
     }
 
+    /// Whether the current client has any enabled device-specific policy.
+    pub fn has_client_rules(&self) -> bool {
+        let source = crate::proxy::routing::client_source();
+        self.rules
+            .rules
+            .iter()
+            .any(|entry| entry.source.is_some() && source_matches(entry.source, source))
+    }
+
     /// Evaluate routing rules for a given destination.
     /// `host` can be a domain name or IP address string.
     pub fn route(&self, host: &str, port: u16) -> RouteAction {
-        let key = cache_key(host, port);
+        let key = client_cache_key(host, port);
         // get() (not peek()) so a hit promotes the entry in LRU order —
         // without promotion a hot route stays evictable under cache churn.
         // This needs the write lock, but it is a std RwLock held only for
@@ -205,9 +246,15 @@ impl Router {
     /// Perform rule matching without cache.
     fn route_uncached(&self, host: &str, port: u16) -> RouteAction {
         let host_lower = host.to_lowercase();
-        let ip: Option<IpAddr> = host.parse().ok();
+        let ip: Option<IpAddr> = host
+            .parse()
+            .ok()
+            .or(crate::proxy::routing::tun_destination().0);
 
         for entry in &self.rules.rules {
+            if !source_matches(entry.source, crate::proxy::routing::client_source()) {
+                continue;
+            }
             if self.rule_matches(&entry.rule, &host_lower, ip, port) {
                 tracing::debug!(
                     "Route match: {}:{} -> {:?} (rule: {:?})",
@@ -236,6 +283,9 @@ impl Router {
     pub fn route_domain_only(&self, host: &str) -> Option<RouteAction> {
         let host_lower = host.to_lowercase();
         for entry in &self.rules.rules {
+            if !source_matches(entry.source, crate::proxy::routing::client_source()) {
+                continue;
+            }
             let matched = match &entry.rule {
                 MatchRule::Domain(_) | MatchRule::DomainSuffix(_) | MatchRule::DomainKeyword(_) => {
                     self.rule_matches(&entry.rule, &host_lower, None, 0)
@@ -259,7 +309,7 @@ impl Router {
     pub async fn route_resolving(&self, host: &str, port: u16) -> RouteAction {
         // Fast path: same cache as `route` (same lowercased keying, same
         // LRU promotion on hit).
-        let key = cache_key(host, port);
+        let key = client_cache_key(host, port);
         if let Ok(mut cache) = self.cache.write()
             && let Some(action) = cache.get(&key)
         {
@@ -277,10 +327,16 @@ impl Router {
 
     async fn route_uncached_resolving(&self, host: &str, port: u16) -> RouteAction {
         let host_lower = host.to_lowercase();
-        let mut ip: Option<IpAddr> = host.parse().ok();
+        let mut ip: Option<IpAddr> = host
+            .parse()
+            .ok()
+            .or(crate::proxy::routing::tun_destination().0);
         let mut dns_attempted = ip.is_some();
 
         for entry in &self.rules.rules {
+            if !source_matches(entry.source, crate::proxy::routing::client_source()) {
+                continue;
+            }
             // Lazily resolve the first time evaluation reaches an IP-based
             // rule for a domain target.
             if !dns_attempted
@@ -339,6 +395,7 @@ impl Router {
             MatchRule::DstPort { min, max } => port >= *min && port <= *max,
 
             MatchRule::MatchAll => true,
+            MatchRule::DomesticHint => crate::proxy::routing::tun_destination().1,
         }
     }
 }
@@ -397,6 +454,60 @@ fn parse_port_range(pattern: &str) -> Option<(u16, u16)> {
     } else {
         let port: u16 = p.parse().ok()?;
         Some((port, port))
+    }
+}
+
+/// Canonicalize a client address/network so equivalent scopes share identity.
+pub fn normalize_rule_source(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    let (ip, bits) = if value.contains('/') {
+        parse_cidr(value)
+            .ok_or_else(|| "来源必须是有效的 IPv4/IPv6 地址或 CIDR 网段".to_string())?
+    } else {
+        let ip: IpAddr = value
+            .parse()
+            .map_err(|_| "来源必须是 IP 地址或 CIDR 网段，不能填写 MAC / 主机名".to_string())?;
+        (ip, if ip.is_ipv4() { 32 } else { 128 })
+    };
+    let (ip, bits) = match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+            if bits < 96 {
+                return Err("IPv4 映射地址的前缀必须至少为 96，或直接填写 IPv4 网段".into());
+            }
+            (IpAddr::V4(v6.to_ipv4_mapped().unwrap()), bits - 96)
+        }
+        _ => (ip, bits),
+    };
+    let network = match ip {
+        IpAddr::V4(ip) => IpAddr::V4(
+            (u32::from(ip)
+                & if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                })
+            .into(),
+        ),
+        IpAddr::V6(ip) => IpAddr::V6(
+            (u128::from(ip)
+                & if bits == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - bits)
+                })
+            .into(),
+        ),
+    };
+    Ok(format!("{network}/{bits}"))
+}
+fn source_matches(scope: Option<(IpAddr, u8)>, source: Option<IpAddr>) -> bool {
+    match (scope, source) {
+        (None, _) => true,
+        (Some((network, bits)), Some(ip)) => cidr_match(ip, network, bits),
+        _ => false,
     }
 }
 
@@ -477,6 +588,7 @@ mod tests {
     fn test_from_config_skips_disabled_rules() {
         let rules = vec![
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -486,6 +598,7 @@ mod tests {
                 priority: 0, // disabled — must not apply
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "match".into(),
@@ -614,6 +727,7 @@ mod tests {
     fn test_from_config() {
         let rules = vec![
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -623,6 +737,7 @@ mod tests {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "ip-cidr".into(),
@@ -632,6 +747,7 @@ mod tests {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-keyword".into(),
@@ -641,6 +757,7 @@ mod tests {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "match".into(),
@@ -750,6 +867,7 @@ mod tests {
     fn test_priority_orders_before_list_index() {
         let rules = vec![
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -759,6 +877,7 @@ mod tests {
                 priority: 1,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "domain-suffix".into(),
@@ -776,6 +895,7 @@ mod tests {
     fn test_dst_port_rule() {
         let rules = vec![
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "dst-port".into(),
@@ -785,6 +905,7 @@ mod tests {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "dst-port".into(),
@@ -794,6 +915,7 @@ mod tests {
                 priority: 0,
             },
             RoutingRule {
+                source: String::new(),
                 name: String::new(),
                 group: String::new(),
                 rule_type: "match".into(),

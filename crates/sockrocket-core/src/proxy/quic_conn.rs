@@ -236,7 +236,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedQuicVerifier {
         use sha2::{Digest, Sha256};
         if Sha256::digest(cert.as_ref()).as_slice() != self.0 {
             return Err(rustls::Error::General(
-                "TUIC certificate pin mismatch".into(),
+                "QUIC certificate pin mismatch".into(),
             ));
         }
         Ok(rustls::client::danger::ServerCertVerified::assertion())

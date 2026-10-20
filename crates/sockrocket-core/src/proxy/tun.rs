@@ -879,6 +879,42 @@ async fn handle_tun_stream(
     router: Option<Arc<Router>>,
     stats: super::ProxyStats,
 ) -> Result<()> {
+    let source = match &stream {
+        IpStackStream::Tcp(tcp) => Some(tcp.local_addr().ip()),
+        IpStackStream::Udp(udp) => Some(udp.local_addr().ip()),
+        _ => None,
+    };
+    let destination = match &stream {
+        IpStackStream::Tcp(tcp) => Some(tcp.peer_addr().ip()),
+        IpStackStream::Udp(udp) => Some(udp.peer_addr().ip()),
+        _ => None,
+    };
+    let domestic = destination.is_some_and(|ip| {
+        fakeip
+            .as_ref()
+            .is_some_and(|pool| pool.lookup_domestic(ip).is_some())
+    });
+    let real_destination =
+        destination.filter(|ip| !matches!(ip, IpAddr::V4(v4) if is_fake_ip(*v4)));
+    super::routing::with_client_source(
+        source,
+        super::routing::with_tun_destination(
+            real_destination,
+            domestic,
+            handle_tun_stream_inner(stream, outbound, dns_resolver, fakeip, router, stats),
+        ),
+    )
+    .await
+}
+
+async fn handle_tun_stream_inner(
+    stream: IpStackStream,
+    outbound: SharedOutbound,
+    dns_resolver: Arc<DnsResolver>,
+    fakeip: Option<Arc<FakeIpPool>>,
+    router: Option<Arc<Router>>,
+    stats: super::ProxyStats,
+) -> Result<()> {
     match stream {
         IpStackStream::Tcp(mut tcp) => {
             let dst = tcp.peer_addr();
@@ -929,7 +965,15 @@ async fn handle_tun_stream(
 
             // Intercept DNS queries (UDP port 53) and resolve locally
             if dst.port() == 53 {
-                handle_tun_dns(&mut udp, &dns_resolver).await?;
+                super::routing::with_client_source(
+                    None,
+                    super::routing::with_tun_destination(
+                        None,
+                        false,
+                        handle_tun_dns(&mut udp, &dns_resolver),
+                    ),
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -1076,6 +1120,11 @@ fn tun_dial_target(
             // Global and Direct have no rule router. Honor their outbound
             // mode instead of forcibly bypassing it for domestic answers.
             if router.is_none() {
+                return Ok((domain, addr.port(), false));
+            }
+            // Device policy must also override domestic-CDN direct shortcuts.
+            // Keep the domain so source-scoped domain/catch-all rules can match.
+            if router.is_some_and(|r| r.has_client_rules()) {
                 return Ok((domain, addr.port(), false));
             }
             if let Some(action) = router.and_then(|r| r.route_domain_only(&domain)) {

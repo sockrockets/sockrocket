@@ -20,6 +20,7 @@ pub struct VlessOutbound {
     port: u16,
     uuid: [u8; 16],
     pool: ConnPool,
+    vision: Option<Arc<TlsConnFactory>>,
 }
 
 impl VlessOutbound {
@@ -42,6 +43,38 @@ impl VlessOutbound {
         transport: Option<&TransportConfig>,
     ) -> Result<Self> {
         Self::build(server, port, uuid_str, transport, false)
+    }
+
+    pub(crate) fn new_vision(
+        server: &str,
+        port: u16,
+        uuid_str: &str,
+        transport: Option<&TransportConfig>,
+    ) -> Result<Self> {
+        use crate::config::model::TransportType;
+        let transport =
+            transport.ok_or_else(|| anyhow::anyhow!("Vision requires TLS or REALITY"))?;
+        anyhow::ensure!(
+            matches!(
+                transport.transport_type,
+                TransportType::Tcp | TransportType::Tls | TransportType::Reality
+            ) && transport.ws.is_none()
+                && (transport.reality.is_some() || transport.tls.is_some()),
+            "Vision requires native TLS or REALITY over TCP"
+        );
+        let factory = Arc::new(TlsConnFactory::from_transport(
+            server,
+            port,
+            Some(transport),
+            true,
+        ));
+        Ok(Self {
+            server: server.into(),
+            port,
+            uuid: *uuid::Uuid::parse_str(uuid_str)?.as_bytes(),
+            pool: ConnPool::lazy(factory.clone()),
+            vision: Some(factory),
+        })
     }
 
     fn build(
@@ -67,6 +100,7 @@ impl VlessOutbound {
             port,
             uuid: *uuid.as_bytes(),
             pool,
+            vision: None,
         })
     }
 }
@@ -79,6 +113,20 @@ impl Outbound for VlessOutbound {
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
         let target_host = host.to_string();
         Box::pin(async move {
+            if let Some(factory) = &self.vision {
+                let mut tls = factory.connect_vision().await?;
+                let mut header = build_vless_request(&self.uuid, &target_host, port)?;
+                let flow = super::vision::FLOW.as_bytes();
+                let mut addon = vec![0x0a, flow.len() as u8];
+                addon.extend_from_slice(flow);
+                header[17] = addon.len() as u8;
+                header.splice(18..18, addon);
+                tls.write_all(&header).await?;
+                tls.flush().await?;
+                return Ok(
+                    Box::new(super::vision::VisionStream::new(tls, self.uuid)) as BoxProxyStream
+                );
+            }
             let mut stream = self.pool.get().await.with_context(|| {
                 format!(
                     "VLESS: failed to connect to {}:{} (target: {}:{})",
@@ -104,6 +152,30 @@ impl Outbound for VlessOutbound {
     ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
         let host = host.to_owned();
         Box::pin(async move {
+            if let Some(factory) = &self.vision {
+                anyhow::ensure!(
+                    port != 443,
+                    "Vision blocks UDP/443 so clients can fall back to HTTPS over TCP"
+                );
+                let mut tls = factory.connect_vision().await?;
+                // Vision UDP travels as XUDP inside a Vision-framed mux
+                // connection; sending a plain UDP command loses the flow.
+                let request = build_vless_request(&self.uuid, &host, port)?;
+                let address = request[19..].to_vec();
+                let flow = super::vision::FLOW.as_bytes();
+                let mut header = vec![0];
+                header.extend_from_slice(&self.uuid);
+                header.push((flow.len() + 2) as u8);
+                header.extend_from_slice(&[0x0a, flow.len() as u8]);
+                header.extend_from_slice(flow);
+                header.push(3);
+                tls.write_all(&header).await?;
+                tls.flush().await?;
+                return Ok(super::stream_datagram::StreamDatagram::boxed(
+                    Box::new(super::vision::VisionStream::new(tls, self.uuid)),
+                    super::stream_datagram::Framing::Xudp(address),
+                ));
+            }
             let mut stream = self.pool.get().await?;
             let mut header = build_vless_request(&self.uuid, &host, port)?;
             header[18] = 2;
@@ -393,3 +465,6 @@ mod tests {
         server_task.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod reference_tests;
