@@ -179,7 +179,9 @@ pub(super) fn act_trace_route(post: &J) -> J {
         .and_then(|i| rules.get(i as usize));
     trace["matched_snapshot"] = matched.map(rule_edit_snapshot).unwrap_or(J::Null);
     let nodes = conf_seq(&map, "nodes");
-    let active = conf_usize(&map, "active_node").filter(|i| *i < nodes.len());
+    // The daemon defaults an omitted active_node to the first configured node.
+    // Match that default so polling status does not invalidate a valid trace.
+    let active = Some(conf_usize(&map, "active_node").unwrap_or(0)).filter(|i| *i < nodes.len());
     let name = active
         .and_then(|i| nodes[i].get(ykey("name")))
         .and_then(Y::as_str);

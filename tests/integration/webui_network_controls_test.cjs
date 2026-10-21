@@ -1,0 +1,38 @@
+// Exercise the shipped controls using synthetic state; never touch host networking.
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
+const elements={},requests=[],messages=[];
+function element(id){return elements[id]||=( {textContent:'',disabled:false,className:'',classList:{toggle(){}}} );}
+const c=vm.createContext({srElement:element,srApi:(...args)=>requests.push(args),srShowMsg:m=>messages.push(m),toastResp:d=>messages.push(d.msg),renderNodes(){},srLoadRules(){},rulePending:false,RULE_READ_PENDING:false,RULE_FLOW_ERROR:false,RULE_RULE_REVISION:null,SR_STATE:{page:'home',statusKnown:true,status:{running:false,transparent_proxy:true,dns_hijack:true}}});
+vm.runInContext(source.slice(source.indexOf('var refreshPending'),source.indexOf('function renderChrome()')),c);
+vm.runInContext(source.slice(source.indexOf('function setChip('),source.indexOf('/* ══ Service control')),c);
+vm.runInContext(source.slice(source.indexOf('var servicePending'),source.indexOf('function toggleService()')),c);
+c.renderChrome=()=>c.renderNetworkControls();
+const request=action=>{let i=requests.findIndex(r=>r[0]===action);assert.ok(i>=0,action);return requests.splice(i,1)[0];};
+const state=(overrides={})=>({running:true,transparent_proxy:true,dns_hijack:true,...overrides});
+c.renderNetworkControls();
+assert.equal(element('dns-state').textContent,'已关闭');assert.equal(element('fw-state').textContent,'已关闭');
+assert.equal(element('chip-dns').disabled,true);assert.equal(element('chip-fw').disabled,true);
+assert.equal(c.SR_STATE.status.dns_hijack,true,'displaying Stop must not overwrite saved preferences');
+c.toggleDns();c.toggleProxy();assert.equal(requests.length,0,'stopped controls cannot implicitly start the service');
+c.SR_STATE.status=state();c.renderNetworkControls();assert.equal(element('chip-dns').disabled,false);
+c.refreshStatus();const stale=request('status');request('stats')[2]({});
+c.toggleDns();let mutation=request('set_toggles');assert.deepEqual(JSON.parse(JSON.stringify(mutation[1])),{dns_hijack:false});
+assert.equal(element('chip-fw').disabled,true);c.toggleProxy();assert.equal(requests.length,0,'independent toggles cannot race each other');
+mutation[2]({ok:true,msg:'saved'});assert.equal(element('chip-dns').disabled,true,'keep locked until authoritative status returns');
+request('status')[2](state({dns_hijack:false}));
+assert.equal(element('dns-state').textContent,'已关闭');assert.equal(element('fw-state').textContent,'已开启');assert.equal(element('chip-fw').disabled,false);
+stale[2](state());assert.equal(c.SR_STATE.status.dns_hijack,false,'stale polling must not undo a completed toggle');
+request('status')[2](state({dns_hijack:false}));request('stats')[2]({});
+c.toggleProxy();mutation=request('set_toggles');assert.deepEqual(JSON.parse(JSON.stringify(mutation[1])),{transparent_proxy:false});
+mutation[2]({ok:true});request('status')[2](state({transparent_proxy:false,dns_hijack:false}));
+assert.equal(element('dns-state').textContent,'已关闭');assert.equal(element('fw-state').textContent,'已关闭');
+c.toggleProxy();mutation=request('set_toggles');assert.deepEqual(JSON.parse(JSON.stringify(mutation[1])),{transparent_proxy:true,dns_hijack:true});
+mutation[3]();request('status')[2](state({transparent_proxy:false,dns_hijack:false}));assert.equal(c.networkPending,false);
+c.toggleDns();request('set_toggles')[2]({ok:true});request('status')[3]();
+assert.equal(c.SR_STATE.statusKnown,false);assert.equal(element('dns-state').textContent,'待确认');assert.equal(element('chip-dns').disabled,true);
+c.SR_STATE.statusKnown=true;c.SR_STATE.status=state();c.serviceAction('stop');
+assert.equal(element('chip-fw').disabled,true,'service lifecycle locks independent controls');
+request('stop')[2]({ok:true,msg:'stopped'});request('status')[2](state({running:false}));request('stats')[2]({});request('sysinfo')[2]({});
+assert.equal(element('dns-state').textContent,'已关闭');assert.equal(element('fw-state').textContent,'已关闭');
+console.log('PASS: stopped cleanup display, independent toggles, no implicit start, mutation locking, stale polling, error recovery and Stop');
