@@ -558,6 +558,7 @@ fn act_status() -> J {
         "proxy_mode": conf_str(&map, "proxy_mode")
             .unwrap_or_else(|| "rule".into())
             .to_ascii_lowercase(),
+        "rules_revision":route_trace::rules_revision(&map),
         "transparent_proxy": transparent_proxy,
         "dns_hijack": dns_hijack,
         "cn_ipset_direct": conf_bool(&map, "cn_ipset_direct", false),
@@ -566,9 +567,21 @@ fn act_status() -> J {
     })
 }
 
+fn prepare_manual_start() -> Result<()> {
+    // Explicit Start restores the complete LAN path. Internal restarts and
+    // watchdog recovery keep the user's independent toggle selections.
+    let mut map = load_conf()?;
+    map.insert(ykey("transparent_proxy"), Y::Bool(true));
+    map.insert(ykey("dns_hijack"), Y::Bool(true));
+    save_conf(&map)
+}
+
 fn act_start() -> J {
     if is_running() {
         return err_msg("Already running");
+    }
+    if prepare_manual_start().is_err() {
+        return err_msg("无法保存启动设置，服务未启动，请检查配置与存储权限");
     }
     if let Err(error) = run_sh("start") {
         return err_msg(&error.to_string());
@@ -613,7 +626,14 @@ fn act_stop() -> J {
 fn act_restart() -> J {
     // An explicit Restart action may start a stopped service. Background
     // settings updates still use restart and preserve the stopped marker.
-    let action = if is_running() { "restart" } else { "start" };
+    let action = if is_running() {
+        "restart"
+    } else {
+        if prepare_manual_start().is_err() {
+            return err_msg("无法保存启动设置，服务未启动，请检查配置与存储权限");
+        }
+        "start"
+    };
     if let Err(error) = run_sh(action) {
         return err_msg(&error.to_string());
     }
@@ -2142,8 +2162,18 @@ fn stale_rule_request(post: &J, rule: &Y) -> bool {
 
 /// Read the `rules:` sequence as JSON rows for the UI.
 fn act_get_rules() -> J {
-    let map = load_conf().unwrap_or_default();
-    let rules: Vec<J> = load_routing_rules(&map)
+    let Ok(map) = load_conf() else {
+        return err_msg("规则配置读取失败，请检查诊断后重试");
+    };
+    let parsed = load_routing_rules(&map);
+    if map
+        .get(ykey("rules"))
+        .is_some_and(|v| !matches!(v, Y::Null | Y::Sequence(_)))
+        || parsed.len() != conf_seq(&map, "rules").len()
+    {
+        return err_msg("部分规则配置损坏，未返回不完整的规则列表，请检查诊断");
+    }
+    let rules: Vec<J> = parsed
         .into_iter()
         .enumerate()
         .map(|(i, r)| {
@@ -2160,7 +2190,7 @@ fn act_get_rules() -> J {
             })
         })
         .collect();
-    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog()})
+    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2685,10 +2715,12 @@ fn act_set_rule_group_enabled(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return json!({"ok":false,"saved":true,"applied":false,"error_code":"rule_apply_failed","msg":"规则已保存，但代理重新加载失败；已保存状态与当前运行状态可能不同，请查看诊断后重试应用。","detail":error.to_string()});
             }
             json!({
                 "ok": true,
+                "saved":true,
+                "applied":is_running(),
                 "msg": format!(
                     "{} {} rule(s) in group",
                     if enabled { "Enabled" } else { "Disabled" },
@@ -3442,6 +3474,29 @@ dns_direct_domains:
     }
 
     #[test]
+    fn route_trace_defaults_to_first_node_like_daemon_and_status() {
+        let _env = TestEnv::new(&SAMPLE.replace("active_node: 0\n", ""));
+        let request =
+            json!({"destination":"example.com","destination_ip":"203.0.113.1","resolve_dns":false});
+        let result = dispatch("trace_route", &request);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["active_node"], 0);
+        assert_eq!(result["active_node"], act_status()["active_node"]);
+        assert_eq!(result["node_name"], "Node A");
+        let mut map = load_conf().unwrap();
+        set_active_node(&mut map, 1);
+        save_conf(&map).unwrap();
+        let result = dispatch("trace_route", &request);
+        assert_eq!(result["active_node"], 1);
+        assert_eq!(result["node_name"], "Node B");
+        map.insert(ykey("nodes"), Y::Sequence(vec![]));
+        save_conf(&map).unwrap();
+        let result = dispatch("trace_route", &request);
+        assert!(result["active_node"].is_null());
+        assert!(result["node_name"].is_null());
+    }
+
+    #[test]
     fn route_trace_handles_mode_and_exact_saved_rule_index() {
         let _env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain, pattern: example.com, target: reject, priority: 999}\n  - {rule_type: final, pattern: '*', target: direct, source: 192.0.2.8, priority: 0}"));
         let result = dispatch(
@@ -3463,6 +3518,41 @@ dns_direct_domains:
         assert_eq!(result["trace"]["action"], "proxy");
         assert_eq!(result["trace"]["steps"], json!([]));
         assert_eq!(result["trace"]["dns"], "not_needed");
+    }
+
+    #[test]
+    fn explicit_start_restores_capture_but_background_restart_preserves_choices() {
+        let env = TestEnv::new(&SAMPLE.replace(
+            "mode: \"tun\"",
+            "mode: \"socks\"\ntransparent_proxy: false\ndns_hijack: false",
+        ));
+        // Fail quickly after recording the controller invocation. The test
+        // exercises the API transaction without opening a real network path.
+        fs::write(
+            sockrocket_sh(),
+            "#!/bin/sh\nprintf '%s' \"$1\" > \"$SOCKROCKET_DIR/action\"\nexit 7\n",
+        )
+        .unwrap();
+        let before = load_conf().unwrap();
+        for action in ["start", "restart"] {
+            save_conf(&before).unwrap();
+            assert_eq!(dispatch(action, &json!({}))["ok"], false);
+            let map = load_conf().unwrap();
+            assert!(conf_bool(&map, "transparent_proxy", false));
+            assert!(conf_bool(&map, "dns_hijack", false));
+            for key in ["nodes", "subscriptions", "rules", "dns_direct_domains"] {
+                assert_eq!(map.get(ykey(key)), before.get(ykey(key)));
+            }
+            assert_eq!(fs::read_to_string(env.dir.join("action")).unwrap(), "start");
+        }
+        save_conf(&before).unwrap();
+        assert!(run_sh("restart").is_err());
+        assert_eq!(load_conf().unwrap(), before);
+        // Stop remains independent of the configuration lock and preferences.
+        let lock = storage::MutationGuard::acquire().unwrap();
+        let _ = dispatch("stop", &json!({}));
+        assert_eq!(load_conf().unwrap(), before);
+        drop(lock);
     }
 
     #[test]
@@ -3951,6 +4041,26 @@ dns_direct_domains:
             false
         );
         assert_eq!(fs::read_to_string(conf_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn rule_snapshot_matches_status_and_does_not_hide_corrupt_config() {
+        let env = TestEnv::new(SAMPLE);
+        let snapshot = act_get_rules();
+        assert_eq!(snapshot["revision"], act_status()["rules_revision"]);
+        assert_eq!(snapshot["proxy_mode"], "rule");
+        let mut map = load_conf().unwrap();
+        map.insert(ykey("proxy_mode"), Y::String("direct".into()));
+        save_conf(&map).unwrap();
+        let latest = act_get_rules();
+        assert_eq!(latest["proxy_mode"], "direct");
+        assert_ne!(latest["revision"], snapshot["revision"]);
+        fs::write(env.dir.join("config.yaml"), "rules: [invalid]").unwrap();
+        assert_eq!(act_get_rules()["ok"], false);
+        fs::write(env.dir.join("config.yaml"), "rules: invalid").unwrap();
+        assert_eq!(act_get_rules()["ok"], false);
+        fs::write(env.dir.join("config.yaml"), "rules: [").unwrap();
+        assert_eq!(act_get_rules()["ok"], false);
     }
 
     #[test]

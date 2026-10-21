@@ -103,6 +103,7 @@ jobs:
           node tests/integration/webui_subscription_jobs_test.cjs
           node tests/integration/webui_rule_flow_test.cjs
           node tests/integration/webui_rule_presets_test.cjs
+          node tests/integration/webui_network_controls_test.cjs
 
       # ── Build ──────────────────────────────────────────────────────────────
       - name: Build (CLI)
