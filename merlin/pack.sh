@@ -63,6 +63,7 @@ pack_one() {
 
   cp "$ROOT/merlin/scripts/sockrocket.sh" "$ROOT/merlin/scripts/iptables.sh" \
      "$ROOT/merlin/scripts/dnsmasq.conf" "$ROOT/merlin/scripts/sockrocket_api.sh" \
+     "$ROOT/merlin/scripts/sockrocket_status.sh" \
      "$pkg/scripts/"
   cp "$ROOT/merlin/webui/sockrocket.asp" "$pkg/webui/sockrocket.asp"
   cp "$ROOT/merlin/webui/sockrocket.asp" "$pkg/webs/Module_sockrocket.asp"
@@ -72,7 +73,7 @@ pack_one() {
 
   chmod +x "$pkg/install.sh" "$pkg/uninstall.sh" \
            "$pkg/scripts/sockrocket.sh" "$pkg/scripts/iptables.sh" \
-           "$pkg/scripts/sockrocket_api.sh"
+           "$pkg/scripts/sockrocket_api.sh" "$pkg/scripts/sockrocket_status.sh"
 
   local tarball="sockrocket-merlin-${platform}.tar.gz"
   # Local macOS packages must not include AppleDouble metadata or the build

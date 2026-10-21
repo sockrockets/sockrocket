@@ -23,23 +23,27 @@ fn is_catch_all(rule_type: &str) -> bool {
 /// behaves sanely. Global catch-all rules are deferred until after China-direct;
 /// device catch-alls precede global rules but only match their own clients.
 pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
-    let enabled: Vec<RoutingRule> = rules.iter().filter(|r| r.enabled).cloned().collect();
+    let enabled: Vec<_> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.enabled)
+        .collect();
     if enabled.is_empty() {
         return china_direct_ruleset();
     }
 
     let (devices, enabled): (Vec<_>, Vec<_>) =
-        enabled.into_iter().partition(|r| !r.source.is_empty());
+        enabled.into_iter().partition(|(_, r)| !r.source.is_empty());
     let (device_rules, device_finals): (Vec<_>, Vec<_>) = devices
         .into_iter()
-        .partition(|r| !is_catch_all(&r.rule_type));
+        .partition(|(_, r)| !is_catch_all(&r.rule_type));
     let (non_final, finals): (Vec<_>, Vec<_>) = enabled
         .into_iter()
-        .partition(|r| !is_catch_all(&r.rule_type));
+        .partition(|(_, r)| !is_catch_all(&r.rule_type));
 
-    let mut set = RuleSet::from_config(&device_rules);
-    set.extend(RuleSet::from_config(&device_finals));
-    set.extend(RuleSet::from_config(&non_final));
+    let mut set = RuleSet::from_indexed_config(device_rules);
+    set.extend(RuleSet::from_indexed_config(device_finals));
+    set.extend(RuleSet::from_indexed_config(non_final));
 
     // Built-in China-direct without its catch-all. Placed after user
     // non-final rules so an explicit user `geoip:CN → proxy` (or a CN
@@ -55,7 +59,7 @@ pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
     if finals.is_empty() {
         set.add_rule(MatchRule::MatchAll, RouteAction::Proxy);
     } else {
-        set.extend(RuleSet::from_config(&finals));
+        set.extend(RuleSet::from_indexed_config(finals));
     }
     set
 }

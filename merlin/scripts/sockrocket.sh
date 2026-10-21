@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sockrocket proxy service control script for AsusWRT-Merlin
 #
-# Usage: sockrocket.sh {start|stop|restart|reload|status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart}
+# Usage: sockrocket.sh {boot|start|stop|restart|reload|status|software-center-status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart}
 
 # Configuration, logs and crash artifacts are private by default. Firmware
 # dnsmasq inputs explicitly opt into 0644 at their write sites.
@@ -161,7 +161,32 @@ api_is_running() {
     return 0
 }
 
+# Software Center's installed bit is not its enabled bit. Only the proxy
+# daemon counts; the always-on API and a saved configuration do not.
+sync_softcenter_state() {
+    which dbus >/dev/null 2>&1 || return 0
+    local enabled=0 key
+    if [ ! -f "$SOCKROCKET_DIR/stopped" ] && is_running; then enabled=1; fi
+    for key in sockrocket_enable softcenter_module_sockrocket_enable; do
+        # Avoid repeated persistent writes from watchdog/status polling.
+        [ "$(dbus get "$key" 2>/dev/null)" = "$enabled" ] || \
+            dbus set "$key=$enabled" >/dev/null 2>&1 || true
+    done
+}
+
+do_softcenter_status() {
+    sync_softcenter_state
+    if [ ! -f "$SOCKROCKET_DIR/stopped" ] && is_running; then
+        printf 'Sockrocket running (PID %s)\n' "$(cat "$SOCKROCKET_PID")"
+    else
+        # Some software centers detect running by the literal "PID". Never
+        # include the independent API's PID in this response.
+        printf 'Sockrocket stopped\n'
+    fi
+}
+
 do_api_start() {
+    sync_softcenter_state
     api_is_running && return 0
     [ -x "$SOCKROCKET_BIN" ] || return 1
     # Clear orphans that hold :18188 before we bind.
@@ -242,10 +267,20 @@ do_restart() {
     # Background subscription/config writes must not revoke a manual Stop.
     # The explicit WebUI Restart action uses start when already stopped.
     if [ -f "$SOCKROCKET_DIR/stopped" ]; then
+        sync_softcenter_state
         info "Service manually stopped; saved settings will apply on next start"
         return 0
     fi
     do_stop && do_start
+}
+
+do_boot() {
+    do_api_start || log_warn "Management API unavailable during boot; preserving proxy intent"
+    if [ -f "$SOCKROCKET_DIR/stopped" ]; then
+        sync_softcenter_state
+        return 0
+    fi
+    do_start
 }
 
 # ── Log rotation ──────────────────────────────────────────────────────────────
@@ -522,6 +557,7 @@ activate_startup_network() {
 
 # ── Start ─────────────────────────────────────────────────────────────────────
 do_start() {
+    sync_softcenter_state
     if is_running; then
         warn "Sockrocket is already running (PID $(cat "$SOCKROCKET_PID"))"
         return 0
@@ -691,6 +727,7 @@ do_start() {
     done
     if is_running; then
         ok "Sockrocket started (PID $(cat "$SOCKROCKET_PID"))"
+        sync_softcenter_state
         # Keep recovery active even when synchronous activation fails below.
         start_guard
         # Softcenter offline install must not block 20–35s on TUN/DNS waits —
@@ -939,6 +976,7 @@ do_stop() {
     # Stamp stopped FIRST so the supervisor does not treat our kill as a crash
     # and immediately respawn / fail-open race.
     : > "$SOCKROCKET_DIR/stopped"
+    sync_softcenter_state
     stop_guard
     stop_supervisor
 
@@ -1028,6 +1066,7 @@ do_proxy_off() {
 
 # ── Status ────────────────────────────────────────────────────────────────────
 do_status() {
+    sync_softcenter_state
     if is_running; then
         local pid socks_port http_port active_node mode
         pid=$(cat "$SOCKROCKET_PID")
@@ -1297,8 +1336,12 @@ start_daemon_supervised() {
             # Poll death every 1s. Only fail-open on "DNS port lost" after we
             # have observed the port UP at least once — otherwise startup races
             # (TUN/DNS bind takes a few seconds) false-trigger degrade.
-            local dns_seen_up=0 dns_missing_checks=0
+            local dns_seen_up=0 dns_missing_checks=0 state_published=0
             while kill -0 "$dpid" 2>/dev/null; do
+                if [ "$state_published" = 0 ] && is_running; then
+                    sync_softcenter_state
+                    state_published=1
+                fi
                 if [ -f "$SOCKROCKET_DIR/stopped" ]; then
                     wait "$dpid" 2>/dev/null
                     exit 0
@@ -1339,6 +1382,7 @@ start_daemon_supervised() {
             if [ "$(cat "$SOCKROCKET_PID" 2>/dev/null)" = "$dpid" ]; then
                 rm -f "$SOCKROCKET_PID"
             fi
+            sync_softcenter_state
             if [ -f "$SOCKROCKET_DIR/stopped" ]; then
                 exit 0
             fi
@@ -1534,6 +1578,7 @@ do_firewall_restore() {
 
 do_watchdog() {
     local issues=0
+    sync_softcenter_state
 
     # Bound the jffs log even when the daemon stays healthy for weeks —
     # otherwise verbose tracing fills flash between restarts.
@@ -1766,6 +1811,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 case "$1" in
+    boot)
+        run_locked 15 do_boot
+        ;;
     start)
         run_locked 15 do_start
         ;;
@@ -1779,6 +1827,7 @@ case "$1" in
         run_locked 15 do_restart
         ;;
     status)  do_status ;;
+    software-center-status) do_softcenter_status ;;
     log)     tail -100 "$SOCKROCKET_LOG" 2>/dev/null || info "No log file found" ;;
     api-start)
         run_locked 5 do_api_start
@@ -1830,7 +1879,7 @@ case "$1" in
         ;;
     diagnose)  cmd_diagnose ;;
     *)
-        echo "Usage: $0 {start|stop|restart|reload|status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|ensure-sshd|dns-on|dns-off|pin-dns|proxy-off|network-restore|recover|kill-half-dead}"
+        echo "Usage: $0 {boot|start|stop|restart|reload|status|software-center-status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|ensure-sshd|dns-on|dns-off|pin-dns|proxy-off|network-restore|recover|kill-half-dead}"
         exit 1
         ;;
 esac

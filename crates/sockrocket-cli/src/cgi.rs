@@ -17,6 +17,8 @@
 //! overridden with `SOCKROCKET_DIR` (used by unit tests and local debugging).
 
 mod http;
+mod route_trace;
+mod rule_presets;
 mod storage;
 mod subscription_jobs;
 pub use subscription_jobs::worker as subscription_worker;
@@ -446,6 +448,7 @@ fn read_only_action(action: &str) -> bool {
             | "sysinfo"
             | "get_direct_domains"
             | "get_rules"
+            | "trace_route"
             | "export_rules"
     )
 }
@@ -505,6 +508,8 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "del_direct_domain" => act_del_direct_domain(post),
         "set_direct_server" => act_set_direct_server(post),
         "get_rules" => act_get_rules(),
+        "add_rule_preset" => rule_presets::add(post),
+        "trace_route" => route_trace::act_trace_route(post),
         "add_rule" => act_add_rule(post),
         "batch_add_rules" => act_batch_add_rules(post),
         "apply_rule_scene" => act_apply_rule_scene(post),
@@ -2155,7 +2160,7 @@ fn act_get_rules() -> J {
             })
         })
         .collect();
-    json!({"ok": true, "rules": rules})
+    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2639,23 +2644,40 @@ fn act_set_rule_group_enabled(post: &J) -> J {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let enabled = post
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let Some(enabled) = post.get("enabled").and_then(|v| v.as_bool()) else {
+        return err_msg("请明确选择开启或停用分组");
+    };
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
     let mut rules = load_routing_rules(&map);
+    if rules.len() != conf_seq(&map, "rules").len() {
+        return err_msg("规则配置损坏，请先修复后再修改分组状态");
+    }
+    if let Some(expected) = post.get("expected_rules") {
+        let current: Vec<_> = rules
+            .iter()
+            .filter(|r| same_rule_group(&r.group, &group))
+            .map(rule_edit_snapshot)
+            .collect();
+        if expected != &json!(current) {
+            return err_msg("分组规则已变化，请刷新后重新选择开启或停用");
+        }
+    }
     let mut n = 0usize;
+    let mut changed = false;
     for r in &mut rules {
         if same_rule_group(&r.group, &group) {
+            changed |= r.enabled != enabled;
             r.enabled = enabled;
             n += 1;
         }
     }
     if n == 0 {
         return err_msg("No rules in that group");
+    }
+    if !changed {
+        return json!({"ok":true,"msg":"分组已处于所选状态"});
     }
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
@@ -3168,23 +3190,30 @@ mod tests {
         }
 
         // A cheap OPTIONS request releases one slot without dispatch/config I/O.
+        // Verify the complete HTTP response, not EOF: Windows can deliver a
+        // reset after the framed response when the server closes the socket.
+        // read_exact still fails if any response byte is missing or invalid.
+        let expected = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         clients[0]
             .write_all(b"OPTIONS /api HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
-        let mut reply = Vec::new();
-        clients[0].read_to_end(&mut reply).await.unwrap();
-        assert!(reply.starts_with(b"HTTP/1.1 204"));
+        let mut reply = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), clients[0].read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, expected);
         let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
         next.write_all(b"OPTIONS /api HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
-        let mut reply = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), next.read_to_end(&mut reply))
+        let mut reply = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), next.read_exact(&mut reply))
             .await
             .unwrap()
             .unwrap();
-        assert!(reply.starts_with(b"HTTP/1.1 204"));
+        assert_eq!(reply, expected);
         server.abort();
         let _ = server.await;
     }
@@ -3356,6 +3385,85 @@ dns_direct_domains:
   - "baidu.com"
   - "qq.com"
 "#;
+
+    #[test]
+    fn route_trace_is_read_only_normalized_and_revision_guarded() {
+        let env = TestEnv::new(SAMPLE);
+        let before = fs::read(env.dir.join("config.yaml")).unwrap();
+        let revision = dispatch("get_rules", &json!({}))["revision"].clone();
+        let result = dispatch(
+            "trace_route",
+            &json!({"destination":"https://WWW.BAIDU.COM/private?secret=token","destination_ip":"203.0.113.1","resolve_dns":false,"expected_revision":revision}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["destination"], "www.baidu.com");
+        assert_eq!(result["port"], 443);
+        assert_eq!(result["trace"]["action"], "direct");
+        assert_eq!(result["trace"]["definitive"], true);
+        assert!(!result.to_string().contains("secret"));
+        assert!(!result.to_string().contains("a.example.com"));
+        assert_eq!(
+            dispatch(
+                "trace_route",
+                &json!({"destination":"example.com","expected_revision":"old"})
+            )["error_code"],
+            "route_trace_stale"
+        );
+        for request in [
+            json!({"destination":"https://user:password@example.com"}),
+            json!({"destination":"example.com","source":"192.0.2.0/24"}),
+            json!({"destination":"example.com","port":0}),
+            json!({"destination":"example.com","resolve_dns":"false"}),
+        ] {
+            assert_eq!(
+                dispatch("trace_route", &request)["error_code"],
+                "route_trace_invalid"
+            );
+        }
+        assert_eq!(
+            dispatch("trace_route", &json!({"destination":"198.18.0.1"}))["error_code"],
+            "route_trace_fake_ip"
+        );
+        assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), before);
+        assert!(read_only_action("trace_route"));
+        fs::write(
+            env.dir.join("config.yaml"),
+            SAMPLE.replace("rules: []", "rules: [invalid]"),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(
+                "trace_route",
+                &json!({"destination":"example.com","resolve_dns":false})
+            )["error_code"],
+            "route_trace_config",
+            "malformed rules cannot silently shift the winning rule's saved index"
+        );
+    }
+
+    #[test]
+    fn route_trace_handles_mode_and_exact_saved_rule_index() {
+        let _env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain, pattern: example.com, target: reject, priority: 999}\n  - {rule_type: final, pattern: '*', target: direct, source: 192.0.2.8, priority: 0}"));
+        let result = dispatch(
+            "trace_route",
+            &json!({"destination":"http://example.com/path","source":"192.0.2.8","resolve_dns":false}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["port"], 80);
+        assert_eq!(result["trace"]["matched_rule"], 1);
+        assert_eq!(result["trace"]["matched_snapshot"]["source"], "192.0.2.8");
+        assert_eq!(result["trace"]["action"], "direct");
+        let mut map = load_conf().unwrap();
+        map.insert(ykey("proxy_mode"), Y::String("global".into()));
+        save_conf(&map).unwrap();
+        let result = dispatch(
+            "trace_route",
+            &json!({"destination":"example.com","resolve_dns":false}),
+        );
+        assert_eq!(result["trace"]["action"], "proxy");
+        assert_eq!(result["trace"]["steps"], json!([]));
+        assert_eq!(result["trace"]["dns"], "not_needed");
+    }
 
     #[test]
     fn lifecycle_failure_cannot_report_success() {
@@ -3843,6 +3951,170 @@ dns_direct_domains:
             false
         );
         assert_eq!(fs::read_to_string(conf_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn rule_presets_are_opt_in_idempotent_and_preserve_custom_rules() {
+        let env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain-suffix, pattern: '.OPENAI.COM', target: reject, priority: 99, enabled: false, group: Custom}\n  - {rule_type: domain-suffix, pattern: chatgpt.com, target: direct, source: 192.0.2.8, priority: 10}"));
+        fs::write(env.dir.join("stopped"), "").unwrap();
+        let before = fs::read(conf_path()).unwrap();
+        let catalog = dispatch("get_rules", &json!({}));
+        assert_eq!(catalog["presets"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            fs::read(conf_path()).unwrap(),
+            before,
+            "viewing defaults must not save or activate them"
+        );
+        let custom = load_routing_rules(&load_conf().unwrap());
+        let revision = catalog["revision"].clone();
+        let result = dispatch(
+            "add_rule_preset",
+            &json!({"preset":"ai","expected_revision":revision}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["added"], 8);
+        assert_eq!(result["skipped"], 1);
+        let saved = load_conf().unwrap();
+        let rules = load_routing_rules(&saved);
+        assert_eq!(
+            rule_edit_snapshot(&rules[0]),
+            rule_edit_snapshot(&custom[0])
+        );
+        assert_eq!(
+            rule_edit_snapshot(&rules[1]),
+            rule_edit_snapshot(&custom[1])
+        );
+        assert!(
+            rules[2..]
+                .iter()
+                .all(|r| !r.enabled && r.priority == -10 && r.source.is_empty())
+        );
+        assert_eq!(node_count(&saved), 2);
+        assert_eq!(conf_seq(&saved, "subscriptions").len(), 1);
+        assert!(env.dir.join("stopped").exists());
+        assert!(!read_only_action("add_rule_preset"));
+        let before = fs::read(conf_path()).unwrap();
+        for invalid in [J::Null, json!("false")] {
+            assert_eq!(
+                dispatch(
+                    "set_rule_group_enabled",
+                    &json!({"group":result["group"],"enabled":invalid})
+                )["ok"],
+                false
+            );
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        assert_eq!(
+            dispatch(
+                "add_rule_preset",
+                &json!({"preset":"ai","expected_revision":revision})
+            )["ok"],
+            false,
+            "stale catalog is rejected"
+        );
+        assert_eq!(
+            dispatch(
+                "add_rule_preset",
+                &json!({"preset":"ai","enabled":true,"expected_revision":route_trace::rules_revision(&saved)})
+            )["ok"],
+            false
+        );
+        let duplicate = dispatch(
+            "add_rule_preset",
+            &json!({"preset":"ai","expected_revision":route_trace::rules_revision(&saved)}),
+        );
+        assert_eq!(duplicate["added"], 0);
+        assert_eq!(fs::read(conf_path()).unwrap(), before);
+        let group = result["group"].as_str().unwrap();
+        let snapshots: Vec<_> = rules
+            .iter()
+            .filter(|r| r.group == group)
+            .map(rule_edit_snapshot)
+            .collect();
+        assert_eq!(
+            dispatch(
+                "set_rule_group_enabled",
+                &json!({"group":group,"enabled":true,"expected_rules":[]})
+            )["ok"],
+            false
+        );
+        assert_eq!(fs::read(conf_path()).unwrap(), before);
+        assert_eq!(
+            dispatch(
+                "set_rule_group_enabled",
+                &json!({"group":group,"enabled":true,"expected_rules":snapshots})
+            )["ok"],
+            true
+        );
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert!(!rules[0].enabled);
+        assert!(rules[2..].iter().all(|r| r.enabled));
+        assert!(
+            env.dir.join("stopped").exists(),
+            "enabling rules does not start a manually stopped proxy"
+        );
+    }
+
+    #[test]
+    fn all_rule_presets_persist_disabled_and_respect_core_routing() {
+        use sockrocket_core::router::{RouteAction, Router, rule_mode_ruleset};
+        let _env = TestEnv::new(SAMPLE);
+        let catalog = rule_presets::catalog();
+        let mut count = 0;
+        for p in catalog.as_array().unwrap() {
+            assert_eq!(p["enabled"], false);
+            count += p["domains"].as_array().unwrap().len();
+            let result = dispatch(
+                "add_rule_preset",
+                &json!({"preset":p["id"],"expected_revision":route_trace::rules_revision(&load_conf().unwrap())}),
+            );
+            assert_eq!(result["ok"], true, "{result}");
+        }
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert_eq!(rules.len(), count);
+        assert!(rules.iter().all(|r| !r.enabled));
+        let router = Router::new(rule_mode_ruleset(&rules));
+        assert_eq!(router.route("www.apple.com", 443), RouteAction::Proxy);
+        assert_eq!(router.route("www.baidu.com", 443), RouteAction::Direct);
+        assert_eq!(
+            dispatch(
+                "set_rule_group_enabled",
+                &json!({"group":"预设 · Apple 直连","enabled":true})
+            )["ok"],
+            true
+        );
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert_eq!(
+            Router::new(rule_mode_ruleset(&rules)).route("www.apple.com", 443),
+            RouteAction::Direct
+        );
+        let bytes = fs::read(conf_path()).unwrap();
+        assert_eq!(
+            dispatch(
+                "set_rule_group_enabled",
+                &json!({"group":"预设 · Apple 直连","enabled":true})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            fs::read(conf_path()).unwrap(),
+            bytes,
+            "unchanged toggle must not rewrite config"
+        );
+        assert_eq!(
+            dispatch(
+                "set_rule_group_enabled",
+                &json!({"group":"预设 · Apple 直连","enabled":false})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            Router::new(rule_mode_ruleset(&load_routing_rules(
+                &load_conf().unwrap()
+            )))
+            .route("www.apple.com", 443),
+            RouteAction::Proxy
+        );
     }
 
     #[test]

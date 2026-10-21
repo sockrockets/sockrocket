@@ -225,6 +225,18 @@ if [ "$UPDATE_ONLY" = "true" ]; then
 fi
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
+install_default_config() {
+    if [ -f "$SOCKROCKET_CONF" ]; then
+        ok "Existing config and proxy state preserved"
+        return 0
+    fi
+    info "Generating default config (proxy stopped)..."
+    # Persist Stop before any boot/retry hook can launch the daemon.
+    : > "$SOCKROCKET_DIR/stopped" || err "Could not persist the default stopped state"
+    xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF" || err "Could not install default config"
+    ok "Default config at $SOCKROCKET_CONF"
+}
+
 install_common_files() {
     # Binary, scripts, config — same in both modes
     info "Creating data directories..."
@@ -244,6 +256,7 @@ install_common_files() {
     xcp "$SCRIPT_DIR/scripts/iptables.sh"  "$SOCKROCKET_SCRIPTS/iptables.sh"
     xcp "$SCRIPT_DIR/scripts/dnsmasq.conf" "$SOCKROCKET_SCRIPTS/dnsmasq.conf.template"
     [ -f "$SCRIPT_DIR/scripts/sockrocket_api.sh" ] && xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh"
+    xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh"
     mkdir -p "$SOCKROCKET_DIR/webui" 2>/dev/null
     xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$SOCKROCKET_DIR/webui/sockrocket.asp" 2>/dev/null || true
     if [ -f "$SCRIPT_DIR/res/icon-sockrocket.png" ]; then
@@ -256,7 +269,7 @@ install_common_files() {
         xcp "$SCRIPT_DIR/uninstall.sh" "$SOCKROCKET_DIR/uninstall.sh"
         chmod +x "$SOCKROCKET_DIR/uninstall.sh" 2>/dev/null || true
     fi
-    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" 2>/dev/null
+    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh" 2>/dev/null
     ok "Control scripts installed"
 
     info "Installing CGI backend..."
@@ -276,13 +289,7 @@ install_common_files() {
         *)             warn "CGI smoke test failed — Web UI may not work" ;;
     esac
 
-    if [ ! -f "$SOCKROCKET_CONF" ]; then
-        info "Generating default config..."
-        xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF"
-        ok "Default config at $SOCKROCKET_CONF"
-    else
-        ok "Existing config preserved"
-    fi
+    install_default_config
 }
 
 # install_hook <script> <content...> — pure-shell, no sed/grep/awk.
@@ -329,17 +336,17 @@ install_hook() {
     ok "Hook installed in $(basename "$script" 2>/dev/null || echo "$script")"
 }
 
-# Bring up API + daemon after install without blocking Softcenter.
+# Bring up API and reload an already-enabled daemon without blocking Softcenter.
 #
 # Softcenter runs install.sh under start-stop-daemon and shows
 # "数据加载中，请稍候重试" if we stall on TUN/DNS waits (20–35s). So we:
 #   1. Start the API bridge synchronously (~1s) — Web UI needs it.
-#   2. Start the daemon detached with SOCKROCKET_FAST_START=1 (no waits).
+#   2. Restart an enabled daemon detached (fresh installs keep their Stop marker).
 #   3. HUP-immune + cru retry so softcenter killing the install session
 #      cannot leave the plugin dead.
 post_install_start() {
     [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ] || return 0
-    info "Starting API bridge (service continues in background)..."
+    info "Starting management API (saved proxy state is preserved)..."
     "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 || true
     sleep 1
 
@@ -359,7 +366,7 @@ post_install_start() {
         kill -0 "$(cat "$SOCKROCKET_DIR/sockrocket-api.pid")" 2>/dev/null && api_ok=1
     fi
     if [ "$api_ok" = "1" ]; then
-        ok "API bridge is running (daemon start scheduled)"
+        ok "API bridge is running (proxy remains stopped until explicitly started on first install)"
     else
         warn "API bridge not yet up — Softcenter Web UI may need a page refresh in a few seconds"
     fi
@@ -400,12 +407,16 @@ ks_install() {
     printf '%s\n' \
         '#!/bin/sh' \
         'case "$1" in' \
-        '    start|"") /jffs/addons/sockrocket/scripts/sockrocket.sh api-start' \
-        '              /jffs/addons/sockrocket/scripts/sockrocket.sh start ;;' \
+        '    start|"") /jffs/addons/sockrocket/scripts/sockrocket.sh boot ;;' \
         '    stop)     /jffs/addons/sockrocket/scripts/sockrocket.sh stop' \
         '              /jffs/addons/sockrocket/scripts/sockrocket.sh api-stop ;;' \
         '    restart)  /jffs/addons/sockrocket/scripts/sockrocket.sh restart ;;' \
-        '    *)        /jffs/addons/sockrocket/scripts/sockrocket.sh "$@" ;;' \
+        '    *[!0-9]*) /jffs/addons/sockrocket/scripts/sockrocket.sh "$@" ;;' \
+        '    *)        case "$(dbus get sockrocket_enable 2>/dev/null)" in' \
+        '                  1) /jffs/addons/sockrocket/scripts/sockrocket.sh start ;;' \
+        '                  *) /jffs/addons/sockrocket/scripts/sockrocket.sh stop ;;' \
+        '              esac' \
+        '              curl --max-time 3 -fsS -X POST --data "$1" "http://127.0.0.1:3030/_resp/$1" >/dev/null 2>&1 ;;' \
         'esac' > "$KS_SCRIPTS/${MODULE}_config.sh"
     chmod +x "$KS_SCRIPTS/${MODULE}_config.sh" 2>/dev/null
 
@@ -416,6 +427,8 @@ ks_install() {
     # so the /cgi-bin symlink path cannot work here.
     xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$KS_SCRIPTS/sockrocket_api.sh"
     chmod +x "$KS_SCRIPTS/sockrocket_api.sh" 2>/dev/null
+    xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$KS_SCRIPTS/sockrocket_status.sh"
+    chmod +x "$KS_SCRIPTS/sockrocket_status.sh" 2>/dev/null
     ok "API bridge installed to $KS_SCRIPTS/sockrocket_api.sh"
 
     # Softcenter looks for /koolshare/scripts/uninstall_<module>.sh
@@ -448,6 +461,7 @@ ks_install() {
     else
         warn "dbus unavailable, skipping software-center status registration (no functional impact)"
     fi
+    "$SOCKROCKET_SCRIPTS/sockrocket.sh" software-center-status >/dev/null 2>&1 || true
 
     # koolshare installer expects temp dir cleanup
     rm -rf "/tmp/${MODULE}" "/tmp/${MODULE}.tar.gz" 2>/dev/null || true
@@ -486,12 +500,9 @@ merlin_install() {
 '
 
     install_hook "/jffs/scripts/services-start" \
-"[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh api-start
-# Manual stop is persistent user intent; reboot must not silently enable it.
-[ -f /jffs/addons/sockrocket/stopped ] || {
-  [ ! -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] || /jffs/addons/sockrocket/scripts/sockrocket.sh start
-}
-"
+'# Boot checks the persistent Stop marker under the lifecycle lock.
+[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh boot
+'
 
     # WAN (re)configuration regenerates /tmp/resolv.dnsmasq with the ISP DNS
     # servers, undoing the hijack's upstream pin — re-pin after every WAN up.

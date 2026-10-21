@@ -6382,7 +6382,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -6390,15 +6390,17 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sockrocket-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
 name = "sockrocket-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6453,7 +6455,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-gui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "chrono",

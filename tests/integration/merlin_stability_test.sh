@@ -387,6 +387,57 @@ test_background_restart_preserves_manual_stop() {
     do_restart
     check 2 "$(wc -l < "$SANDBOX/restart.calls" | tr -d ' ')" 'running service restarts normally'
 }
+test_boot_keeps_fresh_install_and_manual_stop_disabled() {
+    : > "$SOCKROCKET_DIR/stopped"
+    do_api_start() { echo api >> "$SANDBOX/boot.calls"; }
+    do_start() { echo proxy >> "$SANDBOX/boot.calls"; }
+    do_boot
+    check api "$(cat "$SANDBOX/boot.calls")" 'boot starts only management while stopped'
+    check present "$([ -f "$SOCKROCKET_DIR/stopped" ] && echo present || echo absent)" 'boot preserves Stop'
+    rm "$SOCKROCKET_DIR/stopped" "$SANDBOX/boot.calls"
+    do_boot
+    check 'api proxy' "$(tr '\n' ' ' < "$SANDBOX/boot.calls" | sed 's/ $//')" 'enabled boot resumes proxy'
+    rm "$SANDBOX/boot.calls"
+    do_api_start() { return 1; }
+    do_boot
+    check proxy "$(cat "$SANDBOX/boot.calls")" 'management API failure does not suppress enabled proxy boot'
+}
+
+test_softcenter_state_tracks_proxy_not_api_or_saved_intent() {
+    which() { [ "$1" = dbus ] || command -v "$1"; }
+    dbus() {
+        case "$1" in
+            get) cat "$SANDBOX/$2" 2>/dev/null ;;
+            set) printf '%s' "${2#*=}" > "$SANDBOX/${2%%=*}"; echo write >> "$SANDBOX/dbus.calls" ;;
+        esac
+    }
+    local running=0
+    is_running() { [ "$running" = 1 ]; }
+    echo 123 > "$SOCKROCKET_PID"
+    echo 456 > "$SOCKROCKET_DIR/sockrocket-api.pid"
+    sync_softcenter_state
+    check 0 "$(dbus get sockrocket_enable)" 'API-only process is disabled'
+    check 'Sockrocket stopped' "$(do_softcenter_status)" 'stopped report must not contain API PID'
+    running=1
+    sync_softcenter_state
+    check 1 "$(dbus get sockrocket_enable)" 'actual proxy is enabled'
+    check 1 "$(dbus get softcenter_module_sockrocket_enable)" 'tile metadata matches proxy'
+    check 'Sockrocket running (PID 123)' "$(do_softcenter_status)" 'runtime probe identifies only proxy'
+    local writes
+    writes=$(wc -l < "$SANDBOX/dbus.calls" | tr -d ' ')
+    sync_softcenter_state
+    check "$writes" "$(wc -l < "$SANDBOX/dbus.calls" | tr -d ' ')" 'unchanged polls do not write flash'
+    : > "$SOCKROCKET_DIR/stopped"
+    sync_softcenter_state
+    check 0 "$(dbus get sockrocket_enable)" 'stop intent wins while daemon is draining'
+    rm "$SOCKROCKET_DIR/stopped"
+    running=0
+    sync_softcenter_state
+    check 0 "$(dbus get softcenter_module_sockrocket_enable)" 'crashed daemon is not enabled'
+}
+
+run_test test_boot_keeps_fresh_install_and_manual_stop_disabled
+run_test test_softcenter_state_tracks_proxy_not_api_or_saved_intent
 run_test test_background_restart_preserves_manual_stop
 run_test test_existing_dns_pin_permissions_healed
 run_test test_private_log_permissions_healed

@@ -9,6 +9,7 @@ import tempfile
 source = Path('merlin/install.sh').read_text()
 helper = source[source.index('install_binary() {'):source.index('if [ "$UPDATE_ONLY" = "true" ]; then')]
 startup = source[source.index('post_install_start() {'):source.index('# koolshare / koolcenter install path')]
+defaults = source[source.index('install_default_config() {'):source.index('install_common_files() {')]
 with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
     root = Path(directory)
     installed = root / 'sockrocket-cli'
@@ -25,7 +26,8 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
     installed.chmod(0o700)
     old = subprocess.Popen([str(installed), '30'])
     env = dict(os.environ, SOCKROCKET_BIN=str(installed), BINARY=str(bundled),
-               SOCKROCKET_DIR=str(root), SOCKROCKET_SCRIPTS=str(root))
+               SOCKROCKET_DIR=str(root), SOCKROCKET_SCRIPTS=str(root),
+               SOCKROCKET_CONF=str(config), SCRIPT_DIR=str(root))
     def run(script, check=True):
         return subprocess.run(['sh', '-c', 'xcp() { cp "$1" "$2"; }\nerr() { echo "$*" >&2; exit 1; }\n' + script], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
@@ -50,7 +52,53 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         assert calls == ['api-restart', 'restart'], 'both processes must use the new binary without overriding manual Stop'
         cron = (root / 'cron').read_text()
         assert 'sockrocket.sh restart;' in cron and 'sockrocket.sh start;' not in cron
+        (root / 'config.yaml.template').write_bytes(b'fresh default configuration\n')
+        prelude = 'info() { :; }\nok() { :; }\n'
+        # Upgrade preserves both a running user's intent and an explicit Stop.
+        (root / 'stopped').unlink()
+        run(prelude + defaults + '\ninstall_default_config\n')
+        assert not (root / 'stopped').exists()
+        assert config.read_bytes() == b'fixture configuration retained\n'
+        (root / 'stopped').touch()
+        run(prelude + defaults + '\ninstall_default_config\n')
+        assert (root / 'stopped').exists()
+        # Fresh install has no proxy start intent, even after delayed retries.
+        config.unlink()
+        (root / 'stopped').unlink()
+        run(prelude + defaults + '\ninstall_default_config\n')
+        assert config.read_bytes() == b'fresh default configuration\n'
+        assert (root / 'stopped').exists()
+        # Exercise the installed boot wrapper, not a hand-written duplicate.
+        a = source.index("    printf '%s\\n' \\\n", source.index('# koolshare startup wrapper'))
+        b = source.index('    chmod +x "$KS_SCRIPTS/${MODULE}_config.sh"', a)
+        wrapper = source[a:b].replace('/jffs/addons/sockrocket/scripts/sockrocket.sh', str(control))
+        wrapper_env = dict(env, KS_SCRIPTS=str(root), MODULE='sockrocket')
+        subprocess.run(['sh', '-c', wrapper], env=wrapper_env, check=True)
+        (root / 'calls').unlink()
+        subprocess.run(['sh', str(root / 'sockrocket_config.sh'), 'start'], env=env, check=True)
+        assert (root / 'calls').read_text().splitlines() == ['boot']
+        stubs = root / 'stubs'
+        stubs.mkdir()
+        (stubs / 'dbus').write_text('#!/bin/sh\nprintf "%s" "$TEST_PROXY_ENABLED"\n')
+        (stubs / 'curl').write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$SOCKROCKET_DIR/response"\n')
+        for stub in stubs.iterdir():
+            stub.chmod(0o700)
+        for enabled, expected in [('0', 'stop'), ('1', 'start')]:
+            (root / 'calls').unlink()
+            requested = dict(env, PATH=str(stubs) + os.pathsep + env['PATH'], TEST_PROXY_ENABLED=enabled)
+            subprocess.run(['sh', str(root / 'sockrocket_config.sh'), '321'], env=requested, check=True)
+            assert (root / 'calls').read_text().splitlines() == [expected]
+            assert '--data 321 http://127.0.0.1:3030/_resp/321' in (root / 'response').read_text()
+        status = Path('merlin/scripts/sockrocket_status.sh').read_text().replace(
+            '/jffs/addons/sockrocket/scripts/sockrocket.sh', str(control))
+        status_path = root / 'sockrocket_status.sh'
+        status_path.write_text(status)
+        control.write_text('#!/bin/sh\nprintf "Sockrocket stopped\\n"\n')
+        response = subprocess.check_output(['sh', str(status_path)], env=env).decode().strip()
+        assert response == 'Sockrocket stopped' and 'PID' not in response
+        subprocess.run(['sh', str(status_path), '123'], env=requested, check=True)
+        assert '--data Sockrocket stopped http://127.0.0.1:3030/_resp/123' in (root / 'response').read_text()
     finally:
         old.terminate()
         old.wait()
-print('PASS: atomic upgrade of a running executable, invalid-package rollback, API restart and preserved config/Stop')
+print('PASS: atomic upgrade, API restart, fresh install stopped, preserved upgrade intent and boot wrapper')

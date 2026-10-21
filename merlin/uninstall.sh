@@ -204,6 +204,7 @@ force_rm "$CGI_BIN/sockrocket.cgi"
 force_rm "$KS_WEBS/Module_${MODULE}.asp"
 force_rm "$KS_DIR/res/icon-sockrocket.png"
 force_rm "$KS_SCRIPTS/sockrocket_api.sh"
+force_rm "$KS_SCRIPTS/sockrocket_status.sh"
 force_rm "$KS_SCRIPTS/sockrocket_config.sh"
 force_rm "$KS_SCRIPTS/${MODULE}_config.sh"
 force_rm "$KS_SCRIPTS/${MODULE}_api.sh"
@@ -218,6 +219,7 @@ for p in \
     "$KS_WEBS/Module_${MODULE}.asp" \
     "$KS_DIR/res/icon-sockrocket.png" \
     "$KS_SCRIPTS/sockrocket_api.sh" \
+    "$KS_SCRIPTS/sockrocket_status.sh" \
     "$KS_SCRIPTS/sockrocket_config.sh"
 do
     if [ -e "$p" ] || [ -L "$p" ]; then

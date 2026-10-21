@@ -9,10 +9,14 @@ Transparent proxy integration for **AsusWRT-Merlin** routers.
 - **Subscriptions** — manage URLs from Web UI
 - **Node selection** — switch nodes and run latency tests
 - **Routing rules** — search and filter, edit individual rules and numeric priorities, paste mixed rule types, and manage groups. The list follows effective priority, with final rules after built-in China-direct routing. Invalid batch input is rejected without partial saves; stale edit snapshots cannot overwrite newer changes. Applying changes restarts a running proxy.
+- **Routing explanation** — query a site/IP, optional source-device IP and destination port using the core matcher. See the first matching rule, evaluation steps and proxy/direct/reject outcome; open the exact matching rule or filter all rules in a diagram stage. The diagram represents every enabled rule by phase rather than truncating the list. Optional DNS or a supplied real destination IP verifies IP/GeoIP conditions. Unresolved conditions remain provisional; stale input/configuration results cannot edit rules. Queries are not persisted. This explains saved policy for a new connection, not live traffic or endpoint reachability; TUN hints, connection caches and kernel bypass can affect actual traffic.
+- **Optional rule presets** — seven bundled groups: AI services, overseas video, Telegram web, developer tools, Apple direct, Microsoft direct and domestic sites. Preview domains, add disabled rules, then explicitly enable a group. Imports skip existing global domain-suffix selectors without changing their state, action or priority; new rules start at priority −10. Importing disabled rules does not restart the proxy. Preset contents and per-rule/group changes persist in the normal configuration; opening the catalog never writes configuration. Existing upgrades do not inject or enable presets automatically.
 - **Modes** — TUN, SOCKS5, or system-style proxy (see `config.yaml`)
 - **Watchdog** — restarts crashed daemon; optional subscription cron
 - **IPv6 policy** — respects firmware IPv6 disable settings. Transparent routing currently uses IPv4; while it is active, LAN DNS omits AAAA and HTTPS endpoint hints, and external forwarded IPv6 from the main LAN is rejected promptly so applications can fall back to IPv4. Same-bridge LAN access and router management are preserved. Stopping or failing open removes only Sockrocket’s IPv6 guard; firmware IPv6 settings are never changed. IPv6-only destinations require leaving transparent mode.
 - **Web UI** — `/ext/sockrocket/sockrocket.asp`
+
+Preset coverage is a curated starting point, not a complete service endpoint list. Shared authentication/CDNs may need additional rules; Telegram client data-center IPs still follow IP rules or the default route. Public endpoint references: [ChatGPT](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps), [Apple](https://support.apple.com/en-us/101555), [Microsoft 365](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges?view=o365-worldwide), [GitHub](https://docs.github.com/en/get-started/using-github/allowing-access-to-githubs-services-from-a-restricted-network), [Telegram](https://core.telegram.org/api/datacenter).
 
 ## Platforms (koolcenter)
 
@@ -97,7 +101,13 @@ sing-box TLS settings that cannot yet be enforced, including `certificate_public
 
 VLESS `xtls-rprx-vision` runs natively over TLS 1.3 or REALITY/TCP, including Vision padding and independent read/write raw-copy transitions. Non-HTTPS UDP uses XUDP through the Vision connection; the standard flow rejects UDP/443 to permit client TCP fallback. Unknown flows and Vision over WebSocket are rejected. The reference interoperability test covers ordinary TCP, TLS 1.3 data transfer, half-close and UDP without changing host routes.
 
-**Exit proxy**, available at the top of every plugin page, runs the normal service stop/cleanup path and preserves subscriptions and rules.
+**Exit**, available at the top of every plugin page, returns to Software Center while the proxy keeps its current state. Use **Stop service** on the Overview page to stop the proxy and run network cleanup; saved subscriptions and rules are preserved.
+
+A fresh installation starts only the management API and leaves the proxy stopped.
+Choose **Start service** explicitly after adding nodes. Boot and delayed install
+retries preserve this stopped state; upgrades preserve the existing choice.
+Software Center's enabled state follows the actual proxy daemon, separately from
+the installed marker and management API. Stopping or a daemon exit clears it.
 
 ## Per-device routing
 

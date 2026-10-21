@@ -7,11 +7,15 @@ use lru::LruCache;
 use super::geoip::GeoIpDb;
 use crate::config::model::RoutingRule;
 
+mod trace;
+pub use trace::{RouteTrace, RouteTraceStep};
+
 /// Maximum number of cached route decisions.
 const ROUTE_CACHE_CAP: usize = 4096;
 
 /// Action to take for a matched connection.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RouteAction {
     /// Use the configured proxy outbound.
     Proxy,
@@ -45,6 +49,8 @@ pub enum MatchRule {
 /// A single rule with its action.
 #[derive(Debug, Clone)]
 pub struct RuleEntry {
+    /// Original saved-rule index; None for built-in rules.
+    pub config_index: Option<usize>,
     pub source: Option<(IpAddr, u8)>,
     pub rule: MatchRule,
     pub action: RouteAction,
@@ -73,6 +79,7 @@ impl RuleSet {
     /// Add a rule to the set.
     pub fn add_rule(&mut self, rule: MatchRule, action: RouteAction) {
         self.rules.push(RuleEntry {
+            config_index: None,
             source: None,
             rule,
             action,
@@ -84,15 +91,18 @@ impl RuleSet {
     /// Rules are ordered by **priority descending**, then original list
     /// index (stable). Higher `priority` wins when patterns overlap.
     pub fn from_config(rules: &[RoutingRule]) -> Self {
+        Self::from_indexed_config(rules.iter().enumerate())
+    }
+
+    pub(crate) fn from_indexed_config<'a>(
+        rules: impl IntoIterator<Item = (usize, &'a RoutingRule)>,
+    ) -> Self {
         let mut set = Self::new();
-        let mut indexed: Vec<(usize, &RoutingRule)> = rules
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.enabled)
-            .collect();
+        let mut indexed: Vec<(usize, &RoutingRule)> =
+            rules.into_iter().filter(|(_, r)| r.enabled).collect();
         indexed.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
 
-        for (_, r) in indexed {
+        for (index, r) in indexed {
             let action = match r.target.to_lowercase().as_str() {
                 "direct" => RouteAction::Direct,
                 "reject" | "block" => RouteAction::Reject,
@@ -141,6 +151,7 @@ impl RuleSet {
                 parse_cidr(&normalized)
             };
             set.rules.push(RuleEntry {
+                config_index: Some(index),
                 source,
                 rule,
                 action,

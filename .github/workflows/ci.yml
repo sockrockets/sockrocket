@@ -101,6 +101,8 @@ jobs:
           python3 tests/integration/merlin_rpc_test.py
           node tests/integration/webui_transport_test.cjs
           node tests/integration/webui_subscription_jobs_test.cjs
+          node tests/integration/webui_rule_flow_test.cjs
+          node tests/integration/webui_rule_presets_test.cjs
 
       # ── Build ──────────────────────────────────────────────────────────────
       - name: Build (CLI)
