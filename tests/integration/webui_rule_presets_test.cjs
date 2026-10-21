@@ -19,6 +19,8 @@ assert.equal(add[1].preset,'ai');assert.equal(add[1].expected_revision,'current'
 assert.equal(element('rule-preset-add').disabled,true);assert.equal(element('rule-preset').disabled,true);
 c.addRulePreset();assert.equal(requests.length,0,'duplicate clicks must not queue mutations');
 add[2]({ok:true,added:2});
+assert.equal(c.rulePending,true,'mutation lock must include authoritative refresh');
+c.toggleRulePreset(true);assert.equal(requests.filter(r=>r[0]==='set_rule_group_enabled').length,0,'cannot toggle against the previous snapshot during refresh');
 const rows=presets[0].domains.map((pattern,index)=>({index,source:'',name:'',group:presets[0].group,rule_type:'domain-suffix',pattern,target:'proxy',priority:-10,enabled:false}));
 refresh(rows,'added');
 assert.equal(element('rule-preset-add').disabled,true);assert.equal(element('rule-preset-enable').hidden,false);assert.equal(element('rule-preset-disable').hidden,true);
@@ -33,7 +35,16 @@ c.viewRulePreset();assert.equal(element('rule-search').value,presets[0].group);a
 element('rule-preset').value='domestic';c.renderRulePreset();c.srLoadRules();refresh(rows);
 assert.equal(element('rule-preset').value,'domestic','refresh preserves the selected preset');
 c.addRulePreset();add=request('add_rule_preset');add[3]();
+assert.equal(element('rule-preset-add').disabled,true,'lost mutation must remain locked while reading authoritative state');
+refresh(rows);
 assert.equal(element('rule-preset-add').disabled,false,'failed request remains retryable');
+element('rule-preset').value='ai';c.renderRulePreset();c.toggleRulePreset(true);
+request('set_rule_group_enabled')[3]({ok:false,saved:true,applied:false,error_code:'rule_apply_failed',msg:'规则已保存，但应用失败'});
+assert.equal(c.rulePending,true,'apply failure still requires a saved-state refresh');
+refresh(rows.map(r=>({...r,enabled:true})),'saved-not-applied');
+assert.equal(element('rule-preset-disable').hidden,false,'saved configuration is shown even when service reload failed');
+assert.match(element('rule-operation-state').textContent,/应用失败/);
+assert.equal(c.rulePending,false);assert.equal(requests.length,0,'application failure must not automatically retry the restart');
 c.srLoadRules();request('get_rules')[3]();assert.equal(element('rule-preset-add').disabled,true);
 c.addRulePreset();assert.equal(requests.length,0,'failed rule load blocks stale imports');
 console.log('PASS: catalog is passive, imports remain off, guarded group toggles, duplicate clicks, selection, filters and error recovery');
