@@ -516,7 +516,7 @@ pub struct RoutingRule {
     pub rule_type: String,
     /// Match pattern
     pub pattern: String,
-    /// Target: "direct", "proxy", "reject"
+    /// Target: "direct", "proxy", "reject", "group:Name", or "node:<public id>"
     pub target: String,
     /// Whether this rule is active (defaults to true)
     #[serde(default = "default_true")]
