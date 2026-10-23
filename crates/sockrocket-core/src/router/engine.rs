@@ -20,6 +20,8 @@ pub enum RouteAction {
     Proxy,
     /// A named proxy group; never falls back to the global node.
     Group(String),
+    /// One saved node, by its public id. A missing node fails closed.
+    Node(String),
     /// Connect directly, bypassing proxy.
     Direct,
     /// Drop/reject the connection.
@@ -33,6 +35,7 @@ impl serde::Serialize for RouteAction {
             Self::Direct => serializer.serialize_str("direct"),
             Self::Reject => serializer.serialize_str("reject"),
             Self::Group(name) => serializer.serialize_str(&format!("group:{name}")),
+            Self::Node(id) => serializer.serialize_str(&format!("node:{id}")),
         }
     }
 }
@@ -117,6 +120,8 @@ impl RuleSet {
         for (index, r) in indexed {
             let action = if let Some(name) = r.target.strip_prefix("group:") {
                 RouteAction::Group(name.to_owned())
+            } else if let Some(id) = r.target.strip_prefix("node:") {
+                RouteAction::Node(id.to_ascii_lowercase())
             } else {
                 match r.target.to_lowercase().as_str() {
                     "direct" => RouteAction::Direct,

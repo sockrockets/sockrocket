@@ -11,19 +11,22 @@ pub mod update;
 
 pub use config::clash::parse_clash_config;
 pub use config::dedup::{
-    SUB_URL_EXTRA_KEY, apply_subscription_refresh, dedup_nodes, node_fingerprint,
+    SUB_URL_EXTRA_KEY, apply_subscription_refresh, dedup_nodes, node_fingerprint, node_public_id,
     remove_subscription_nodes, uniquify_node_names,
 };
 pub use config::export::{SubscriptionFormat, export_clash_config, export_v2ray_base64};
-pub use config::group::{ProbeResult, fallback_pick, resolve_members, url_test_pick};
+pub use config::group::{
+    ProbeResult, fallback_pick, is_proxy_target, node_target_id, resolve_members, url_test_pick,
+};
 pub use config::model::{
     AppConfig, GroupType, HealthCheckConfig, Node, ProxyGroupConfig, ProxyMode, ProxyProtocol,
     RoutingRule, ShadowTlsConfig, Subscription, TransportConfig, TransportType,
     decode_display_name, normalize_node_names,
 };
 pub use config::rule_groups::{
-    RuleGroupSnapshot, RuleGroupView, existing_rule_groups, group_member_indices,
-    group_rules_for_display, replace_rule_group, same_rule_group, snapshot_rule_group,
+    GroupOutlet, RuleGroupSnapshot, RuleGroupView, assign_group_outlet, existing_rule_groups,
+    group_member_indices, group_outlet, group_rules_for_display, replace_rule_group,
+    same_rule_group, snapshot_rule_group,
 };
 pub use config::rule_scenes::{RuleScene, builtin_rule_scenes, rule_scene_by_id};
 pub use config::rules_batch::{

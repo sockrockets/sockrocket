@@ -5,7 +5,10 @@ use crate::theme::*;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{Icon, Sizable as _};
-use sockrocket_core::{ProxyMode, RoutingRule, builtin_rule_scenes};
+use sockrocket_core::{
+    GroupOutlet, Node, ProxyMode, RoutingRule, builtin_rule_scenes, group_outlet, node_fingerprint,
+    node_public_id, node_target_id,
+};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const CONFIRM_WINDOW_MS: u64 = 3000;
@@ -118,16 +121,23 @@ fn short_type(rule_type: &str) -> &'static str {
     sockrocket_gui::i18n::t(key)
 }
 
-fn short_target(target: &str) -> &str {
+fn short_target(target: &str, nodes: &[Node]) -> String {
     if let Some(name) = target.strip_prefix("group:") {
-        return name;
+        return name.to_string();
+    }
+    if let Some(id) = node_target_id(target) {
+        return nodes
+            .iter()
+            .find(|node| node_public_id(&node_fingerprint(node)) == id)
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| sockrocket_gui::i18n::t("rules.node.missing").to_string());
     }
     let key = TARGET_OPTIONS
         .iter()
         .find(|(value, _)| *value == target)
         .map(|(_, key)| *key)
         .unwrap_or("rules.act.proxy");
-    sockrocket_gui::i18n::t(key)
+    sockrocket_gui::i18n::t(key).to_string()
 }
 
 /// Group enable control: full / mixed / off (Mac checkbox-ish mark).
@@ -444,6 +454,7 @@ impl AppState {
                     .iter()
                     .filter(|&&i| self.rules.get(i).map(|r| r.enabled).unwrap_or(false))
                     .count();
+                let gkey_outlet = gkey.clone();
                 let gkey_toggle = gkey.clone();
                 let gkey_switch = gkey.clone();
                 let gkey_add = gkey.clone();
@@ -528,6 +539,7 @@ impl AppState {
                                     )
                                     .child(mini_badge(count_label, TEXT_MUTED)),
                             )
+                            .child(self.render_group_outlet(gkey_outlet, cx))
                             .child(
                                 text_action(
                                     SharedString::from(format!("grp-add-{gkey}")),
@@ -786,6 +798,138 @@ impl AppState {
             )
     }
 
+    fn render_group_outlet(&mut self, group: String, cx: &mut Context<Self>) -> Div {
+        let outlet = group_outlet(&self.rules, &group);
+        let (current, selected) = match &outlet {
+            GroupOutlet::Shared(target) => {
+                let label = if target == "proxy" {
+                    sockrocket_gui::i18n::t("rules.group.global_node").to_string()
+                } else {
+                    short_target(target, &self.nodes)
+                };
+                (label, Some(target.clone()))
+            }
+            GroupOutlet::Mixed => (
+                sockrocket_gui::i18n::t("rules.group.outlet_mixed").to_string(),
+                None,
+            ),
+            GroupOutlet::Unset => (
+                sockrocket_gui::i18n::t("rules.group.outlet_unset").to_string(),
+                None,
+            ),
+        };
+        let open = self.rule_outlet_open.as_deref() == Some(group.as_str());
+        let choices = std::iter::once((
+            "proxy".to_string(),
+            sockrocket_gui::i18n::t("rules.group.global_node").to_string(),
+        ))
+        .chain(self.nodes.iter().map(|node| {
+            (
+                format!("node:{}", node_public_id(&node_fingerprint(node))),
+                format!(
+                    "{} · {}",
+                    sockrocket_gui::i18n::t("rules.group.node"),
+                    node.name
+                ),
+            )
+        }))
+        .chain(self.groups.iter().map(|item| {
+            (
+                format!("group:{}", item.name),
+                format!(
+                    "{} · {}",
+                    sockrocket_gui::i18n::t("rules.group.label"),
+                    item.name
+                ),
+            )
+        }))
+        .collect::<Vec<_>>();
+        let toggle_group = group.clone();
+        let mut menu = div()
+            .id(SharedString::from(format!("grp-outlet-menu-{group}")))
+            .absolute()
+            .top(px(28.0))
+            .right_0()
+            .min_w(px(180.0))
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .py_1()
+            .rounded(px(8.0))
+            .bg(rgb(BG_PANEL))
+            .border_1()
+            .border_color(rgba(with_alpha(BORDER, 0x88)))
+            .shadow_md()
+            .occlude();
+        for (target, label) in choices {
+            let active = selected.as_deref() == Some(target.as_str());
+            let apply_group = group.clone();
+            let apply_target = target.clone();
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("grp-outlet-opt-{target}")))
+                    .px_3()
+                    .py_1p5()
+                    .cursor_pointer()
+                    .text_size(px(SMALL))
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(rgb(if active { TEXT_ACCENT } else { TEXT_SECONDARY }))
+                    .when(active, |row| row.bg(rgba(with_alpha(ACCENT, 0x14))))
+                    .hover(|row| row.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                    .child(label)
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_rule_group_outlet(&apply_group, &apply_target, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        let dismiss_group = group.clone();
+        div()
+            .relative()
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if this.rule_outlet_open.as_deref() == Some(dismiss_group.as_str()) {
+                    this.rule_outlet_open = None;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("grp-outlet-{group}")))
+                    .px_2()
+                    .py(px(3.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .bg(rgba(with_alpha(BORDER, 0x55)))
+                    .text_size(px(MICRO))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .hover(|row| row.bg(rgb(BG_HOVER)).text_color(rgb(TEXT_PRIMARY)))
+                    .child(format!("{current} ▾"))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.rule_menu = None;
+                            this.rule_outlet_open = if this.rule_outlet_open.as_deref()
+                                == Some(toggle_group.as_str())
+                            {
+                                None
+                            } else {
+                                Some(toggle_group.clone())
+                            };
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .when(open, |row| row.child(menu))
+    }
+
     fn render_rule_menu(&mut self, menu: RuleMenu, cx: &mut Context<Self>) -> Div {
         let open = self.rule_menu == Some(menu);
         let (id, current, options): (&'static str, String, &'static [(&str, &str)]) = match menu {
@@ -796,7 +940,7 @@ impl AppState {
             ),
             RuleMenu::Target => (
                 "rule-dd-target",
-                short_target(&self.rule_target_sel).to_string(),
+                short_target(&self.rule_target_sel, &self.nodes),
                 TARGET_OPTIONS,
             ),
         };
@@ -805,6 +949,10 @@ impl AppState {
             RuleMenu::Target => self.rule_target_sel.clone(),
         };
         let mut panel = div()
+            .id(match menu {
+                RuleMenu::Type => "rule-type-menu",
+                RuleMenu::Target => "rule-target-scroll",
+            })
             .mt_1()
             .py_1()
             .min_w(px(120.0))
@@ -813,7 +961,10 @@ impl AppState {
             .border_1()
             .border_color(rgba(with_alpha(BORDER, 0x88)))
             .shadow_md()
-            .occlude();
+            .occlude()
+            .when(menu == RuleMenu::Target, |panel| {
+                panel.max_h(px(280.0)).overflow_y_scroll()
+            });
         for (value, key) in options {
             let value = *value;
             let active = selected == value
@@ -852,6 +1003,30 @@ impl AppState {
             );
         }
         if menu == RuleMenu::Target {
+            for node in &self.nodes {
+                let target = format!("node:{}", node_public_id(&node_fingerprint(node)));
+                let label = format!(
+                    "{} · {}",
+                    sockrocket_gui::i18n::t("rules.group.node"),
+                    node.name
+                );
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(target.clone()))
+                        .px_3()
+                        .py_1p5()
+                        .child(label)
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.rule_target_sel = target.clone();
+                                this.rule_menu = None;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
             for group in &self.groups {
                 let target = format!("group:{}", group.name);
                 let label = format!("Group · {}", group.name);
@@ -1062,7 +1237,7 @@ impl AppState {
         let is_enabled = rule.enabled;
         let pattern = display_pattern(rule);
         let type_label = short_type(&rule.rule_type).to_string();
-        let target_label = short_target(&rule.target).to_string();
+        let target_label = short_target(&rule.target, &self.nodes);
         let tgt_color = target_color(&rule.target);
         let pattern_color = if is_enabled { TEXT_PRIMARY } else { TEXT_MUTED };
         let del_armed = delete_confirm_armed(index);

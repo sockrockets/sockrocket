@@ -70,6 +70,7 @@ pub struct RoutingOutbound {
     proxy_outbound: SharedOutbound,
     direct_outbound: SharedOutbound,
     groups: std::collections::HashMap<String, SharedOutbound>,
+    nodes: std::collections::HashMap<String, SharedOutbound>,
 }
 
 impl RoutingOutbound {
@@ -77,6 +78,7 @@ impl RoutingOutbound {
         Self {
             router,
             groups: Default::default(),
+            nodes: Default::default(),
             proxy_outbound,
             direct_outbound: SharedOutbound::direct(),
         }
@@ -90,12 +92,18 @@ impl RoutingOutbound {
         nodes: &[crate::Node],
     ) -> Self {
         self.groups = super::groups::build_groups(groups, nodes);
+        self.nodes = super::groups::pinned_nodes(nodes);
         self
     }
     fn group(&self, name: &str) -> Result<&SharedOutbound> {
         self.groups
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Routing proxy group does not exist"))
+    }
+    fn node(&self, id: &str) -> Result<&SharedOutbound> {
+        self.nodes
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Routing node does not exist"))
     }
 }
 
@@ -115,6 +123,7 @@ impl Outbound for RoutingOutbound {
             match action {
                 RouteAction::Proxy => self.proxy_outbound.0.connect(&host, port).await,
                 RouteAction::Group(name) => self.group(&name)?.0.connect(&host, port).await,
+                RouteAction::Node(id) => self.node(&id)?.0.connect(&host, port).await,
                 RouteAction::Direct => self.direct_outbound.0.connect(&host, port).await,
                 RouteAction::Reject => {
                     anyhow::bail!("Connection rejected by routing rule: {}:{}", host, port)
@@ -136,6 +145,7 @@ impl Outbound for RoutingOutbound {
                 RouteAction::Group(name) => {
                     self.group(&name)?.0.connect_datagram(&host, port).await
                 }
+                RouteAction::Node(id) => self.node(&id)?.0.connect_datagram(&host, port).await,
                 RouteAction::Reject => anyhow::bail!("UDP rejected by routing rule"),
             }
         })
@@ -147,6 +157,7 @@ impl Outbound for RoutingOutbound {
             proxy_outbound: proxy,
             direct_outbound: self.direct_outbound.clone(),
             groups: self.groups.clone(),
+            nodes: self.nodes.clone(),
         })))
     }
     fn routing_policy(&self) -> Option<Arc<Router>> {
@@ -300,6 +311,24 @@ mod tests {
                 .iter()
                 .any(|r| r.target == "group:Device" && !r.source.is_empty())
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_pinned_node_does_not_use_the_global_node() {
+        let id = "ab".repeat(32);
+        let rules =
+            crate::parse_batch_rules(&format!("DOMAIN,example.invalid,node:{id}"), "proxy").rules;
+        assert_eq!(rules[0].target, format!("node:{id}"));
+        let router = Arc::new(Router::new(crate::rule_mode_ruleset(&rules)));
+        let outbound = RoutingOutbound::new(router, SharedOutbound(Arc::new(Tagged("global"))));
+        let err = outbound
+            .connect("example.invalid", 443)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!err.contains("global"), "{err}");
     }
 
     #[tokio::test]

@@ -50,6 +50,25 @@ pub fn fallback_pick(nodes: &[Node], probes: &[ProbeResult]) -> Option<String> {
         .map(node_fingerprint)
 }
 
+/// `node:` plus the lowercase SHA-256 from [`super::dedup::node_public_id`].
+pub fn node_target_id(target: &str) -> Option<&str> {
+    let id = target.strip_prefix("node:")?;
+    if id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// A rule that dials some proxy, rather than direct or reject.
+pub fn is_proxy_target(target: &str) -> bool {
+    target == "proxy" || target.starts_with("group:") || node_target_id(target).is_some()
+}
+
 /// Names are portable through native CSV, JSON and YAML rule editors.
 pub fn valid_group_name(name: &str) -> bool {
     !name.is_empty()
@@ -77,8 +96,19 @@ pub fn lan_wide_udp(config: &AppConfig) -> Result<bool, &'static str> {
     Ok(config.rules.iter().any(|rule| {
         rule.enabled
             && rule.source.is_empty()
-            && rule_group_supports_udp(rule.target.as_str(), config)
+            && (rule_group_supports_udp(rule.target.as_str(), config)
+                || rule_node_supports_udp(rule.target.as_str(), config))
     }))
+}
+
+fn rule_node_supports_udp(target: &str, config: &AppConfig) -> bool {
+    let Some(id) = node_target_id(target) else {
+        return false;
+    };
+    config.nodes.iter().any(|node| {
+        super::dedup::node_public_id(&super::dedup::node_fingerprint(node)) == id
+            && node.protocol.supports_udp()
+    })
 }
 
 fn active_index(config: &AppConfig) -> Result<Option<usize>, &'static str> {

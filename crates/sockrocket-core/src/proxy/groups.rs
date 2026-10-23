@@ -9,6 +9,8 @@ use crate::config::{
 use anyhow::Result;
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -190,6 +192,50 @@ impl Outbound for GroupOutbound {
     fn name(&self) -> &str {
         "proxy-group"
     }
+}
+
+struct PinnedOutbound(Arc<Member>);
+
+impl Outbound for PinnedOutbound {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+        let member = Arc::clone(&self.0);
+        let host = host.to_string();
+        Box::pin(async move { member.get()?.0.connect(&host, port).await })
+    }
+
+    fn connect_datagram(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
+        let member = Arc::clone(&self.0);
+        let host = host.to_string();
+        Box::pin(async move { member.get()?.0.connect_datagram(&host, port).await })
+    }
+
+    fn name(&self) -> &str {
+        "pinned-node"
+    }
+}
+
+/// One outbound per node, keyed by [`crate::node_public_id`].
+/// Duplicate fingerprints keep the first node. Missing ids fail closed.
+pub fn pinned_nodes(nodes: &[Node]) -> HashMap<String, SharedOutbound> {
+    let mut out = HashMap::new();
+    for node in nodes {
+        let id = crate::node_public_id(&crate::node_fingerprint(node));
+        out.entry(id).or_insert_with(|| {
+            SharedOutbound(Arc::new(PinnedOutbound(Arc::new(Member {
+                node: node.clone(),
+                outbound: OnceLock::new(),
+            }))))
+        });
+    }
+    out
 }
 
 pub fn build_groups(
