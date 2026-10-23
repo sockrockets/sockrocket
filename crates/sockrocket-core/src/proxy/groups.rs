@@ -124,14 +124,12 @@ impl Outbound for GroupOutbound {
             }
             tokio::time::timeout(Duration::from_secs(10), async {
                 if self.kind == GroupKind::UrlTest {
-                    if let Some(index) = self.sticky_index() {
-                        match self
+                    if let Some(index) = self.sticky_index()
+                        && let Ok(stream) = self
                             .connect_at(index, &host, port, Duration::from_secs(10))
                             .await
-                        {
-                            Ok(stream) => return Ok(stream),
-                            Err(_) => {}
-                        }
+                    {
+                        return Ok(stream);
                     }
                     return self.connect_fastest(&host, port).await;
                 }
