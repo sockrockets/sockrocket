@@ -153,10 +153,12 @@ impl Outbound for VlessOutbound {
         let host = host.to_owned();
         Box::pin(async move {
             if let Some(factory) = &self.vision {
-                anyhow::ensure!(
-                    port != 443,
-                    "Vision blocks UDP/443 so clients can fall back to HTTPS over TCP"
-                );
+                if port == 443 {
+                    return Err(super::connector::UdpUnsupported::new(
+                        "Vision blocks UDP/443 so clients can fall back to HTTPS over TCP",
+                    )
+                    .into());
+                }
                 let mut tls = factory.connect_vision().await?;
                 // Vision UDP travels as XUDP inside a Vision-framed mux
                 // connection; sending a plain UDP command loses the flow.

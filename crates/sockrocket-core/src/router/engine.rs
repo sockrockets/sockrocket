@@ -14,15 +14,27 @@ pub use trace::{RouteTrace, RouteTraceStep};
 const ROUTE_CACHE_CAP: usize = 4096;
 
 /// Action to take for a matched connection.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RouteAction {
     /// Use the configured proxy outbound.
     Proxy,
+    /// A named proxy group; never falls back to the global node.
+    Group(String),
     /// Connect directly, bypassing proxy.
     Direct,
     /// Drop/reject the connection.
     Reject,
+}
+
+impl serde::Serialize for RouteAction {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Proxy => serializer.serialize_str("proxy"),
+            Self::Direct => serializer.serialize_str("direct"),
+            Self::Reject => serializer.serialize_str("reject"),
+            Self::Group(name) => serializer.serialize_str(&format!("group:{name}")),
+        }
+    }
 }
 
 /// A compiled match rule for fast evaluation.
@@ -103,10 +115,14 @@ impl RuleSet {
         indexed.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
 
         for (index, r) in indexed {
-            let action = match r.target.to_lowercase().as_str() {
-                "direct" => RouteAction::Direct,
-                "reject" | "block" => RouteAction::Reject,
-                _ => RouteAction::Proxy,
+            let action = if let Some(name) = r.target.strip_prefix("group:") {
+                RouteAction::Group(name.to_owned())
+            } else {
+                match r.target.to_lowercase().as_str() {
+                    "direct" => RouteAction::Direct,
+                    "reject" | "block" => RouteAction::Reject,
+                    _ => RouteAction::Proxy,
+                }
             };
 
             let rule = match r.rule_type.to_lowercase().as_str() {
@@ -415,6 +431,9 @@ impl Router {
 /// database is primarily v4). None on failure/timeout — IP-based rules then
 /// simply don't match, and evaluation falls through to the default action.
 async fn resolve_host(host: &str) -> Option<IpAddr> {
+    if let Some(result) = crate::dns::scoped_resolve(host).await {
+        return result.ok().and_then(|ips| ips.into_iter().next());
+    }
     let lookup = tokio::net::lookup_host((host, 0));
     let addrs = match tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await {
         Ok(Ok(iter)) => iter,

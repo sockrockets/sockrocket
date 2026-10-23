@@ -63,7 +63,7 @@ pub fn china_direct_ruleset() -> RuleSet {
 pub fn china_geoip_db() -> GeoIpDb {
     let mut db = GeoIpDb::builtin(); // private ranges already included
 
-    for cidr in CHINA_IP_CIDRS {
+    for cidr in CHINA_IP_CIDRS.iter().chain(CHINA_IPV6_CIDRS) {
         db.add_entry(cidr, "CN");
     }
 
@@ -243,6 +243,12 @@ const CHINA_DOMAIN_KEYWORDS: &[&str] = &["chinaz", "cnzz", "umeng"];
 const CHINA_IP_CIDRS: &[&str] = &include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/data/china_ipv4_cidrs.inc.rs"
+));
+
+// Allocation-based approximation, not a guarantee of physical geolocation.
+const CHINA_IPV6_CIDRS: &[&str] = &include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/data/china_ipv6_cidrs.inc.rs"
 ));
 
 #[cfg(test)]

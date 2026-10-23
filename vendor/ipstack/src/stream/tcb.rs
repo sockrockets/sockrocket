@@ -1,5 +1,7 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{collections::BTreeMap, time::Duration};
 
 pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
@@ -50,7 +52,19 @@ pub(crate) struct Tcb {
     ack: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
-    send_window: u16,
+    /// Peer's receive window in bytes. A raw TCP header only holds 16 bits;
+    /// when window scaling was negotiated this is `header << snd_scale`.
+    send_window: u32,
+    /// Shift from the peer's SYN. Zero when scaling was not negotiated.
+    snd_scale: u8,
+    /// Shift we advertise. Zero when scaling was not negotiated, so the
+    /// header value stays the real byte window.
+    rcv_scale: u8,
+    scale_ok: bool,
+    /// Live byte cap shared by every flow. Tun lowers it as more TCP
+    /// sessions appear so a speed test can use a wide window without
+    /// reserving that width for every idle flow.
+    window_limit: Arc<AtomicU32>,
     state: TcpState,
     state_since: std::time::Instant,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
@@ -75,6 +89,7 @@ impl Tcb {
         max_count_for_dup_ack: usize,
         rto: std::time::Duration,
         max_retransmit_count: usize,
+        window_limit: Arc<AtomicU32>,
     ) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
@@ -85,7 +100,13 @@ impl Tcb {
             ack,
             mtu,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
+            // Until the peer's ACK arrives, allow one budget's worth. The
+            // handshake ACK replaces this with the scaled header window.
+            send_window: max_unacked_bytes,
+            snd_scale: 0,
+            rcv_scale: 0,
+            scale_ok: false,
+            window_limit,
             state: TcpState::Listen,
             state_since: std::time::Instant::now(),
             inflight_packets: BTreeMap::new(),
@@ -151,9 +172,17 @@ impl Tcb {
         if self.queued_read_chunks >= 64 {
             return 0;
         }
-        self.read_buffer_size
+        self.buffer_limit()
             .saturating_sub(self.get_unordered_packets_total_len())
             .saturating_sub(self.queued_read_bytes)
+    }
+
+    /// Bytes this flow may keep in flight right now. The atomic is the
+    /// shared live cap; the config fields are the per-flow ceiling.
+    fn buffer_limit(&self) -> usize {
+        let live = self.window_limit.load(Ordering::Relaxed) as usize;
+        live.min(self.read_buffer_size)
+            .min(self.max_unacked_bytes as usize)
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
@@ -255,16 +284,34 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
-    pub(super) fn update_send_window(&mut self, window: u16) {
-        self.send_window = window;
+    pub(super) fn enable_window_scale(&mut self, peer: u8, ours: u8) {
+        self.scale_ok = true;
+        self.snd_scale = peer.min(14);
+        self.rcv_scale = ours.min(14);
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+
+    /// Scale to put on our SYN-ACK. `None` when the peer did not offer it —
+    /// sending the option only on our side would leave the two shifts
+    /// disagreeing about the same header field.
+    pub(super) fn advertised_scale(&self) -> Option<u8> {
+        self.scale_ok.then_some(self.rcv_scale)
+    }
+
+    pub(super) fn update_send_window(&mut self, window: u16) {
+        self.send_window = Self::scale_window(window, self.snd_scale);
+    }
+    pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
     pub(super) fn get_recv_window(&self) -> u16 {
-        self.get_available_read_buffer_size()
-            .try_into()
-            .unwrap_or(u16::MAX)
+        let available = self.get_available_read_buffer_size() >> self.rcv_scale;
+        u16::try_from(available).unwrap_or(u16::MAX)
+    }
+
+    fn scale_window(window: u16, shift: u8) -> u32 {
+        u32::from(window)
+            .checked_shl(u32::from(shift.min(14)))
+            .unwrap_or(u32::MAX)
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -282,7 +329,7 @@ impl Tcb {
     pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
-        let rcvd_window = tcp_header.window_size;
+        let rcvd_window = Self::scale_window(tcp_header.window_size, self.snd_scale);
         let len = payload.len();
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
@@ -401,9 +448,73 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.inflight_packets.len() >= 64
+        let byte_limit = self.buffer_limit() as u32;
+        // One full-sized segment per slot, so a wider byte window is not
+        // silently cut back to 64 packets (~90 KiB).
+        let packet_limit = (byte_limit / 1400).max(64) as usize;
+        self.inflight_packets.len() >= packet_limit
             || self.seq.distance(self.get_last_received_ack())
-                >= self.max_unacked_bytes.min(self.get_send_window() as u32)
+                >= byte_limit.min(self.get_send_window())
+    }
+}
+
+/// Shift that lets a 16-bit header represent `buffer` bytes.
+pub(super) fn window_scale_shift(buffer: usize) -> u8 {
+    let mut shift = 0u8;
+    while shift < 14 && (usize::from(u16::MAX) << shift) < buffer {
+        shift += 1;
+    }
+    shift
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_shift_covers_the_buffer_without_wasting_bits() {
+        assert_eq!(window_scale_shift(16 * 1024), 0);
+        assert_eq!(window_scale_shift(64 * 1024), 1);
+        assert_eq!(window_scale_shift(512 * 1024), 4);
+    }
+
+    #[test]
+    fn negotiated_scale_widens_the_peer_window_and_the_advertisement() {
+        let limit = Arc::new(AtomicU32::new(512 * 1024));
+        let mut tcb = Tcb::new(
+            SeqNum(1),
+            1500,
+            512 * 1024,
+            512 * 1024,
+            3,
+            Duration::from_secs(1),
+            3,
+            limit,
+        );
+        tcb.enable_window_scale(7, window_scale_shift(512 * 1024));
+        tcb.update_send_window(1000);
+        assert_eq!(tcb.get_send_window(), 1000 << 7);
+        assert_eq!(tcb.advertised_scale(), Some(4));
+        assert_eq!(tcb.get_recv_window(), ((512 * 1024) >> 4) as u16);
+    }
+
+    #[test]
+    fn missing_scale_keeps_the_raw_16_bit_window() {
+        let limit = Arc::new(AtomicU32::new(512 * 1024));
+        let mut tcb = Tcb::new(
+            SeqNum(1),
+            1500,
+            512 * 1024,
+            512 * 1024,
+            3,
+            Duration::from_secs(1),
+            3,
+            limit,
+        );
+        tcb.update_send_window(1000);
+        assert_eq!(tcb.get_send_window(), 1000);
+        assert_eq!(tcb.advertised_scale(), None);
+        assert_eq!(tcb.get_recv_window(), u16::MAX);
     }
 }
 

@@ -10,8 +10,13 @@ pub mod fakeip;
 #[cfg(test)]
 mod integration_tests;
 mod listener;
+#[cfg(test)]
+mod policy_tests;
 pub use listener::check_listener as check_dns_listener;
+mod runtime;
 mod upstream;
+pub use runtime::configure_bootstrap;
+pub(crate) use runtime::{bootstrap_is_default, bootstrap_resolver, scoped_resolve, with_resolver};
 pub(crate) mod wire;
 pub use wire::{
     build_dns_error_response, build_dns_response, build_dns_response_with_ttl, parse_dns_query,
@@ -41,6 +46,16 @@ const CN_DIRECT_CACHE_MAX: usize = 4096;
 /// DNS resolver configuration.
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
+    pub reject_local_addresses: bool,
+    pub bootstrap_servers: Option<Vec<SocketAddr>>,
+    pub node_hosts: std::collections::HashSet<String>,
+    pub client_ipv4_only: bool,
+    pub dual_stack_fakeip: bool,
+    /// Explicit proxy group. None retains the historical runtime defaults.
+    pub proxy_servers: Option<Vec<DnsServer>>,
+    pub strategy: crate::config::dns::AddressStrategy,
+    pub cache_capacity: usize,
+    pub timeout_secs: u64,
     /// Primary DNS servers (IP:port or DoH URL)
     pub servers: Vec<DnsServer>,
     /// Second server group, selected per-domain via [`DnsConfig::domain_rules`]
@@ -51,7 +66,7 @@ pub struct DnsConfig {
     pub fallback: Vec<DnsServer>,
     /// Domain rules: domain suffix -> server group (e.g., "cn" -> use fallback)
     pub domain_rules: HashMap<String, DnsGroup>,
-    /// Cache TTL override (0 = use DNS TTL, >0 = override)
+    /// Cache TTL cap (0 = use DNS TTL, >0 = upper bound)
     pub cache_ttl: u32,
     /// Enable DNS cache
     pub cache_enabled: bool,
@@ -60,6 +75,15 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
+            reject_local_addresses: false,
+            bootstrap_servers: None,
+            node_hosts: Default::default(),
+            client_ipv4_only: false,
+            dual_stack_fakeip: false,
+            proxy_servers: None,
+            strategy: Default::default(),
+            cache_capacity: DNS_CACHE_MAX_ENTRIES,
+            timeout_secs: 5,
             servers: vec![
                 DnsServer::Udp("8.8.8.8:53".parse().unwrap()),
                 DnsServer::Udp("1.1.1.1:53".parse().unwrap()),
@@ -87,6 +111,14 @@ pub enum DnsGroup {
 pub enum DnsServer {
     /// Standard UDP DNS
     Udp(SocketAddr),
+    Tcp(SocketAddr),
+    Tls(SocketAddr, String),
+    /// Validated URL with independent, IP-only bootstrap resolvers.
+    Endpoint {
+        url: String,
+        proxy: bool,
+        bootstrap: Vec<SocketAddr>,
+    },
     /// DNS-over-HTTPS (e.g., "https://dns.google/dns-query")
     DoH(String),
     /// DNS-over-TCP through a proxy outbound (e.g. the active proxy node).
@@ -123,6 +155,8 @@ struct CacheEntry {
 /// Cache key: answers are per (domain, qtype) so a negative AAAA entry can
 /// never poison A lookups for the same name (and vice versa).
 type CacheKey = (String, u16);
+type EndpointKey = (String, Vec<SocketAddr>, bool);
+type EndpointCache = LruCache<EndpointKey, (Instant, Vec<IpAddr>)>;
 
 /// Maximum number of entries in the DNS cache before LRU eviction.
 const DNS_CACHE_MAX_ENTRIES: usize = 1024;
@@ -207,9 +241,44 @@ impl ProxyConnPool {
 
 struct RuntimeDnsCache {
     outbound: SharedOutbound,
+    config: Arc<DnsConfig>,
     cache: Arc<RwLock<LruCache<CacheKey, CacheEntry>>>,
     inflight: InflightMap,
     cn_direct: Arc<RwLock<LruCache<String, bool>>>,
+    wire: Arc<Mutex<WireCache>>,
+    bootstrap: Option<Arc<DnsResolver>>,
+}
+
+struct WireCache {
+    entries: LruCache<Vec<u8>, (Vec<u8>, Instant)>,
+    bytes: usize,
+}
+impl WireCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(capacity.clamp(16, 16384)).unwrap()),
+            bytes: 0,
+        }
+    }
+    fn put(&mut self, key: Vec<u8>, reply: Vec<u8>, expiry: Instant) {
+        if key.len() > 512 || reply.len() > 4096 {
+            return;
+        }
+        if let Some((key, (reply, _))) = self.entries.pop_entry(&key) {
+            self.bytes -= key.len() + reply.len();
+        }
+        while self.entries.len() >= self.entries.cap().get()
+            || self.bytes + key.len() + reply.len() > 1024 * 1024
+        {
+            if let Some((key, (reply, _))) = self.entries.pop_lru() {
+                self.bytes -= key.len() + reply.len();
+            } else {
+                break;
+            }
+        }
+        self.bytes += key.len() + reply.len();
+        self.entries.put(key, (reply, expiry));
+    }
 }
 
 /// The main DNS resolver.
@@ -241,6 +310,12 @@ pub struct DnsResolver {
     follow_runtime: bool,
     primary_override: Option<Arc<Vec<DnsServer>>>,
     runtime_cache: Arc<std::sync::Mutex<Option<RuntimeDnsCache>>>,
+    endpoint_cache: Arc<Mutex<EndpointCache>>,
+    /// Same-key bootstrap lookups share one query. The map is a std mutex so
+    /// a cancelled leader can wake waiters from `Drop` without awaiting.
+    endpoint_wait: Arc<std::sync::Mutex<HashMap<EndpointKey, Arc<tokio::sync::Notify>>>>,
+    wire_cache: Arc<Mutex<WireCache>>,
+    bootstrap: Option<Arc<DnsResolver>>,
     /// Shared DNS-over-TCP connections through the proxy. Small pool of
     /// slots, each independently locked: queries within one slot are
     /// serialized (one outstanding exchange per connection), but different
@@ -291,6 +366,8 @@ impl Default for DnsResolver {
 impl DnsResolver {
     /// Create a new resolver with custom config.
     pub fn with_config(config: DnsConfig) -> Self {
+        let capacity = config.cache_capacity.clamp(16, 16384);
+        let bootstrap = Self::make_bootstrap(&config);
         let doh_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(2)
@@ -300,7 +377,7 @@ impl DnsResolver {
             client_ipv4_only: false,
             config: Arc::new(config),
             cache: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(DNS_CACHE_MAX_ENTRIES).expect("capacity is non-zero"),
+                NonZeroUsize::new(capacity).expect("capacity is non-zero"),
             ))),
             doh_client,
             inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -309,6 +386,10 @@ impl DnsResolver {
             follow_runtime: false,
             primary_override: None,
             runtime_cache: Arc::new(std::sync::Mutex::new(None)),
+            endpoint_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap()))),
+            endpoint_wait: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            wire_cache: Arc::new(Mutex::new(WireCache::new(capacity))),
+            bootstrap,
             proxy_tcp_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
             proxy_tls_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
             tls_connector: build_dot_tls_connector(),
@@ -378,7 +459,7 @@ impl DnsResolver {
     /// Whether `ip` belongs to the fake-IP range this resolver hands out.
     /// Cheap pure range check; safe on hot paths.
     pub fn is_fake(&self, ip: &IpAddr) -> bool {
-        self.fakeip.is_some() && matches!(ip, IpAddr::V4(v4) if fakeip::is_fake_ip(*v4))
+        self.fakeip.is_some() && fakeip::fake_ipv4(*ip).is_some()
     }
 
     /// Whether a fake-IP pool is attached (TUN transparent proxy mode).
@@ -399,8 +480,25 @@ impl DnsResolver {
         self.follow_runtime = true;
     }
 
+    fn make_bootstrap(config: &DnsConfig) -> Option<Arc<Self>> {
+        config.bootstrap_servers.as_ref().map(|servers| {
+            Arc::new(Self::with_config(DnsConfig {
+                reject_local_addresses: config.reject_local_addresses,
+                servers: servers.iter().copied().map(DnsServer::Udp).collect(),
+                fallback: vec![],
+                strategy: crate::config::dns::AddressStrategy::PreferIpv4,
+                timeout_secs: config.timeout_secs,
+                cache_ttl: 0,
+                ..Default::default()
+            }))
+        })
+    }
+    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        runtime::with_resolver(Some(self.clone()), future).await
+    }
     fn query_snapshot(&self) -> Self {
         let mut snapshot = self.clone();
+        let mut applied_gateway_policy = false;
         if let Some(outbound) = &self.outbound
             && let Some((current, config)) = outbound.0.dns_snapshot().or_else(|| {
                 outbound
@@ -410,17 +508,25 @@ impl DnsResolver {
             })
         {
             if let Some(config) = config {
+                // Published gateway policy replaces the process-start flag.
+                // OR-ing would keep AAAA suppressed after a later dual-stack
+                // config is published into this same resolver.
+                snapshot.client_ipv4_only = config.client_ipv4_only;
                 snapshot.config = config;
+                applied_gateway_policy = true;
             }
             let mut generation = self.runtime_cache.lock().unwrap();
-            if generation
-                .as_ref()
-                .is_none_or(|cache| !Arc::ptr_eq(&cache.outbound.0, &current.0))
-            {
+            if generation.as_ref().is_none_or(|cache| {
+                !Arc::ptr_eq(&cache.outbound.0, &current.0)
+                    || !Arc::ptr_eq(&cache.config, &snapshot.config)
+            }) {
                 *generation = Some(RuntimeDnsCache {
                     outbound: current.clone(),
+                    config: snapshot.config.clone(),
+                    bootstrap: Self::make_bootstrap(&snapshot.config),
+                    wire: Arc::new(Mutex::new(WireCache::new(snapshot.config.cache_capacity))),
                     cache: Arc::new(RwLock::new(LruCache::new(
-                        NonZeroUsize::new(DNS_CACHE_MAX_ENTRIES).unwrap(),
+                        NonZeroUsize::new(snapshot.config.cache_capacity.clamp(16, 16384)).unwrap(),
                     ))),
                     inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     cn_direct: Arc::new(RwLock::new(LruCache::new(
@@ -432,6 +538,8 @@ impl DnsResolver {
             snapshot.cache = generation.cache.clone();
             snapshot.inflight = generation.inflight.clone();
             snapshot.cn_direct = generation.cn_direct.clone();
+            snapshot.wire_cache = generation.wire.clone();
+            snapshot.bootstrap = generation.bootstrap.clone();
             snapshot.outbound = Some(current);
         }
         if self.follow_runtime {
@@ -443,25 +551,36 @@ impl DnsResolver {
                 snapshot.fakeip = None;
             }
             snapshot.primary_override = Some(Arc::new(
-                if snapshot
-                    .outbound
-                    .as_ref()
-                    .is_some_and(|outbound| outbound.0.is_direct())
-                {
-                    vec![
-                        DnsServer::Udp(([8, 8, 8, 8], 53).into()),
-                        DnsServer::Udp(([1, 1, 1, 1], 53).into()),
-                    ]
+                if let Some(servers) = &snapshot.config.proxy_servers {
+                    if snapshot.outbound.as_ref().is_some_and(|o| o.0.is_direct()) {
+                        snapshot.config.servers.clone()
+                    } else {
+                        servers.clone()
+                    }
                 } else {
-                    vec![
-                        DnsServer::ProxyTls(([8, 8, 8, 8], 853).into(), "dns.google".into()),
-                        DnsServer::ProxyTls(
-                            ([1, 1, 1, 1], 853).into(),
-                            "cloudflare-dns.com".into(),
-                        ),
-                    ]
+                    if snapshot
+                        .outbound
+                        .as_ref()
+                        .is_some_and(|outbound| outbound.0.is_direct())
+                    {
+                        vec![
+                            DnsServer::Udp(([8, 8, 8, 8], 53).into()),
+                            DnsServer::Udp(([1, 1, 1, 1], 53).into()),
+                        ]
+                    } else {
+                        vec![
+                            DnsServer::ProxyTls(([8, 8, 8, 8], 853).into(), "dns.google".into()),
+                            DnsServer::ProxyTls(
+                                ([1, 1, 1, 1], 853).into(),
+                                "cloudflare-dns.com".into(),
+                            ),
+                        ]
+                    }
                 },
             ));
+        }
+        if !applied_gateway_policy {
+            snapshot.client_ipv4_only |= snapshot.config.client_ipv4_only;
         }
         snapshot
     }
@@ -518,6 +637,13 @@ impl DnsResolver {
     /// Inner resolution path: IP-literal short-circuit, fake-IP hook,
     /// cache, dedup. See [`Self::resolve_with_qtype`] for the contract.
     async fn resolve_qtype_inner(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
+        use crate::config::dns::AddressStrategy;
+        if matches!(
+            (self.config.strategy, qtype),
+            (AddressStrategy::Ipv4Only, 28) | (AddressStrategy::Ipv6Only, 1)
+        ) {
+            return Ok(Vec::new());
+        }
         // IP literals short-circuit; only the queried family answers.
         if let Ok(ip) = domain.parse::<IpAddr>() {
             return Ok(match (qtype, ip) {
@@ -536,6 +662,17 @@ impl DnsResolver {
         if let Some(pool) = &self.fakeip
             && self.match_domain_group(domain) == DnsGroup::Primary
         {
+            if self.config.dual_stack_fakeip && qtype == QTYPE_AAAA {
+                let addresses = self.resolve_dedup(domain, qtype).await?;
+                return Ok(if addresses.is_empty() {
+                    vec![]
+                } else if self.ips_are_cn(&addresses) {
+                    self.record_probe_domestic(domain, pool, &addresses);
+                    addresses
+                } else {
+                    vec![IpAddr::V6(pool.allocate_v6(domain))]
+                });
+            }
             if self.geoip.is_some() {
                 return self.resolve_primary_fakeip_or_cn(domain, qtype, pool).await;
             }
@@ -694,7 +831,7 @@ impl DnsResolver {
             let (addresses, ttl) = match &result {
                 Ok(answer) if !answer.addresses.is_empty() => {
                     let ttl = if self.config.cache_ttl > 0 {
-                        self.config.cache_ttl
+                        self.config.cache_ttl.min(answer.ttl)
                     } else {
                         answer.ttl
                     };
@@ -727,6 +864,7 @@ impl DnsResolver {
                 28 => ip.is_ipv6(),
                 _ => true,
             })
+            .take(128)
             .collect();
         Ok(LookupAnswer {
             addresses,
@@ -744,6 +882,49 @@ impl DnsResolver {
                 _ => None,
             })
             .ok_or_else(|| anyhow::anyhow!("No IPv4 address for {}", domain))
+    }
+
+    /// Real addresses in configured order; resolution does not allocate Fake-IP.
+    pub async fn resolve_addresses(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        let mut snapshot = self.query_snapshot();
+        snapshot.fakeip = None;
+        let (a, aaaa) = tokio::join!(
+            snapshot.resolve_qtype_snapshot(domain, 1),
+            snapshot.resolve_qtype_snapshot(domain, 28)
+        );
+        let mut ips: Vec<_> = a
+            .into_iter()
+            .flatten()
+            .chain(aaaa.into_iter().flatten())
+            .collect();
+        let prefer_v6 = matches!(
+            snapshot.config.strategy,
+            crate::config::dns::AddressStrategy::PreferIpv6
+                | crate::config::dns::AddressStrategy::Ipv6Only
+        );
+        ips.sort_by_key(|ip| ip.is_ipv6() != prefer_v6);
+        anyhow::ensure!(
+            !ips.is_empty(),
+            "DNS returned no addresses for configured strategy"
+        );
+        Ok(ips)
+    }
+
+    /// On-demand wire diagnostic, without cache, Fake-IP or saved history.
+    pub async fn test_upstream(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
+        anyhow::ensure!(matches!(qtype, 1 | 28), "Unsupported DNS diagnostic type");
+        let query = build_dns_query(domain, qtype);
+        let mut snapshot = self.query_snapshot();
+        let mut config = (*snapshot.config).clone();
+        config.cache_enabled = false;
+        snapshot.config = Arc::new(config);
+        let reply = snapshot.exchange_raw(&query).await?;
+        anyhow::ensure!(
+            reply[3] & 15 == 0,
+            "DNS server returned rcode {}",
+            reply[3] & 15
+        );
+        parse_dns_response(&reply)
     }
 
     /// Resolve to first IPv6 address.
@@ -970,6 +1151,7 @@ pub fn china_split_dns_config() -> DnsConfig {
         domain_rules: rules,
         cache_ttl: 600,
         cache_enabled: true,
+        ..Default::default()
     }
 }
 
@@ -1011,16 +1193,30 @@ pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u
         return build_dns_error_response(query, 1);
     }
     let snapshot = resolver.query_snapshot();
-    if snapshot.client_ipv4_only
-        && parse_dns_query(query).is_ok_and(|(_, qtype)| matches!(qtype, 28 | 65))
-    {
+    if parse_dns_query(query).is_ok_and(|(_, qtype)| {
+        use crate::config::dns::AddressStrategy;
+        // A client that cannot reach IPv6 must keep its A answers even under
+        // ipv6_only: otherwise a missing IPv6 interception blanks all LAN DNS.
+        if snapshot.client_ipv4_only {
+            return matches!(qtype, 28 | 65);
+        }
+        matches!(
+            (snapshot.config.strategy, qtype),
+            (AddressStrategy::Ipv4Only, 28 | 65) | (AddressStrategy::Ipv6Only, 1 | 65)
+        )
+    }) {
         // Return successful NODATA, not NXDOMAIN: A lookup must still work.
         // HTTPS records may carry ipv6hint/alternate endpoints, so let these
         // clients use conventional A lookup rather than an unusable hint.
         return build_dns_response_with_ttl(query, &[], 5)
             .unwrap_or_else(|_| build_dns_error_response(query, 1));
     }
-    match tokio::time::timeout(Duration::from_secs(5), answer_wire(&snapshot, query)).await {
+    match tokio::time::timeout(
+        Duration::from_secs(snapshot.config.timeout_secs.clamp(1, 12)),
+        answer_wire(&snapshot, query),
+    )
+    .await
+    {
         Ok(Ok(reply)) => reply,
         _ => build_dns_error_response(query, 2),
     }
@@ -1032,6 +1228,28 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     let Some(pool) = &resolver.fakeip else {
         return resolver.exchange_raw(query).await;
     };
+    if qtype == 28
+        && resolver.config.dual_stack_fakeip
+        && resolver.match_domain_group(&domain) == DnsGroup::Primary
+    {
+        let reply = resolver.exchange_raw(query).await?;
+        let addresses = parse_dns_response(&reply).unwrap_or_default();
+        if reply[3] & 15 != 0 || addresses.is_empty() {
+            return Ok(reply);
+        }
+        if resolver.ips_are_cn(&addresses) {
+            resolver.record_probe_domestic(&domain, pool, &addresses);
+            let mut reply = reply;
+            wire::cap_ttl(&mut reply, 30)?;
+            return Ok(reply);
+        }
+        return build_dns_response_with_ttl(query, &[IpAddr::V6(pool.allocate_v6(&domain))], 5);
+    }
+    // HTTPS/SVCB hints carry real addresses; a browser that dials them skips
+    // the Fake-IP and with it domain routing.
+    if qtype == 65 && resolver.match_domain_group(&domain) == DnsGroup::Primary {
+        return build_dns_response_with_ttl(query, &[], 5);
+    }
     if !matches!(qtype, 1 | 28) {
         return resolver.exchange_raw(query).await;
     }
@@ -1089,7 +1307,25 @@ pub async fn serve_dns_udp(
     resolver: DnsResolver,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    listener::serve(bind_addr, port, resolver, shutdown).await
+    listener::serve(bind_addr, port, resolver, shutdown, None).await
+}
+
+/// IPv4 listener plus an IPv6-only socket on the same port.
+///
+/// Merlin redirects LAN IPv6 DNS to this port. Firmware resolvers often bind
+/// IPv4 only, so the redirected packets need this socket. A host without
+/// IPv6 keeps the IPv4 listener; the IPv6 bind failure is logged and ignored.
+/// The IPv6 socket answers only while `ipv6_open` is true. The caller sets it
+/// once the firewall limits the port to the LAN, so the socket is never an
+/// open resolver for the WAN.
+pub async fn serve_dns_udp_and_ipv6(
+    bind_addr: &str,
+    port: u16,
+    resolver: DnsResolver,
+    shutdown: Arc<tokio::sync::Notify>,
+    ipv6_open: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    listener::serve(bind_addr, port, resolver, shutdown, Some(ipv6_open)).await
 }
 
 async fn serve_dns_socket(
@@ -1097,6 +1333,7 @@ async fn serve_dns_socket(
     resolver: DnsResolver,
     shutdown: Arc<tokio::sync::Notify>,
     max_inflight: usize,
+    gate: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<()> {
     let socket = Arc::new(socket);
     let mut queries = tokio::task::JoinSet::new();
@@ -1111,6 +1348,12 @@ async fn serve_dns_socket(
         };
         if n < 12 {
             continue; // too short to be a DNS packet
+        }
+        if gate
+            .as_ref()
+            .is_some_and(|open| !open.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            continue;
         }
         // Upstream timeouts must not turn a LAN DNS burst into an
         // unbounded number of tasks waiting for resolver/pool slots.
@@ -1367,6 +1610,7 @@ mod tests {
             domain_rules: HashMap::new(),
             cache_ttl: 0,
             cache_enabled: true,
+            ..Default::default()
         })
     }
 
@@ -1440,6 +1684,7 @@ mod tests {
             domain_rules: HashMap::new(),
             cache_ttl: 0,
             cache_enabled: true,
+            ..Default::default()
         });
         resolver.set_outbound(SharedOutbound::direct());
 
@@ -1480,6 +1725,7 @@ mod tests {
             domain_rules: HashMap::new(),
             cache_ttl: 0,
             cache_enabled: false,
+            ..Default::default()
         });
 
         let err = resolver.resolve("example.com").await.unwrap_err();
@@ -1523,6 +1769,7 @@ mod tests {
             domain_rules: HashMap::new(),
             cache_ttl: 0,
             cache_enabled: false,
+            ..Default::default()
         });
         resolver.set_outbound(SharedOutbound::direct());
 
@@ -1624,6 +1871,7 @@ mod tests {
             domain_rules: HashMap::new(),
             cache_ttl: 1, // expire after 1s
             cache_enabled: true,
+            ..Default::default()
         };
         let resolver = DnsResolver::with_config(config);
 
@@ -1723,7 +1971,13 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let server = tokio::spawn(serve_dns_socket(socket, resolver, shutdown.clone(), 2));
+        let server = tokio::spawn(serve_dns_socket(
+            socket,
+            resolver,
+            shutdown.clone(),
+            2,
+            None,
+        ));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for i in 0..8 {
             let query = build_dns_query(&format!("burst-{i}.example.com"), QTYPE_A);
@@ -1762,7 +2016,7 @@ mod tests {
         shutdown.notify_one();
         tokio::time::timeout(
             Duration::from_secs(1),
-            serve_dns_socket(socket, resolver, shutdown, 2),
+            serve_dns_socket(socket, resolver, shutdown, 2, None),
         )
         .await
         .expect("an early shutdown must not be lost")
@@ -1824,6 +2078,60 @@ mod tests {
 
         // Shutdown: the listener task must exit promptly.
         shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("listener must stop on shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv6_dns_listener_answers_only_when_opened() {
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let resolver = DnsResolver::with_config(china_split_dns_config());
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_clone = shutdown.clone();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = open.clone();
+        let server = tokio::spawn(async move {
+            serve_dns_udp_and_ipv6("127.0.0.1", port, resolver, shutdown_clone, gate)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let client = UdpSocket::bind("[::1]:0").await.unwrap();
+        let query = [
+            0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
+        ];
+        client
+            .send_to(&query, format!("[::1]:{port}"))
+            .await
+            .unwrap();
+        let mut resp = vec![0u8; 512];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut resp))
+                .await
+                .is_err(),
+            "closed IPv6 listener must not answer"
+        );
+        open.store(true, std::sync::atomic::Ordering::Relaxed);
+        client
+            .send_to(&query, format!("[::1]:{port}"))
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), client.recv_from(&mut resp))
+            .await
+            .expect("IPv6 listener must answer")
+            .unwrap();
+        assert!(n >= 12);
+        assert_eq!(resp[0], 0xAB);
+        assert_ne!(resp[2] & 0x80, 0);
+        shutdown.notify_one();
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .expect("listener must stop on shutdown")

@@ -499,6 +499,12 @@ merlin_install() {
   /jffs/addons/sockrocket/scripts/sockrocket.sh firewall-restore
 '
 
+    install_hook "/jffs/scripts/nat-start" \
+'# NAT rebuilds drop DNS redirects before the next watchdog pass.
+[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+  /jffs/addons/sockrocket/scripts/sockrocket.sh nat-restore
+'
+
     install_hook "/jffs/scripts/services-start" \
 '# Boot checks the persistent Stop marker under the lifecycle lock.
 [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh boot

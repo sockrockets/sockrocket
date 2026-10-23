@@ -6,9 +6,9 @@ use sockrocket_core::router::{RouteAction, Router, china_geoip_db, rule_mode_rul
 use std::net::IpAddr;
 
 pub(super) fn rules_revision(map: &Mapping) -> String {
-    let input = json!({"rules": load_routing_rules(map),
+    let input = json!({"groups":map.get(ykey("groups")), "nodes":map.get(ykey("nodes")), "rules": load_routing_rules(map),
         "mode": conf_str(map,"proxy_mode").unwrap_or_else(||"rule".into()).to_lowercase(),
-        "active_node": conf_usize(map,"active_node")});
+        "active_node": conf_usize(map,"active_node"), "dns":map.get(ykey("dns")),"dns_direct_server":map.get(ykey("dns_direct_server")),"dns_direct_domains":map.get(ykey("dns_direct_domains")),"ipv6_mode":map.get(ykey("ipv6_mode"))});
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&input).unwrap_or_default())
@@ -105,7 +105,7 @@ pub(super) fn act_trace_route(post: &J) -> J {
         .parse::<IpAddr>()
         .ok()
         .or(destination_ip)
-        .is_some_and(|ip| matches!(ip,IpAddr::V4(ip) if sockrocket_core::is_fake_ip(ip)))
+        .is_some_and(|ip| sockrocket_core::dns::fakeip::fake_ipv4(ip).is_some())
     {
         return failure(
             "route_trace_fake_ip",
@@ -155,13 +155,34 @@ pub(super) fn act_trace_route(post: &J) -> J {
             Err(_) => return failure("route_trace_unavailable", "无法启动分流查询，请稍后重试"),
         };
         match rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(12),
-                router.trace_route(&host, port, source, destination_ip, resolve),
-            )
-            .await
+            let context = async {
+                let settings =
+                    sockrocket_core::config::dns::DnsSettings::from_yaml(&Y::Mapping(map.clone()))?;
+                let config: sockrocket_core::AppConfig =
+                    serde_yaml::from_value(Y::Mapping(map.clone()))?;
+                let dns = settings
+                    .resolver_config(config.nodes.iter().map(|node| node.server.clone()))?;
+                let mut resolver = sockrocket_core::DnsResolver::with_config(dns);
+                let outbound = match config.nodes.get(config.active_node.unwrap_or(0)) {
+                    Some(node) => sockrocket_core::create_outbound_unwarmed(node)?,
+                    None => sockrocket_core::SharedOutbound::direct(),
+                };
+                resolver.follow_runtime(outbound);
+                Ok::<_, anyhow::Error>(
+                    resolver
+                        .scope(router.trace_route(&host, port, source, destination_ip, resolve))
+                        .await,
+                )
+            };
+            tokio::time::timeout(Duration::from_secs(12), context).await
         }) {
-            Ok(value) => serde_json::to_value(value).unwrap(),
+            Ok(Ok(value)) => serde_json::to_value(value).unwrap(),
+            Ok(Err(_)) => {
+                return failure(
+                    "route_trace_dns_config",
+                    "无法构建当前 DNS 或节点配置，请检查网络与 DNS 设置",
+                );
+            }
             Err(_) => {
                 return failure(
                     "route_trace_timeout",
@@ -182,6 +203,18 @@ pub(super) fn act_trace_route(post: &J) -> J {
     // The daemon defaults an omitted active_node to the first configured node.
     // Match that default so polling status does not invalidate a valid trace.
     let active = Some(conf_usize(&map, "active_node").unwrap_or(0)).filter(|i| *i < nodes.len());
+    let selected_group = trace["action"]
+        .as_str()
+        .and_then(|s| s.strip_prefix("group:"));
+    let group_info = proxy_groups::catalog(&map);
+    let group_node = selected_group
+        .and_then(|name| {
+            group_info
+                .as_array()?
+                .iter()
+                .find(|g| g["name"].as_str() == Some(name))
+        })
+        .and_then(|g| g["selected_node"].as_str());
     let name = active
         .and_then(|i| nodes[i].get(ykey("name")))
         .and_then(Y::as_str);
@@ -190,7 +223,7 @@ pub(super) fn act_trace_route(post: &J) -> J {
         "mode":mode,"running":is_running(),"transparent_proxy":transparent_proxy,
         "lan_degraded":sockrocket_dir().join(".lan_degraded").exists(),
         "cn_ipset_direct":conf_bool(&map,"cn_ipset_direct",false),
-        "active_node":active,"node_name":name,"trace":trace})
+        "active_node":active,"node_name":if selected_group.is_some() {group_node} else {name},"proxy_group":selected_group,"group_type":selected_group.and_then(|name|group_info.as_array()?.iter().find(|g|g["name"].as_str()==Some(name))).map(|g|g["type"].clone()),"trace":trace})
 }
 
 #[cfg(test)]

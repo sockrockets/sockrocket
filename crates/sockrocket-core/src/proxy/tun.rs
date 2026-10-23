@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use etherparse::{Icmpv4Header, Icmpv6Header};
@@ -15,7 +15,7 @@ use super::connector::{SharedOutbound, connect_upstream};
 use super::relay::relay_bidirectional_with_idle_timeout;
 use super::routing::RoutingState;
 use crate::dns::DnsResolver;
-use crate::dns::fakeip::{FakeIpPool, is_fake_ip};
+use crate::dns::fakeip::FakeIpPool;
 use crate::router::Router;
 
 // ─── Global TUN exit state for emergency cleanup ───
@@ -616,10 +616,15 @@ impl TunProxy {
         // hold ipstack memory on a memory-tight Merlin router.
         tcp_config.timeout = std::time::Duration::from_secs(1800);
         tcp_config.options = Some(vec![TcpOptions::MaximumSegmentSize(tun_tcp_mss(TUN_MTU))]);
-        // 64 KiB (was 256 KiB): each TUN TCP session buffers up to this many
-        // unacked bytes in userspace. Hundreds of phone/PC flows × 256 KiB
-        // was a major contributor to OOM / dropbear death on 1 GB routers.
-        tcp_config.max_unacked_bytes = 64 * 1024;
+        // Ceiling for one LAN flow. The live cap sits on `window_limit` and
+        // shrinks toward 64 KiB as more TCP sessions appear, so a speed test
+        // gets a wide window without reserving 512 KiB for every flow. Both
+        // directions use it: the receive buffer used to stay at ipstack's
+        // 16 KiB default, which capped uploads the same way.
+        let window_limit = Arc::new(AtomicU32::new(crate::resources::tun_tcp_window_bytes(1)));
+        tcp_config.max_unacked_bytes = 512 * 1024;
+        tcp_config.read_buffer_size = 512 * 1024;
+        tcp_config.window_limit = window_limit.clone();
         ipstack_config.with_tcp_config(tcp_config);
         ipstack_config.udp_timeout(std::time::Duration::from_secs(30));
 
@@ -642,12 +647,17 @@ impl TunProxy {
         let active_tcp = Arc::new(AtomicUsize::new(0));
 
         /// Decrements the active-stream counter when a per-stream task ends.
-        struct StreamSlot(Arc<AtomicUsize>, Option<Arc<AtomicUsize>>);
+        struct StreamSlot(Arc<AtomicUsize>, Option<Arc<AtomicUsize>>, Arc<AtomicU32>);
         impl Drop for StreamSlot {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
                 if let Some(counter) = &self.1 {
-                    counter.fetch_sub(1, Ordering::Relaxed);
+                    let left = counter.fetch_sub(1, Ordering::Relaxed);
+                    let now = left.saturating_sub(1).max(1);
+                    self.2.store(
+                        crate::resources::tun_tcp_window_bytes(now),
+                        Ordering::Relaxed,
+                    );
                 }
             }
         }
@@ -762,15 +772,20 @@ impl TunProxy {
                         let resolver = dns_resolver.clone();
                         let fakeip = fakeip.clone();
                         let tcp_counter = if matches!(&stream, IpStackStream::Tcp(_)) {
-                            active_tcp.fetch_add(1, Ordering::Relaxed);
+                            let now = active_tcp.fetch_add(1, Ordering::Relaxed) + 1;
+                            window_limit.store(
+                                crate::resources::tun_tcp_window_bytes(now),
+                                Ordering::Relaxed,
+                            );
                             Some(active_tcp.clone())
                         } else {
                             None
                         };
                         active.fetch_add(1, Ordering::Relaxed);
                         let stats = stats.clone();
+                        let flow_window = window_limit.clone();
                         streams.spawn(async move {
-                            let _slot = StreamSlot(active, tcp_counter);
+                            let _slot = StreamSlot(active, tcp_counter, flow_window);
                             if let Err(e) =
                                 handle_tun_stream(stream, outbound, resolver, fakeip, router, stats)
                                     .await
@@ -894,14 +909,16 @@ async fn handle_tun_stream(
             .as_ref()
             .is_some_and(|pool| pool.lookup_domestic(ip).is_some())
     });
-    let real_destination =
-        destination.filter(|ip| !matches!(ip, IpAddr::V4(v4) if is_fake_ip(*v4)));
+    let real_destination = destination.filter(|ip| crate::dns::fakeip::fake_ipv4(*ip).is_none());
     super::routing::with_client_source(
         source,
         super::routing::with_tun_destination(
             real_destination,
             domestic,
-            handle_tun_stream_inner(stream, outbound, dns_resolver, fakeip, router, stats),
+            super::routing::with_tun_family(
+                destination.is_some_and(|ip| ip.is_ipv6()),
+                handle_tun_stream_inner(stream, outbound, dns_resolver, fakeip, router, stats),
+            ),
         ),
     )
     .await
@@ -997,12 +1014,32 @@ async fn handle_tun_stream_inner(
             } else {
                 outbound
             };
-            let remote = tokio::time::timeout(
+            let remote = match tokio::time::timeout(
                 super::connector::UPSTREAM_CONNECT_TIMEOUT,
                 transport.0.connect_datagram(&host, port),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("UDP association timed out"))??;
+            {
+                Ok(Ok(remote)) => remote,
+                Ok(Err(error)) => {
+                    // A UDP-capable group shares the LAN QUIC path with nodes
+                    // that have no datagram transport. Port unreachable lets
+                    // those clients fall back to TCP instead of hanging.
+                    if super::connector::udp_unsupported(&error)
+                        && let Err(send_error) = udp.reject_port_unreachable()
+                    {
+                        tracing::debug!("TUN UDP port unreachable {}: {}", dst, send_error);
+                    }
+                    tracing::debug!("TUN UDP {}: {}", dst, error);
+                    let _ = udp.shutdown().await;
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::debug!("TUN UDP {}: association timed out", dst);
+                    let _ = udp.shutdown().await;
+                    return Ok(());
+                }
+            };
             let connection = stats.track_active(format!("{}:{}", host, port), "TUN UDP");
             let result =
                 super::datagram::relay(&mut connection.observe(&mut udp), remote.as_ref()).await;
@@ -1105,9 +1142,7 @@ fn tun_dial_target(
     router: Option<&Arc<Router>>,
 ) -> Result<(String, u16, bool)> {
     if let Some(pool) = fakeip {
-        if let IpAddr::V4(v4) = addr.ip()
-            && is_fake_ip(v4)
-        {
+        if let Some(v4) = crate::dns::fakeip::fake_ipv4(addr.ip()) {
             return match pool.lookup(v4) {
                 Some(domain) => Ok((domain, addr.port(), false)),
                 None => anyhow::bail!(
@@ -1301,7 +1336,27 @@ fn relax_tun_rp_filter(tun_name: &str) {
     let _ = tun_name;
 }
 
-/// Assign the TUN IPv6 ULA address to the device.
+/// What to do with this TUN device's own `disable_ipv6` sysctl.
+///
+/// A new interface copies `default.disable_ipv6`. That inherited 1 is not a
+/// decision about the proxy; IPv6 on other interfaces and forwarding stay
+/// untouched. Missing sysctl means this kernel has no IPv6 for the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunIpv6Enable {
+    AlreadyOn,
+    TurnOn,
+    Missing,
+}
+
+fn tun_ipv6_enable_action(current: Option<&str>) -> TunIpv6Enable {
+    match current.map(str::trim) {
+        None => TunIpv6Enable::Missing,
+        Some("0") => TunIpv6Enable::AlreadyOn,
+        Some(_) => TunIpv6Enable::TurnOn,
+    }
+}
+
+/// Enable IPv6 on this TUN device only, then assign its ULA.
 ///
 /// The `tun` crate (0.8) only configures IPv4, so the v6 address is applied
 /// with platform tools after device creation. Failure is **non-fatal**: the
@@ -1314,18 +1369,8 @@ fn configure_tun_ipv6(tun_name: &str) -> Option<Ipv6Addr> {
     }
 
     #[cfg(target_os = "linux")]
-    let result = {
-        // Merlin may deliberately disable IPv6 on newly created interfaces.
-        // Respect that policy instead of issuing a command known to fail.
-        let disabled =
-            std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{tun_name}/disable_ipv6"))
-                .is_ok_and(|value| value.trim() == "1");
-        if disabled {
-            tracing::info!("TUN IPv6 disabled by system policy; using IPv4-only mode");
-            return None;
-        }
-        run_cmd_strs("ip", &linux_v6_addr_args(tun_name))
-    };
+    let result = enable_linux_tun_ipv6(tun_name)
+        .and_then(|_| run_cmd_strs("ip", &linux_v6_addr_args(tun_name)));
 
     #[cfg(target_os = "macos")]
     let result = run_cmd_strs("ifconfig", &macos_v6_addr_args(tun_name));
@@ -2605,11 +2650,49 @@ fn linux_v6_addr_args(dev: &str) -> Vec<String> {
     vec![
         "-6".into(),
         "addr".into(),
-        "add".into(),
+        "replace".into(),
         format!("{}/{}", TUN_IPV6, TUN_PREFIX_V6),
         "dev".into(),
         dev.into(),
     ]
+}
+
+/// Turn IPv6 on for the proxy TUN device. Does not change `all`, `default`,
+/// or forwarding, so firmware WAN advertisements stay as they were.
+#[cfg(target_os = "linux")]
+fn enable_linux_tun_ipv6(tun_name: &str) -> Result<()> {
+    let path = format!("/proc/sys/net/ipv6/conf/{tun_name}/disable_ipv6");
+    let mut last_err = None;
+    for attempt in 0..10 {
+        let action = match std::fs::read_to_string(&path) {
+            Ok(value) => tun_ipv6_enable_action(Some(&value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tun_ipv6_enable_action(None)
+            }
+            Err(error) => {
+                last_err = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+        };
+        match action {
+            TunIpv6Enable::AlreadyOn => return Ok(()),
+            TunIpv6Enable::Missing => {
+                bail!("TUN {tun_name}: IPv6 sysctl is not available");
+            }
+            TunIpv6Enable::TurnOn => match std::fs::write(&path, "0") {
+                Ok(()) => {
+                    tracing::info!("TUN {tun_name}: IPv6 enabled on the proxy interface");
+                    return Ok(());
+                }
+                Err(error) => last_err = Some(error),
+            },
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    bail!("TUN {tun_name}: failed to enable IPv6 ({last_err:?})")
 }
 
 #[allow(dead_code)]
@@ -3549,13 +3632,27 @@ mod tests {
     }
 
     #[test]
+    fn tun_ipv6_inherited_disable_is_turned_on_for_this_device_only() {
+        assert_eq!(tun_ipv6_enable_action(Some("1\n")), TunIpv6Enable::TurnOn);
+        assert_eq!(tun_ipv6_enable_action(Some("0")), TunIpv6Enable::AlreadyOn);
+        assert_eq!(tun_ipv6_enable_action(None), TunIpv6Enable::Missing);
+    }
+
+    #[test]
     fn test_linux_v6_command_builders() {
         let gw: Ipv6Addr = "fe80::1".parse().unwrap();
         let dns: Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
 
         assert_eq!(
             linux_v6_addr_args("tun0"),
-            vec!["-6", "addr", "add", "fd9a:4c2e:17b0::2/64", "dev", "tun0"]
+            vec![
+                "-6",
+                "addr",
+                "replace",
+                "fd9a:4c2e:17b0::2/64",
+                "dev",
+                "tun0"
+            ]
         );
         assert_eq!(
             linux_v6_default_add_args(&TUN_GATEWAY_V6, "tun0"),

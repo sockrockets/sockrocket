@@ -2,10 +2,12 @@
 //! to the built-in China-direct ruleset when no custom rule is enabled.
 //!
 //! Order when custom rules exist:
-//! 1. Device non-final rules, then device final rules (source match required).
-//! 2. Global non-final rules.
+//! 1. Device destination rules (source match required).
+//! 2. Global destination rules.
 //! 3. Built-in China-direct (including known domestic TUN destinations).
-//! 4. Global final rules, or a built-in MatchAll → Proxy fallback.
+//! 4. Device final rules (source match required). They replace only the global
+//!    fallback for that source.
+//! 5. Global final rules, or a built-in MatchAll → Proxy fallback.
 //!
 //! Priorities descend within each phase; ties keep configuration order.
 
@@ -20,8 +22,9 @@ fn is_catch_all(rule_type: &str) -> bool {
 ///
 /// Enabled custom rules win (sorted by [`RoutingRule::priority`]); when none
 /// are enabled the built-in China-direct ruleset is used so rule mode still
-/// behaves sanely. Global catch-all rules are deferred until after China-direct;
-/// device catch-alls precede global rules but only match their own clients.
+/// behaves sanely. Device and global catch-alls are deferred until after
+/// China-direct. A device catch-all replaces the global fallback for its
+/// source and does not hide earlier destination rules.
 pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
     let enabled: Vec<_> = rules
         .iter()
@@ -42,7 +45,6 @@ pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
         .partition(|(_, r)| !is_catch_all(&r.rule_type));
 
     let mut set = RuleSet::from_indexed_config(device_rules);
-    set.extend(RuleSet::from_indexed_config(device_finals));
     set.extend(RuleSet::from_indexed_config(non_final));
 
     // Built-in China-direct without its catch-all. Placed after user
@@ -56,6 +58,7 @@ pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
         set.add_rule(entry.rule.clone(), entry.action.clone());
     }
 
+    set.extend(RuleSet::from_indexed_config(device_finals));
     if finals.is_empty() {
         set.add_rule(MatchRule::MatchAll, RouteAction::Proxy);
     } else {
@@ -271,7 +274,7 @@ mod device_tests {
         );
     }
     #[tokio::test]
-    async fn device_catch_all_overrides_domestic_defaults_without_affecting_other_devices() {
+    async fn device_catch_all_replaces_only_the_global_fallback() {
         let router = Router::new(rule_mode_ruleset(&[
             rule(
                 "2001:db8:1::/64",
@@ -280,19 +283,24 @@ mod device_tests {
                 "direct",
                 20,
             ),
+            rule("", "domain-suffix", "shared.invalid", "direct", 0),
             rule("2001:db8:1::/64", "final", "*", "reject", 0),
-            rule("192.0.2.0/24", "final", "*", "proxy", 0),
+            rule("192.0.2.0/24", "final", "*", "direct", 0),
         ]));
         with_client_source(Some("2001:db8:1::10".parse().unwrap()), async {
             assert_eq!(router.route("safe.invalid", 443), RouteAction::Direct);
-            assert_eq!(router.route("www.baidu.com", 443), RouteAction::Reject);
+            assert_eq!(router.route("shared.invalid", 443), RouteAction::Direct);
+            assert_eq!(router.route("www.baidu.com", 443), RouteAction::Direct);
+            assert_eq!(router.route("other.invalid", 443), RouteAction::Reject);
         })
         .await;
         with_client_source(Some("192.0.2.10".parse().unwrap()), async {
-            assert_eq!(router.route("www.baidu.com", 443), RouteAction::Proxy);
+            assert_eq!(router.route("www.baidu.com", 443), RouteAction::Direct);
+            assert_eq!(router.route("other.invalid", 443), RouteAction::Direct);
         })
         .await;
         assert_eq!(router.route("www.baidu.com", 443), RouteAction::Direct);
+        assert_eq!(router.route("other.invalid", 443), RouteAction::Proxy);
     }
     #[tokio::test]
     async fn tun_original_destination_and_domestic_hint_survive_device_routing() {

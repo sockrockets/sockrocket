@@ -164,6 +164,24 @@ test_command_failure_exit_status() {
     check absent "$([ -d "$LOCK_DIR" ] && echo present || echo absent)" 'failed action releases lock'
 }
 
+test_nat_restore_reinstalls_dns_without_undoing_fail_open() {
+    printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    export SANDBOX
+    wait_for_dns() { return 0; }
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    echo fault > "$DEGRADED_FILE"
+    do_nat_restore
+    check absent "$([ -f "$SANDBOX/firewall.calls" ] && echo present || echo absent)" 'NAT rebuild cannot undo fail-open'
+    rm -f "$DEGRADED_FILE"
+    do_nat_restore
+    check dns-start "$(head -1 "$SANDBOX/firewall.calls")" 'NAT rebuild restores DNS hijack'
+    printf '\nipv6_mode: dual_stack\n' >> "$SOCKROCKET_CONF"
+    : > "$SANDBOX/firewall.calls"
+    do_nat_restore
+    check dns-start "$(head -1 "$SANDBOX/firewall.calls")" 'dual-stack NAT rebuild still restores IPv4 DNS first'
+    check ipv6-apply "$(tail -1 "$SANDBOX/firewall.calls")" 'dual-stack NAT rebuild restores IPv6 DNS'
+}
+
 test_firewall_event_respects_degraded_and_stopped() {
     printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
     export SANDBOX
@@ -174,6 +192,21 @@ test_firewall_event_respects_degraded_and_stopped() {
     rm -f "$DEGRADED_FILE"; touch "$SOCKROCKET_DIR/stopped"
     do_firewall_restore
     check absent "$([ -f "$SANDBOX/firewall.calls" ] && echo present || echo absent)" 'manual stop survives firewall rebuild'
+}
+
+test_reapply_respects_fail_open_and_clears_stale_ipv6_dns() {
+    printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    export SANDBOX
+    wait_for_tun() { return 0; }
+    iptables() { return 0; }
+    echo fault > "$DEGRADED_FILE"
+    do_reapply_policy
+    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'saving settings keeps fail-open armed'
+    check absent "$([ -f "$SANDBOX/firewall.calls" ] && echo present || echo absent)" 'fail-open LAN is not re-captured by a save'
+    rm -f "$DEGRADED_FILE"
+    sed -i.bak 's/^transparent_proxy: true/transparent_proxy: false/' "$SOCKROCKET_CONF"
+    do_reapply_policy
+    check ipv6-apply "$(head -1 "$SANDBOX/firewall.calls")" 'non-transparent save still removes IPv6 DNS redirects'
 }
 
 test_policy_routing_staged_and_idempotent() {
@@ -237,13 +270,13 @@ test_policy_routing_staged_and_idempotent() {
     printf '#!/bin/sh\nexit 0\n' > "$SOCKROCKET_DIR/sockrocket-cli"
     chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
     do_start
-    check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'UDP-capable nodes capture QUIC'
+    check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'QUIC stays inside the proxy for a UDP node'
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'native fake-IP UDP is not rejected'
     : > "$SANDBOX/kernel.calls"
     printf '#!/bin/sh\n[ "$1" = --dump-rule-sources ] && exit 0\nexit 1\n' > "$SOCKROCKET_DIR/sockrocket-cli"
     do_start
-    check 1 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls")" 'unsupported UDP retains safe fallback'
-    check 1 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls")" 'unsupported fake-IP UDP fails fast'
+    check 1 "$(grep -c -- '! -d 198.18.0.0/16 -p udp --dport 443 -j RETURN' "$SANDBOX/kernel.calls")" 'stream-only node keeps real-address QUIC on the kernel path'
+    check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'stream-only fake-IP UDP reaches userspace'
     # Device policies must reach userspace before CN bypass or QUIC fallback.
     LAN_SUBNET="192.0.2.0/24"
     : > "$SANDBOX/kernel.calls"
@@ -252,12 +285,12 @@ test_policy_routing_staged_and_idempotent() {
     printf '\ncn_ipset_direct: true\n' >> "$SOCKROCKET_CONF"
     do_start
     check 4 "$(grep -c '^-*iptables -t mangle -A SOCKROCKET_DEVICES -s ' "$SANDBOX/kernel.calls")" 'both TCP and UDP device scopes marked'
-    check 2 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD -s .* -j RETURN' "$SANDBOX/kernel.calls")" 'device direct UDP reaches core despite a stream-only node'
-    check 1 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD -s .* -d 198.18.0.0/16 -p udp -j REJECT' "$SANDBOX/kernel.calls")" 'other clients retain fake-UDP fast rejection'
+    check 0 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD ' "$SANDBOX/kernel.calls" || true)" 'QUIC is not a LAN-wide kernel switch'
     device_line=$(awk '/-A SOCKROCKET_MANGLE -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
     cn_line=$(awk '/--match-set sockrocket_cn dst/{print NR;exit}' "$SANDBOX/kernel.calls")
-    udp_line=$(awk '/--dport 443 -j RETURN/{print NR;exit}' "$SANDBOX/kernel.calls")
-    [ "$device_line" -lt "$cn_line" ] && [ "$device_line" -lt "$udp_line" ] || { echo 'device policies bypassed' >&2;exit 1; }
+    [ -n "$device_line" ] && [ -n "$cn_line" ] && [ "$device_line" -lt "$cn_line" ] || { echo 'device policies bypassed' >&2;exit 1; }
+    quic_line=$(awk '/-A SOCKROCKET_MANGLE .*--dport 443 -j RETURN/{print NR;exit}' "$SANDBOX/kernel.calls")
+    [ -n "$quic_line" ] && [ "$device_line" -lt "$quic_line" ] || { echo 'device policies bypassed by the stream-only QUIC path' >&2;exit 1; }
     flush_chains
     check 2 "$(grep -c -- '-X SOCKROCKET_DEVICES' "$SANDBOX/kernel.calls")" 'device chain removed on rebuild and explicit cleanup'
     : > "$SANDBOX/kernel.calls"
@@ -460,6 +493,8 @@ run_test test_old_kernel_memory_fallback
 run_test test_log_rotation_preserves_writer
 run_test test_degraded_start_still_creates_tun
 run_test test_command_failure_exit_status
+run_test test_nat_restore_reinstalls_dns_without_undoing_fail_open
 run_test test_firewall_event_respects_degraded_and_stopped
+run_test test_reapply_respects_fail_open_and_clears_stale_ipv6_dns
 run_test test_policy_routing_staged_and_idempotent
 echo "$PASS stability scenarios passed"

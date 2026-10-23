@@ -23,10 +23,6 @@ use super::pool::ConnFactory;
 
 /// Default timeout for TCP connect + TLS handshake.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Socket send/receive buffer size (256KB — improves throughput on high-BDP links).
-// 64 KiB keeps throughput acceptable while capping kernel+userspace buffer
-// residency on memory-tight Merlin routers (was 256 KiB).
-const SOCKET_BUF_SIZE: usize = 64 * 1024;
 /// TCP keepalive interval (keeps connections alive through NATs/firewalls).
 const TCP_KEEPALIVE_SECS: u64 = 30;
 
@@ -59,13 +55,17 @@ fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::Fingerpr
     }
 }
 
-/// Apply performance-critical socket options to a connected TCP stream:
-/// TCP_NODELAY, enlarged send/receive buffers, and TCP keepalive.
+/// Apply TCP_NODELAY and keepalive to a connected stream.
+///
+/// Send and receive buffer sizes stay unset. `SO_SNDBUF` / `SO_RCVBUF` lock
+/// the window — on Linux that disables autotune — and the previous 64 KiB
+/// lock capped each flow at about 64 KiB/RTT (roughly 2.5 Mbit/s at 200 ms).
+/// The kernel grows the window up to `tcp_rmem` / `tcp_wmem` and still limits
+/// the process total with `tcp_mem`. The TUN stack keeps a separate userspace
+/// window, widened for a few flows and narrowed again as sessions pile up.
 pub(crate) fn tune_socket(stream: &TcpStream) {
     stream.set_nodelay(true).ok();
     let sock = SockRef::from(stream);
-    sock.set_send_buffer_size(SOCKET_BUF_SIZE).ok();
-    sock.set_recv_buffer_size(SOCKET_BUF_SIZE).ok();
     let keepalive = TcpKeepalive::new().with_time(Duration::from_secs(TCP_KEEPALIVE_SECS));
     sock.set_tcp_keepalive(&keepalive).ok();
 }
@@ -144,6 +144,12 @@ async fn connect_tcp_inner(addr: &str) -> Result<TcpStream> {
 /// IP_BOUND_IF) can be applied before connecting — without it, our own
 /// direct-routed connections would loop back into the TUN device.
 async fn connect_bound(sa: SocketAddr) -> std::io::Result<TcpStream> {
+    if crate::dns::fakeip::fake_ipv4(sa.ip()).is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Fake-IP must be restored to a domain before connecting",
+        ));
+    }
     let socket = if sa.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
@@ -399,36 +405,135 @@ pub(crate) async fn resolve_server_ips(host: &str) -> Option<Vec<IpAddr>> {
     if host.parse::<IpAddr>().is_ok() {
         return None; // literal IPs don't need caching
     }
+    let configured = crate::dns::bootstrap_resolver(host);
+    let node_host = matches!(configured, Some((_, true)));
+    // Destinations follow per-request DNS policy. Node hostnames do not: they
+    // must resolve the same way whatever flow first dials them.
+    if !node_host
+        && let Some(Ok(ips)) = crate::dns::scoped_resolve(host).await
+        && !ips.is_empty()
+    {
+        return Some(ips);
+    }
     let cache = server_addr_cache();
     let now = Instant::now();
     if let Some(ips) = cache.get(host, now) {
         return Some(ips);
     }
+    if recently_failed(host, now) {
+        return None;
+    }
+    // Desktop TUN binds outbound sockets to the physical interface; direct
+    // UDP to a public resolver would otherwise enter the TUN itself.
+    if node_host && super::outbound_bind::outbound_bind().is_none() {
+        if let Some((resolver, _)) = &configured
+            && let Ok(ips) = resolver.resolve_addresses(host).await
+            && !ips.is_empty()
+        {
+            cache.insert(host, ips.clone(), Instant::now());
+            return Some(ips);
+        }
+        if !crate::dns::bootstrap_is_default() {
+            return remember_resolution(host, None);
+        }
+        let resolved = match resolve_with_bootstrap(global_bootstrap_dns_resolver(), host).await {
+            Some(ips) => Some(ips),
+            None if system_resolver_is_loopback() => None,
+            None => resolve_via_system(host).await,
+        };
+        return remember_resolution(host, resolved);
+    }
     // Bootstrap through domestic resolvers FIRST (see
-    // `resolve_via_bootstrap_dns`): on the router the system resolver is
-    // sockrocket's own pipeline, so asking it for the tunnel's own server hostname
-    // is circular. In desktop TUN mode (`outbound_bind` active) direct UDP
-    // would loop into the TUN device, so keep the system resolver there.
+    // `resolve_via_bootstrap_dns`). A resolv.conf that only lists 127.0.0.1
+    // or ::1 is this process's own pipeline on a transparent gateway, so
+    // falling through to it looks up the tunnel's own server through the
+    // tunnel. systemd-resolved's 127.0.0.53 is a different resolver and
+    // still counts as a usable system fallback. Desktop TUN
+    // (`outbound_bind` active) keeps the system resolver because direct UDP
+    // would loop into the TUN device.
     let resolved = if super::outbound_bind::outbound_bind().is_some() {
         resolve_via_system(host).await
+    } else if system_resolver_is_loopback() {
+        resolve_via_bootstrap_dns(host).await
     } else {
         match resolve_via_bootstrap_dns(host).await {
             Some(ips) => Some(ips),
             None => resolve_via_system(host).await,
         }
     };
-    match resolved {
-        Some(ips) => {
-            cache.insert(host, ips.clone(), Instant::now());
-            Some(ips)
-        }
-        None => None,
-    }
+    remember_resolution(host, resolved)
 }
 
-/// Resolve via the OS resolver (`/etc/resolv.conf`). On the router that file
-/// points at the local dnsmasq → sockrocket's own DNS listener, so this is only
-/// safe as a bootstrap fallback (or when no proxy pipeline is involved).
+/// A failed lookup is retried after this long instead of on every dial, so
+/// unreachable resolvers cost one timeout per window rather than per flow.
+const SERVER_ADDR_FAILURE_TTL: Duration = Duration::from_secs(5);
+
+fn failed_lookups() -> &'static Mutex<HashMap<String, Instant>> {
+    static FAILED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    FAILED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn recently_failed(host: &str, now: Instant) -> bool {
+    failed_lookups().lock().is_ok_and(|failed| {
+        failed
+            .get(host)
+            .is_some_and(|at| now.saturating_duration_since(*at) < SERVER_ADDR_FAILURE_TTL)
+    })
+}
+
+fn remember_resolution(host: &str, resolved: Option<Vec<IpAddr>>) -> Option<Vec<IpAddr>> {
+    let now = Instant::now();
+    if let Ok(mut failed) = failed_lookups().lock() {
+        failed.retain(|_, at| now.saturating_duration_since(*at) < SERVER_ADDR_FAILURE_TTL);
+        match &resolved {
+            Some(_) => {
+                failed.remove(host);
+            }
+            None if failed.len() < SERVER_ADDR_CACHE_CAP => {
+                failed.insert(host.to_owned(), now);
+            }
+            None => {}
+        }
+    }
+    if let Some(ips) = &resolved {
+        server_addr_cache().insert(host, ips.clone(), now);
+    }
+    resolved
+}
+
+/// True when every nameserver is the gateway's own loopback resolver.
+///
+/// `127.0.0.53` is left as a real system resolver. An empty file is not a
+/// loop: there is nothing to recurse into.
+pub(crate) fn nameservers_are_self_loop(resolv_conf: &str) -> bool {
+    let mut saw = false;
+    for line in resolv_conf.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(server) = parts.next() else {
+            continue;
+        };
+        saw = true;
+        if server != "127.0.0.1" && server != "::1" {
+            return false;
+        }
+    }
+    saw
+}
+
+fn system_resolver_is_loopback() -> bool {
+    std::fs::read_to_string("/etc/resolv.conf").is_ok_and(|text| nameservers_are_self_loop(&text))
+}
+
+/// Resolve via the OS resolver (`/etc/resolv.conf`). On a transparent gateway
+/// that file points at the local resolver, which forwards back here, so
+/// callers skip it when [`nameservers_are_self_loop`] is true.
 async fn resolve_via_system(host: &str) -> Option<Vec<IpAddr>> {
     match tokio::net::lookup_host((host, 0u16)).await {
         Ok(addrs) => {
@@ -455,28 +560,48 @@ async fn resolve_via_system(host: &str) -> Option<Vec<IpAddr>> {
 /// bootstrap them via domestic resolvers — direct, fast, and closer to the
 /// CDN edges the nodes sit behind. Any failure falls back to the system
 /// resolver (previous behaviour), which keeps non-CN desktops working.
-fn bootstrap_dns_resolver() -> &'static crate::dns::DnsResolver {
-    static RESOLVER: OnceLock<crate::dns::DnsResolver> = OnceLock::new();
-    RESOLVER.get_or_init(|| {
-        crate::dns::DnsResolver::with_config(crate::dns::DnsConfig {
-            servers: vec![
-                crate::dns::DnsServer::Udp("223.5.5.5:53".parse().unwrap()),
-                crate::dns::DnsServer::Udp("119.29.29.29:53".parse().unwrap()),
-            ],
-            fallback: Vec::new(),
-            domain_rules: Default::default(),
-            cache_ttl: 0,
-            // ServerAddrCache (60s) already memoizes; a second cache layer
-            // here would only lengthen the stale window.
-            cache_enabled: false,
-        })
+fn bootstrap_resolver_for(servers: &[&str]) -> crate::dns::DnsResolver {
+    crate::dns::DnsResolver::with_config(crate::dns::DnsConfig {
+        servers: servers
+            .iter()
+            .map(|server| crate::dns::DnsServer::Udp(server.parse().unwrap()))
+            .collect(),
+        fallback: Vec::new(),
+        domain_rules: Default::default(),
+        cache_ttl: 0,
+        // ServerAddrCache (60s) already memoizes; a second cache layer
+        // here would only lengthen the stale window.
+        cache_enabled: false,
+        ..Default::default()
     })
 }
 
-/// Resolve `host` via the bootstrap resolver (A and AAAA concurrently).
-/// Returns None when both families fail or come back empty.
+fn bootstrap_dns_resolver() -> &'static crate::dns::DnsResolver {
+    static RESOLVER: OnceLock<crate::dns::DnsResolver> = OnceLock::new();
+    RESOLVER.get_or_init(|| bootstrap_resolver_for(&["223.5.5.5:53", "119.29.29.29:53"]))
+}
+
+/// Tried only after the domestic pair fails, so a gateway outside China, or
+/// one whose WAN cannot reach those addresses, still resolves its nodes
+/// without looping through its own DNS listener.
+fn global_bootstrap_dns_resolver() -> &'static crate::dns::DnsResolver {
+    static RESOLVER: OnceLock<crate::dns::DnsResolver> = OnceLock::new();
+    RESOLVER.get_or_init(|| bootstrap_resolver_for(&["1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"]))
+}
+
+/// Resolve `host` via the bootstrap resolvers (A and AAAA concurrently).
+/// Returns None when both families fail or come back empty everywhere.
 async fn resolve_via_bootstrap_dns(host: &str) -> Option<Vec<IpAddr>> {
-    let resolver = bootstrap_dns_resolver();
+    if let Some(ips) = resolve_with_bootstrap(bootstrap_dns_resolver(), host).await {
+        return Some(ips);
+    }
+    resolve_with_bootstrap(global_bootstrap_dns_resolver(), host).await
+}
+
+async fn resolve_with_bootstrap(
+    resolver: &crate::dns::DnsResolver,
+    host: &str,
+) -> Option<Vec<IpAddr>> {
     let (a, aaaa) = tokio::join!(
         resolver.resolve_with_qtype(host, crate::dns::QTYPE_A),
         resolver.resolve_with_qtype(host, crate::dns::QTYPE_AAAA),
@@ -1144,6 +1269,24 @@ impl ConnFactory for TlsConnFactory {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn tune_socket_does_not_shrink_the_receive_window() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let before = SockRef::from(&client).recv_buffer_size().unwrap();
+        tune_socket(&client);
+        let after = SockRef::from(&client).recv_buffer_size().unwrap();
+        accept.abort();
+        assert!(
+            after >= before,
+            "tune_socket shrank the receive buffer from {before} to {after}"
+        );
+    }
+
     #[test]
     fn reality_bad_public_key_returns_error_not_panic() {
         let reality = RealityConfig {
@@ -1209,6 +1352,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_server_lookup_is_retried_only_after_the_window() {
+        let host = "failed-window.example.test";
+        let now = Instant::now();
+        assert!(!recently_failed(host, now));
+        assert_eq!(remember_resolution(host, None), None);
+        assert!(recently_failed(host, Instant::now()));
+        assert!(!recently_failed(
+            host,
+            Instant::now() + SERVER_ADDR_FAILURE_TTL
+        ));
+        let ips = vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))];
+        assert_eq!(remember_resolution(host, Some(ips.clone())), Some(ips));
+        assert!(!recently_failed(host, Instant::now()));
+    }
+
+    #[test]
     fn server_addr_cache_stores_ipv6() {
         let cache = ServerAddrCache::new();
         let ips = vec![
@@ -1221,6 +1380,18 @@ mod tests {
         let got = cache.get("dual.example.com", t0).unwrap();
         assert_eq!(got, ips);
         assert!(got.iter().any(|ip| ip.is_ipv6()));
+    }
+
+    #[test]
+    fn self_loop_nameservers_are_only_gateway_loopback() {
+        assert!(nameservers_are_self_loop("nameserver 127.0.0.1\n"));
+        assert!(nameservers_are_self_loop("# generated\nnameserver ::1\n"));
+        assert!(!nameservers_are_self_loop("nameserver 127.0.0.53\n"));
+        assert!(!nameservers_are_self_loop("nameserver 8.8.8.8\n"));
+        assert!(!nameservers_are_self_loop(
+            "nameserver 127.0.0.1\nnameserver 1.1.1.1\n"
+        ));
+        assert!(!nameservers_are_self_loop(""));
     }
 
     #[tokio::test]
