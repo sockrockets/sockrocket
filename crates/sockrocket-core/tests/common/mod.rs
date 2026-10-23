@@ -31,6 +31,8 @@ pub fn load_env_file(name: &str) -> HashMap<String, String> {
     map
 }
 
+// Each integration binary compiles this module alone and uses only one helper.
+#[allow(dead_code)]
 pub fn require(map: &HashMap<String, String>, key: &str) -> String {
     map.get(key)
         .cloned()
@@ -43,6 +45,7 @@ pub fn require(map: &HashMap<String, String>, key: &str) -> String {
         })
 }
 
+#[allow(dead_code)]
 pub fn optional(map: &HashMap<String, String>, key: &str) -> Option<String> {
     map.get(key).cloned().filter(|s| !s.is_empty())
 }

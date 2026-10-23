@@ -53,7 +53,7 @@ impl Budget {
     }
     fn take(&self, n: usize, reserve: usize) -> bool {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(n)
                     .filter(|next| *next <= self.limit.saturating_sub(reserve))
             })

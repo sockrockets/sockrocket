@@ -981,102 +981,9 @@ impl DnsResolver {
         }
         DnsGroup::Primary
     }
-
-    #[cfg(test)]
-    async fn query_proxy_tcp(
-        &self,
-        server: SocketAddr,
-        domain: &str,
-        qtype: u16,
-    ) -> Result<Vec<IpAddr>> {
-        let query = build_dns_query(domain, qtype);
-        parse_dns_response(
-            &self
-                .exchange_server(&DnsServer::ProxyTcp(server), &query)
-                .await?,
-        )
-    }
-    #[cfg(test)]
-    async fn query_proxy_tls(
-        &self,
-        server: SocketAddr,
-        sni: &str,
-        domain: &str,
-        qtype: u16,
-    ) -> Result<Vec<IpAddr>> {
-        let query = build_dns_query(domain, qtype);
-        parse_dns_response(
-            &self
-                .exchange_server(&DnsServer::ProxyTls(server, sni.to_owned()), &query)
-                .await?,
-        )
-    }
-
-    /// Query an upstream while retaining full wire validation and TCP fallback.
-    #[cfg(test)]
-    async fn query_udp(&self, server: SocketAddr, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        let query = build_dns_query(domain, qtype);
-        parse_dns_response(
-            &self
-                .exchange_server(&DnsServer::Udp(server), &query)
-                .await?,
-        )
-    }
-    #[cfg(test)]
-    async fn query_doh(&self, url: &str, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        let query = build_dns_query(domain, qtype);
-        parse_dns_response(
-            &self
-                .exchange_server(&DnsServer::DoH(url.to_owned()), &query)
-                .await?,
-        )
-    }
 }
 
 // --- DNS wire format helpers ---
-
-/// One RFC 7858-style DNS exchange over a (possibly TLS-wrapped) TCP stream:
-/// sends `[u16 length][query]`, reads the framed reply, parses it.
-/// Shared by the plain (`ProxyTcp`) and TLS (`ProxyTls`) proxy paths.
-#[cfg(test)]
-async fn dns_tcp_exchange(stream: &mut BoxProxyStream, query: &[u8]) -> Result<Vec<IpAddr>> {
-    let mut framed = Vec::with_capacity(query.len() + 2);
-    framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
-    framed.extend_from_slice(query);
-    stream.write_all(&framed).await?;
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    if resp_len == 0 {
-        bail!("Empty DNS-over-TCP response");
-    }
-    let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp).await?;
-
-    // Orphan-response guard. The exchange runs on a SHARED connection, and a
-    // racing query that lost `race_group` is aborted mid-exchange — its query
-    // was already written, so its response arrives LATE and sits in the read
-    // buffer. Without ID validation the NEXT exchange (any domain) reads that
-    // stale response, caches it under the wrong name for 600s, and clients
-    // connect to a different site's IP — observed as github.com
-    // answering with Google IPs and youtube serving Apple IPs, producing
-    // ERR_CERT_COMMON_NAME_INVALID all over the LAN. A mismatched ID means
-    // the stream is desynced by at least one orphan; bail and let the caller
-    // drop the connection and redial (both proxy exchange paths do).
-    if resp.len() >= 2 && query.len() >= 2 && resp[0..2] != query[0..2] {
-        bail!(
-            "DNS response ID mismatch (query {:02x}{:02x}, got {:02x}{:02x}) — stale orphan response on shared connection",
-            query[0],
-            query[1],
-            resp[0],
-            resp[1]
-        );
-    }
-
-    validate_response(query, &resp)?;
-    parse_dns_response(&resp)
-}
 
 /// Build the TLS connector used for DNS-over-TLS through the proxy.
 ///
@@ -1617,7 +1524,7 @@ mod tests {
     /// Mock DNS-over-TCP server: reads the 2-byte length prefix + wire query,
     /// answers A queries with `v4` and AAAA queries with `v6`.
     /// `DirectOutbound` plays the proxy role so this exercises the exact
-    /// framing `query_proxy_tcp` uses against a real socket. Increments
+    /// framing the proxy TCP resolver uses against a real socket. Increments
     /// `conns` for every accepted TCP connection so tests can assert reuse.
     async fn spawn_mock_dns_tcp(
         v4: Vec<IpAddr>,
