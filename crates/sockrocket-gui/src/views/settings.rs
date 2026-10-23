@@ -116,7 +116,7 @@ impl AppState {
                         use sockrocket_core::config::dns::AddressStrategy::*;
                         this.dns_draft.strategy=match this.dns_draft.strategy{PreferIpv4=>PreferIpv6,PreferIpv6=>Ipv4Only,Ipv4Only=>Ipv6Only,Ipv6Only=>PreferIpv4};cx.notify();
                     })))
-                    .child(dns_button("dns-cache",if self.dns_draft.cache_enabled{"Cache: On"}else{"Cache: Off"}).on_click(cx.listener(|this,_,_,cx|{this.dns_draft.cache_enabled=!this.dns_draft.cache_enabled;cx.notify();})))
+                    .child(dns_button("dns-cache",if self.dns_draft.cache_enabled{"Cache: On"}else{"Cache: Off"}).on_click(cx.listener(|this,_,_,cx|{this.dns_draft.cache_enabled = !this.dns_draft.cache_enabled;cx.notify();})))
                     .child(primary_button("dns-save","Apply DNS").on_click(cx.listener(|this,_,_,cx|{this.apply_dns_settings(cx);})))
                     .child(dns_button("dns-reload","Reload saved DNS").on_click(cx.listener(|this,_,window,cx|{this.reload_dns_form(window,cx);}))))
                 .child(div().text_size(px(MICRO)).text_color(rgb(TEXT_MUTED)).child("Encrypted DNS verifies certificates. Applying DNS preserves the current proxy and TUN state; new lookups use the saved policy.")))
