@@ -45,7 +45,7 @@ pub struct ReloadedConfig {
 #[derive(Debug, Clone)]
 pub enum ConfigWatchEvent {
     /// The file changed and parsed successfully.
-    Reloaded(ReloadedConfig),
+    Reloaded(Box<ReloadedConfig>),
     /// The file changed but failed to parse; the old config stays active.
     ParseError(String),
 }
@@ -55,7 +55,7 @@ struct WatcherState {
     content_hash: u64,
     /// The listen settings of the running service; changes against this
     /// baseline are reported as `requires_restart`.
-    restart_baseline: (String, u16, u16),
+    restart_baseline: (String, u16, u16, super::dns::Ipv6Mode),
 }
 
 /// Cloneable handle for writers to suppress self-triggered reloads.
@@ -75,6 +75,7 @@ impl ConfigWatchHandle {
             config.listen_addr.clone(),
             config.socks_port,
             config.http_port,
+            config.ipv6_mode,
         );
     }
 }
@@ -104,6 +105,7 @@ impl ConfigWatcher {
                 current.listen_addr.clone(),
                 current.socks_port,
                 current.http_port,
+                current.ipv6_mode,
             ),
         }));
 
@@ -154,10 +156,10 @@ impl ConfigWatcher {
                             requires_restart
                         );
                         let _ = events_tx
-                            .send(ConfigWatchEvent::Reloaded(ReloadedConfig {
+                            .send(ConfigWatchEvent::Reloaded(Box::new(ReloadedConfig {
                                 config,
                                 requires_restart,
-                            }))
+                            })))
                             .await;
                     }
                     Err(e) => {
@@ -218,7 +220,10 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
 }
 
 /// Compare the restart-relevant listen fields against the running baseline.
-fn restart_fields(baseline: &(String, u16, u16), config: &AppConfig) -> Vec<String> {
+fn restart_fields(
+    baseline: &(String, u16, u16, super::dns::Ipv6Mode),
+    config: &AppConfig,
+) -> Vec<String> {
     let mut fields = Vec::new();
     if config.listen_addr != baseline.0 {
         fields.push("listen_addr".to_string());
@@ -228,6 +233,9 @@ fn restart_fields(baseline: &(String, u16, u16), config: &AppConfig) -> Vec<Stri
     }
     if config.http_port != baseline.2 {
         fields.push("http_port".to_string());
+    }
+    if config.ipv6_mode != baseline.3 {
+        fields.push("ipv6_mode".into());
     }
     fields
 }

@@ -111,14 +111,15 @@ the installed marker and management API. Stopping or a daemon exit clears it.
 
 ## Per-device routing
 
-In **Routing rules**, set **Device source IP / subnet** to a client's fixed DHCP address, or a CIDR network for a device group. Leave it empty for a global rule. The destination condition still applies: two clients can send the same video domain to different actions (`proxy`, `direct`, or `reject`). A device-scoped final rule applies to the remaining traffic from that device.
+In **Routing rules**, set **Device source IP / subnet** to a client's fixed DHCP address, or a CIDR network for a device group. Leave it empty for a global rule. The destination condition still applies: two clients can send the same video domain to different actions (`proxy`, `direct`, or `reject`). A device-scoped final rule applies only to the remaining traffic from that device, after shared destination rules and built-in domestic routing.
 
 In rule mode, matching order is:
 
-1. Enabled device destination rules, then device final rules.
+1. Enabled device destination rules.
 2. Global destination rules.
 3. Built-in domestic / private-network direct routing.
-4. Global final rules, or default proxy.
+4. Device final rules for the matching source.
+5. Global final rules, or default proxy.
 
 Within each phase, higher priority wins; ties keep configuration order. Overlapping source networks do not automatically prefer the longest prefix. Global and direct modes bypass this policy entirely.
 
@@ -137,9 +138,9 @@ rules:
 
 Settings survive service and router restarts. Applying changes restarts the service; existing hardware-accelerated direct sessions may require reconnecting the client application. Bulk add accepts a shared source selector; native export preserves different selectors with `SOURCE,192.0.2.10/32,DOMAIN-SUFFIX,video.example.invalid,PROXY`. This prefix is Sockrocket syntax, not a portable Clash rule. Group editing retains the prefix; remove a device restriction with the individual rule editor by clearing its source.
 
-The flow overview can preview a client's IP locally without changing configuration. It includes applicable overlapping subnets and shows where a device final rule stops evaluation.
+The flow overview can preview a client's IP locally without changing configuration. It includes applicable overlapping subnets. A device final ends evaluation for that client after domestic and shared rules; it does not hide those earlier rules.
 
-Merlin's transparent path currently captures the main IPv4 LAN. Router/private destinations keep the existing kernel bypass; forwarded IPv6 remains subject to the existing IPv6 guard. IPv6 source matching is available in the core for supported ingress paths and does not enable IPv6 transparent interception on Merlin. HTTP/SOCKS identify the socket peer; NAT or an intermediate proxy can hide the original device. MAC discovery, per-device DNS resolvers, and different proxy nodes per device are not included. DNS/ICMP handling is unchanged; these are routing policies, not a replacement for router firewall access controls.
+Merlin's transparent path captures the main IPv4 LAN. Router/private destinations keep the existing kernel bypass. Compatibility mode keeps the IPv6 forward guard and does not intercept LAN IPv6. Dual-stack mode adds IPv6 policy routing and DNS interception for global on-link prefixes, and leaves queries already addressed to the router's own IPv6 addresses alone; that path is not accepted on a live router yet. Changing the IPv6 mode updates DNS in the running process and reapplies the firewall without exiting, so a rejected combination does not restart-loop the LAN into bypass. When the active node cannot carry UDP, QUIC still reaches a proxy group selected by an unsourced rule when that group can carry UDP; other proxied QUIC gets port unreachable so clients fall back to TCP. IPv6 source matching is available in the core for supported ingress paths. HTTP/SOCKS identify the socket peer; NAT or an intermediate proxy can hide the original device. MAC discovery, per-device DNS resolvers, and different proxy nodes per device are not included. DNS/ICMP handling is unchanged; these are routing policies, not a replacement for router firewall access controls.
 
 CN hardware bypass remains enabled for other clients. Sources with device policies enter the userspace router before the CN bypass, so the policy is not silently skipped. Enabling many such devices can increase router CPU load.
 

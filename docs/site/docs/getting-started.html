@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Sockrocket 使用指南：安装、导入订阅、连接与验证。">
+<title>使用指南 · Sockrocket</title>
+<link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+<script defer src="../docs.js"></script>
+</head>
+<body data-page="getting-started">
+<a class="skip" href="#main" data-t="skip">跳转到内容</a>
+<header class="header"><div class="nav wrap">
+  <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
+  <nav aria-label="Main navigation">
+    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
+    <a href="../index.html#merlin">Merlin</a>
+    <a href="../index.html#download" data-t="navDownload">下载</a>
+    <a href="./" data-t="navDocs" aria-current="page">文档</a>
+    <a href="../index.html#community" data-t="navCommunity">社区</a>
+  </nav>
+  <div class="nav-tools"><label class="sr-only" for="language">Language</label><select id="language"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select>
+  <a class="github" href="https://github.com/sockrockets/sockrocket" aria-label="GitHub"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true"><path d="M12 .8a11.2 11.2 0 0 0-3.54 21.83c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.03-.7.08-.69.08-.69 1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.93.1-.73.39-1.22.71-1.5-2.5-.29-5.13-1.25-5.13-5.54 0-1.22.44-2.22 1.16-3-.12-.28-.5-1.42.11-2.96 0 0 .95-.3 3.08 1.15a10.7 10.7 0 0 1 5.6 0c2.14-1.45 3.08-1.15 3.08-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3 0 4.3-2.63 5.25-5.14 5.53.4.35.76 1.03.76 2.08v3.1c0 .3.21.65.78.54A11.2 11.2 0 0 0 12 .8Z"/></svg></a></div>
+</div></header>
+<main id="main" class="wrap">
+  <header class="doc-hero">
+    <div class="doc-locale" data-locale="zh">
+      <p class="eyebrow"><span class="dot"></span>使用指南</p>
+      <h1>三步建立连接。</h1>
+      <p class="lead">先下载对应平台的发行包，导入你自己的订阅或节点，再验证系统代理是否工作。需要接管更多流量时再开 TUN。</p>
+    </div>
+    <div class="doc-locale" data-locale="en" hidden>
+      <p class="eyebrow"><span class="dot"></span>Getting started</p>
+      <h1>Three steps to a working connection.</h1>
+      <p class="lead">Download the package for your platform, import your own subscription or nodes, then verify the system proxy. Enable TUN only when you need broader capture.</p>
+    </div>
+  </header>
+  <div class="doc-layout">
+    <aside class="doc-toc" aria-label="On this page">
+      <strong>ON THIS PAGE</strong>
+      <div class="doc-locale" data-locale="zh">
+        <a href="#install">1. 安装</a>
+        <a href="#import">2. 导入</a>
+        <a href="#connect">3. 连接</a>
+        <a href="#verify">验证</a>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <a href="#en-install">1. Install</a>
+        <a href="#en-import">2. Import</a>
+        <a href="#en-connect">3. Connect</a>
+        <a href="#en-verify">Verify</a>
+      </div>
+      <div class="toc-group"><strong>MORE</strong>
+        <a href="merlin.html">Merlin</a>
+        <a href="configuration.html">配置 / Config</a>
+        <a href="./">文档首页</a>
+      </div>
+    </aside>
+    <article class="doc-article">
+      <div class="doc-locale" data-locale="zh">
+        <h2 id="install">1. 安装</h2>
+        <p>从 <a href="https://github.com/sockrockets/sockrocket/releases/latest">GitHub Releases</a> 下载对应系统的包：</p>
+        <div class="doc-table"><table>
+          <thead><tr><th>平台</th><th>桌面</th><th>CLI</th></tr></thead>
+          <tbody>
+            <tr><td>macOS Apple Silicon</td><td><code>sockrocket-macos-aarch64.dmg</code></td><td><code>sockrocket-cli-macos-aarch64</code></td></tr>
+            <tr><td>macOS Intel</td><td><code>sockrocket-macos-x86_64.dmg</code></td><td><code>sockrocket-cli-macos-x86_64</code></td></tr>
+            <tr><td>Windows x86_64</td><td><code>sockrocket-windows-x86_64.zip</code></td><td><code>sockrocket-cli-windows-x86_64.exe</code></td></tr>
+            <tr><td>Linux x86_64 / ARM64</td><td>对应 <code>.tar.gz</code></td><td>对应 <code>sockrocket-cli-linux-*</code></td></tr>
+          </tbody>
+        </table></div>
+        <p>升级前请先退出旧版及其后台进程，避免端口或路由被重复占用。</p>
+        <h2 id="import">2. 导入订阅或节点</h2>
+        <p><strong>桌面端：</strong>打开配置页，粘贴订阅 URL 并导入；或手动添加节点。支持节点链接以及 Clash、V2Ray、sing-box 订阅格式。</p>
+        <p><strong>命令行：</strong></p>
+        <pre><code>sockrocket-cli --init config.yaml
+# 编辑 config.yaml：填入 subscription URL 或 nodes
+sockrocket-cli config.yaml</code></pre>
+        <div class="doc-callout"><strong>本软件不提供节点</strong>订阅与节点需自行准备。不要在 issue 或截图里贴出完整订阅地址、密码或 UUID。</div>
+        <h2 id="connect">3. 连接</h2>
+        <ol>
+          <li>选择一个节点，可先测延迟。</li>
+          <li>按需要选择规则 / 全局 / 直连模式。</li>
+          <li>点击连接。默认系统代理即可覆盖多数应用。</li>
+          <li>需要接管更多流量时，再启用 TUN，并按系统提示授权。</li>
+        </ol>
+        <h2 id="verify">验证访问</h2>
+        <pre><code>curl -x socks5://127.0.0.1:1080 https://www.google.com -I
+curl -x http://127.0.0.1:1087 https://www.google.com -I</code></pre>
+        <p>默认监听：SOCKS5 <code>127.0.0.1:1080</code>，HTTP <code>127.0.0.1:1087</code>。</p>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <h2 id="en-install">1. Install</h2>
+        <p>Download from <a href="https://github.com/sockrockets/sockrocket/releases/latest">GitHub Releases</a>:</p>
+        <div class="doc-table"><table>
+          <thead><tr><th>Platform</th><th>Desktop</th><th>CLI</th></tr></thead>
+          <tbody>
+            <tr><td>macOS Apple Silicon</td><td><code>sockrocket-macos-aarch64.dmg</code></td><td><code>sockrocket-cli-macos-aarch64</code></td></tr>
+            <tr><td>macOS Intel</td><td><code>sockrocket-macos-x86_64.dmg</code></td><td><code>sockrocket-cli-macos-x86_64</code></td></tr>
+            <tr><td>Windows x86_64</td><td><code>sockrocket-windows-x86_64.zip</code></td><td><code>sockrocket-cli-windows-x86_64.exe</code></td></tr>
+            <tr><td>Linux x86_64 / ARM64</td><td>matching <code>.tar.gz</code></td><td>matching <code>sockrocket-cli-linux-*</code></td></tr>
+          </tbody>
+        </table></div>
+        <p>Quit the old version and its background instance before upgrading.</p>
+        <h2 id="en-import">2. Import a subscription or nodes</h2>
+        <p><strong>Desktop:</strong> paste a subscription URL and import, or add nodes manually. Node links plus Clash, V2Ray and sing-box formats are supported.</p>
+        <p><strong>CLI:</strong></p>
+        <pre><code>sockrocket-cli --init config.yaml
+# Edit config.yaml with your subscription URL or nodes
+sockrocket-cli config.yaml</code></pre>
+        <div class="doc-callout"><strong>No nodes are bundled</strong>Bring your own. Never paste full subscription URLs, passwords or UUIDs into issues or screenshots.</div>
+        <h2 id="en-connect">3. Connect</h2>
+        <ol>
+          <li>Pick a node; latency test is optional.</li>
+          <li>Choose Rule, Global or Direct.</li>
+          <li>Connect. System proxy covers most apps.</li>
+          <li>Enable TUN (and authorize) only when you need broader capture.</li>
+        </ol>
+        <h2 id="en-verify">Verify</h2>
+        <pre><code>curl -x socks5://127.0.0.1:1080 https://www.google.com -I
+curl -x http://127.0.0.1:1087 https://www.google.com -I</code></pre>
+        <p>Defaults: SOCKS5 <code>127.0.0.1:1080</code>, HTTP <code>127.0.0.1:1087</code>.</p>
+      </div>
+      <div class="doc-next">
+        <a href="merlin.html">→ Merlin 安装</a>
+        <a href="configuration.html">→ 配置说明</a>
+        <a href="./">← 文档首页</a>
+      </div>
+    </article>
+  </div>
+</main>
+<footer class="wrap"><a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="27" height="27" alt=""><span>Sockrocket</span></a><p data-t="footer">开源 Rust 代理客户端 · Apache-2.0</p><div><a href="./" data-t="docs">文档</a><a href="https://t.me/sockrocket">Telegram</a><a href="https://github.com/sockrockets/sockrocket">GitHub</a></div></footer>
+</body>
+</html>

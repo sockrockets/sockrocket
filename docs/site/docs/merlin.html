@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Sockrocket Merlin 插件安装：按固件平台选包、软件中心离线安装。">
+<title>Merlin 安装指南 · Sockrocket</title>
+<link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+<script defer src="../docs.js"></script>
+</head>
+<body data-page="merlin">
+<a class="skip" href="#main" data-t="skip">跳转到内容</a>
+<header class="header"><div class="nav wrap">
+  <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
+  <nav aria-label="Main navigation">
+    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
+    <a href="../index.html#merlin">Merlin</a>
+    <a href="../index.html#download" data-t="navDownload">下载</a>
+    <a href="./" data-t="navDocs" aria-current="page">文档</a>
+    <a href="../index.html#community" data-t="navCommunity">社区</a>
+  </nav>
+  <div class="nav-tools"><label class="sr-only" for="language">Language</label><select id="language"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select>
+  <a class="github" href="https://github.com/sockrockets/sockrocket" aria-label="GitHub"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true"><path d="M12 .8a11.2 11.2 0 0 0-3.54 21.83c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.03-.7.08-.69.08-.69 1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.93.1-.73.39-1.22.71-1.5-2.5-.29-5.13-1.25-5.13-5.54 0-1.22.44-2.22 1.16-3-.12-.28-.5-1.42.11-2.96 0 0 .95-.3 3.08 1.15a10.7 10.7 0 0 1 5.6 0c2.14-1.45 3.08-1.15 3.08-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3 0 4.3-2.63 5.25-5.14 5.53.4.35.76 1.03.76 2.08v3.1c0 .3.21.65.78.54A11.2 11.2 0 0 0 12 .8Z"/></svg></a></div>
+</div></header>
+<main id="main" class="wrap">
+  <header class="doc-hero">
+    <div class="doc-locale" data-locale="zh">
+      <p class="eyebrow"><span class="dot"></span>Merlin</p>
+      <h1>按固件平台选包，不是按路由器名字猜。</h1>
+      <p class="lead">在 AsusWRT-Merlin 上用软件中心离线安装。装错平台是最常见失败原因——尤其是 <code>hnd</code> 与 <code>hnd_v8</code>。</p>
+    </div>
+    <div class="doc-locale" data-locale="en" hidden>
+      <p class="eyebrow"><span class="dot"></span>Merlin</p>
+      <h1>Match the firmware platform, not the marketing name.</h1>
+      <p class="lead">Install offline from Software Center on AsusWRT-Merlin. Wrong platform is the usual failure — especially <code>hnd</code> vs <code>hnd_v8</code>.</p>
+    </div>
+  </header>
+  <div class="doc-layout">
+    <aside class="doc-toc">
+      <strong>ON THIS PAGE</strong>
+      <div class="doc-locale" data-locale="zh">
+        <a href="#requirements">准备</a>
+        <a href="#packages">选包</a>
+        <a href="#install">安装</a>
+        <a href="#after">安装后</a>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <a href="#en-requirements">Requirements</a>
+        <a href="#en-packages">Packages</a>
+        <a href="#en-install">Install</a>
+        <a href="#en-after">After</a>
+      </div>
+      <div class="toc-group"><strong>MORE</strong>
+        <a href="getting-started.html">使用指南</a>
+        <a href="configuration.html">配置</a>
+        <a href="./">文档首页</a>
+      </div>
+    </aside>
+    <article class="doc-article">
+      <div class="doc-locale" data-locale="zh">
+        <h2 id="requirements">准备</h2>
+        <ul>
+          <li>Asus 路由器，固件为 <strong>AsusWRT-Merlin</strong>（建议 388.x+，含软件中心）。</li>
+          <li>开启 <strong>JFFS</strong> 与自定义脚本（系统管理 → 系统设置）。</li>
+          <li>SSH 上执行 <code>uname -m</code>：<code>armv7l</code> 或 <code>aarch64</code>，用来对照下表。</li>
+        </ul>
+        <h2 id="packages">按平台选包</h2>
+        <div class="doc-table"><table>
+          <thead><tr><th>平台</th><th>软件包</th><th>常见机型 / SoC</th></tr></thead>
+          <tbody>
+            <tr><td><code>hnd_v8</code></td><td><code>sockrocket-merlin-hnd_v8.tar.gz</code></td><td>RT-AX86U / PRO、RT-AX88U、GT-AX6000 等 BCM490x/491x（aarch64）</td></tr>
+            <tr><td><code>hnd</code></td><td><code>sockrocket-merlin-hnd.tar.gz</code></td><td>TUF-AX3000、RT-AX58U、ZenWiFi XT8 等 BCM675x（armv7）</td></tr>
+            <tr><td><code>arm</code></td><td><code>sockrocket-merlin-arm.tar.gz</code></td><td>RT-AC68U、RT-AC88U 等经典 AC（BCM4708/4709）</td></tr>
+            <tr><td><code>qca</code></td><td><code>sockrocket-merlin-qca.tar.gz</code></td><td>RT-AX89X（IPQ807x）</td></tr>
+            <tr><td><code>mtk</code></td><td><code>sockrocket-merlin-mtk.tar.gz</code></td><td>TUF-AX4200 / AX6000、RT-AX59U（Filogic）</td></tr>
+            <tr><td><code>ipq32</code> / <code>ipq64</code></td><td>对应 tar.gz</td><td>IPQ53xx：以 <code>uname -m</code> 为准</td></tr>
+          </tbody>
+        </table></div>
+        <div class="doc-callout"><strong>和 fancyss 的差异</strong>fancyss 的 <code>hnd</code> 可能同时覆盖 ARMv7 与 ARMv8。Sockrocket 拆成 <code>hnd</code> 与 <code>hnd_v8</code>，必须和 CPU 一致，否则会出现 Exec format error。</div>
+        <h2 id="install">安装步骤</h2>
+        <ol>
+          <li>从 <a href="https://github.com/sockrockets/sockrocket/releases/latest">Releases</a> 下载对应 <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>（校验见 <code>SHA256SUMS-merlin.txt</code>）。</li>
+          <li>路由器 WebUI → <strong>软件中心</strong> → <strong>离线安装</strong>，上传该包。</li>
+          <li>安装完成后打开 Sockrocket 入口（或 Softcenter 菜单中的模块页）。</li>
+          <li>在页面里添加订阅或节点，开启透明代理 / DNS 劫持（按需）。</li>
+        </ol>
+        <p>也可用 SSH 解压后执行 <code>sh sockrocket/install.sh</code>（可选传入平台标签）。日常更推荐软件中心。</p>
+        <h2 id="after">安装后注意</h2>
+        <ul>
+          <li>默认 IPv6 模式为<strong>兼容</strong>：不依赖运营商是否开通 IPv6；只有固件已有 IPv6 时再考虑双栈。</li>
+          <li>升级前备份配置，并确认 JFFS 空间足够。</li>
+          <li>完整机型对照与故障排查见仓库长文（需要时再打开）：<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>。</li>
+        </ul>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <h2 id="en-requirements">Requirements</h2>
+        <ul>
+          <li>Asus router on <strong>AsusWRT-Merlin</strong> (388.x+ recommended) with Software Center.</li>
+          <li><strong>JFFS</strong> and custom scripts enabled.</li>
+          <li>Run <code>uname -m</code> (<code>armv7l</code> or <code>aarch64</code>) and match the table below.</li>
+        </ul>
+        <h2 id="en-packages">Pick a package</h2>
+        <div class="doc-table"><table>
+          <thead><tr><th>Platform</th><th>Package</th><th>Typical models / SoC</th></tr></thead>
+          <tbody>
+            <tr><td><code>hnd_v8</code></td><td><code>sockrocket-merlin-hnd_v8.tar.gz</code></td><td>RT-AX86U / PRO, RT-AX88U, GT-AX6000… BCM490x/491x (aarch64)</td></tr>
+            <tr><td><code>hnd</code></td><td><code>sockrocket-merlin-hnd.tar.gz</code></td><td>TUF-AX3000, RT-AX58U, ZenWiFi XT8… BCM675x (armv7)</td></tr>
+            <tr><td><code>arm</code></td><td><code>sockrocket-merlin-arm.tar.gz</code></td><td>RT-AC68U, RT-AC88U… classic AC</td></tr>
+            <tr><td><code>qca</code> / <code>mtk</code> / <code>ipq*</code></td><td>matching tar.gz</td><td>See full model lists in the repo guide when needed</td></tr>
+          </tbody>
+        </table></div>
+        <div class="doc-callout"><strong>Unlike fancyss</strong>Sockrocket splits <code>hnd</code> and <code>hnd_v8</code>. The wrong one fails with Exec format error.</div>
+        <h2 id="en-install">Install</h2>
+        <ol>
+          <li>Download the matching package from <a href="https://github.com/sockrockets/sockrocket/releases/latest">Releases</a>.</li>
+          <li>Router WebUI → Software Center → Offline install → upload the archive.</li>
+          <li>Open the Sockrocket module and add your subscription or nodes.</li>
+          <li>Enable transparent proxy / DNS hijack as needed.</li>
+        </ol>
+        <h2 id="en-after">After install</h2>
+        <ul>
+          <li>Default IPv6 mode is <strong>compatibility</strong> — no ISP IPv6 required.</li>
+          <li>Back up config and check JFFS space before upgrades.</li>
+          <li>Full model tables: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/merlin.md">docs/merlin.md</a>.</li>
+        </ul>
+      </div>
+      <div class="doc-next">
+        <a href="configuration.html">→ 配置说明</a>
+        <a href="getting-started.html">← 使用指南</a>
+        <a href="./">文档首页</a>
+      </div>
+    </article>
+  </div>
+</main>
+<footer class="wrap"><a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="27" height="27" alt=""><span>Sockrocket</span></a><p data-t="footer">开源 Rust 代理客户端 · Apache-2.0</p><div><a href="./" data-t="docs">文档</a><a href="https://t.me/sockrocket">Telegram</a><a href="https://github.com/sockrockets/sockrocket">GitHub</a></div></footer>
+</body>
+</html>

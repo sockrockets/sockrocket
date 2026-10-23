@@ -220,10 +220,10 @@ mod tests {
             .await;
         assert_eq!(
             trace.matched_rule,
-            Some(9),
-            "device final precedes global rules"
+            Some(0),
+            "global destination rules precede a device final"
         );
-        assert_eq!(trace.action, RouteAction::Direct);
+        assert_eq!(trace.action, RouteAction::Reject);
         let trace = router
             .trace_route("example.com", 443, None, None, false)
             .await;

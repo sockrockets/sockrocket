@@ -2,14 +2,26 @@
 
 Cross-platform proxy client (Rust): Shadowsocks, VMess, VLess, TUIC, Trojan, Hysteria2, and more.
 
-## User guides
+## Website guides (preferred for users)
+
+Readable pages on the marketing site (not raw GitHub Markdown):
+
+| Page | Description |
+|------|-------------|
+| [Docs hub](./site/docs/) | Index of user-facing guides |
+| [Getting started](./site/docs/getting-started.html) | Install, import, connect |
+| [Merlin install](./site/docs/merlin.html) | Package pick + Softcenter install |
+| [Configuration](./site/docs/configuration.html) | Everyday settings overview |
+| [Protocols](./site/docs/protocols.html) | Protocol matrix and limits |
+
+## Repository Markdown (full reference)
 
 | Document | Description |
 |----------|-------------|
-| [Getting started](./getting-started.md) | Install, configure, and first run |
-| [Configuration](./configuration.md) | Config file format and options |
-| [Protocols](./protocols.md) | Proxy protocols and transports |
-| [Merlin plugin](./merlin.md) | AsusWRT-Merlin transparent proxy |
+| [Getting started](./getting-started.md) | Same content as the site guide, Markdown form |
+| [Configuration](./configuration.md) | Full config file format and options |
+| [Protocols](./protocols.md) | Detailed protocol and transport notes |
+| [Merlin plugin](./merlin.md) | Full model tables and troubleshooting |
 | [Merlin technical reference](./merlin-reference.md) | Router deployment details |
 
 ## Developer guides

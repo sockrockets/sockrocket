@@ -118,7 +118,10 @@ fn short_type(rule_type: &str) -> &'static str {
     sockrocket_gui::i18n::t(key)
 }
 
-fn short_target(target: &str) -> &'static str {
+fn short_target(target: &str) -> &str {
+    if let Some(name) = target.strip_prefix("group:") {
+        return name;
+    }
     let key = TARGET_OPTIONS
         .iter()
         .find(|(value, _)| *value == target)
@@ -847,6 +850,28 @@ impl AppState {
                         }),
                     ),
             );
+        }
+        if menu == RuleMenu::Target {
+            for group in &self.groups {
+                let target = format!("group:{}", group.name);
+                let label = format!("Group · {}", group.name);
+                panel = panel.child(
+                    div()
+                        .id(SharedString::from(target.clone()))
+                        .px_3()
+                        .py_1p5()
+                        .child(label)
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.rule_target_sel = target.clone();
+                                this.rule_menu = None;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
         }
         div()
             .relative()

@@ -42,6 +42,12 @@ fn hairline() -> Div {
         .bg(rgba(with_alpha(BORDER, 0x99)))
 }
 
+fn dns_button(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
+    primary_button(id, label)
+        .bg(rgba(with_alpha(ACCENT, 0x15)))
+        .text_color(rgb(ACCENT))
+}
+
 impl AppState {
     pub(crate) fn render_settings(&mut self, cx: &mut Context<Self>) -> Div {
         let listen_addr_input = self.listen_addr_input.clone();
@@ -97,6 +103,23 @@ impl AppState {
                         ))
                     }),
             )
+            .child(card().child(section_label("DNS"))
+                .child(div().text_size(px(SMALL)).text_color(rgb(TEXT_SECONDARY)).child("One endpoint per line. Direct: UDP / TCP / TLS / HTTPS. Proxy: TCP / TLS / HTTPS."))
+                .child(div().text_size(px(SMALL)).child("Direct DNS (required)"))
+                .child(gpui_component::input::Input::new(&self.dns_direct_input).xsmall())
+                .child(div().text_size(px(SMALL)).child("Proxy DNS (required)"))
+                .child(gpui_component::input::Input::new(&self.dns_proxy_input).xsmall())
+                .child(div().text_size(px(SMALL)).child("Bootstrap and node DNS (required IP:port)"))
+                .child(gpui_component::input::Input::new(&self.dns_bootstrap_input).xsmall())
+                .child(div().flex().flex_row().flex_wrap().gap_2()
+                    .child(dns_button("dns-strategy",format!("Address policy: {:?}",self.dns_draft.strategy)).on_click(cx.listener(|this,_,_,cx|{
+                        use sockrocket_core::config::dns::AddressStrategy::*;
+                        this.dns_draft.strategy=match this.dns_draft.strategy{PreferIpv4=>PreferIpv6,PreferIpv6=>Ipv4Only,Ipv4Only=>Ipv6Only,Ipv6Only=>PreferIpv4};cx.notify();
+                    })))
+                    .child(dns_button("dns-cache",if self.dns_draft.cache_enabled{"Cache: On"}else{"Cache: Off"}).on_click(cx.listener(|this,_,_,cx|{this.dns_draft.cache_enabled = !this.dns_draft.cache_enabled;cx.notify();})))
+                    .child(primary_button("dns-save","Apply DNS").on_click(cx.listener(|this,_,_,cx|{this.apply_dns_settings(cx);})))
+                    .child(dns_button("dns-reload","Reload saved DNS").on_click(cx.listener(|this,_,window,cx|{this.reload_dns_form(window,cx);}))))
+                .child(div().text_size(px(MICRO)).text_color(rgb(TEXT_MUTED)).child("Encrypted DNS verifies certificates. Applying DNS preserves the current proxy and TUN state; new lookups use the saved policy.")))
             // === SYSTEM card (v2: System Proxy toggle + static Theme label) ===
             .child(
                 card()
@@ -223,7 +246,7 @@ impl AppState {
                 .child(div().text_size(px(SMALL)).text_color(rgb(TEXT_SECONDARY))
                     .child("HTTP/HTTPS · SOCKS5 TCP and UDP · TUN TCP and UDP"))
                 .child(div().text_size(px(MICRO)).text_color(rgb(TEXT_MUTED))
-                    .child("UDP requires a compatible node. SOCKS BIND is unsupported. Merlin transparent routing currently uses IPv4; full IPv6 forwarding is not enabled.")))
+                    .child("UDP requires a compatible node. SOCKS BIND is unsupported. Merlin offers IPv4 compatibility and opt-in dual-stack routing. Firmware and LAN acceptance checks are required for IPv6.")))
             // === ABOUT card (v2: gradient logo + name/version + GitHub) ===
             .child(
                 card()

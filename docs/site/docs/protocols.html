@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Sockrocket 协议能力：Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS、WireGuard。">
+<title>协议与传输 · Sockrocket</title>
+<link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+<script defer src="../docs.js"></script>
+</head>
+<body data-page="protocols">
+<a class="skip" href="#main" data-t="skip">跳转到内容</a>
+<header class="header"><div class="nav wrap">
+  <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
+  <nav aria-label="Main navigation">
+    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
+    <a href="../index.html#merlin">Merlin</a>
+    <a href="../index.html#download" data-t="navDownload">下载</a>
+    <a href="./" data-t="navDocs" aria-current="page">文档</a>
+    <a href="../index.html#community" data-t="navCommunity">社区</a>
+  </nav>
+  <div class="nav-tools"><label class="sr-only" for="language">Language</label><select id="language"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select>
+  <a class="github" href="https://github.com/sockrockets/sockrocket" aria-label="GitHub"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true"><path d="M12 .8a11.2 11.2 0 0 0-3.54 21.83c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.03-.7.08-.69.08-.69 1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.93.1-.73.39-1.22.71-1.5-2.5-.29-5.13-1.25-5.13-5.54 0-1.22.44-2.22 1.16-3-.12-.28-.5-1.42.11-2.96 0 0 .95-.3 3.08 1.15a10.7 10.7 0 0 1 5.6 0c2.14-1.45 3.08-1.15 3.08-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3 0 4.3-2.63 5.25-5.14 5.53.4.35.76 1.03.76 2.08v3.1c0 .3.21.65.78.54A11.2 11.2 0 0 0 12 .8Z"/></svg></a></div>
+</div></header>
+<main id="main" class="wrap">
+  <header class="doc-hero">
+    <div class="doc-locale" data-locale="zh">
+      <p class="eyebrow"><span class="dot"></span>协议</p>
+      <h1>一个 Rust 内核，桌面与路由器共用。</h1>
+      <p class="lead">运行时不依赖外部代理可执行文件。下表描述<strong>当前源码</strong>能力；已下载的发行包以对应版本说明为准。</p>
+    </div>
+    <div class="doc-locale" data-locale="en" hidden>
+      <p class="eyebrow"><span class="dot"></span>Protocols</p>
+      <h1>One Rust engine for desktop and router.</h1>
+      <p class="lead">No external proxy binary at runtime. The table describes <strong>current source</strong> capabilities; installed packages follow their release notes.</p>
+    </div>
+  </header>
+  <div class="doc-layout">
+    <aside class="doc-toc">
+      <strong>ON THIS PAGE</strong>
+      <div class="doc-locale" data-locale="zh">
+        <a href="#table">协议一览</a>
+        <a href="#limits">兼容边界</a>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <a href="#en-table">Protocol matrix</a>
+        <a href="#en-limits">Limits</a>
+      </div>
+      <div class="toc-group"><strong>MORE</strong>
+        <a href="configuration.html">配置</a>
+        <a href="getting-started.html">使用指南</a>
+        <a href="./">文档首页</a>
+      </div>
+    </aside>
+    <article class="doc-article">
+      <div class="doc-locale" data-locale="zh">
+        <h2 id="table">协议一览</h2>
+        <div class="doc-table"><table>
+          <thead><tr><th>协议</th><th>TCP</th><th>UDP</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>Shadowsocks</td><td>是</td><td>是</td><td>AEAD / SS2022；ShadowTLS 仅 TCP</td></tr>
+            <tr><td>VMess</td><td>是</td><td>是</td><td>仅 AEAD（alterId = 0）</td></tr>
+            <tr><td>VLESS</td><td>是</td><td>是</td><td>TLS / WS / REALITY；Vision 见下</td></tr>
+            <tr><td>Trojan</td><td>是</td><td>是</td><td>默认 TLS</td></tr>
+            <tr><td>TUIC v5</td><td>是</td><td>是</td><td>原生 QUIC</td></tr>
+            <tr><td>Hysteria2</td><td>是</td><td>是</td><td>原生 QUIC；混淆与端口跳跃未实现</td></tr>
+            <tr><td>AnyTLS v2</td><td>是</td><td>是</td><td>原生 TLS 会话复用；UDP-over-TCP v2</td></tr>
+            <tr><td>WireGuard</td><td>是</td><td>是</td><td>用户态单 Peer；UDP 需符合隧道 MTU</td></tr>
+          </tbody>
+        </table></div>
+        <h2 id="limits">兼容边界</h2>
+        <ul>
+          <li>VLESS Vision：TLS 1.3 / REALITY TCP 与 XUDP；标准 flow 拒绝 UDP/443，便于客户端回退 TCP。</li>
+          <li>gRPC / XHTTP 等未实现的传输会<strong>明确拒绝</strong>，不会悄悄改成裸 TCP。</li>
+          <li>WireGuard：暂不支持多 Peer、IP 分片与配置脚本。</li>
+          <li>默认校验证书；节点的 <code>udp</code> 开关也会限制 UDP。</li>
+        </ul>
+        <p>更细的 Vision / AnyTLS / WireGuard 说明见仓库：<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/protocols.md">docs/protocols.md</a>。</p>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <h2 id="en-table">Protocol matrix</h2>
+        <div class="doc-table"><table>
+          <thead><tr><th>Protocol</th><th>TCP</th><th>UDP</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Shadowsocks</td><td>Yes</td><td>Yes</td><td>AEAD / SS2022; ShadowTLS is TCP only</td></tr>
+            <tr><td>VMess</td><td>Yes</td><td>Yes</td><td>AEAD only (alterId = 0)</td></tr>
+            <tr><td>VLESS</td><td>Yes</td><td>Yes</td><td>TLS / WS / REALITY; Vision below</td></tr>
+            <tr><td>Trojan</td><td>Yes</td><td>Yes</td><td>TLS by default</td></tr>
+            <tr><td>TUIC v5</td><td>Yes</td><td>Yes</td><td>Native QUIC</td></tr>
+            <tr><td>Hysteria2</td><td>Yes</td><td>Yes</td><td>Native QUIC; obfuscation / port hopping not implemented</td></tr>
+            <tr><td>AnyTLS v2</td><td>Yes</td><td>Yes</td><td>Native TLS reuse; UDP-over-TCP v2</td></tr>
+            <tr><td>WireGuard</td><td>Yes</td><td>Yes</td><td>Userspace, one peer; UDP must fit tunnel MTU</td></tr>
+          </tbody>
+        </table></div>
+        <h2 id="en-limits">Limits</h2>
+        <ul>
+          <li>VLESS Vision: TLS 1.3 / REALITY TCP and XUDP; standard flow rejects UDP/443 for TCP fallback.</li>
+          <li>Unsupported transports such as gRPC / XHTTP are rejected explicitly.</li>
+          <li>WireGuard: no multi-peer, IP fragmentation or profile scripts yet.</li>
+        </ul>
+        <p>Details: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/protocols.md">docs/protocols.md</a>.</p>
+      </div>
+      <div class="doc-next">
+        <a href="getting-started.html">→ 使用指南</a>
+        <a href="configuration.html">← 配置</a>
+        <a href="./">文档首页</a>
+      </div>
+    </article>
+  </div>
+</main>
+<footer class="wrap"><a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="27" height="27" alt=""><span>Sockrocket</span></a><p data-t="footer">开源 Rust 代理客户端 · Apache-2.0</p><div><a href="./" data-t="docs">文档</a><a href="https://t.me/sockrocket">Telegram</a><a href="https://github.com/sockrockets/sockrocket">GitHub</a></div></footer>
+</body>
+</html>

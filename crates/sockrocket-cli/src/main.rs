@@ -100,7 +100,13 @@ async fn async_main() -> Result<()> {
     }
 
     // Validated IPv4 source networks needing userspace policy before CN bypass.
-    if let Some(index) = args.iter().position(|arg| arg == "--dump-rule-sources") {
+    if let Some(index) = args.iter().position(|arg| {
+        matches!(
+            arg.as_str(),
+            "--dump-rule-sources" | "--dump-rule-sources-v6"
+        )
+    }) {
+        let ipv6 = args[index] == "--dump-rule-sources-v6";
         let path = args
             .get(index + 1)
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
@@ -110,7 +116,7 @@ async fn async_main() -> Result<()> {
                 .rules
                 .iter()
                 .filter(|rule| {
-                    rule.enabled && !rule.source.is_empty() && !rule.source.contains(':')
+                    rule.enabled && !rule.source.is_empty() && rule.source.contains(':') == ipv6
                 })
                 .map(|rule| rule.source.as_str())
                 .collect();
@@ -129,11 +135,13 @@ async fn async_main() -> Result<()> {
         if config.proxy_mode == ProxyMode::Direct {
             return Ok(());
         }
-        let selected = resolve_active_index(&config)?.and_then(|index| config.nodes.get(index));
-        if selected.is_some_and(|node| node.protocol.supports_udp()) {
-            return Ok(());
+        // LAN-wide UDP/443 follows the active node, or an unsourced rule whose
+        // group can carry UDP. One unused member must not open that port.
+        match sockrocket_core::config::group::lan_wide_udp(&config) {
+            Ok(true) => return Ok(()),
+            Ok(false) => bail!("UDP disabled or unsupported for this node"),
+            Err(message) => bail!(message),
         }
-        bail!("UDP disabled or unsupported for this node");
     }
 
     // API mode: `sockrocket-cli api [port]` — standalone HTTP JSON backend for the
@@ -170,6 +178,19 @@ async fn async_main() -> Result<()> {
         .await
         .with_context(|| format!("failed to load config from {}", config_path))?;
 
+    let dns_value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(&config_path)?)?;
+    let dns_settings = sockrocket_core::config::dns::DnsSettings::from_yaml(&dns_value)?;
+    sockrocket_core::dns::configure_bootstrap(
+        &dns_settings,
+        config.nodes.iter().map(|n| n.server.clone()),
+    )?;
+    anyhow::ensure!(
+        !(enable_tun
+            && !setup_routes
+            && config.ipv6_mode == sockrocket_core::config::dns::Ipv6Mode::Compatibility
+            && dns_settings.strategy == sockrocket_core::config::dns::AddressStrategy::Ipv6Only),
+        "IPv6-only DNS requires dual_stack in Merlin transparent mode"
+    );
     let active_index = resolve_active_index(&config)?;
     let router = router_for_mode(&config);
     let outbound = build_outbound(&config, active_index, router.as_ref())?;
@@ -186,11 +207,49 @@ async fn async_main() -> Result<()> {
     // Swappable wrapper: health-check failover and config hot-reload replace
     // the inner outbound without rebinding the local listeners.
     let swappable = Arc::new(SwappableOutbound::new(outbound.clone()));
-    swappable.publish(
-        outbound.clone(),
-        Arc::new(read_router_dns_config(&config_path, &config.nodes)?),
+    let mut dns_config = read_router_dns_config(&config_path, &config.nodes)?;
+    set_transparent_dns_flags(
+        &mut dns_config,
+        enable_tun && !setup_routes,
+        config.ipv6_mode,
+        &config_path,
     );
+    swappable.publish(outbound.clone(), Arc::new(dns_config));
     let shared_outbound = SharedOutbound(swappable.clone());
+    // IPv6 DNS answers and the IPv6 listener both follow the installed LAN
+    // interception, never the saved mode alone.
+    // The mode last accepted by startup or reload; the gate task must not
+    // re-read a file the reload rejected.
+    let mut applied_ipv6_mode = config.ipv6_mode;
+    let dual_stack_mode = Arc::new(std::sync::atomic::AtomicBool::new(
+        config.ipv6_mode == sockrocket_core::config::dns::Ipv6Mode::DualStack,
+    ));
+    let ipv6_dns_open = Arc::new(std::sync::atomic::AtomicBool::new(
+        enable_tun && !setup_routes && merlin_ipv6_answers(config.ipv6_mode, &config_path),
+    ));
+    if enable_tun && !setup_routes {
+        let watcher = swappable.clone();
+        let watched_config = config_path.clone();
+        let gate = ipv6_dns_open.clone();
+        let dual_stack_mode = dual_stack_mode.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let now = dual_stack_mode.load(Relaxed) && merlin_ipv6_dns_ready(&watched_config);
+                if now == gate.load(Relaxed) {
+                    continue;
+                }
+                if watcher.update_dns(|dns| set_ipv6_answer_flags(dns, true, now)) {
+                    gate.store(now, Relaxed);
+                    tracing::info!(
+                        active = now,
+                        "LAN DNS follows the installed IPv6 interception"
+                    );
+                }
+            }
+        });
+    }
 
     // Start HTTP/SOCKS5 proxy service
     let mut service = ProxyService::with_outbound(shared_outbound.clone());
@@ -238,7 +297,7 @@ async fn async_main() -> Result<()> {
             let mut resolver = DnsResolver::with_config(dns_config);
             // Merlin owns IPv4 policy routing in iptables.sh, rather than
             // --tun-routes. Do not advertise unreachable LAN IPv6 endpoints.
-            if enable_tun && !setup_routes {
+            if enable_tun && !setup_routes && !merlin_ipv6_answers(config.ipv6_mode, &config_path) {
                 resolver.set_client_ipv4_only(true);
                 tracing::info!(
                     "LAN DNS: IPv4-only transparent gateway; AAAA and HTTPS hints suppressed"
@@ -261,10 +320,21 @@ async fn async_main() -> Result<()> {
             let shutdown = Arc::new(tokio::sync::Notify::new());
             let task = tokio::spawn({
                 let shutdown = shutdown.clone();
+                let ipv6_open = ipv6_dns_open.clone();
                 async move {
-                    if let Err(e) =
+                    let result = if enable_tun && !setup_routes {
+                        sockrocket_core::serve_dns_udp_and_ipv6(
+                            "127.0.0.1",
+                            port,
+                            resolver,
+                            shutdown,
+                            ipv6_open,
+                        )
+                        .await
+                    } else {
                         sockrocket_core::serve_dns_udp("127.0.0.1", port, resolver, shutdown).await
-                    {
+                    };
+                    if let Err(e) = result {
                         tracing::error!("DNS listener failed: {e:#}");
                         let _ = dns_failure_tx.send(e.to_string());
                     }
@@ -293,7 +363,7 @@ async fn async_main() -> Result<()> {
     );
 
     // Node health check + auto-switch (opt-in via `health_check.enabled`).
-    let mut outbound_factory = make_outbound_factory(router.clone());
+    let mut outbound_factory = make_outbound_factory(router.clone(), &config);
     if config.health_check.enabled {
         service.enable_health_check(HealthCheckSetup {
             config: config.health_check.clone(),
@@ -544,19 +614,102 @@ async fn async_main() -> Result<()> {
                         );
                     }
                     ConfigWatchEvent::Reloaded(reloaded) => {
+                        // Compare with the mode the firewall was last told about,
+                        // not the one at process start: dual_stack and back to
+                        // the original mode must still reapply the policy.
+                        let mode_changed = reloaded.config.ipv6_mode != applied_ipv6_mode;
                         for field in &reloaded.requires_restart {
+                            if field == "ipv6_mode" {
+                                continue;
+                            }
                             tracing::warn!(
                                 "config field '{}' changed — restart sockrocket-cli for it to take effect",
                                 field
                             );
                         }
+                        let content = match fs::read_to_string(&config_path) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                tracing::error!(
+                                    "DNS config reload skipped, keeping previous config: {error:#}"
+                                );
+                                continue;
+                            }
+                        };
+                        let parsed: serde_yaml::Value = match serde_yaml::from_str(&content) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::error!(
+                                    "DNS config reload skipped, keeping previous config: {error:#}"
+                                );
+                                continue;
+                            }
+                        };
+                        let settings = match sockrocket_core::config::dns::DnsSettings::from_yaml(
+                            &parsed,
+                        ) {
+                            Ok(settings) => settings,
+                            Err(error) => {
+                                tracing::error!(
+                                    "DNS config reload skipped, keeping previous config: {error:#}"
+                                );
+                                continue;
+                            }
+                        };
+                        let decision = ipv6_reload_decision(
+                            enable_tun && !setup_routes,
+                            mode_changed,
+                            reloaded.config.ipv6_mode
+                                == sockrocket_core::config::dns::Ipv6Mode::Compatibility,
+                            settings.strategy
+                                == sockrocket_core::config::dns::AddressStrategy::Ipv6Only,
+                        );
+                        if decision == Ipv6Reload::Keep {
+                            tracing::error!(
+                                "IPv6-only DNS requires dual_stack in Merlin transparent mode; keeping previous config"
+                            );
+                            continue;
+                        }
                         match apply_reloaded_config(reloaded.config).await {
                             Ok((new_config, new_index, new_outbound)) => {
-                                let dns_config=match read_router_dns_config(&config_path,&new_config.nodes) {
-                                    Ok(config)=>config,
-                                    Err(error)=>{tracing::error!("DNS config reload rejected: {error:#}");continue;}
+                                let mut dns_config = match settings.resolver_config(
+                                    new_config.nodes.iter().map(|node| node.server.clone()),
+                                ) {
+                                    Ok(config) => config,
+                                    Err(error) => {
+                                        tracing::error!(
+                                            "DNS config reload skipped, keeping previous config: {error:#}"
+                                        );
+                                        continue;
+                                    }
                                 };
-                                swappable.publish(new_outbound,Arc::new(dns_config));
+                                set_transparent_dns_flags(
+                                    &mut dns_config,
+                                    enable_tun && !setup_routes,
+                                    new_config.ipv6_mode,
+                                    &config_path,
+                                );
+                                if let Err(error) = sockrocket_core::dns::configure_bootstrap(
+                                    &settings,
+                                    new_config.nodes.iter().map(|node| node.server.clone()),
+                                ) {
+                                    tracing::error!(
+                                        "DNS config reload skipped, keeping previous config: {error:#}"
+                                    );
+                                    continue;
+                                }
+                                let answers = dns_config.dual_stack_fakeip;
+                                swappable.publish(new_outbound, Arc::new(dns_config));
+                                applied_ipv6_mode = new_config.ipv6_mode;
+                                dual_stack_mode.store(
+                                    new_config.ipv6_mode
+                                        == sockrocket_core::config::dns::Ipv6Mode::DualStack,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if enable_tun && !setup_routes {
+                                    ipv6_dns_open
+                                        .store(answers, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 let new_router = router_for_mode(&new_config);
                                 if let Some(tun) = &tun_proxy {
                                     tun.replace_router(new_router.clone());
@@ -564,7 +717,7 @@ async fn async_main() -> Result<()> {
                                 if let Ok(mut set) = server_domains.write() {
                                     *set = collect_server_domains(&new_config.nodes);
                                 }
-                                outbound_factory = make_outbound_factory(new_router);
+                                outbound_factory = make_outbound_factory(new_router, &new_config);
                                 // Disabling health checks must also stop the old monitor.
                                 {
                                     service
@@ -582,6 +735,18 @@ async fn async_main() -> Result<()> {
                                     new_config.nodes.len(),
                                     new_index
                                 );
+                                if decision == Ipv6Reload::Reapply {
+                                    let path = config_path.clone();
+                                    if std::thread::Builder::new()
+                                        .name("ipv6-policy".into())
+                                        .spawn(move || reapply_merlin_policy(&path))
+                                        .is_err()
+                                    {
+                                        tracing::error!(
+                                            "ipv6_mode changed, but the firewall reapply thread did not start"
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -640,46 +805,9 @@ fn read_router_dns_config(
     path: &str,
     nodes: &[sockrocket_core::Node],
 ) -> Result<sockrocket_core::dns::DnsConfig> {
-    use sockrocket_core::dns::{DnsGroup, DnsServer};
     let value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(path)?)?;
-    let mut config = sockrocket_core::china_split_dns_config();
-    if let Some(server) = value
-        .get("dns_direct_server")
-        .and_then(|value| value.as_str())
-    {
-        let ip = server
-            .parse::<std::net::IpAddr>()
-            .context("Invalid dns_direct_server")?;
-        config.fallback = vec![DnsServer::Udp((ip, 53).into())];
-    }
-    if let Some(domains) = value.get("dns_direct_domains") {
-        let domains = domains
-            .as_sequence()
-            .ok_or_else(|| anyhow::anyhow!("dns_direct_domains must be a list"))?;
-        for domain in domains {
-            let domain = domain
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("DNS direct domain must be text"))?
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            anyhow::ensure!(
-                !domain.is_empty()
-                    && domain.len() <= 253
-                    && domain
-                        .split('.')
-                        .all(|label| !label.is_empty() && label.len() <= 63),
-                "Invalid DNS direct domain"
-            );
-            config.domain_rules.insert(domain, DnsGroup::Fallback);
-        }
-    }
-    for node in nodes {
-        let server = node.server.trim_end_matches('.').to_ascii_lowercase();
-        if server.parse::<IpAddr>().is_err() {
-            config.domain_rules.insert(server, DnsGroup::Fallback);
-        }
-    }
-    Ok(config)
+    let settings = sockrocket_core::config::dns::DnsSettings::from_yaml(&value)?;
+    settings.resolver_config(nodes.iter().map(|node| node.server.clone()))
 }
 
 /// Read the router-only `dns_port` key from config.yaml.
@@ -942,6 +1070,98 @@ async fn apply_reloaded_config(
     Ok((config, index, outbound))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ipv6Reload {
+    /// The new file cannot run in transparent mode. Leave the process on the
+    /// previous config instead of exiting into a supervisor restart loop.
+    Keep,
+    Apply,
+    /// DNS is applied in-process. The Merlin script rebuilds firewall rules
+    /// without treating the process exit as a crash.
+    Reapply,
+}
+
+/// Same tmpfs directory `iptables.sh` writes. A reboot removes it together
+/// with the kernel rules it describes.
+fn runtime_dir() -> std::path::PathBuf {
+    env::var_os("SOCKROCKET_RUNTIME_DIR")
+        .map(Into::into)
+        .unwrap_or_else(|| "/tmp/sockrocket-run".into())
+}
+
+fn merlin_ipv6_dns_ready(_config_path: &str) -> bool {
+    runtime_dir().join("ipv6_dns_active").is_file()
+}
+
+fn merlin_ipv6_answers(mode: sockrocket_core::config::dns::Ipv6Mode, config_path: &str) -> bool {
+    mode == sockrocket_core::config::dns::Ipv6Mode::DualStack && merlin_ipv6_dns_ready(config_path)
+}
+
+/// IPv6 answers follow the installed interception on a transparent gateway.
+/// A saved dual_stack mode still suppresses AAAA until that file exists.
+fn set_transparent_dns_flags(
+    dns: &mut sockrocket_core::dns::DnsConfig,
+    merlin_transparent: bool,
+    mode: sockrocket_core::config::dns::Ipv6Mode,
+    config_path: &str,
+) {
+    let answers = merlin_transparent && merlin_ipv6_answers(mode, config_path);
+    set_ipv6_answer_flags(dns, merlin_transparent, answers);
+}
+
+fn set_ipv6_answer_flags(
+    dns: &mut sockrocket_core::dns::DnsConfig,
+    merlin_transparent: bool,
+    answers: bool,
+) {
+    dns.client_ipv4_only = merlin_transparent && !answers;
+    dns.dual_stack_fakeip = answers;
+}
+
+fn ipv6_reload_decision(
+    merlin_transparent: bool,
+    mode_changed: bool,
+    compatibility: bool,
+    ipv6_only: bool,
+) -> Ipv6Reload {
+    if merlin_transparent && compatibility && ipv6_only {
+        Ipv6Reload::Keep
+    } else if merlin_transparent && mode_changed {
+        Ipv6Reload::Reapply
+    } else {
+        Ipv6Reload::Apply
+    }
+}
+
+fn reapply_merlin_policy(config_path: &str) {
+    let Some(dir) = Path::new(config_path).parent() else {
+        return;
+    };
+    let script = dir.join("scripts/sockrocket.sh");
+    if !script.is_file() {
+        tracing::error!(
+            "ipv6_mode changed and DNS is updated, but {} is missing so the firewall was left unchanged",
+            script.display()
+        );
+        return;
+    }
+    match std::process::Command::new("sh")
+        .arg(&script)
+        .arg("reapply-policy")
+        .status()
+    {
+        Ok(status) if status.success() => {
+            tracing::info!("ipv6_mode applied to the Merlin firewall without stopping the proxy");
+        }
+        Ok(status) => {
+            tracing::error!("ipv6_mode firewall reapply failed ({status})");
+        }
+        Err(error) => {
+            tracing::error!("ipv6_mode firewall reapply failed: {error}");
+        }
+    }
+}
+
 fn resolve_active_index(config: &AppConfig) -> Result<Option<usize>> {
     if config.nodes.is_empty() {
         return Ok(None);
@@ -966,6 +1186,8 @@ fn build_outbound(
     active_index: Option<usize>,
     router: Option<&Arc<Router>>,
 ) -> Result<SharedOutbound> {
+    sockrocket_core::config::group::validate_targets(&config.groups, &config.rules)
+        .map_err(anyhow::Error::msg)?;
     if config.proxy_mode == ProxyMode::Direct {
         return Ok(SharedOutbound::direct());
     }
@@ -974,7 +1196,7 @@ fn build_outbound(
         None => SharedOutbound::direct(),
     };
 
-    Ok(wrap_with_rules(base_outbound, router))
+    Ok(wrap_with_rules(base_outbound, router, config))
 }
 
 /// Router for the configured [`ProxyMode`].
@@ -994,28 +1216,38 @@ fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
 }
 
 /// Wrap a node outbound with rule-based routing when a router exists.
-fn wrap_with_rules(base_outbound: SharedOutbound, router: Option<&Arc<Router>>) -> SharedOutbound {
+fn wrap_with_rules(
+    base_outbound: SharedOutbound,
+    router: Option<&Arc<Router>>,
+    config: &AppConfig,
+) -> SharedOutbound {
     match router {
-        Some(router) => SharedOutbound(Arc::new(RoutingOutbound::new(
-            router.clone(),
-            base_outbound,
-        ))),
+        Some(router) => SharedOutbound(Arc::new(
+            RoutingOutbound::new(router.clone(), base_outbound)
+                .with_groups(&config.groups, &config.nodes),
+        )),
         None => base_outbound,
     }
 }
 
 /// Factory used by the health monitor to rebuild the full (routing-aware)
 /// outbound for a failover target node.
-fn make_outbound_factory(router: Option<Arc<Router>>) -> OutboundFactory {
+fn make_outbound_factory(router: Option<Arc<Router>>, config: &AppConfig) -> OutboundFactory {
+    let config = config.clone();
     Arc::new(move |node| {
         let base = create_outbound(node).ok()?;
-        Some(wrap_with_rules(base, router.as_ref()))
+        Some(wrap_with_rules(base, router.as_ref(), &config))
     })
 }
 
 /// Resolve proxy server hostnames to IP addresses (v4 and v6) for TUN route bypass.
 async fn collect_proxy_ips(config: &AppConfig, active_index: Option<usize>) -> Vec<IpAddr> {
     let mut ips = Vec::new();
+    for group in &config.groups {
+        for i in sockrocket_core::config::group::resolve_members(group, &config.nodes) {
+            ips.extend(resolve_to_ips(&config.nodes[i].server));
+        }
+    }
     if let Some(idx) = active_index
         && let Some(node) = config.nodes.get(idx)
     {
@@ -1067,6 +1299,34 @@ mod tests {
             tags: vec![],
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn ipv6_reload_keeps_the_process_when_compatibility_cannot_start() {
+        assert_eq!(
+            ipv6_reload_decision(true, true, true, true),
+            Ipv6Reload::Keep
+        );
+        assert_eq!(
+            ipv6_reload_decision(true, false, true, true),
+            Ipv6Reload::Keep
+        );
+    }
+
+    #[test]
+    fn ipv6_reload_reapplies_the_firewall_without_exiting() {
+        assert_eq!(
+            ipv6_reload_decision(true, true, false, true),
+            Ipv6Reload::Reapply
+        );
+        assert_eq!(
+            ipv6_reload_decision(false, true, true, true),
+            Ipv6Reload::Apply
+        );
+        assert_eq!(
+            ipv6_reload_decision(true, false, false, false),
+            Ipv6Reload::Apply
+        );
     }
 
     #[test]

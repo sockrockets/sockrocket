@@ -18,7 +18,13 @@ CHAIN="SOCKROCKET_PREROUTING"
 DNS_CHAIN="SOCKROCKET_DNS"
 MANGLE_CHAIN="SOCKROCKET_MANGLE"
 IPV6_CHAIN="SOCKROCKET_IPV6_GUARD"
+IPV6_MANGLE="SOCKROCKET_IPV6_MANGLE"
+IPV6_FORWARD="SOCKROCKET_IPV6_FORWARD"
+IPV6_DNS="SOCKROCKET_IPV6_DNS"
 TUN_MARK=0x4765   # 'Ve' in hex
+# Same ULA the daemon assigns in configure_tun_ipv6. A new interface often
+# inherits disable_ipv6=1; that flag is per device, not a global IPv6 ban.
+TUN_IPV6_ADDR=fd9a:4c2e:17b0::2/64
 # Policy-routing table for fwmark 0x4765. NOT table 100: on AsusWRT the
 # rt_tables file aliases table 100 → "wan0" (and 200 → wan1 for dual-WAN
 # failover), and firmware WAN events rewrite/flush that table — silently
@@ -185,9 +191,30 @@ ipv6_lan_interface() {
     printf '%s\n' "$iface"
 }
 
-ipv6_guard_stop() {
+# Runtime IPv6 state lives on tmpfs: it describes installed kernel rules,
+# which a reboot clears. A persistent copy would outlive those rules.
+SOCKROCKET_RUNTIME_DIR="${SOCKROCKET_RUNTIME_DIR:-/tmp/sockrocket-run}"
+ipv6_state() {
+    mkdir -p "$SOCKROCKET_RUNTIME_DIR" 2>/dev/null
+    printf '%s/ipv6_%s' "$SOCKROCKET_RUNTIME_DIR" "$1"
+}
+
+ipv6_clear_fallback() {
+    rm -f "$(ipv6_state fallback)"
+}
+
+# Remember a dual-stack miss without repeating the same line every minute.
+ipv6_note_fallback() {
+    local reason="$1" old
+    old=$(cat "$(ipv6_state fallback)" 2>/dev/null || true)
+    if [ "$old" != "$reason" ]; then
+        printf '%s\n' "$reason" > "$(ipv6_state fallback)"
+        err "$reason"
+    fi
+}
+
+ipv6_compat_guard_stop() {
     local count=0
-    # Delete only our unqualified jump, including leftovers from old starts.
     while [ "$count" -lt 32 ] && ip6tables -D FORWARD -j "$IPV6_CHAIN" 2>/dev/null; do
         count=$((count + 1))
     done
@@ -199,31 +226,488 @@ ipv6_guard_stop() {
     ip6tables -X "$IPV6_CHAIN" 2>/dev/null || true
 }
 
-ipv6_guard_start() {
+# Reject forwarded LAN IPv6 so clients fall back to the IPv4 proxy.
+# This does not touch IPv4 rules.
+ipv6_compat_guard_present() {
+    local iface
+    iface=$(ipv6_lan_interface) || return 1
+    ip6tables -C "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
+        -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null &&
+    ipv6_forward_jump_ok "$IPV6_CHAIN"
+}
+
+ipv6_compat_guard_start() {
     ipv6_guard_needed || return 0
     local iface
     iface=$(ipv6_lan_interface) || { err "Invalid LAN interface for IPv6 protection"; return 1; }
+    # Re-inserting an intact guard would open a window with no guard at all.
+    ipv6_compat_guard_present && return 0
+    ipv6_compat_guard_stop || return 1
     if ! {
         { ip6tables -N "$IPV6_CHAIN" 2>/dev/null || ip6tables -F "$IPV6_CHAIN"; } &&
         ip6tables -A "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
             -j REJECT --reject-with icmp6-adm-prohibited &&
         ip6tables -I FORWARD 1 -j "$IPV6_CHAIN"
     }; then
-        ipv6_guard_stop
+        ipv6_compat_guard_stop || true
         err "IPv6 bypass protection unavailable — transparent proxy NOT enabled"
         return 1
     fi
     ok "IPv4 proxy mode: external LAN IPv6 rejected for IPv4 fallback (restored on stop)"
 }
 
+ipv6_guard_stop() {
+    ipv6_proxy_stop || return 1
+    ipv6_compat_guard_stop || return 1
+}
+
+# Install dual-stack when this host can complete it. Otherwise keep the IPv4
+# proxy and install the compatibility guard. A missing prefix, forwarding
+# flag, or ip6tables target must not flush IPv4 rules.
+ipv6_try_dual_stack() {
+    if ipv6_proxy_verify; then
+        ipv6_compat_guard_stop || return 1
+        ipv6_clear_fallback
+        return 0
+    fi
+    # Keep LAN IPv6 rejected while the dual-stack chain is rebuilt: the guard
+    # is only removed once the new chain verifies above it.
+    ipv6_compat_guard_start || return 1
+    ipv6_proxy_stop || return 1
+    if ipv6_proxy_start; then
+        return 0
+    fi
+    ipv6_proxy_stop || return 1
+    ipv6_note_fallback "IPv6 dual-stack unavailable; IPv4 proxy kept and external IPv6 rejected"
+    ipv6_compat_guard_start
+}
+
+ipv6_guard_start() {
+    if [ "$(get_conf ipv6_mode)" = "dual_stack" ]; then
+        ipv6_try_dual_stack
+        return $?
+    fi
+    ipv6_clear_fallback
+    ipv6_compat_guard_start
+}
+
 ipv6_guard_verify() {
+    if [ "$(get_conf ipv6_mode)" = "dual_stack" ]; then
+        ipv6_proxy_verify
+        return $?
+    fi
     ipv6_guard_needed || return 0
     local iface first
     iface=$(ipv6_lan_interface) || return 1
     ip6tables -C "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
         -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || return 1
-    first=$(ip6tables -S FORWARD 2>/dev/null | sed -n '/^-A FORWARD /{p;q;}')
-    [ "$first" = "-A FORWARD -j $IPV6_CHAIN" ]
+    ipv6_forward_jump_ok "$IPV6_CHAIN"
+}
+
+# IPv6 has independent policy tables. Never change the WAN default route,
+# firmware RA/DHCPv6 state, forwarding sysctls or the router's OUTPUT chain.
+ipv6_proxy_stop() {
+    local count=0
+    while [ "$count" -lt 32 ] && ip6tables -t mangle -D PREROUTING -j "$IPV6_MANGLE" 2>/dev/null; do count=$((count+1)); done
+    ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null && return 1
+    ip6tables -t mangle -F "$IPV6_MANGLE" 2>/dev/null || true
+    ip6tables -t mangle -X "$IPV6_MANGLE" 2>/dev/null || true
+    ip6tables -t mangle -F SOCKROCKET_IPV6_DEVICES 2>/dev/null || true
+    ip6tables -t mangle -X SOCKROCKET_IPV6_DEVICES 2>/dev/null || true
+    count=0
+    while [ "$count" -lt 32 ] && ip6tables -D FORWARD -j "$IPV6_FORWARD" 2>/dev/null; do count=$((count+1)); done
+    ip6tables -C FORWARD -j "$IPV6_FORWARD" 2>/dev/null && return 1
+    ip6tables -F "$IPV6_FORWARD" 2>/dev/null || true
+    ip6tables -X "$IPV6_FORWARD" 2>/dev/null || true
+    count=0
+    while [ "$count" -lt 32 ] && ip -6 rule del fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; do count=$((count+1)); done
+    ip -6 rule show 2>/dev/null | grep -Eq "fwmark ${TUN_MARK}(/0xffffffff)? .*lookup ${SOCKROCKET_RT_TABLE}([[:space:]]|$)" && return 1
+    ip -6 route del default dev sockrocket-tun table "$SOCKROCKET_RT_TABLE" 2>/dev/null || true
+    ip -6 route del 2001:2:0:4765::/96 dev sockrocket-tun 2>/dev/null || true
+    return 0
+}
+
+# Enable IPv6 on the proxy TUN only and install its ULA. Forwarding and
+# every other interface are left to the firmware.
+ensure_tun_ipv6() {
+    local tun="$1" sysctl
+    sysctl="/proc/sys/net/ipv6/conf/$tun/disable_ipv6"
+    if [ -w "$sysctl" ] && [ "$(cat "$sysctl" 2>/dev/null)" != 0 ]; then
+        echo 0 > "$sysctl" 2>/dev/null || true
+    fi
+    ip -6 addr replace "$TUN_IPV6_ADDR" dev "$tun"
+}
+
+ipv6_proxy_start() {
+    local iface tun dest proto router_addresses
+    iface=$(ipv6_lan_interface) || return 1
+    tun=$(detect_tun_dev) || return 1
+    # ICMPv6 and forwarding belong to the firmware; enabling a disabled
+    # forwarding sysctl here could disable acceptance of WAN advertisements.
+    ensure_tun_ipv6 "$tun" || true
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != 1 ] ||
+       ! ip -6 addr show dev "$tun" 2>/dev/null | grep -q 'inet6 '; then
+        err "IPv6 dual-stack needs firmware IPv6 forwarding and an IPv6 address on the TUN device"
+        return 1
+    fi
+    if ! {
+        { ip6tables -t mangle -N "$IPV6_MANGLE" 2>/dev/null || ip6tables -t mangle -F "$IPV6_MANGLE"; } &&
+        { ip6tables -N "$IPV6_FORWARD" 2>/dev/null || ip6tables -F "$IPV6_FORWARD"; }
+    }; then ipv6_proxy_stop; return 1; fi
+    # Multicast/link-local/ULA traffic stays on the LAN or firmware path.
+    for dest in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
+        ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
+    done
+    router_addresses=$(ip -6 addr show dev "$iface" 2>/dev/null | awk '/inet6 /{print $2}')
+    for dest in $router_addresses; do
+        # Keep on-link LAN traffic out of the transparent internet path.
+        ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
+    done
+    # Device scopes are marked before the stream-only QUIC bypass, so a
+    # device whose group can carry UDP still reaches userspace for real-address QUIC.
+    local device_sources device_source device_proto
+    device_sources=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-rule-sources-v6 "$SOCKROCKET_CONF" 2>/dev/null) || {
+        ipv6_proxy_stop
+        err "Cannot validate IPv6 device rule sources"
+        return 1
+    }
+    if [ -n "$device_sources" ]; then
+        if ! ip6tables -t mangle -N SOCKROCKET_IPV6_DEVICES 2>/dev/null \
+            && ! ip6tables -t mangle -F SOCKROCKET_IPV6_DEVICES; then
+            ipv6_proxy_stop
+            return 1
+        fi
+        for device_source in $device_sources; do
+            for device_proto in tcp udp; do
+                ip6tables -t mangle -A SOCKROCKET_IPV6_DEVICES -s "$device_source" -p "$device_proto" \
+                    -j MARK --set-mark "$TUN_MARK" || { ipv6_proxy_stop; return 1; }
+            done
+        done
+        ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" -j SOCKROCKET_IPV6_DEVICES || { ipv6_proxy_stop; return 1; }
+        ip6tables -t mangle -A "$IPV6_MANGLE" -m mark --mark "$TUN_MARK" -j RETURN || { ipv6_proxy_stop; return 1; }
+    fi
+    if ! "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
+        ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" ! -d 2001:2:0:4765::/96 -p udp --dport 443 -j RETURN || { ipv6_proxy_stop; return 1; }
+    fi
+    for proto in tcp udp; do
+        ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" -p "$proto" -j MARK --set-mark "$TUN_MARK" || { ipv6_proxy_stop; return 1; }
+    done
+    # Never mark ICMPv6: preserve NDP, router advertisements and PMTU.
+    if ! {
+        ip -6 route replace default dev "$tun" table "$SOCKROCKET_RT_TABLE" &&
+        ip -6 rule add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" &&
+        ip -6 route replace 2001:2:0:4765::/96 dev "$tun" &&
+        ip6tables -A "$IPV6_FORWARD" -i "$tun" -o "$iface" -j ACCEPT
+    }; then ipv6_proxy_stop; return 1; fi
+    # QUIC is forwarded with other UDP. Userspace accepts, directs, or
+    # rejects that one flow. A group rule must not reject the rest of the LAN.
+    if ! {
+        ip6tables -A "$IPV6_FORWARD" -i "$iface" -o "$tun" -p tcp -j ACCEPT &&
+        ip6tables -A "$IPV6_FORWARD" -i "$iface" -o "$tun" -p udp -j ACCEPT &&
+        ip6tables -I FORWARD 1 -j "$IPV6_FORWARD" &&
+        ip6tables -t mangle -A PREROUTING -j "$IPV6_MANGLE"
+    }; then ipv6_proxy_stop; return 1; fi
+    ipv6_proxy_verify || { ipv6_proxy_stop; return 1; }
+    # The dual-stack jump now precedes the guard; dropping the guard last
+    # means no forwarded IPv6 packet ever saw neither.
+    ipv6_compat_guard_stop || { ipv6_proxy_stop; return 1; }
+    ipv6_clear_fallback
+    ok "IPv6 dual-stack applied (LAN TCP+UDP to owned TUN policy table)"
+}
+
+ipv6_proxy_verify() {
+    local iface tun
+    iface=$(ipv6_lan_interface) || return 1
+    tun=$(detect_tun_dev) || return 1
+    ipv6_forward_jump_ok "$IPV6_FORWARD" || return 1
+    ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null &&
+    ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p tcp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&
+    ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p udp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&
+    ip6tables -C FORWARD -j "$IPV6_FORWARD" 2>/dev/null &&
+    ip6tables -C "$IPV6_FORWARD" -i "$tun" -o "$iface" -j ACCEPT 2>/dev/null &&
+    ip -6 rule show 2>/dev/null | grep -Eq "fwmark ${TUN_MARK}(/0xffffffff)? .*lookup ${SOCKROCKET_RT_TABLE}([[:space:]]|$)" || return 1
+    ip -6 route show table "$SOCKROCKET_RT_TABLE" 2>/dev/null | grep -Eq "^default dev $tun( |$)" || return 1
+    ip -6 route show 2001:2:0:4765::/96 2>/dev/null | grep -Eq "^2001:2:0:4765::/96 dev $tun( |$)"
+}
+
+# Client source prefixes for whichever LAN interface this host is using.
+# Connected routes may be kernel, static, or router-advertisement routes,
+# and some firmwares only show the prefix on the address itself.
+ipv6_client_prefixes() {
+    local iface="$1"
+    {
+        ip -6 route show dev "$iface" 2>/dev/null | awk '$1 ~ /:/ && $1 ~ /\// {print $1}'
+        ip -6 addr show dev "$iface" scope global 2>/dev/null | awk '/inet6 / {print $2}'
+    } | awk '
+        $1 ~ /^fe80:/ || $1 ~ /^ff[0-9a-fA-F][0-9a-fA-F]:/ { next }
+        $1 ~ /^fd9a:4c2e:17b0:/ { next }
+        $1 ~ /\/128$/ { next }
+        !seen[$1]++ { print }
+    '
+}
+
+# Sockrocket's DNS listener, not dnsmasq. IPv6 REDIRECT delivers to this
+# port; dnsmasq on many firmwares accepts only IPv4.
+ipv6_dns_port() {
+    local port
+    port=$(get_conf dns_port)
+    port=${port:-5300}
+    case "$port" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    printf '%s\n' "$port"
+}
+
+ipv6_dns_guard_stop() {
+    local port="" iface
+    if [ -f "$(ipv6_state dns_port)" ]; then
+        port=$(cat "$(ipv6_state dns_port)" 2>/dev/null || true)
+    fi
+    iface=$(ipv6_lan_interface 2>/dev/null) || iface=br0
+    if [ -n "$port" ]; then
+        ip6tables -D INPUT -p udp --dport "$port" ! -i "$iface" -j DROP 2>/dev/null || true
+        ip6tables -D INPUT -p tcp --dport "$port" ! -i "$iface" -j DROP 2>/dev/null || true
+    fi
+    rm -f "$(ipv6_state dns_port)"
+    return 0
+}
+
+# Close the IPv6 listener on every interface except the LAN. Redirected
+# client queries arrive on that interface; WAN clients must not reach the port.
+ipv6_dns_guard_start() {
+    local iface="$1" port="$2"
+    ipv6_dns_guard_stop
+    printf '%s\n' "$port" > "$(ipv6_state dns_port)"
+    if ! {
+        ip6tables -I INPUT 1 -p udp --dport "$port" ! -i "$iface" -j DROP &&
+        ip6tables -I INPUT 1 -p tcp --dport "$port" ! -i "$iface" -j DROP
+    }; then
+        ipv6_dns_guard_stop
+        return 1
+    fi
+}
+
+ipv6_dns_installed_prefixes() {
+    local iface
+    iface=$(ipv6_lan_interface) || return 1
+    ipv6_client_prefixes "$iface" | awk '$1 !~ /^fe80:/' | sort
+}
+
+ipv6_dns_prefixes_match() {
+    local now saved
+    now=$(ipv6_dns_installed_prefixes) || return 1
+    saved=$(sort "$(ipv6_state dns_prefixes)" 2>/dev/null || true)
+    [ -n "$now" ] && [ "$now" = "$saved" ]
+}
+
+ipv6_dns_attached() {
+    local port
+    port=$(ipv6_dns_port) || return 1
+    [ "$(cat "$(ipv6_state dns_port)" 2>/dev/null || true)" = "$port" ] || return 1
+    ip6tables -t nat -C PREROUTING -j "$IPV6_DNS" 2>/dev/null || return 1
+    ipv6_dns_prefixes_match
+}
+
+ipv6_dns_mark_active() {
+    printf '1\n' > "$(ipv6_state dns_active)"
+}
+
+ipv6_dns_mark_inactive() {
+    rm -f "$(ipv6_state dns_active)"
+}
+
+# The daemon opens its IPv6 DNS listener only as a transparent TUN gateway.
+# Redirecting IPv6 :53 anywhere else would point clients at a closed port.
+ipv6_transparent_ready() {
+    case "$(get_conf transparent_proxy | tr 'A-Z' 'a-z')" in
+        false|no|0) return 1 ;;
+    esac
+    [ -n "$(detect_tun_dev)" ]
+}
+
+# True when the jump sits before every ACCEPT in FORWARD. Other add-ons may
+# insert rules above ours; only an earlier ACCEPT lets traffic skip us.
+ipv6_forward_jump_ok() {
+    ip6tables -S FORWARD 2>/dev/null | awk -v want="-A FORWARD -j $1" '
+        $0 == want { found = 1; exit }
+        $1 == "-A" && / -j ACCEPT( |$)/ { exit }
+        END { exit !found }
+    '
+}
+
+ipv6_dns_start() {
+    # The daemon answers AAAA only while this file exists. Clear it before a
+    # mode that does not intercept IPv6 DNS, so saved dual_stack cannot leak
+    # IPv6 answers through an IPv4 firewall.
+    if [ "$(get_conf ipv6_mode)" != dual_stack ] || ! ipv6_transparent_ready; then
+        ipv6_dns_stop
+        return 0
+    fi
+    local iface dest prefix prefixes port
+    iface=$(ipv6_lan_interface) || return 1
+    port=$(ipv6_dns_port) || {
+        err "IPv6 DNS interception needs a numeric dns_port"
+        return 1
+    }
+    # On-link prefixes only. An interface-wide redirect would also catch
+    # forwarded traffic that merely arrives on the LAN interface.
+    prefixes=$(ipv6_client_prefixes "$iface")
+    [ -n "$prefixes" ] || {
+        err "IPv6 DNS interception needs an on-link LAN prefix"
+        return 1
+    }
+    if ! {
+        { ip6tables -t nat -N "$IPV6_DNS" 2>/dev/null || ip6tables -t nat -F "$IPV6_DNS"; }
+    }; then
+        err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
+        return 1
+    fi
+    # Queries already addressed to this router, including its link-local
+    # address, stay on dnsmasq. The address string from `ip` includes the
+    # on-link prefix length; matching that would exempt the whole LAN.
+    # Same exception the IPv4 chain gives ROUTER_IP, so match the host only.
+    for dest in $(ip -6 addr show dev "$iface" scope global 2>/dev/null | awk '/inet6 / {print $2}'); do
+        local host="${dest%%/*}"
+        case "$host" in
+            *:*) ;;
+            *) err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"; return 1 ;;
+        esac
+        ip6tables -t nat -A "$IPV6_DNS" -d "$host/128" -j RETURN || {
+            err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
+            return 1
+        }
+    done
+    ip6tables -t nat -A "$IPV6_DNS" -d fe80::/10 -j RETURN || {
+        err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
+        return 1
+    }
+    local redirected=0
+    for prefix in $prefixes; do
+        # Link-local kernel routes are not LAN client sources. Redirecting
+        # them would catch non-global traffic that arrived on the bridge.
+        case "$prefix" in
+            fe80:*) continue ;;
+        esac
+        ip6tables -t nat -A "$IPV6_DNS" -s "$prefix" -p udp --dport 53 -j REDIRECT --to-ports "$port" &&
+        ip6tables -t nat -A "$IPV6_DNS" -s "$prefix" -p tcp --dport 53 -j REDIRECT --to-ports "$port" || {
+            err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
+            return 1
+        }
+        redirected=1
+    done
+    if [ "$redirected" != 1 ]; then
+        err "IPv6 DNS interception needs a global on-link LAN prefix"
+        return 1
+    fi
+    ipv6_dns_installed_prefixes > "$(ipv6_state dns_prefixes)" || {
+        err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
+        return 1
+    }
+    ipv6_dns_guard_start "$iface" "$port" || {
+        err "IPv6 DNS listener could not be limited to the LAN interface"
+        return 1
+    }
+    { ip6tables -t nat -C PREROUTING -j "$IPV6_DNS" 2>/dev/null ||
+      ip6tables -t nat -A PREROUTING -j "$IPV6_DNS"; } || {
+        err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
+        return 1
+    }
+    ipv6_dns_sync_marker
+}
+
+# Fake IPv6 answers are useful only while LAN IPv6 reaches the TUN. In the
+# compatibility fallback the guard rejects them and every client stalls.
+ipv6_dns_sync_marker() {
+    if ipv6_dns_attached && ipv6_proxy_verify; then
+        ipv6_dns_mark_active
+    else
+        ipv6_dns_mark_inactive
+    fi
+}
+
+ipv6_dns_stop() {
+    local count=0
+    ipv6_dns_mark_inactive
+    rm -f "$(ipv6_state dns_prefixes)"
+    ipv6_dns_guard_stop
+    while [ "$count" -lt 32 ] && ip6tables -t nat -D PREROUTING -j "$IPV6_DNS" 2>/dev/null; do count=$((count+1)); done
+    ip6tables -t nat -C PREROUTING -j "$IPV6_DNS" 2>/dev/null && return 1
+    ip6tables -t nat -F "$IPV6_DNS" 2>/dev/null || true
+    ip6tables -t nat -X "$IPV6_DNS" 2>/dev/null || true
+    return 0
+}
+
+# Replace only the IPv6 policy. IPv4 mangle, NAT and DNS chains stay in place,
+# including when dual-stack cannot be completed on this host.
+do_ipv6_apply() {
+    # Without the TUN gateway there is no IPv6 proxy path or IPv6 listener.
+    case "$(get_conf transparent_proxy | tr 'A-Z' 'a-z')" in
+        false|no|0)
+            ipv6_clear_fallback
+            ipv6_dns_stop || return 1
+            ipv6_guard_stop
+            return $?
+            ;;
+    esac
+    if [ -z "$(detect_tun_dev)" ]; then
+        # Mid-restart: leave the current guard; the next pass completes it.
+        ipv6_dns_mark_inactive
+        err "IPv6 policy not applied; TUN device is not ready"
+        return 1
+    fi
+    if [ "$(get_conf ipv6_mode)" = "dual_stack" ]; then
+        if ! ipv6_try_dual_stack; then
+            # A partial ip6tables failure may have left neither policy.
+            ipv6_dns_mark_inactive
+            ipv6_compat_guard_start || err "IPv6 protection could not be restored; retrying on the next pass"
+            return 1
+        fi
+        if [ "$(get_conf dns_hijack)" = "true" ]; then
+            if ! ipv6_dns_attached; then
+                ipv6_dns_stop || return 1
+                if ! ipv6_dns_start; then
+                    ipv6_dns_stop || return 1
+                    ipv6_note_fallback "IPv6 DNS interception unavailable; IPv4 DNS hijack kept"
+                fi
+            fi
+        else
+            ipv6_dns_stop || return 1
+        fi
+        # The tmpfs marker can be lost while rules survive; restore it.
+        ipv6_dns_sync_marker
+        if ipv6_proxy_verify && { [ "$(get_conf dns_hijack)" != "true" ] || ipv6_dns_attached; }; then
+            ipv6_clear_fallback
+        fi
+        return 0
+    fi
+    ipv6_clear_fallback
+    ipv6_proxy_stop || return 1
+    ipv6_dns_stop || return 1
+    ipv6_compat_guard_start
+}
+
+# Compatibility mode does not proxy IPv6. When the firmware later enables
+# IPv6, install the reject guard without waiting for a firewall rebuild.
+# Turning firmware IPv6 back off removes that guard.
+do_ipv6_guard() {
+    case "$(get_conf transparent_proxy | tr 'A-Z' 'a-z')" in
+        false|no|0)
+            ipv6_dns_stop || return 1
+            ipv6_guard_stop
+            return $?
+            ;;
+    esac
+    if [ "$(get_conf ipv6_mode)" = "dual_stack" ]; then
+        return 0
+    fi
+    if ! ipv6_guard_needed; then
+        ipv6_compat_guard_stop
+        return $?
+    fi
+    ipv6_compat_guard_start
 }
 
 flush_chains() {
@@ -320,12 +804,12 @@ do_start() {
         fi
     fi
 
-    # Capture QUIC only when the active node has a real datagram transport.
-    local udp_supported=0
-    if "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
-        udp_supported=1
-    else
-        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p udp --dport 443 -j RETURN || {
+    # Fake-IP QUIC always reaches the proxy, which proxies it, sends it
+    # direct, or answers port unreachable for a stream-only route. When no
+    # route can carry UDP, QUIC to real addresses (domestic answers) stays on
+    # the kernel fast path instead of costing userspace CPU for nothing.
+    if ! "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
+        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" ! -d 198.18.0.0/16 -p udp --dport 443 -j RETURN || {
             flush_chains
             return 1
         }
@@ -388,24 +872,10 @@ do_start() {
     fi
     iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
         -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
-    if [ "$udp_supported" != 1 ]; then
-        if [ -n "$device_sources" ]; then
-            # Device direct/reject decisions do not depend on the selected
-            # node supporting UDP. Let those sources reach the core; other
-            # clients retain the existing fast Fake-IP UDP rejection.
-            iptables -N SOCKROCKET_UDP_GUARD 2>/dev/null || iptables -F SOCKROCKET_UDP_GUARD || { flush_chains; return 1; }
-            for device_source in $device_sources; do
-                iptables -A SOCKROCKET_UDP_GUARD -s "$device_source" -j RETURN || { flush_chains; return 1; }
-            done
-            iptables -A SOCKROCKET_UDP_GUARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
-                -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
-            iptables -I FORWARD 1 -j SOCKROCKET_UDP_GUARD || { flush_chains; return 1; }
-        else
-            iptables -I FORWARD 1 -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
-                -j REJECT --reject-with icmp-port-unreachable || { flush_chains; return 1; }
-        fi
-    fi
-    # Keep TUN return-path ACCEPT at the very top (above Fake-IP REJECT).
+    iptables -D FORWARD -j SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -F SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
+    # Keep TUN return-path ACCEPT at the very top.
     iptables -D FORWARD -i "$TUN_DEV" -j ACCEPT 2>/dev/null || true
     if ! iptables -I FORWARD 1 -i "$TUN_DEV" -j ACCEPT; then
         flush_chains
@@ -447,10 +917,19 @@ do_dns_start() {
         do_dns_stop
         return 1
     fi
+    if ! ipv6_dns_start; then
+        # IPv4 hijack is already installed. Removing it here would send the
+        # LAN back to direct DNS because IPv6 could not be completed.
+        ipv6_dns_stop || return 1
+        ipv6_note_fallback "IPv6 DNS interception unavailable; IPv4 DNS hijack kept"
+        ok "DNS hijack applied for IPv4; IPv6 DNS interception pending"
+        return 0
+    fi
     ok "DNS hijack applied (LAN :53 → router dnsmasq)"
 }
 
 do_dns_stop() {
+    ipv6_dns_stop || return 1
     iptables -t nat -D PREROUTING -j "$DNS_CHAIN" 2>/dev/null || true
     iptables -t nat -F "$DNS_CHAIN" 2>/dev/null || true
     iptables -t nat -X "$DNS_CHAIN" 2>/dev/null || true
@@ -467,7 +946,7 @@ do_stop() {
     iptables -t nat -X "$CHAIN" 2>/dev/null || true
 
     # DNS rules
-    do_dns_stop
+    do_dns_stop || cleanup_rc=1
 
     # UDP/mangle rules
     iptables -t mangle -D PREROUTING -j "$MANGLE_CHAIN" 2>/dev/null || true
@@ -568,6 +1047,8 @@ case "$1" in
     start)   do_start ;;
     stop)    do_stop ;;
     restart) do_stop; do_start ;;
+    ipv6-apply) do_ipv6_apply ;;
+    ipv6-guard) do_ipv6_guard ;;
     dns-start) do_dns_start ;;
     dns-stop)  do_dns_stop ;;
     ipset-on)  do_ipset_start ;;
@@ -575,7 +1056,7 @@ case "$1" in
     status)  do_status ;;
     verify)  do_verify ;;
     *)
-        echo "Usage: $0 {start|stop|restart|dns-start|dns-stop|ipset-on|ipset-off|status|verify}"
+        echo "Usage: $0 {start|stop|restart|ipv6-apply|ipv6-guard|dns-start|dns-stop|ipset-on|ipset-off|status|verify}"
         exit 1
         ;;
 esac

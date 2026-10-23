@@ -78,7 +78,7 @@ pub use dns::fakeip::{FakeIpPool, is_fake_ip};
 pub use dns::{
     DnsConfig, DnsGroup, DnsResolver, DnsServer, answer_raw_dns_query, build_dns_error_response,
     build_dns_response, china_domain_suffixes, china_split_dns_config,
-    china_split_dns_config_proxy_tls, parse_dns_query, serve_dns_udp,
+    china_split_dns_config_proxy_tls, parse_dns_query, serve_dns_udp, serve_dns_udp_and_ipv6,
 };
 
 pub use router::{

@@ -369,6 +369,8 @@ fn parse_clash_line(line: &str) -> Result<RoutingRule, String> {
         return Err(format!("{typ} requires a pattern"));
     }
     let pattern = parts[1];
+    // Public Clash lists name a policy group this config does not have.
+    // Keep the rule on the proxy path instead of dropping the line.
     let target = parts
         .get(2)
         .copied()
@@ -500,7 +502,10 @@ fn normalize_type(s: &str) -> &str {
     }
 }
 
-fn normalize_target(s: &str) -> Option<&'static str> {
+fn normalize_target(s: &str) -> Option<&str> {
+    if s.starts_with("group:") && super::group::valid_group_name(&s[6..]) {
+        return Some(s);
+    }
     match s.trim().to_ascii_lowercase().as_str() {
         "direct" | "dir" => Some("direct"),
         "proxy" | "proxied" => Some("proxy"),
@@ -522,7 +527,10 @@ fn export_type(t: &str) -> &'static str {
     }
 }
 
-fn export_target(t: &str) -> &'static str {
+fn export_target(t: &str) -> &str {
+    if t.starts_with("group:") {
+        return t;
+    }
     match t {
         "direct" => "DIRECT",
         "reject" => "REJECT",
@@ -617,6 +625,14 @@ mod tests {
         assert_eq!(r.rules[1].rule_type, "match");
         assert_eq!(r.rules[2].rule_type, "geoip");
         assert_eq!(r.rules[2].pattern, "CN");
+        let named = parse_batch_rules(
+            "DOMAIN-SUFFIX,netflix.com,Netflix\nDOMAIN-SUFFIX,video.example,group:Video\nDOMAIN,direct.example,DIRECT\n",
+            "proxy",
+        );
+        assert!(named.errors.is_empty(), "{:?}", named.errors);
+        assert_eq!(named.rules[0].target, "proxy");
+        assert_eq!(named.rules[1].target, "group:Video");
+        assert_eq!(named.rules[2].target, "direct");
     }
 
     #[test]

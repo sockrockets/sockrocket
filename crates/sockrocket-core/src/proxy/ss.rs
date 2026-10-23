@@ -60,17 +60,16 @@ impl Outbound for SsOutbound {
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
         let addr = target_address(host, port);
         Box::pin(async move {
-            // Match the socket tuning every other protocol gets from
-            // transport.rs::tune_socket (256 KB buffers + TCP_NODELAY +
-            // keepalive). The shadowsocks crate reads these from ConnectOpts
-            // at dial time, so set them here instead of leaving the OS
-            // defaults in place — the smaller default recv buffer caps
-            // throughput on high-BDP links.
+            // Shadowsocks dials its own socket, so it never reaches
+            // `tune_socket`. Keep TCP_NODELAY, and leave both buffer sizes
+            // unset: pinning 64 KiB disables Linux autotune and caps the
+            // flow at buffer/RTT. `None` means the crate does not call
+            // setsockopt, matching every other outbound.
             let opts = ConnectOpts {
                 bind_interface: super::outbound_bind::outbound_bind().and_then(|bind| bind.if_name),
                 tcp: shadowsocks::net::TcpSocketOpts {
-                    send_buffer_size: Some(64 * 1024),
-                    recv_buffer_size: Some(64 * 1024),
+                    send_buffer_size: None,
+                    recv_buffer_size: None,
                     nodelay: true,
                     ..Default::default()
                 },
@@ -95,7 +94,12 @@ impl Outbound for SsOutbound {
     ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
         let address = target_address(host, port);
         Box::pin(async move {
-            anyhow::ensure!(self.udp_enabled, "UDP disabled for this Shadowsocks node");
+            if !self.udp_enabled {
+                return Err(super::connector::UdpUnsupported::new(
+                    "UDP disabled for this Shadowsocks node",
+                )
+                .into());
+            }
             let opts = ConnectOpts {
                 bind_interface: super::outbound_bind::outbound_bind().and_then(|bind| bind.if_name),
                 ..Default::default()

@@ -3,12 +3,12 @@
 //! Groups store members as node fingerprints (see `dedup::node_fingerprint`)
 //! so membership survives renames and subscription refreshes. These helpers
 //! are pure functions: they map fingerprints to node indices and turn probe
-//! results into a new pick, leaving the actual probing and persistence to
-//! the caller (the GUI). Fingerprints that no longer resolve to a node are
+//! results into a new pick. The running proxy also races url-test members and
+//! remembers a fallback success in memory. Fingerprints that no longer resolve to a node are
 //! skipped, never an error.
 
 use super::dedup::node_fingerprint;
-use super::model::{Node, ProxyGroupConfig};
+use super::model::{AppConfig, GroupType, Node, ProxyGroupConfig, ProxyMode};
 
 /// A probe result for one group member, in member order (as returned by
 /// [`resolve_members`]): `Some(latency_ms)` for a successful probe,
@@ -50,10 +50,112 @@ pub fn fallback_pick(nodes: &[Node], probes: &[ProbeResult]) -> Option<String> {
         .map(node_fingerprint)
 }
 
+/// Names are portable through native CSV, JSON and YAML rule editors.
+pub fn valid_group_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 96
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// Whether the active node, or an unsourced group's datagram member, can
+/// carry UDP. The firewall does not use this to open or close QUIC: each
+/// datagram is decided in userspace. The flag remains for diagnostics.
+pub fn lan_wide_udp(config: &AppConfig) -> Result<bool, &'static str> {
+    if config.proxy_mode == ProxyMode::Direct {
+        return Ok(true);
+    }
+    if let Some(index) = active_index(config)?
+        && config
+            .nodes
+            .get(index)
+            .is_some_and(|node| node.protocol.supports_udp())
+    {
+        return Ok(true);
+    }
+    Ok(config.rules.iter().any(|rule| {
+        rule.enabled
+            && rule.source.is_empty()
+            && rule_group_supports_udp(rule.target.as_str(), config)
+    }))
+}
+
+fn active_index(config: &AppConfig) -> Result<Option<usize>, &'static str> {
+    if config.nodes.is_empty() {
+        return Ok(None);
+    }
+    match config.active_node {
+        Some(index) if index < config.nodes.len() => Ok(Some(index)),
+        Some(_) => Err("active_node is out of range"),
+        None => Ok(Some(0)),
+    }
+}
+
+/// UDP stays on a fallback group's first member. Select uses the stored
+/// pick. url-test's live choice can move after a handshake race; this check
+/// uses the stored pick, or the first member when nothing is stored.
+fn group_udp_member(group: &ProxyGroupConfig, nodes: &[Node]) -> Option<usize> {
+    if group.gtype == GroupType::Fallback {
+        resolve_members(group, nodes).first().copied()
+    } else {
+        selected_member(group, nodes)
+    }
+}
+
+fn rule_group_supports_udp(target: &str, config: &AppConfig) -> bool {
+    let Some(name) = target.strip_prefix("group:") else {
+        return false;
+    };
+    let Some(group) = config.groups.iter().find(|group| group.name == name) else {
+        return false;
+    };
+    group_udp_member(group, &config.nodes)
+        .and_then(|index| config.nodes.get(index))
+        .is_some_and(|node| node.protocol.supports_udp())
+}
+
+/// Resolve the selected member without silently replacing a deleted selection.
+pub fn selected_member(group: &ProxyGroupConfig, nodes: &[Node]) -> Option<usize> {
+    let members = resolve_members(group, nodes);
+    if let Some(current) = &group.current {
+        return members
+            .into_iter()
+            .find(|i| node_fingerprint(&nodes[*i]) == *current);
+    }
+    members.first().copied()
+}
+
+pub fn validate_targets(
+    groups: &[ProxyGroupConfig],
+    rules: &[super::model::RoutingRule],
+) -> Result<(), &'static str> {
+    let mut names = std::collections::HashSet::new();
+    if groups.len() > 64 {
+        return Err("Too many proxy groups (maximum 64)");
+    }
+    for group in groups {
+        if !names.insert(group.name.as_str()) {
+            return Err("Duplicate proxy group name");
+        }
+        if group.members.len() > 256 {
+            return Err("Too many group members (maximum 256)");
+        }
+    }
+    for rule in rules {
+        if let Some(name) = rule.target.strip_prefix("group:")
+            && !names.contains(name)
+        {
+            return Err("Rule refers to a missing proxy group");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::{GroupType, ProxyProtocol};
+    use crate::config::model::{GroupType, ProxyProtocol, RoutingRule};
 
     fn ss(name: &str, server: &str, port: u16, password: &str) -> Node {
         Node {
@@ -165,5 +267,97 @@ mod tests {
         let probes: Vec<ProbeResult> = vec![(0, None)];
         assert_eq!(fallback_pick(&nodes, &probes), None);
         assert_eq!(fallback_pick(&nodes, &[]), None);
+    }
+
+    fn stream_only(name: &str, server: &str) -> Node {
+        let mut node = ss(name, server, 8388, name);
+        if let ProxyProtocol::Shadowsocks { udp, .. } = &mut node.protocol {
+            *udp = false;
+        }
+        node
+    }
+
+    fn domain_rule(source: &str, target: &str, enabled: bool) -> RoutingRule {
+        RoutingRule {
+            source: source.to_string(),
+            name: String::new(),
+            group: String::new(),
+            rule_type: "domain".to_string(),
+            pattern: "example.com".to_string(),
+            target: target.to_string(),
+            enabled,
+            priority: 0,
+        }
+    }
+
+    fn config_with(
+        nodes: Vec<Node>,
+        groups: Vec<ProxyGroupConfig>,
+        rules: Vec<RoutingRule>,
+    ) -> AppConfig {
+        AppConfig {
+            nodes,
+            active_node: Some(0),
+            groups,
+            rules,
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn lan_wide_udp_follows_active_node_or_unsourced_group() {
+        let stream = stream_only("primary", "1.1.1.1");
+        let udp = ss("stream", "2.2.2.2", 8388, "pw");
+        let nodes = vec![stream, udp];
+        let fingerprints = fps(&nodes);
+        let mut media = group(vec![fingerprints[1].clone()]);
+        media.name = "media".to_string();
+        let config = config_with(
+            nodes,
+            vec![media],
+            vec![domain_rule("", "group:media", true)],
+        );
+        assert!(lan_wide_udp(&config).unwrap());
+
+        let mut only_device = config;
+        only_device.rules = vec![domain_rule("192.0.2.10/32", "group:media", true)];
+        assert!(!lan_wide_udp(&only_device).unwrap());
+
+        only_device.rules = vec![domain_rule("", "group:media", false)];
+        assert!(!lan_wide_udp(&only_device).unwrap());
+
+        only_device.rules = vec![domain_rule("", "proxy", true)];
+        assert!(!lan_wide_udp(&only_device).unwrap());
+    }
+
+    #[test]
+    fn lan_wide_udp_uses_fallback_first_member_not_a_later_pick() {
+        let nodes = vec![
+            stream_only("primary", "1.1.1.1"),
+            stream_only("first", "2.2.2.2"),
+            ss("later", "3.3.3.3", 8388, "pw"),
+        ];
+        let fingerprints = fps(&nodes);
+        let mut media = group(vec![fingerprints[1].clone(), fingerprints[2].clone()]);
+        media.name = "media".to_string();
+        media.gtype = GroupType::Fallback;
+        media.current = Some(fingerprints[2].clone());
+        let config = config_with(
+            nodes,
+            vec![media],
+            vec![domain_rule("", "group:media", true)],
+        );
+        assert!(!lan_wide_udp(&config).unwrap());
+    }
+
+    #[test]
+    fn lan_wide_udp_direct_mode_and_rejects_a_bad_index() {
+        let mut config = AppConfig::default();
+        config.proxy_mode = ProxyMode::Direct;
+        assert!(lan_wide_udp(&config).unwrap());
+        config.proxy_mode = ProxyMode::Rule;
+        config.nodes = vec![stream_only("primary", "1.1.1.1")];
+        config.active_node = Some(4);
+        assert!(lan_wide_udp(&config).is_err());
     }
 }

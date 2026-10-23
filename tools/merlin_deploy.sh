@@ -9,6 +9,7 @@
 #
 # Env overrides:
 #   BIN=.../sockrocket-cli   ASP=.../sockrocket.asp   SH=.../sockrocket.sh
+#   IPT=.../iptables.sh
 #   SKIP_RESTART=1           # upload only (no stop/start)
 #   FORCE_RESTART=1          # restart even when remote md5 matches
 
@@ -26,11 +27,13 @@ PASS="${ROUTER_PASS:?set ROUTER_PASS in .local/router.env}"
 BIN="${BIN:-$ROOT/target/aarch64-unknown-linux-musl/release/sockrocket-cli}"
 ASP="${ASP:-$ROOT/merlin/webui/sockrocket.asp}"
 SH="${SH:-$ROOT/merlin/scripts/sockrocket.sh}"
+IPT="${IPT:-$ROOT/merlin/scripts/iptables.sh}"
 REMOTE_DIR="/jffs/addons/sockrocket"
 
 [[ -x "$BIN" ]] || { echo "missing binary: $BIN"; exit 1; }
 [[ -f "$ASP" ]] || { echo "missing asp: $ASP"; exit 1; }
 [[ -f "$SH" ]] || { echo "missing script: $SH"; exit 1; }
+[[ -f "$IPT" ]] || { echo "missing iptables.sh: $IPT"; exit 1; }
 
 SSH_OPTS=(-p "$PORT" -o StrictHostKeyChecking=yes
   -o PreferredAuthentications=password -o PubkeyAuthentication=no
@@ -61,8 +64,14 @@ ssh_do "cp -f /jffs/.koolshare/webs/Module_sockrocket.asp /koolshare/webs/Module
 cp -f $REMOTE_DIR/webui/sockrocket.asp /tmp/var/wwwext/sockrocket/sockrocket.asp 2>/dev/null || true"
 # Normalize LF for ash
 tr -d '\r' < "$SH" > /tmp/sockrocket.sh.lf
+tr -d '\r' < "$IPT" > /tmp/iptables.sh.lf
+LOCAL_SH_MD5=$(md5 -q /tmp/sockrocket.sh.lf 2>/dev/null || md5sum /tmp/sockrocket.sh.lf | awk '{print $1}')
+LOCAL_IPT_MD5=$(md5 -q /tmp/iptables.sh.lf 2>/dev/null || md5sum /tmp/iptables.sh.lf | awk '{print $1}')
+REMOTE_SH_MD5=$(ssh_do "md5sum $REMOTE_DIR/scripts/sockrocket.sh 2>/dev/null | awk '{print \$1}'" || true)
+REMOTE_IPT_MD5=$(ssh_do "md5sum $REMOTE_DIR/scripts/iptables.sh 2>/dev/null | awk '{print \$1}'" || true)
 scp_do /tmp/sockrocket.sh.lf "$REMOTE_DIR/scripts/sockrocket.sh"
-rm -f /tmp/sockrocket.sh.lf
+scp_do /tmp/iptables.sh.lf "$REMOTE_DIR/scripts/iptables.sh"
+rm -f /tmp/sockrocket.sh.lf /tmp/iptables.sh.lf
 
 REMOTE_MD5=$(ssh_do "md5sum $REMOTE_DIR/sockrocket-cli 2>/dev/null | awk '{print \$1}'" || true)
 NEW_MD5=$(ssh_do "md5sum $REMOTE_DIR/sockrocket-cli.new | awk '{print \$1}'")
@@ -74,9 +83,10 @@ echo "    remote_new=$NEW_MD5"
 NEED_RESTART=1
 if [[ "${SKIP_RESTART:-0}" == "1" ]]; then
   NEED_RESTART=0
-elif [[ "${FORCE_RESTART:-0}" != "1" && -n "$REMOTE_MD5" && "$REMOTE_MD5" == "$NEW_MD5" ]]; then
-  echo "==> binary unchanged — skip daemon restart (avoid network flap)"
-  ssh_do "rm -f $REMOTE_DIR/sockrocket-cli.new; chmod +x $REMOTE_DIR/scripts/sockrocket.sh"
+elif [[ "${FORCE_RESTART:-0}" != "1" && -n "$REMOTE_MD5" && "$REMOTE_MD5" == "$NEW_MD5" \
+    && "$REMOTE_SH_MD5" == "$LOCAL_SH_MD5" && "$REMOTE_IPT_MD5" == "$LOCAL_IPT_MD5" ]]; then
+  echo "==> binary and firewall scripts unchanged — skip daemon restart (avoid network flap)"
+  ssh_do "rm -f $REMOTE_DIR/sockrocket-cli.new; chmod +x $REMOTE_DIR/scripts/sockrocket.sh $REMOTE_DIR/scripts/iptables.sh"
   NEED_RESTART=0
 fi
 
@@ -87,7 +97,7 @@ if [[ "$NEED_RESTART" == "1" ]]; then
     exec >>/tmp/sockrocket-deploy.log 2>&1
     echo \"=== deploy \$(date) ===\"
     cd $REMOTE_DIR || exit 1
-    chmod +x scripts/sockrocket.sh sockrocket-cli.new
+    chmod +x scripts/sockrocket.sh scripts/iptables.sh sockrocket-cli.new
     sh scripts/sockrocket.sh stop
     mv -f sockrocket-cli.new sockrocket-cli
     chmod +x sockrocket-cli
@@ -123,11 +133,22 @@ else
 fi
 
 echo "==> 4/4 verify"
-ssh_do "
+# The local API needs its bearer token and the /api path; a bare GET is
+# dropped without a reply and looks like a dead service. Fail the deploy when
+# the daemon or the API is down instead of printing DONE.
+verify_out=$(ssh_do "
   sh $REMOTE_DIR/scripts/sockrocket.sh status | head -12
-  curl -s -m 5 http://127.0.0.1:18188/?action=version
-  echo
+  echo \"api=\$(curl -s -m 5 -H \"Authorization: Bearer \$(cat $REMOTE_DIR/api-token 2>/dev/null)\" http://127.0.0.1:18188/api?action=version)\"
   curl -s -o /dev/null -w 'socks=%{http_code} t=%{time_total}\n' --connect-timeout 8 --max-time 12 --socks5-hostname 127.0.0.1:1080 http://www.gstatic.com/generate_204
   # Verification must never change the active node or subscription settings.
-"
+") || true
+echo "$verify_out"
+if ! echo "$verify_out" | grep -Eq 'is running \(PID [0-9]+\)|PID [0-9]+'; then
+  echo "VERIFY FAILED: daemon is not running" >&2
+  exit 1
+fi
+if ! echo "$verify_out" | grep -q '^api={"version"'; then
+  echo "VERIFY FAILED: API did not answer" >&2
+  exit 1
+fi
 echo "DONE"
