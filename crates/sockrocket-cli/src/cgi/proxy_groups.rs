@@ -1,16 +1,15 @@
 //! Group and device policy mutations share the config transaction with rules.
 use super::*;
 use sockrocket_core::config::{
-    dedup::node_fingerprint,
-    group::{resolve_members, selected_member, valid_group_name},
+    dedup::{node_fingerprint, node_public_id},
+    group::{node_target_id, resolve_members, selected_member, valid_group_name},
 };
 use sockrocket_core::{Node, ProxyGroupConfig};
 
 // Legacy config fingerprints contain credentials. Only SHA-256 opaque IDs
 // cross the UI/API boundary; raw identities stay in the private config file.
 fn member_id(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    node_public_id(value)
 }
 fn groups(map: &Mapping) -> Vec<ProxyGroupConfig> {
     serde_yaml::from_value(
@@ -51,8 +50,23 @@ pub(super) fn get() -> J {
     json!({"ok":true,"groups":catalog(&map),"revision":route_trace::rules_revision(&map),
         "nodes":nodes(&map).iter().map(|n|json!({"name":n.name,"fingerprint":member_id(&node_fingerprint(n))})).collect::<Vec<_>>()})
 }
+pub(super) fn node_catalog(map: &Mapping) -> J {
+    json!(
+        nodes(map)
+            .iter()
+            .map(|node| json!({"name": node.name, "id": node_public_id(&node_fingerprint(node))}))
+            .collect::<Vec<_>>()
+    )
+}
+pub(super) fn node_name(map: &Mapping, id: &str) -> Option<String> {
+    nodes(map)
+        .into_iter()
+        .find(|node| node_public_id(&node_fingerprint(node)) == id)
+        .map(|node| node.name)
+}
 pub(super) fn valid_target(target: &str) -> bool {
     RULE_TARGETS.contains(&target)
+        || node_target_id(target).is_some()
         || target.strip_prefix("group:").is_some_and(|name| {
             load_conf().is_ok_and(|map| groups(&map).iter().any(|g| g.name == name))
         })

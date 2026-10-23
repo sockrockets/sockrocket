@@ -203,9 +203,11 @@ pub(super) fn act_trace_route(post: &J) -> J {
     // The daemon defaults an omitted active_node to the first configured node.
     // Match that default so polling status does not invalidate a valid trace.
     let active = Some(conf_usize(&map, "active_node").unwrap_or(0)).filter(|i| *i < nodes.len());
-    let selected_group = trace["action"]
-        .as_str()
-        .and_then(|s| s.strip_prefix("group:"));
+    let action = trace["action"].as_str().unwrap_or("");
+    let selected_group = action.strip_prefix("group:");
+    let pinned_node = action
+        .strip_prefix("node:")
+        .and_then(|id| proxy_groups::node_name(&map, id));
     let group_info = proxy_groups::catalog(&map);
     let group_node = selected_group
         .and_then(|name| {
@@ -223,7 +225,7 @@ pub(super) fn act_trace_route(post: &J) -> J {
         "mode":mode,"running":is_running(),"transparent_proxy":transparent_proxy,
         "lan_degraded":sockrocket_dir().join(".lan_degraded").exists(),
         "cn_ipset_direct":conf_bool(&map,"cn_ipset_direct",false),
-        "active_node":active,"node_name":if selected_group.is_some() {group_node} else {name},"proxy_group":selected_group,"group_type":selected_group.and_then(|name|group_info.as_array()?.iter().find(|g|g["name"].as_str()==Some(name))).map(|g|g["type"].clone()),"trace":trace})
+        "active_node":active,"node_name":if selected_group.is_some() {group_node} else if action.starts_with("node:") {pinned_node.as_deref()} else {name},"proxy_group":selected_group,"group_type":selected_group.and_then(|name|group_info.as_array()?.iter().find(|g|g["name"].as_str()==Some(name))).map(|g|g["type"].clone()),"trace":trace})
 }
 
 #[cfg(test)]

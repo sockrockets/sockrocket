@@ -98,6 +98,20 @@ h3{font-size:19px;line-height:1.4;font-weight:620}
 .router-row span:last-child{font-family:ui-monospace,monospace;color:#8ba4c2;font-size:10px}
 .router-bottom{font-size:10px;color:#a3b3c8;display:flex;align-items:center;gap:7px;padding-top:9px}
 .network-note{font-size:10px;color:#7c90a9;text-align:center;margin-top:20px}
+.merlin-files{display:grid;gap:8px;margin-top:22px;max-width:420px}
+.merlin-files a{display:flex;align-items:center;justify-content:space-between;gap:14px;color:#f1f5fb;background:#233141;border:1px solid #3b4d62;border-radius:10px;padding:12px 14px;font-size:12px}
+.merlin-files a:hover{background:#2c3d50}
+.merlin-files code{color:#9eb6d4;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;font-weight:500}
+.merlin-files .merlin-more{background:transparent;color:#d5e4f7}
+.download-base{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 14px;margin:8px 0 28px;font-size:12px;color:var(--muted)}
+.download-base code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;color:#243750;background:#eef3f9;border-radius:6px;padding:6px 8px;overflow-wrap:anywhere}
+#download h3{font-size:18px;margin:8px 0 8px}
+.file-lead{font-size:13px;color:var(--muted);max-width:720px;margin-bottom:8px}
+.file-note{font-size:12px;color:var(--muted);margin:4px 0 28px}
+.file-note a,.doc-table a{color:var(--blue);font-weight:600}
+.doc-table a:hover{text-decoration:underline}
+.doc-table td,.doc-table th{overflow-wrap:anywhere}
+#router-downloads{scroll-margin-top:25px}
 .download-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
 .download-grid article{background:white;border:1px solid var(--line);border-radius:16px;padding:26px 23px}
 .download-grid h3{margin-top:25px;font-size:20px}
@@ -208,6 +222,8 @@ section[id]{scroll-margin-top:25px}
 .capabilities article{display:grid;grid-template-columns:28px 1fr;gap:0 10px}
 .number{grid-row:span 2;margin-top:3px}
 .capabilities p{grid-column:2;margin-top:7px}
+.merlin-files{max-width:none}
+.merlin-files a{align-items:flex-start;flex-wrap:wrap}
 .merlin-section{padding:60px 0}
 .merlin-layout{grid-template-columns:1fr;gap:45px}
 .merlin-layout h2{font-size:39px}
@@ -219,6 +235,12 @@ section[id]{scroll-margin-top:25px}
 .download-grid article{padding:24px 18px}
 .download-foot{display:block}
 .download-foot a{display:inline-block;margin-top:12px}
+#download .doc-table,.doc-article .doc-table{overflow:visible}
+#download .doc-table table,.doc-article .doc-table table{min-width:0}
+#download .doc-table thead,.doc-article .doc-table thead{display:none}
+#download .doc-table tr,.doc-article .doc-table tr{display:block;border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:0 0 10px;background:#fff}
+#download .doc-table td,.doc-article .doc-table td{display:block;border:0;padding:3px 0}
+#download .doc-table td:last-child,.doc-article .doc-table td:last-child{padding-top:8px}
 .getting-started,.cli,.faq{grid-template-columns:1fr;gap:35px}
 .getting-started{padding-block:40px}
 .start-intro h2,.faq h2{font-size:30px}

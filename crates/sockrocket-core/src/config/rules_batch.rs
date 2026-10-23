@@ -506,6 +506,9 @@ fn normalize_target(s: &str) -> Option<&str> {
     if s.starts_with("group:") && super::group::valid_group_name(&s[6..]) {
         return Some(s);
     }
+    if super::group::node_target_id(s).is_some() {
+        return Some(s);
+    }
     match s.trim().to_ascii_lowercase().as_str() {
         "direct" | "dir" => Some("direct"),
         "proxy" | "proxied" => Some("proxy"),
@@ -528,7 +531,7 @@ fn export_type(t: &str) -> &'static str {
 }
 
 fn export_target(t: &str) -> &str {
-    if t.starts_with("group:") {
+    if t.starts_with("group:") || super::group::node_target_id(t).is_some() {
         return t;
     }
     match t {

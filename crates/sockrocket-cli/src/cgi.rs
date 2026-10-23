@@ -538,6 +538,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "move_rule" => act_move_rule(post),
         "update_rule" => act_update_rule(post),
         "set_rule_group_enabled" => act_set_rule_group_enabled(post),
+        "set_rule_group_target" => act_set_rule_group_target(post),
         "delete_rule_group" => act_delete_rule_group(post),
         "replace_rule_group" => act_replace_rule_group(post),
         "check_update" => act_check_update(),
@@ -2213,7 +2214,7 @@ fn act_get_rules() -> J {
             })
         })
         .collect();
-    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2706,6 +2707,56 @@ fn act_export_rules() -> J {
     let rules = load_routing_rules(&map);
     let text = sockrocket_core::format_rules_export(&rules);
     json!({"ok": true, "text": text, "count": rules.len()})
+}
+
+fn act_set_rule_group_target(post: &J) -> J {
+    let group = post
+        .get("group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(target) = post.get("target").and_then(|v| v.as_str()) else {
+        return err_msg("请选择分组出口");
+    };
+    if !proxy_groups::valid_target(target) || target == "direct" || target == "reject" {
+        return err_msg("分组出口只能是全局节点、一个节点，或已有的节点分组");
+    }
+    let Ok(mut map) = load_conf() else {
+        return err_msg("Config file not found");
+    };
+    let mut rules = load_routing_rules(&map);
+    if rules.len() != conf_seq(&map, "rules").len() {
+        return err_msg("规则配置损坏，请先修复后再修改分组出口");
+    }
+    if let Some(expected) = post.get("expected_rules") {
+        let current: Vec<_> = rules
+            .iter()
+            .filter(|r| same_rule_group(&r.group, &group))
+            .map(rule_edit_snapshot)
+            .collect();
+        if expected != &json!(current) {
+            return err_msg("分组规则已变化，请刷新后重新选择出口");
+        }
+    }
+    let changed = match sockrocket_core::assign_group_outlet(&mut rules, &group, target) {
+        Ok(changed) => changed,
+        Err(_) => return err_msg("无法设置这个分组的出口"),
+    };
+    if changed == 0 {
+        return json!({"ok": true, "msg": "分组出口未变化"});
+    }
+    save_routing_rules(&mut map, rules);
+    match save_conf(&map) {
+        Ok(()) => {
+            if is_running()
+                && let Err(error) = run_sh("restart")
+            {
+                return json!({"ok":false,"saved":true,"applied":false,"error_code":"rule_apply_failed","msg":"分组出口已保存，但代理重新加载失败；请查看诊断后重试应用。","detail":error.to_string()});
+            }
+            json!({"ok": true, "saved": true, "applied": is_running(), "msg": format!("已更新 {changed} 条规则的出口")})
+        }
+        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    }
 }
 
 fn act_set_rule_group_enabled(post: &J) -> J {
@@ -3585,6 +3636,60 @@ dns_direct_domains:
   - "baidu.com"
   - "qq.com"
 "#;
+
+    #[test]
+    fn a_rule_group_can_pin_a_different_node() {
+        let _env = TestEnv::new(SAMPLE);
+        assert_eq!(
+            dispatch(
+                "add_rule",
+                &json!({"rule_type":"domain-suffix","pattern":"video.example","target":"proxy","group":"Video"})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                "add_rule",
+                &json!({"rule_type":"domain-suffix","pattern":"ads.example","target":"reject","group":"Video"})
+            )["ok"],
+            true
+        );
+        let listed = dispatch("get_rules", &json!({}));
+        let id = listed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "Node B")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let target = format!("node:{id}");
+        let result = dispatch(
+            "set_rule_group_target",
+            &json!({"group":"Video","target":target}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        let rules = load_routing_rules(&load_conf().unwrap());
+        let video: Vec<_> = rules.iter().filter(|rule| rule.group == "Video").collect();
+        assert!(
+            video
+                .iter()
+                .any(|rule| rule.pattern == "video.example" && rule.target == target)
+        );
+        assert!(
+            video
+                .iter()
+                .any(|rule| rule.pattern == "ads.example" && rule.target == "reject")
+        );
+        assert_eq!(
+            dispatch(
+                "set_rule_group_target",
+                &json!({"group":"Video","target":"proxy","expected_rules":[]})
+            )["ok"],
+            false
+        );
+    }
 
     #[test]
     fn route_trace_is_read_only_normalized_and_revision_guarded() {

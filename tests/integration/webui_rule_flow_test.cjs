@@ -61,6 +61,9 @@ assert.deepEqual(Array.from(model.filter(r=>r.indices).flatMap(r=>Array.from(r.i
 assert.equal(model[1].disabled,true);assert.equal(model[1].title,'Region');
 g.renderRuleFlow();assert.match(grouped.element('rule-flow-summary').textContent,/共 5 条 · 启用 4 条 · 停用 1 条/);
 g.showFlowRuleList('global_rule',1);assert.match(grouped.element('rule-count').textContent,/当前显示 1 条/);assert.match(grouped.element('rule-list').innerHTML,/Region/);
+g.SR_RULE_NODES=[{id:'ab'.repeat(32),name:'Example B'}];g.renderRules(false);
+assert.match(grouped.element('rule-list').innerHTML,/aria-label="分组出口"/);
+assert.match(grouped.element('rule-list').innerHTML,/节点 · Example B/);
 g.SR_STATE.status.transparent_proxy=true;g.SR_STATE.status.cn_ipset_direct=false;
 g.RULE_TRACE=result(g.SR_STATE.ruleRows[3]);g.RULE_FLOW_SELECTED=-1;g.renderRuleFlow();assert.equal(g.RULE_FLOW_SELECTED,3,'highlight the exact matching group segment, not the first global group');
 let graph=grouped.element('rule-flow').innerHTML;
