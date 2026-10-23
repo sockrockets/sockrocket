@@ -369,12 +369,13 @@ fn parse_clash_line(line: &str) -> Result<RoutingRule, String> {
         return Err(format!("{typ} requires a pattern"));
     }
     let pattern = parts[1];
-    let target = match parts.get(2).copied().and_then(normalize_target) {
-        Some(target) => target,
-        // Public Clash lists name a policy group this config does not have.
-        // Keep the rule on the proxy path instead of dropping the line.
-        None => "proxy",
-    };
+    // Public Clash lists name a policy group this config does not have.
+    // Keep the rule on the proxy path instead of dropping the line.
+    let target = parts
+        .get(2)
+        .copied()
+        .and_then(normalize_target)
+        .unwrap_or("proxy");
     build_rule(typ, pattern, target)
 }
 
