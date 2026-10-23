@@ -13,9 +13,9 @@
 <header class="header"><div class="nav wrap">
   <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
   <nav aria-label="Main navigation">
-    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
     <a href="../index.html#merlin">Merlin</a>
     <a href="../index.html#download" data-t="navDownload">下载</a>
+    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
     <a href="./" data-t="navDocs" aria-current="page">文档</a>
     <a href="../index.html#community" data-t="navCommunity">社区</a>
   </nav>
@@ -59,14 +59,15 @@
     <article class="doc-article">
       <div class="doc-locale" data-locale="zh">
         <h2 id="install">1. 安装</h2>
-        <p>从 <a href="https://github.com/sockrockets/sockrocket/releases/latest">GitHub Releases</a> 下载对应系统的包：</p>
+        <p>点文件名直接下载。路由器安装包按固件平台列在 <a href="../index.html#router-downloads">下载页</a>。</p>
         <div class="doc-table"><table>
-          <thead><tr><th>平台</th><th>桌面</th><th>CLI</th></tr></thead>
+          <thead><tr><th>平台</th><th>桌面</th><th>命令行</th></tr></thead>
           <tbody>
-            <tr><td>macOS Apple Silicon</td><td><code>sockrocket-macos-aarch64.dmg</code></td><td><code>sockrocket-cli-macos-aarch64</code></td></tr>
-            <tr><td>macOS Intel</td><td><code>sockrocket-macos-x86_64.dmg</code></td><td><code>sockrocket-cli-macos-x86_64</code></td></tr>
-            <tr><td>Windows x86_64</td><td><code>sockrocket-windows-x86_64.zip</code></td><td><code>sockrocket-cli-windows-x86_64.exe</code></td></tr>
-            <tr><td>Linux x86_64 / ARM64</td><td>对应 <code>.tar.gz</code></td><td>对应 <code>sockrocket-cli-linux-*</code></td></tr>
+            <tr><td>macOS Apple Silicon</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-macos-aarch64.dmg">sockrocket-macos-aarch64.dmg</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-macos-aarch64">sockrocket-cli-macos-aarch64</a></td></tr>
+            <tr><td>macOS Intel</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-macos-x86_64.dmg">sockrocket-macos-x86_64.dmg</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-macos-x86_64">sockrocket-cli-macos-x86_64</a></td></tr>
+            <tr><td>Windows x86_64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-windows-x86_64.zip">sockrocket-windows-x86_64.zip</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-windows-x86_64.exe">sockrocket-cli-windows-x86_64.exe</a></td></tr>
+            <tr><td>Linux x86_64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-linux-x86_64.tar.gz">sockrocket-linux-x86_64.tar.gz</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-linux-x86_64">sockrocket-cli-linux-x86_64</a></td></tr>
+            <tr><td>Linux aarch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-linux-aarch64.tar.gz">sockrocket-linux-aarch64.tar.gz</a></td><td>桌面压缩包内</td></tr>
           </tbody>
         </table></div>
         <p>升级前请先退出旧版及其后台进程，避免端口或路由被重复占用。</p>
@@ -91,14 +92,15 @@ curl -x http://127.0.0.1:1087 https://www.google.com -I</code></pre>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <h2 id="en-install">1. Install</h2>
-        <p>Download from <a href="https://github.com/sockrockets/sockrocket/releases/latest">GitHub Releases</a>:</p>
+        <p>Select a filename to download it. Router packages are listed by firmware platform on the <a href="../index.html#router-downloads">download page</a>.</p>
         <div class="doc-table"><table>
           <thead><tr><th>Platform</th><th>Desktop</th><th>CLI</th></tr></thead>
           <tbody>
-            <tr><td>macOS Apple Silicon</td><td><code>sockrocket-macos-aarch64.dmg</code></td><td><code>sockrocket-cli-macos-aarch64</code></td></tr>
-            <tr><td>macOS Intel</td><td><code>sockrocket-macos-x86_64.dmg</code></td><td><code>sockrocket-cli-macos-x86_64</code></td></tr>
-            <tr><td>Windows x86_64</td><td><code>sockrocket-windows-x86_64.zip</code></td><td><code>sockrocket-cli-windows-x86_64.exe</code></td></tr>
-            <tr><td>Linux x86_64 / ARM64</td><td>matching <code>.tar.gz</code></td><td>matching <code>sockrocket-cli-linux-*</code></td></tr>
+            <tr><td>macOS Apple Silicon</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-macos-aarch64.dmg">sockrocket-macos-aarch64.dmg</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-macos-aarch64">sockrocket-cli-macos-aarch64</a></td></tr>
+            <tr><td>macOS Intel</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-macos-x86_64.dmg">sockrocket-macos-x86_64.dmg</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-macos-x86_64">sockrocket-cli-macos-x86_64</a></td></tr>
+            <tr><td>Windows x86_64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-windows-x86_64.zip">sockrocket-windows-x86_64.zip</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-windows-x86_64.exe">sockrocket-cli-windows-x86_64.exe</a></td></tr>
+            <tr><td>Linux x86_64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-linux-x86_64.tar.gz">sockrocket-linux-x86_64.tar.gz</a></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-cli-linux-x86_64">sockrocket-cli-linux-x86_64</a></td></tr>
+            <tr><td>Linux aarch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-linux-aarch64.tar.gz">sockrocket-linux-aarch64.tar.gz</a></td><td>Inside the desktop archive</td></tr>
           </tbody>
         </table></div>
         <p>Quit the old version and its background instance before upgrading.</p>

@@ -13,9 +13,9 @@
 <header class="header"><div class="nav wrap">
   <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
   <nav aria-label="Main navigation">
-    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
     <a href="../index.html#merlin">Merlin</a>
     <a href="../index.html#download" data-t="navDownload">下载</a>
+    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
     <a href="./" data-t="navDocs" aria-current="page">文档</a>
     <a href="../index.html#community" data-t="navCommunity">社区</a>
   </nav>
@@ -68,18 +68,19 @@
         <div class="doc-table"><table>
           <thead><tr><th>平台</th><th>软件包</th><th>常见机型 / SoC</th></tr></thead>
           <tbody>
-            <tr><td><code>hnd_v8</code></td><td><code>sockrocket-merlin-hnd_v8.tar.gz</code></td><td>RT-AX86U / PRO、RT-AX88U、GT-AX6000 等 BCM490x/491x（aarch64）</td></tr>
-            <tr><td><code>hnd</code></td><td><code>sockrocket-merlin-hnd.tar.gz</code></td><td>TUF-AX3000、RT-AX58U、ZenWiFi XT8 等 BCM675x（armv7）</td></tr>
-            <tr><td><code>arm</code></td><td><code>sockrocket-merlin-arm.tar.gz</code></td><td>RT-AC68U、RT-AC88U 等经典 AC（BCM4708/4709）</td></tr>
-            <tr><td><code>qca</code></td><td><code>sockrocket-merlin-qca.tar.gz</code></td><td>RT-AX89X（IPQ807x）</td></tr>
-            <tr><td><code>mtk</code></td><td><code>sockrocket-merlin-mtk.tar.gz</code></td><td>TUF-AX4200 / AX6000、RT-AX59U（Filogic）</td></tr>
-            <tr><td><code>ipq32</code> / <code>ipq64</code></td><td>对应 tar.gz</td><td>IPQ53xx：以 <code>uname -m</code> 为准</td></tr>
+            <tr><td><code>hnd_v8</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz">sockrocket-merlin-hnd_v8.tar.gz</a></td><td>RT-AX86U / PRO、RT-AX86S、RT-AX88U / PRO、RT-AX68U、RT-AX92U、GT-AX6000、GT-AX11000 / PRO、GT-AXE11000、GT-AXE16000、ZenWiFi Pro XT12、RT-AC86U、GT-AC2900、GT-AC5300。BCM490x / BCM491x。联名版与基础型号同一个包。</td></tr>
+            <tr><td><code>hnd</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz">sockrocket-merlin-hnd.tar.gz</a></td><td>TUF-AX3000 / V2、TUF-AX5400、RT-AX58U / V2、RT-AX82U / V2、RT-AX56U、RT-AX55、RT-AX57、ZenWiFi XT8、ZenWiFi XD4。BCM675x。</td></tr>
+            <tr><td><code>arm</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz">sockrocket-merlin-arm.tar.gz</a></td><td>RT-AC68U、RT-AC66U B1、RT-AC1900 / P、RT-AC87U、RT-AC88U、RT-AC3100、RT-AC3200、RT-AC5300。BCM4708 / BCM4709，需带软件中心的 Merlin。</td></tr>
+            <tr><td><code>qca</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz">sockrocket-merlin-qca.tar.gz</a></td><td>RT-AX89X、RT-AC89X。IPQ807x。</td></tr>
+            <tr><td><code>mtk</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz">sockrocket-merlin-mtk.tar.gz</a></td><td>TUF-AX4200、TUF-AX6000、RT-AX59U、ZenWiFi BD4。MT798x。</td></tr>
+            <tr><td><code>ipq32</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz">sockrocket-merlin-ipq32.tar.gz</a></td><td>IPQ53xx，且 <code>uname -m</code> 为 armv7l。同一机箱的 64 位固件用 ipq64。</td></tr>
+            <tr><td><code>ipq64</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz">sockrocket-merlin-ipq64.tar.gz</a></td><td>IPQ53xx，且 <code>uname -m</code> 为 aarch64。同一机箱的 32 位固件用 ipq32。</td></tr>
           </tbody>
         </table></div>
         <div class="doc-callout"><strong>和 fancyss 的差异</strong>fancyss 的 <code>hnd</code> 可能同时覆盖 ARMv7 与 ARMv8。Sockrocket 拆成 <code>hnd</code> 与 <code>hnd_v8</code>，必须和 CPU 一致，否则会出现 Exec format error。</div>
         <h2 id="install">安装步骤</h2>
         <ol>
-          <li>从 <a href="https://github.com/sockrockets/sockrocket/releases/latest">Releases</a> 下载对应 <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>（校验见 <code>SHA256SUMS-merlin.txt</code>）。</li>
+          <li>从上表直接下载对应的 <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>，并用 <a href="https://github.com/sockrockets/sockrocket/releases/latest/download/SHA256SUMS-merlin.txt">SHA256SUMS-merlin.txt</a> 校验。</li>
           <li>路由器 WebUI → <strong>软件中心</strong> → <strong>离线安装</strong>，上传该包。</li>
           <li>安装完成后打开 Sockrocket 入口（或 Softcenter 菜单中的模块页）。</li>
           <li>在页面里添加订阅或节点，开启透明代理 / DNS 劫持（按需）。</li>
@@ -103,16 +104,19 @@
         <div class="doc-table"><table>
           <thead><tr><th>Platform</th><th>Package</th><th>Typical models / SoC</th></tr></thead>
           <tbody>
-            <tr><td><code>hnd_v8</code></td><td><code>sockrocket-merlin-hnd_v8.tar.gz</code></td><td>RT-AX86U / PRO, RT-AX88U, GT-AX6000… BCM490x/491x (aarch64)</td></tr>
-            <tr><td><code>hnd</code></td><td><code>sockrocket-merlin-hnd.tar.gz</code></td><td>TUF-AX3000, RT-AX58U, ZenWiFi XT8… BCM675x (armv7)</td></tr>
-            <tr><td><code>arm</code></td><td><code>sockrocket-merlin-arm.tar.gz</code></td><td>RT-AC68U, RT-AC88U… classic AC</td></tr>
-            <tr><td><code>qca</code> / <code>mtk</code> / <code>ipq*</code></td><td>matching tar.gz</td><td>See full model lists in the repo guide when needed</td></tr>
+            <tr><td><code>hnd_v8</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz">sockrocket-merlin-hnd_v8.tar.gz</a></td><td>RT-AX86U / PRO, RT-AX86S, RT-AX88U / PRO, RT-AX68U, RT-AX92U, GT-AX6000, GT-AX11000 / PRO, GT-AXE11000, GT-AXE16000, ZenWiFi Pro XT12, RT-AC86U, GT-AC2900, GT-AC5300. BCM490x / BCM491x. Co-branded editions use the same package as the base model.</td></tr>
+            <tr><td><code>hnd</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz">sockrocket-merlin-hnd.tar.gz</a></td><td>TUF-AX3000 / V2, TUF-AX5400, RT-AX58U / V2, RT-AX82U / V2, RT-AX56U, RT-AX55, RT-AX57, ZenWiFi XT8, ZenWiFi XD4. BCM675x.</td></tr>
+            <tr><td><code>arm</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz">sockrocket-merlin-arm.tar.gz</a></td><td>RT-AC68U, RT-AC66U B1, RT-AC1900 / P, RT-AC87U, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300. BCM4708 / BCM4709, on Merlin with Software Center.</td></tr>
+            <tr><td><code>qca</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz">sockrocket-merlin-qca.tar.gz</a></td><td>RT-AX89X, RT-AC89X. IPQ807x.</td></tr>
+            <tr><td><code>mtk</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz">sockrocket-merlin-mtk.tar.gz</a></td><td>TUF-AX4200, TUF-AX6000, RT-AX59U, ZenWiFi BD4. MT798x.</td></tr>
+            <tr><td><code>ipq32</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz">sockrocket-merlin-ipq32.tar.gz</a></td><td>IPQ53xx when <code>uname -m</code> is armv7l. The same chassis on 64-bit firmware uses ipq64.</td></tr>
+            <tr><td><code>ipq64</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz">sockrocket-merlin-ipq64.tar.gz</a></td><td>IPQ53xx when <code>uname -m</code> is aarch64. The same chassis on 32-bit firmware uses ipq32.</td></tr>
           </tbody>
         </table></div>
         <div class="doc-callout"><strong>Unlike fancyss</strong>Sockrocket splits <code>hnd</code> and <code>hnd_v8</code>. The wrong one fails with Exec format error.</div>
         <h2 id="en-install">Install</h2>
         <ol>
-          <li>Download the matching package from <a href="https://github.com/sockrockets/sockrocket/releases/latest">Releases</a>.</li>
+          <li>Download the matching package from the table. Check it with <a href="https://github.com/sockrockets/sockrocket/releases/latest/download/SHA256SUMS-merlin.txt">SHA256SUMS-merlin.txt</a>.</li>
           <li>Router WebUI → Software Center → Offline install → upload the archive.</li>
           <li>Open the Sockrocket module and add your subscription or nodes.</li>
           <li>Enable transparent proxy / DNS hijack as needed.</li>
