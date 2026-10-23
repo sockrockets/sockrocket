@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -68,6 +68,19 @@ pub fn is_fake_ip(ip: Ipv4Addr) -> bool {
     u32::from(ip) & FAKE_IP_MASK == FAKE_IP_BASE
 }
 
+/// RFC 5180 benchmark space; shares the persisted IPv4 allocation identity.
+pub fn fake_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(ip) if is_fake_ip(ip) => Some(ip),
+        IpAddr::V6(ip) if ip.segments()[..6] == [0x2001, 2, 0, 0x4765, 0, 0] => {
+            let octets = ip.octets();
+            let ip = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+            is_fake_ip(ip).then_some(ip)
+        }
+        _ => None,
+    }
+}
+
 /// Bidirectional fake-IP ↔ domain map with LRU eviction.
 ///
 /// Cheap to clone (Arc inside and out); the DNS resolver and the TUN
@@ -92,6 +105,10 @@ struct Inner {
 }
 
 impl FakeIpPool {
+    pub fn allocate_v6(&self, domain: &str) -> Ipv6Addr {
+        let ip = u32::from(self.allocate(domain));
+        Ipv6Addr::new(0x2001, 2, 0, 0x4765, 0, 0, (ip >> 16) as u16, ip as u16)
+    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {

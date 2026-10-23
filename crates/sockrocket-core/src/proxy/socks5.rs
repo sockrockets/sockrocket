@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -22,7 +21,7 @@ impl Socks5Server {
         outbound: SharedOutbound,
         stats: ProxyStats,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(format!("{}:{}", addr, port)).await?;
+        let listener = TcpListener::bind((addr.trim_matches(['[', ']']), port)).await?;
         tracing::info!("SOCKS5 server listening on {}:{}", addr, port);
         Ok(Self {
             listener,
@@ -56,10 +55,10 @@ impl Socks5Server {
                         if rejected.is_power_of_two() { tracing::warn!(rejected, "Local proxy connection capacity reached"); }
                         continue;
                     };
+                    // Buffer sizes stay at the kernel default so autotune can
+                    // grow the window. A fixed 64 KiB lock capped Wi-Fi clients
+                    // as well as the WAN hop.
                     stream.set_nodelay(true).ok();
-                    let sock = SockRef::from(&stream);
-                    sock.set_send_buffer_size(64 * 1024).ok();
-                    sock.set_recv_buffer_size(64 * 1024).ok();
                     let outbound = self.outbound.clone();
                     let stats = self.stats.clone();
                     connections.spawn(async move {

@@ -178,12 +178,23 @@ pub(super) fn add(post: &J) -> J {
     if rules.len() != conf_seq(&map, "rules").len() {
         return err_msg("规则配置损坏，请先修复后再添加预设");
     }
+    let target = post
+        .get("target")
+        .and_then(J::as_str)
+        .unwrap_or(preset.target);
+    if !proxy_groups::valid_target(target) {
+        return err_msg("请选择有效的预设出口");
+    }
+    let source = match requested_rule_source(post, "") {
+        Ok(v) => v,
+        Err(e) => return err_msg(&e),
+    };
     let mut added = 0;
     for domain in preset.domains {
         // An existing global selector belongs to the user, even if its target,
         // priority or enabled state differs. Do not replace or re-enable it.
         if rules.iter().any(|r| {
-            r.source.is_empty()
+            r.source == source
                 && r.rule_type.eq_ignore_ascii_case("domain-suffix")
                 && r.pattern
                     .trim_start_matches('.')
@@ -192,12 +203,12 @@ pub(super) fn add(post: &J) -> J {
             continue;
         }
         rules.push(RoutingRule {
-            source: String::new(),
+            source: source.clone(),
             name: String::new(),
             group: group(preset),
             rule_type: "domain-suffix".into(),
             pattern: (*domain).into(),
-            target: preset.target.into(),
+            target: target.into(),
             priority: -10,
             enabled: false,
         });

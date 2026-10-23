@@ -33,6 +33,14 @@ pub trait Outbound: Send + Sync + 'static {
     fn routing_policy(&self) -> Option<Arc<crate::router::Router>> {
         None
     }
+    /// DNS's proxy group bypasses destination routing but retains node policy.
+    fn proxy_transport(&self) -> Option<SharedOutbound> {
+        None
+    }
+    /// Retain the latest routing/group snapshot during default-node failover.
+    fn with_default_proxy(&self, _proxy: SharedOutbound) -> Option<SharedOutbound> {
+        None
+    }
     fn is_direct(&self) -> bool {
         false
     }
@@ -40,10 +48,42 @@ pub trait Outbound: Send + Sync + 'static {
     /// Datagram support is an explicit capability. Never tunnel payloads
     /// through `connect`, which only provides TCP byte-stream semantics.
     fn connect_datagram(&self, _host: &str, _port: u16) -> DatagramFuture<'_, BoxDatagram> {
-        Box::pin(async { anyhow::bail!("Outbound does not support UDP datagrams") })
+        Box::pin(async { Err(UdpUnsupported::new(UDP_UNSUPPORTED).into()) })
     }
 
     fn name(&self) -> &str;
+}
+
+/// Error text for an outbound that has no datagram transport.
+pub const UDP_UNSUPPORTED: &str = "Outbound does not support UDP datagrams";
+
+/// An outbound refused a datagram flow by policy or capability, before any
+/// network I/O. Distinct from a failed UDP attempt, which must not trigger a
+/// client-side fallback.
+#[derive(Debug)]
+pub struct UdpUnsupported(&'static str);
+
+impl UdpUnsupported {
+    pub fn new(reason: &'static str) -> Self {
+        Self(reason)
+    }
+}
+
+impl std::fmt::Display for UdpUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for UdpUnsupported {}
+
+/// True when establishing the datagram failed because the selected outbound
+/// has no UDP transport. Callers use this to send port unreachable instead
+/// of waiting for the client to time out.
+pub fn udp_unsupported(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|item| item.downcast_ref::<UdpUnsupported>().is_some())
 }
 
 /// Overall timeout for establishing an upstream connection through an
@@ -228,9 +268,21 @@ impl Outbound for StreamOnlyOutbound {
 /// [`SwappableOutbound::set`] redirects all *new* connections to the new
 /// outbound without rebinding the local listeners. In-flight connections
 /// keep using the outbound they started with.
+fn same_dns(
+    a: &Option<Arc<crate::dns::DnsConfig>>,
+    b: &Option<Arc<crate::dns::DnsConfig>>,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 struct PublishedOutbound {
     outbound: SharedOutbound,
     dns: Option<Arc<crate::dns::DnsConfig>>,
+    resolver: Option<crate::dns::DnsResolver>,
 }
 pub struct SwappableOutbound {
     inner: std::sync::RwLock<PublishedOutbound>,
@@ -242,20 +294,66 @@ impl SwappableOutbound {
             inner: std::sync::RwLock::new(PublishedOutbound {
                 outbound,
                 dns: None,
+                resolver: None,
             }),
         }
     }
 
     /// Replace the inner outbound (e.g. switch to another node).
     pub fn set(&self, outbound: SharedOutbound) {
-        self.inner.write().unwrap().outbound = outbound;
+        // Building a resolver loads TLS roots; keep that outside the write
+        // lock every new connection reads.
+        loop {
+            let dns = self.inner.read().unwrap().dns.clone();
+            let resolver = dns.as_ref().map(|config| {
+                let mut resolver = crate::dns::DnsResolver::with_config((**config).clone());
+                resolver.follow_runtime(outbound.clone());
+                resolver
+            });
+            let mut state = self.inner.write().unwrap();
+            if !same_dns(&state.dns, &dns) {
+                continue;
+            }
+            state.resolver = resolver;
+            state.outbound = outbound;
+            return;
+        }
+    }
+
+    /// Change the published DNS config in place, keeping whatever outbound
+    /// is current at commit time. Returns false when no DNS config exists.
+    pub fn update_dns(&self, edit: impl Fn(&mut crate::dns::DnsConfig)) -> bool {
+        loop {
+            let (outbound, dns) = {
+                let state = self.inner.read().unwrap();
+                (state.outbound.clone(), state.dns.clone())
+            };
+            let Some(current) = dns.clone() else {
+                return false;
+            };
+            let mut next = (*current).clone();
+            edit(&mut next);
+            let next = Arc::new(next);
+            let mut resolver = crate::dns::DnsResolver::with_config((*next).clone());
+            resolver.follow_runtime(outbound.clone());
+            let mut state = self.inner.write().unwrap();
+            if !same_dns(&state.dns, &dns) || !Arc::ptr_eq(&state.outbound.0, &outbound.0) {
+                continue;
+            }
+            state.dns = Some(next);
+            state.resolver = Some(resolver);
+            return true;
+        }
     }
 
     /// Atomically commit transport, embedded routing policy and DNS settings.
     pub fn publish(&self, outbound: SharedOutbound, dns: Arc<crate::dns::DnsConfig>) {
+        let mut resolver = crate::dns::DnsResolver::with_config((*dns).clone());
+        resolver.follow_runtime(outbound.clone());
         *self.inner.write().unwrap() = PublishedOutbound {
             outbound,
             dns: Some(dns),
+            resolver: Some(resolver),
         };
     }
 
@@ -271,13 +369,13 @@ impl Outbound for SwappableOutbound {
         host: &str,
         port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
-        let inner = self.current();
+        let inner = self.runtime_snapshot().unwrap();
         let host = host.to_owned();
         Box::pin(async move { inner.connect(&host, port).await })
     }
 
     fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
-        let inner = self.current();
+        let inner = self.runtime_snapshot().unwrap();
         let host = host.to_owned();
         Box::pin(async move { inner.0.connect_datagram(&host, port).await })
     }
@@ -288,11 +386,55 @@ impl Outbound for SwappableOutbound {
     }
 
     fn runtime_snapshot(&self) -> Option<SharedOutbound> {
-        Some(self.current())
+        let state = self.inner.read().unwrap();
+        Some(SharedOutbound(Arc::new(PolicyOutbound {
+            inner: state.outbound.clone(),
+            resolver: state.resolver.clone(),
+        })))
     }
 
     fn name(&self) -> &str {
         "swappable"
+    }
+}
+
+struct PolicyOutbound {
+    inner: SharedOutbound,
+    resolver: Option<crate::dns::DnsResolver>,
+}
+impl Outbound for PolicyOutbound {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            crate::dns::with_resolver(self.resolver.clone(), self.inner.0.connect(&host, port))
+                .await
+        })
+    }
+    fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
+        let host = host.to_owned();
+        Box::pin(async move {
+            crate::dns::with_resolver(
+                self.resolver.clone(),
+                self.inner.0.connect_datagram(&host, port),
+            )
+            .await
+        })
+    }
+    fn routing_policy(&self) -> Option<Arc<crate::router::Router>> {
+        self.inner.0.routing_policy()
+    }
+    fn proxy_transport(&self) -> Option<SharedOutbound> {
+        self.inner.0.proxy_transport()
+    }
+    fn is_direct(&self) -> bool {
+        self.inner.0.is_direct()
+    }
+    fn name(&self) -> &str {
+        self.inner.0.name()
     }
 }
 
@@ -321,6 +463,14 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn udp_refusal_is_typed_not_matched_by_text() {
+        let refused: anyhow::Error = UdpUnsupported::new("Vision blocks UDP/443").into();
+        assert!(udp_unsupported(&refused.context("group member")));
+        assert!(!udp_unsupported(&anyhow::anyhow!(UDP_UNSUPPORTED)));
+        assert!(!udp_unsupported(&anyhow::anyhow!("UDP relay timed out")));
+    }
 
     #[tokio::test]
     async fn test_direct_outbound() {

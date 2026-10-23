@@ -104,6 +104,9 @@ jobs:
           node tests/integration/webui_rule_flow_test.cjs
           node tests/integration/webui_rule_presets_test.cjs
           node tests/integration/webui_network_controls_test.cjs
+          node tests/integration/webui_dns_policy_test.cjs
+          node tests/integration/webui_proxy_groups_test.cjs
+          sh tests/integration/merlin_ipv6_policy_test.sh
 
       # ── Build ──────────────────────────────────────────────────────────────
       - name: Build (CLI)

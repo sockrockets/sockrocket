@@ -53,6 +53,11 @@ pub struct AppConfig {
     pub socks_port: u16,
     /// Local HTTP proxy port
     pub http_port: u16,
+    /// Shared DNS policy. None preserves legacy router keys and defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<super::dns::DnsSettings>,
+    #[serde(default)]
+    pub ipv6_mode: super::dns::Ipv6Mode,
     /// Proxy routing mode
     #[serde(default)]
     pub proxy_mode: ProxyMode,
@@ -73,7 +78,7 @@ pub struct AppConfig {
     /// Node health check + auto-switch settings
     #[serde(default)]
     pub health_check: HealthCheckConfig,
-    /// User-defined proxy groups (persisted; UI-level state, not used by routing)
+    /// User-defined proxy groups used by group:name routing targets
     #[serde(default)]
     pub groups: Vec<ProxyGroupConfig>,
     /// UI locale id (`en`, later `zh-CN` / `vi` / `hi`). Unknown values are
@@ -92,6 +97,8 @@ impl Default for AppConfig {
             listen_addr: "127.0.0.1".to_string(),
             socks_port: 1080,
             http_port: 1087,
+            dns: None,
+            ipv6_mode: super::dns::Ipv6Mode::default(),
             proxy_mode: ProxyMode::default(),
             nodes: Vec::new(),
             active_node: None,
@@ -115,6 +122,8 @@ impl AppConfig {
         if raw.get("proxy_mode").is_none() {
             cfg.proxy_mode = ProxyMode::Rule;
         }
+        super::group::validate_targets(&cfg.groups, &cfg.rules)
+            .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
         Ok(cfg)
     }
 }

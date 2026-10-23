@@ -208,10 +208,10 @@ impl WireguardOutbound {
         .map_err(|_| anyhow::anyhow!("WireGuard TCP connection timed out"))?
     }
     async fn udp(&self, host: &str, port: u16) -> Result<BoxDatagram> {
-        ensure!(
-            port != 0 && self.config.udp,
-            "WireGuard UDP is disabled or target port is invalid"
-        );
+        if !self.config.udp {
+            return Err(super::connector::UdpUnsupported::new("WireGuard UDP is disabled").into());
+        }
+        ensure!(port != 0, "WireGuard UDP target port is invalid");
         tokio::time::timeout(CONNECT_TIMEOUT, async {
             let state = self.endpoint().await?;
             let slot = state

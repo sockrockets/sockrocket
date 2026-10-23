@@ -2,8 +2,16 @@ use crate::{
     IpStackError, PacketReceiver, PacketSender, TTL,
     packet::{IpHeader, NetworkPacket, TransportHeader},
 };
-use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
-use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use etherparse::{
+    Icmpv4Header, Icmpv4Type, Icmpv6Header, Icmpv6Type, IpNumber, Ipv4Header, Ipv6FlowLabel,
+    Ipv6Header, UdpHeader,
+};
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     time::Sleep,
@@ -165,10 +173,137 @@ impl IpStackUdpStream {
         self.dst_addr
     }
 
+    /// Tell the client this destination has no UDP service.
+    ///
+    /// The reply uses the original destination as its source, matching the
+    /// kernel `icmp-port-unreachable` reject. Best-effort: a full queue
+    /// returns an error and the caller still drops the flow.
+    pub fn reject_port_unreachable(&self) -> std::io::Result<()> {
+        let packet = self.port_unreachable_packet()?;
+        self.up_pkt_sender.send(packet).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "TUN ICMP queue did not accept the port-unreachable reply",
+            )
+        })
+    }
+
+    fn port_unreachable_packet(&self) -> std::io::Result<NetworkPacket> {
+        // RFC 1122 3.2.2 / RFC 4443 2.4: no ICMP errors about multicast,
+        // broadcast or unspecified addresses.
+        let no_error = |ip: IpAddr| match ip {
+            IpAddr::V4(ip) => ip.is_multicast() || ip.is_broadcast() || ip.is_unspecified(),
+            IpAddr::V6(ip) => ip.is_multicast() || ip.is_unspecified(),
+        };
+        if no_error(self.src_addr.ip()) || no_error(self.dst_addr.ip()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no ICMP error for multicast, broadcast or unspecified addresses",
+            ));
+        }
+        match (self.src_addr.ip(), self.dst_addr.ip()) {
+            (IpAddr::V4(client), IpAddr::V4(target)) => self.ipv4_unreachable(client, target),
+            (IpAddr::V6(client), IpAddr::V6(target)) => self.ipv6_unreachable(client, target),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP flow mixes IPv4 and IPv6",
+            )),
+        }
+    }
+
+    fn ipv4_unreachable(
+        &self,
+        client: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> std::io::Result<NetworkPacket> {
+        let mut quoted_ip = Ipv4Header::new(
+            UdpHeader::LEN_U16,
+            TTL,
+            IpNumber::UDP,
+            client.octets(),
+            target.octets(),
+        )
+        .map_err(invalid_packet)?;
+        quoted_ip.header_checksum = quoted_ip.calc_header_checksum();
+        let quoted_udp =
+            UdpHeader::without_ipv4_checksum(self.src_addr.port(), self.dst_addr.port(), 0)
+                .map_err(invalid_packet)?;
+        let mut quoted = Vec::new();
+        quoted_ip.write(&mut quoted)?;
+        quoted_udp.write(&mut quoted)?;
+        let mut icmp = Icmpv4Header::new(Icmpv4Type::DestinationUnreachable(
+            etherparse::icmpv4::DestUnreachableHeader::Port,
+        ));
+        icmp.update_checksum(&quoted);
+        let mut payload = icmp.to_bytes().to_vec();
+        payload.extend_from_slice(&quoted);
+        let mut reply = Ipv4Header::new(
+            payload.len() as u16,
+            TTL,
+            IpNumber::ICMP,
+            target.octets(),
+            client.octets(),
+        )
+        .map_err(invalid_packet)?;
+        reply.header_checksum = reply.calc_header_checksum();
+        Ok(NetworkPacket {
+            ip: IpHeader::Ipv4(reply),
+            transport: TransportHeader::Unknown,
+            payload: Some(payload),
+        })
+    }
+
+    fn ipv6_unreachable(
+        &self,
+        client: Ipv6Addr,
+        target: Ipv6Addr,
+    ) -> std::io::Result<NetworkPacket> {
+        let quoted_ip = Ipv6Header {
+            traffic_class: 0,
+            flow_label: Ipv6FlowLabel::ZERO,
+            payload_length: UdpHeader::LEN_U16,
+            next_header: IpNumber::UDP,
+            hop_limit: TTL,
+            source: client.octets(),
+            destination: target.octets(),
+        };
+        let quoted_udp =
+            UdpHeader::without_ipv4_checksum(self.src_addr.port(), self.dst_addr.port(), 0)
+                .map_err(invalid_packet)?;
+        let mut quoted = Vec::new();
+        quoted_ip.write(&mut quoted)?;
+        quoted_udp.write(&mut quoted)?;
+        let mut icmp = Icmpv6Header::new(Icmpv6Type::DestinationUnreachable(
+            etherparse::icmpv6::DestUnreachableCode::Port,
+        ));
+        icmp.update_checksum(target.octets(), client.octets(), &quoted)
+            .map_err(invalid_packet)?;
+        let mut payload = icmp.to_bytes().to_vec();
+        payload.extend_from_slice(&quoted);
+        let reply = Ipv6Header {
+            traffic_class: 0,
+            flow_label: Ipv6FlowLabel::ZERO,
+            payload_length: payload.len() as u16,
+            next_header: IpNumber::IPV6_ICMP,
+            hop_limit: TTL,
+            source: target.octets(),
+            destination: client.octets(),
+        };
+        Ok(NetworkPacket {
+            ip: IpHeader::Ipv6(reply),
+            transport: TransportHeader::Unknown,
+            payload: Some(payload),
+        })
+    }
+
     fn reset_timeout(&mut self) {
         let deadline = tokio::time::Instant::now() + self.timeout_interval;
         self.timeout.as_mut().reset(deadline);
     }
+}
+
+fn invalid_packet<E: std::fmt::Display>(error: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
 }
 
 impl AsyncRead for IpStackUdpStream {

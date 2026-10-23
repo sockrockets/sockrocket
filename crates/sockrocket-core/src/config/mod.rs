@@ -1,6 +1,7 @@
 pub(crate) mod bandwidth;
 pub mod clash;
 pub mod dedup;
+pub mod dns;
 pub mod export;
 pub mod group;
 pub mod model;

@@ -37,8 +37,12 @@ pub(super) async fn connect_direct(host: &str, port: u16) -> Result<BoxDatagram>
     } else {
         tokio::net::lookup_host((host, port)).await?.collect()
     };
-    let addr=resolved.into_iter().find(|addr| !matches!(addr.ip(),std::net::IpAddr::V4(ip) if crate::dns::fakeip::is_fake_ip(ip)))
-        .ok_or_else(|| anyhow::anyhow!("No real UDP destination address (Fake-IP cannot be dialed directly)"))?;
+    let addr = resolved
+        .into_iter()
+        .find(|addr| crate::dns::fakeip::fake_ipv4(addr.ip()).is_none())
+        .ok_or_else(|| {
+            anyhow::anyhow!("No real UDP destination address (Fake-IP cannot be dialed directly)")
+        })?;
     let socket = UdpSocket::bind(if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {

@@ -4,7 +4,7 @@ const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 function fixture() {
   const elements={},requests=[],inspected=[],edited=[];
   const element=id=>elements[id]||=( {value:'',checked:true,hidden:false,innerHTML:'',textContent:'',setAttribute(){},focus(){},scrollIntoView(){}} );
-  const context=vm.createContext({srElement:element,srApi:(...args)=>requests.push(args),srEsc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),srShowMsg(){},inspectRule:i=>inspected.push(i),editRule:i=>edited.push(i),SR_PAGE_LOADED:{},SR_STATE:{statusKnown:true,status:{running:true,proxy_mode:'rule',active_node:0},nodes:[{name:'Example node'}],ruleRows:[]}});
+  const context=vm.createContext({SR_PROXY_GROUPS:[],setProxyGroupTargets(){},renderDevicePolicies(){},srElement:element,srApi:(...args)=>requests.push(args),srEsc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),srShowMsg(){},inspectRule:i=>inspected.push(i),editRule:i=>edited.push(i),SR_PAGE_LOADED:{},SR_STATE:{statusKnown:true,status:{running:true,proxy_mode:'rule',active_node:0},nodes:[{name:'Example node'}],ruleRows:[]}});
   vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var RULE_PATTERN_HINT')),context);
   vm.runInContext(source.slice(source.indexOf('var RULE_COLLAPSED'),source.indexOf('function useRuleGroup')),context);
   context.RULE_RULE_REVISION='revision';
@@ -18,7 +18,10 @@ c.SR_STATE.ruleRows=Array.from({length:12},(_,i)=>rule(i));
 assert.equal(c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','')[0].count,12,'all rules are represented');
 c.SR_STATE.ruleRows.push(rule(12,{rule_type:'final',source:'192.0.2.8',target:'direct'}));
 let stages=c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','192.0.2.8');
-assert.equal(stages.length,1);assert.equal(stages[0].kind,'device_final');
+assert.equal(stages.at(-1).kind,'device_final');
+assert.ok(stages.some(stage=>stage.kind==='global_rule'));
+assert.ok(stages.some(stage=>stage.kind==='builtin'));
+assert.ok(!stages.some(stage=>stage.kind==='global_final'));
 assert.ok(c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','').some(r=>r.kind==='device_final'));
 f.element('rule-flow-destination').value='example.com';c.traceRuleFlow();
 let req=f.request('trace_route');assert.equal(req[1].expected_revision,'revision');assert.equal(req[1].port,undefined);
@@ -87,3 +90,18 @@ m.SR_STATE.ruleRows[0].enabled=false;mixedGroup=m.ruleFlowModel(m.SR_STATE.ruleR
 assert.equal(mixedGroup.disabled,true);m.renderRuleFlow();
 assert.doesNotMatch(mixed.element('rule-flow').innerHTML,/<path[^>]*d="M 700 34 /,'fully disabled groups must have no outbound route');
 console.log('PASS: partially disabled groups expose only effective outlets; fully disabled groups have no route');
+
+{
+ const f=fixture(),c=f.context;
+ c.SR_PROXY_GROUPS=[{name:'Video',selected_node:'Example B'},{name:'Work',selected_node:'Example C'}];
+ c.RULE_TARGET_LABEL['group:Video']='Video';c.RULE_TARGET_LABEL['group:Work']='Work';
+ c.SR_STATE.ruleRows=[rule(0,{group:'Video rules',target:'group:Video'}),rule(1,{group:'Work rules',target:'group:Work'})];
+ f.element('rule-flow-destination').value='example.com';c.traceRuleFlow();
+ f.request('trace_route')[2](result(c.SR_STATE.ruleRows[0],{proxy_group:'Video',node_name:'Example B'}));
+ const html=f.element('rule-flow').innerHTML;
+ assert.match(html, /出口成员：Example B/);
+ assert.match(html, /<div class="flow-box selected"><strong>Video<\/strong>/);
+ assert.match(html, /height:380px/,'five exits fit their SVG stage');
+ assert.doesNotMatch(html, /\[object Object\]/);
+ console.log('PASS: group trace highlights the exact exit and expands the diagram for additional groups');
+}
