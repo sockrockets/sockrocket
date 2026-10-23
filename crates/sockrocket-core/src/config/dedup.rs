@@ -141,6 +141,13 @@ pub fn remove_subscription_nodes(config: &mut AppConfig, url: &str) {
     });
 }
 
+/// Opaque id safe to show in the UI and in saved rule targets.
+/// The raw fingerprint includes protocol credentials and stays in the config file.
+pub fn node_public_id(fingerprint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(fingerprint.as_bytes()))
+}
+
 /// Stable fingerprint for a node, covering protocol + address + port +
 /// credentials + transport identity (but not the display name or other
 /// cosmetic metadata).

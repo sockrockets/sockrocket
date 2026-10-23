@@ -40,10 +40,10 @@ use sockrocket_core::{
     BatchConflict, ConfigWatchEvent, ConfigWatchHandle, ConfigWatcher, DEFAULT_SHARE_PORT,
     HealthCheckSetup, HealthEvent, Outbound, OutboundFactory, ProbeResult, ProxyMode, ProxyService,
     Router, RoutingOutbound, ShareServer, SharedOutbound, SharedShareState, SubscriptionFormat,
-    SwappableOutbound, TunProxy, config_content_hash, create_outbound, dedup_nodes, fallback_pick,
-    fetch_subscription, format_rule_clash_line, format_rules_export, generate_token,
-    get_system_proxy as get_os_proxy, group_member_indices, local_lan_ip, make_typed_rule,
-    merge_batch_rules, new_shared_state, node_fingerprint, normalize_node_names,
+    SwappableOutbound, TunProxy, assign_group_outlet, config_content_hash, create_outbound,
+    dedup_nodes, fallback_pick, fetch_subscription, format_rule_clash_line, format_rules_export,
+    generate_token, get_system_proxy as get_os_proxy, group_member_indices, local_lan_ip,
+    make_typed_rule, merge_batch_rules, new_shared_state, node_fingerprint, normalize_node_names,
     parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group, resolve_members,
     resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group, setup_tun_routes,
     start_share_server, system_proxy_supported, uniquify_node_names, url_test_pick,
@@ -171,6 +171,8 @@ pub struct AppState {
     pub(crate) adding_rule_group: Option<String>,
     /// Which rule dropdown is open in the add/edit row.
     pub(crate) rule_menu: Option<RuleMenu>,
+    /// Display group whose exit menu is open.
+    pub(crate) rule_outlet_open: Option<String>,
     /// Toolbar expands the new-group name field.
     pub(crate) rules_new_group_open: bool,
     /// Group currently open in batch text edit (one rule per line).
@@ -753,6 +755,7 @@ impl AppState {
             rule_filter_input,
             adding_rule_group: None,
             rule_menu: None,
+            rule_outlet_open: None,
             rules_new_group_open: false,
             batch_edit_group: None,
             rule_group_focused: false,
@@ -5306,6 +5309,46 @@ impl AppState {
             } else {
                 sockrocket_gui::i18n::t("rules.status.group_off")
             }
+        );
+        if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
+            self.rules_status
+                .push_str(sockrocket_gui::i18n::t("rules.status.restarted"));
+            self.restart_proxy_with_current_state(cx);
+        }
+        self.pending_persist = false;
+        self.schedule_persist(cx);
+        self.schedule_rules_status_clear(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_rule_group_outlet(
+        &mut self,
+        group: &str,
+        outlet: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.rule_outlet_open = None;
+        let changed = match assign_group_outlet(&mut self.rules, group, outlet) {
+            Ok(changed) => changed,
+            Err(_) => {
+                self.rules_status =
+                    sockrocket_gui::i18n::t("rules.group.outlet_invalid").to_string();
+                cx.notify();
+                return;
+            }
+        };
+        if changed == 0 {
+            cx.notify();
+            return;
+        }
+        let label = if group.trim().is_empty() {
+            sockrocket_gui::i18n::t("rules.group.ungrouped")
+        } else {
+            group.trim()
+        };
+        self.rules_status = format!(
+            "✓ {}「{label}」",
+            sockrocket_gui::i18n::t("rules.status.group_outlet")
         );
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             self.rules_status

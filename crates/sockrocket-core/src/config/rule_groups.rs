@@ -43,6 +43,88 @@ pub fn same_rule_group(rule_group: &str, want: &str) -> bool {
     rule_group.trim() == want.trim()
 }
 
+/// What the proxy-like rules in a display group currently share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupOutlet {
+    /// Every proxy-like rule uses this target.
+    Shared(String),
+    /// Proxy-like rules point at more than one exit.
+    Mixed,
+    /// The group has rules, but none of them dial a proxy.
+    Unset,
+}
+
+fn proxy_like(target: &str) -> bool {
+    crate::config::group::is_proxy_target(target)
+}
+
+fn selectable_outlet(outlet: &str) -> bool {
+    outlet == "proxy"
+        || outlet
+            .strip_prefix("group:")
+            .is_some_and(crate::config::group::valid_group_name)
+        || crate::config::group::node_target_id(outlet).is_some()
+}
+
+/// The shared proxy exit for `group`, ignoring direct and reject members.
+pub fn group_outlet(rules: &[RoutingRule], group: &str) -> GroupOutlet {
+    let mut shared = None;
+    let mut any = false;
+    for rule in rules
+        .iter()
+        .filter(|rule| same_rule_group(&rule.group, group) && proxy_like(&rule.target))
+    {
+        any = true;
+        match &shared {
+            None => shared = Some(rule.target.clone()),
+            Some(current) if current != &rule.target => return GroupOutlet::Mixed,
+            _ => {}
+        }
+    }
+    if any {
+        GroupOutlet::Shared(shared.unwrap_or_else(|| "proxy".into()))
+    } else {
+        GroupOutlet::Unset
+    }
+}
+
+/// Point a display group's proxy rules at `outlet`.
+///
+/// Direct and reject rules stay put when the group already has a proxy rule.
+/// A group that is only direct or reject is rewritten, because that is the
+/// explicit choice of an exit for the whole group. Returns how many targets changed.
+pub fn assign_group_outlet(
+    rules: &mut [RoutingRule],
+    group: &str,
+    outlet: &str,
+) -> Result<usize, &'static str> {
+    if !selectable_outlet(outlet) {
+        return Err("group outlet must be the global node, one node, or a proxy group");
+    }
+    let has_proxy = rules
+        .iter()
+        .any(|rule| same_rule_group(&rule.group, group) && proxy_like(&rule.target));
+    let mut seen = 0usize;
+    let mut changed = 0usize;
+    for rule in rules
+        .iter_mut()
+        .filter(|rule| same_rule_group(&rule.group, group))
+    {
+        if has_proxy && !proxy_like(&rule.target) {
+            continue;
+        }
+        seen += 1;
+        if rule.target != outlet {
+            rule.target = outlet.to_string();
+            changed += 1;
+        }
+    }
+    if seen == 0 {
+        return Err("no rules in that group");
+    }
+    Ok(changed)
+}
+
 /// Indices of every rule in `group` (empty name = ungrouped).
 pub fn group_member_indices(rules: &[RoutingRule], group: &str) -> Vec<usize> {
     rules
@@ -178,5 +260,38 @@ mod tests {
         let clash = vec![r("B", "nope.com")];
         assert!(replace_rule_group(&mut rules, "A", clash).is_err());
         assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn group_outlet_keeps_direct_rules_and_rewrites_an_all_direct_group() {
+        let id = "ab".repeat(32);
+        let outlet = format!("node:{id}");
+        let mut rules = vec![r("Video", "a.com"), r("Video", "ads.com")];
+        rules[0].target = "proxy".into();
+        rules[1].target = "reject".into();
+        assert_eq!(
+            group_outlet(&rules, "Video"),
+            GroupOutlet::Shared("proxy".into())
+        );
+        assert_eq!(
+            assign_group_outlet(&mut rules, "Video", &outlet).unwrap(),
+            1
+        );
+        assert_eq!(rules[0].target, outlet);
+        assert_eq!(rules[1].target, "reject");
+        assert_eq!(
+            assign_group_outlet(&mut rules, "Video", &outlet).unwrap(),
+            0
+        );
+
+        let mut direct = vec![r("Home", "baidu.com")];
+        direct[0].target = "direct".into();
+        assert_eq!(group_outlet(&direct, "Home"), GroupOutlet::Unset);
+        assert_eq!(
+            assign_group_outlet(&mut direct, "Home", "proxy").unwrap(),
+            1
+        );
+        assert_eq!(direct[0].target, "proxy");
+        assert!(assign_group_outlet(&mut direct, "Home", "node:nope").is_err());
     }
 }
