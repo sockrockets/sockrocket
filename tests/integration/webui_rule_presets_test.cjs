@@ -2,7 +2,7 @@ const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/st
 const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 const elements={},requests=[],messages=[];
 const element=id=>elements[id]||={value:'',checked:true,hidden:false,disabled:false,innerHTML:'',textContent:'',setAttribute(){},scrollIntoView(){}};
-const c=vm.createContext({srElement:element,srApi:(...args)=>requests.push(args),srShowMsg:m=>messages.push(m),toastResp:d=>messages.push(d.msg),srEsc:v=>String(v??'').replace(/[&<>"']/g,'_'),SR_PAGE_LOADED:{},SR_STATE:{status:{running:false,proxy_mode:'rule'},ruleRows:[]}});
+const c=vm.createContext({SR_PROXY_GROUPS:[],setProxyGroupTargets(){},renderDevicePolicies(){},srElement:element,srApi:(...args)=>requests.push(args),srShowMsg:m=>messages.push(m),toastResp:d=>messages.push(d.msg),srEsc:v=>String(v??'').replace(/[&<>"']/g,'_'),SR_PAGE_LOADED:{},SR_STATE:{status:{running:false,proxy_mode:'rule'},ruleRows:[]}});
 vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var RULE_PATTERN_HINT')),c);
 vm.runInContext(source.slice(source.indexOf('var RULE_COLLAPSED'),source.indexOf('function useRuleGroup')),c);
 vm.runInContext(source.slice(source.indexOf('function setRuleGroupEnabled'),source.indexOf('function deleteRuleGroup')),c);

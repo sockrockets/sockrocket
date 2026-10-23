@@ -287,10 +287,12 @@ impl AppState {
 
             let desc = match group.gtype {
                 GroupType::UrlTest => {
-                    "Test Now measures manually, then auto-locks the lowest-latency member"
+                    "Connections race members and keep the fastest handshake for five minutes"
                 }
                 GroupType::Select => "Pick the outbound node manually",
-                GroupType::Fallback => "Tries members in order, stops at the first usable one",
+                GroupType::Fallback => {
+                    "TCP keeps the last working member, then retries earlier ones. UDP stays on the first"
+                }
             };
 
             // --- Member chips (wrap): name + latency, current highlighted (✓),

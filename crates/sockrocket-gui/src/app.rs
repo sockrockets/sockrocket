@@ -93,6 +93,13 @@ pub struct AppState {
     pub(crate) listen_addr: String,
     pub(crate) socks_port: u16,
     pub(crate) http_port: u16,
+    pub(crate) dns: Option<sockrocket_core::config::dns::DnsSettings>,
+    pub(crate) ipv6_mode: sockrocket_core::config::dns::Ipv6Mode,
+    pub(crate) dns_direct_input: Entity<InputState>,
+    pub(crate) dns_proxy_input: Entity<InputState>,
+    pub(crate) dns_bootstrap_input: Entity<InputState>,
+    pub(crate) dns_draft: sockrocket_core::config::dns::DnsSettings,
+    pub(crate) dns_form_baseline: sockrocket_core::config::dns::DnsSettings,
     pub(crate) system_proxy_enabled: bool,
     pub(crate) system_proxy_status: String,
     pub(crate) system_proxy_managed_by_app: bool,
@@ -408,6 +415,8 @@ pub(crate) fn apply_proxy_mode(
     outbound: SharedOutbound,
     mode: &ProxyMode,
     rules: &[RoutingRule],
+    groups: &[ProxyGroupConfig],
+    nodes: &[Node],
 ) -> SharedOutbound {
     match mode {
         ProxyMode::Global => outbound,
@@ -417,7 +426,7 @@ pub(crate) fn apply_proxy_mode(
                 Router::new(ruleset)
                     .with_geoip(std::sync::Arc::new(sockrocket_core::china_geoip_db())),
             );
-            let routing = RoutingOutbound::new(router, outbound);
+            let routing = RoutingOutbound::new(router, outbound).with_groups(groups, nodes);
             SharedOutbound(std::sync::Arc::new(routing))
         }
         ProxyMode::Direct => SharedOutbound::direct(),
@@ -506,6 +515,27 @@ impl AppState {
             InputState::new(window, cx)
                 .placeholder("1087")
                 .default_value(persisted.http_port.to_string())
+        });
+        let dns_draft = persisted.dns.clone().unwrap_or_default();
+        let dns_direct_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(2, 6)
+                .default_value(dns_draft.direct_servers.join("\n"))
+        });
+        let dns_proxy_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(2, 6)
+                .default_value(dns_draft.proxy_servers.join("\n"))
+        });
+        let dns_bootstrap_input = cx.new(|cx| {
+            InputState::new(window, cx).auto_grow(2, 4).default_value(
+                dns_draft
+                    .bootstrap_servers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         });
         let (system_proxy_enabled, system_proxy_status) = current_system_proxy_state();
         let rule_batch_input = cx.new(|cx| {
@@ -684,6 +714,13 @@ impl AppState {
             listen_addr: persisted.listen_addr,
             socks_port: persisted.socks_port,
             http_port: persisted.http_port,
+            dns: persisted.dns.clone(),
+            ipv6_mode: persisted.ipv6_mode,
+            dns_direct_input,
+            dns_proxy_input,
+            dns_bootstrap_input,
+            dns_form_baseline: dns_draft.clone(),
+            dns_draft,
             system_proxy_enabled,
             system_proxy_status,
             system_proxy_managed_by_app: false,
@@ -1117,13 +1154,6 @@ impl AppState {
         }
         self.selected_node = Some(index);
         self.schedule_persist(cx);
-        // Keep group "current" pointers consistent with the actual pick.
-        let fp = node_fingerprint(&self.nodes[index]);
-        for g in &mut self.groups {
-            if g.members.contains(&fp) {
-                g.current = Some(fp.clone());
-            }
-        }
         if self.proxy_running {
             self.restart_proxy_with_current_state(cx);
         }
@@ -1154,16 +1184,27 @@ impl AppState {
             return;
         };
         if let Some(g) = self.groups.get_mut(group_idx) {
+            if !g.members.iter().any(|fp| fp == member_fp) {
+                return;
+            }
             g.current = Some(member_fp.to_string());
+        } else {
+            return;
         }
-        self.use_node_by_index(node_idx, cx);
+        let _ = node_idx;
+        self.apply_outbound_hot_swap(cx);
+        self.schedule_persist(cx);
+        cx.notify();
     }
 
     /// Create a group from the Groups page creation row (name input + type
     /// chips). Empty names are ignored.
     pub(crate) fn group_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.group_name_input.read(cx).value().trim().to_string();
-        if name.is_empty() {
+        if !sockrocket_core::config::group::valid_group_name(&name)
+            || self.groups.len() >= 64
+            || self.groups.iter().any(|g| g.name == name)
+        {
             return;
         }
         self.groups.push(ProxyGroupConfig {
@@ -1181,10 +1222,13 @@ impl AppState {
     /// One-click template: a url-test group spanning every current node
     /// (replaces the old auto-generated AUTO-SELECT group).
     pub(crate) fn group_template_auto_select(&mut self, cx: &mut Context<Self>) {
-        if self.nodes.is_empty() {
+        if self.nodes.is_empty() || self.nodes.len() > 256 || self.groups.len() >= 64 {
             return;
         }
         let members = self.nodes.iter().map(node_fingerprint).collect();
+        if self.groups.iter().any(|g| g.name == "AUTO-SELECT") {
+            return;
+        }
         self.groups.push(ProxyGroupConfig {
             name: "AUTO-SELECT".to_string(),
             gtype: GroupType::UrlTest,
@@ -1198,6 +1242,16 @@ impl AppState {
     /// Delete a group (the Groups page gates this behind a two-step confirm).
     pub(crate) fn group_delete(&mut self, group_idx: usize, cx: &mut Context<Self>) {
         if group_idx >= self.groups.len() {
+            return;
+        }
+        if self
+            .rules
+            .iter()
+            .any(|r| r.target == format!("group:{}", self.groups[group_idx].name))
+        {
+            self.proxy_status =
+                "Group is referenced by routing rules; update those rules first".into();
+            cx.notify();
             return;
         }
         self.groups.remove(group_idx);
@@ -1221,10 +1275,22 @@ impl AppState {
     /// Confirm an inline rename from the group_rename_input.
     pub(crate) fn group_rename_confirm(&mut self, group_idx: usize, cx: &mut Context<Self>) {
         let new_name = self.group_rename_input.read(cx).value().trim().to_string();
-        if !new_name.is_empty()
+        if sockrocket_core::config::group::valid_group_name(&new_name)
+            && !self
+                .groups
+                .iter()
+                .enumerate()
+                .any(|(i, g)| i != group_idx && g.name == new_name)
             && let Some(g) = self.groups.get_mut(group_idx)
         {
-            g.name = new_name;
+            let previous = format!("group:{}", g.name);
+            g.name = new_name.clone();
+            for rule in &mut self.rules {
+                if rule.target == previous {
+                    rule.target = format!("group:{new_name}");
+                }
+            }
+            self.apply_outbound_hot_swap(cx);
             self.schedule_persist(cx);
         }
         self.editing_group_index = None;
@@ -1244,8 +1310,10 @@ impl AppState {
         let fp = node_fingerprint(node);
         if let Some(g) = self.groups.get_mut(group_idx)
             && !g.members.contains(&fp)
+            && g.members.len() < 256
         {
             g.members.push(fp);
+            self.apply_outbound_hot_swap(cx);
             self.schedule_persist(cx);
         }
         cx.notify();
@@ -1264,6 +1332,7 @@ impl AppState {
             if g.current.as_deref() == Some(member_fp) {
                 g.current = None;
             }
+            self.apply_outbound_hot_swap(cx);
             self.schedule_persist(cx);
         }
         cx.notify();
@@ -1297,7 +1366,9 @@ impl AppState {
             if let Some(g) = self.groups.get_mut(group_idx) {
                 g.current = Some(fp);
             }
-            self.use_node_by_index(idx, cx);
+            let _ = idx;
+            self.apply_outbound_hot_swap(cx);
+            self.schedule_persist(cx);
         }
         // The completion path is group-aware (group_test_pending), so the
         // generic min-latency auto-select must stay off for this batch.
@@ -1335,7 +1406,9 @@ impl AppState {
         if let Some(g) = self.groups.get_mut(group_idx) {
             g.current = Some(fp);
         }
-        self.use_node_by_index(idx, cx);
+        let _ = idx;
+        self.apply_outbound_hot_swap(cx);
+        self.schedule_persist(cx);
     }
 
     // === Proxy Control ===
@@ -1365,6 +1438,16 @@ impl AppState {
             return;
         }
 
+        if sockrocket_core::dns::configure_bootstrap(
+            &self.dns.clone().unwrap_or_default(),
+            self.nodes.iter().map(|n| n.server.clone()),
+        )
+        .is_err()
+        {
+            self.proxy_status = "Invalid DNS configuration".into();
+            cx.notify();
+            return;
+        }
         let selected_index = self.selected_node;
         let node = selected_index.and_then(|i| self.nodes.get(i).cloned());
         let node_name = node
@@ -1398,7 +1481,13 @@ impl AppState {
             }
             ProxyMode::Rule => {
                 tracing::info!("Proxy mode: Rule ({})", rule_mode_summary(&self.rules));
-                apply_proxy_mode(outbound, &ProxyMode::Rule, &self.rules)
+                apply_proxy_mode(
+                    outbound,
+                    &ProxyMode::Rule,
+                    &self.rules,
+                    &self.groups,
+                    &self.nodes,
+                )
             }
             ProxyMode::Direct => {
                 tracing::info!("Proxy mode: Direct (no proxy)");
@@ -1408,18 +1497,40 @@ impl AppState {
 
         // Swappable layer: the health monitor (auto-switch) and config
         // hot-reload replace the inner outbound without rebinding listeners.
-        let swappable = std::sync::Arc::new(SwappableOutbound::new(final_outbound));
+        let swappable = std::sync::Arc::new(SwappableOutbound::new(final_outbound.clone()));
+        let settings = self.dns.clone().unwrap_or_default();
+        if let Err(error) = sockrocket_core::dns::configure_bootstrap(
+            &settings,
+            self.nodes.iter().map(|n| n.server.clone()),
+        ) {
+            self.proxy_status = format!("DNS configuration error: {error}");
+            cx.notify();
+            return;
+        }
+        match settings.resolver_config(self.nodes.iter().map(|n| n.server.clone())) {
+            Ok(config) => swappable.publish(final_outbound, std::sync::Arc::new(config)),
+            Err(error) => {
+                self.proxy_status = format!("DNS configuration error: {error}");
+                cx.notify();
+                return;
+            }
+        }
         let service = ProxyService::with_outbound(SharedOutbound(swappable.clone()));
         let stats = service.stats().clone();
 
         // Health check setup: probes the active node and fails over to the
         // fastest reachable node when it dies. Entirely opt-in.
         let health_setup = if self.health_check.enabled {
-            let rules = self.rules.clone();
-            let mode = self.proxy_mode.clone();
+            let live = swappable.clone();
             let factory: OutboundFactory = std::sync::Arc::new(move |node| {
                 let base = create_outbound(node).ok()?;
-                Some(apply_proxy_mode(base, &mode, &rules))
+                let current = live.current();
+                Some(
+                    current
+                        .0
+                        .with_default_proxy(base.clone())
+                        .unwrap_or_else(|| if current.0.is_direct() { current } else { base }),
+                )
             });
             Some(HealthCheckSetup {
                 config: self.health_check.clone(),
@@ -2680,6 +2791,13 @@ impl AppState {
             .and_then(|i| self.nodes.get(i))
             .map(|n| n.server.clone());
 
+        let group_proxy_hosts: Vec<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| resolve_members(g, &self.nodes))
+            .map(|i| self.nodes[i].server.clone())
+            .collect();
+
         // Build outbound from current state
         let node = self.selected_node.and_then(|i| self.nodes.get(i).cloned());
         let outbound = match &node {
@@ -2703,7 +2821,8 @@ impl AppState {
                     Router::new(ruleset)
                         .with_geoip(std::sync::Arc::new(sockrocket_core::china_geoip_db())),
                 );
-                let routing = RoutingOutbound::new(router, outbound);
+                let routing =
+                    RoutingOutbound::new(router, outbound).with_groups(&self.groups, &self.nodes);
                 SharedOutbound(std::sync::Arc::new(routing))
             }
             ProxyMode::Direct => SharedOutbound::direct(),
@@ -2712,7 +2831,26 @@ impl AppState {
         // Wrap in a swappable layer so a later node change can redirect TUN's
         // outbound with `set()` — keeping TUN (and the default route) up —
         // instead of tearing the device down and rebuilding it.
-        let tun_swappable = std::sync::Arc::new(SwappableOutbound::new(final_outbound));
+        let tun_swappable = std::sync::Arc::new(SwappableOutbound::new(final_outbound.clone()));
+        let settings = self.dns.clone().unwrap_or_default();
+        if sockrocket_core::dns::configure_bootstrap(
+            &settings,
+            self.nodes.iter().map(|n| n.server.clone()),
+        )
+        .is_err()
+        {
+            self.tun_status = "Invalid DNS settings".into();
+            cx.notify();
+            return;
+        }
+        match settings.resolver_config(self.nodes.iter().map(|n| n.server.clone())) {
+            Ok(config) => tun_swappable.publish(final_outbound, std::sync::Arc::new(config)),
+            Err(error) => {
+                self.tun_status = format!("DNS configuration error: {error}");
+                cx.notify();
+                return;
+            }
+        }
         self.tun_swappable = Some(tun_swappable.clone());
         let tun_outbound = SharedOutbound(tun_swappable.clone() as std::sync::Arc<dyn Outbound>);
         let tun_stats = self.proxy_stats.clone().unwrap_or_default();
@@ -2784,10 +2922,11 @@ impl AppState {
                             // loop-avoidance route the entire system loses
                             // network access, so refuse to start rather than
                             // install a default route we cannot survive.
-                            let proxy_server_ips = proxy_server_host
+                            let mut proxy_server_ips = proxy_server_host
                                 .as_deref()
                                 .map(resolve_to_ips)
                                 .unwrap_or_default();
+                            for host in &group_proxy_hosts {proxy_server_ips.extend(resolve_to_ips(host));}
                             if proxy_server_ips.is_empty() {
                                 return Err(anyhow::anyhow!(
                                     "TUN not started: cannot resolve the proxy node's IP address ({}). \
@@ -3086,7 +3225,13 @@ impl AppState {
         };
         Some(match self.proxy_mode {
             ProxyMode::Global => outbound,
-            ProxyMode::Rule => apply_proxy_mode(outbound, &ProxyMode::Rule, &self.rules),
+            ProxyMode::Rule => apply_proxy_mode(
+                outbound,
+                &ProxyMode::Rule,
+                &self.rules,
+                &self.groups,
+                &self.nodes,
+            ),
             ProxyMode::Direct => SharedOutbound::direct(),
         })
     }
@@ -3107,25 +3252,44 @@ impl AppState {
         // Prepare loop avoidance before publishing the new node. Keep old
         // bypasses until teardown so existing QUIC connections can drain.
         if self.tun_enabled {
-            let node_ips = self
+            let mut node_ips = self
                 .selected_node
                 .and_then(|i| self.nodes.get(i))
                 .map(|node| resolve_to_ips(&node.server))
                 .unwrap_or_default();
+            for g in &self.groups {
+                for i in resolve_members(g, &self.nodes) {
+                    node_ips.extend(resolve_to_ips(&self.nodes[i].server));
+                }
+            }
             if node_ips.is_empty() || sockrocket_core::update_tun_bypass_ips(&node_ips).is_err() {
                 self.tun_status = "Node switch needs a TUN restart: bypass routes not ready".into();
                 return false;
             }
         }
+        let settings = self.dns.clone().unwrap_or_default();
+        let Ok(dns_config) = settings.resolver_config(self.nodes.iter().map(|n| n.server.clone()))
+        else {
+            return false;
+        };
+        if sockrocket_core::dns::configure_bootstrap(
+            &settings,
+            self.nodes.iter().map(|n| n.server.clone()),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let dns_config = std::sync::Arc::new(dns_config);
         let mut swapped = false;
         if let Some(swappable) = &self.proxy_swappable {
-            swappable.set(final_outbound.clone());
+            swappable.publish(final_outbound.clone(), dns_config.clone());
             swapped = true;
         }
         if self.tun_enabled
             && let Some(swappable) = &self.tun_swappable
         {
-            swappable.set(final_outbound.clone());
+            swappable.publish(final_outbound.clone(), dns_config.clone());
             swapped = true;
         }
         if swapped {
@@ -3243,12 +3407,97 @@ impl AppState {
         }
     }
 
+    pub(crate) fn reload_dns_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dns_draft = self.dns.clone().unwrap_or_default();
+        self.dns_form_baseline = self.dns_draft.clone();
+        self.dns_direct_input.update(cx, |input, cx| {
+            input.set_value(self.dns_draft.direct_servers.join("\n"), window, cx)
+        });
+        self.dns_proxy_input.update(cx, |input, cx| {
+            input.set_value(self.dns_draft.proxy_servers.join("\n"), window, cx)
+        });
+        self.dns_bootstrap_input.update(cx, |input, cx| {
+            input.set_value(
+                self.dns_draft
+                    .bootstrap_servers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                window,
+                cx,
+            )
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn apply_dns_settings(&mut self, cx: &mut Context<Self>) {
+        if self.dns.clone().unwrap_or_default() != self.dns_form_baseline {
+            self.settings_status =
+                "⚠ DNS changed outside this form. Reload saved DNS before applying.".into();
+            cx.notify();
+            return;
+        }
+        let mut settings = self.dns_draft.clone();
+        let lines = |text: String| {
+            text.lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        settings.direct_servers = lines(self.dns_direct_input.read(cx).value().to_string());
+        settings.proxy_servers = lines(self.dns_proxy_input.read(cx).value().to_string());
+        settings.bootstrap_servers =
+            match lines(self.dns_bootstrap_input.read(cx).value().to_string())
+                .iter()
+                .map(|s| s.parse())
+                .collect::<std::result::Result<Vec<_>, _>>()
+            {
+                Ok(servers) => servers,
+                Err(_) => {
+                    self.settings_status =
+                        "✗ Bootstrap DNS requires IP:port entries (bracket IPv6 addresses).".into();
+                    cx.notify();
+                    return;
+                }
+            };
+        if let Err(error) = settings.validate() {
+            self.settings_status = format!("✗ {error}");
+            cx.notify();
+            return;
+        }
+        if self.tun_starting || self.proxy_validation_cancel_tx.is_some() {
+            self.settings_status =
+                "⚠ Wait for the current connection attempt before applying DNS.".into();
+            cx.notify();
+            return;
+        }
+        let previous = self.dns.clone();
+        self.dns = Some(settings.clone());
+        if (self.proxy_running || self.tun_enabled) && !self.apply_outbound_hot_swap(cx) {
+            self.dns = previous;
+            self.settings_status =
+                "✗ DNS could not be applied. Current saved settings were retained.".into();
+            cx.notify();
+            return;
+        }
+        self.dns_draft = settings.clone();
+        self.dns_form_baseline = settings;
+        self.schedule_persist(cx);
+        self.settings_status =
+            "✓ DNS policy applied; existing connections keep their current path.".into();
+        cx.notify();
+    }
+
     /// Assemble the on-disk config from current UI state.
     pub(crate) fn snapshot_config(&self) -> AppConfig {
         AppConfig {
             listen_addr: self.listen_addr.clone(),
             socks_port: self.socks_port,
             http_port: self.http_port,
+            dns: self.dns.clone(),
+            ipv6_mode: self.ipv6_mode,
             proxy_mode: self.proxy_mode.clone(),
             nodes: self.nodes.clone(),
             active_node: self.selected_node,
@@ -3666,6 +3915,8 @@ impl AppState {
                 self.nodes_generation = self.nodes_generation.wrapping_add(1);
                 self.subscriptions = new_config.subscriptions.clone();
                 self.rules = new_config.rules.clone();
+                self.dns = new_config.dns.clone();
+                self.ipv6_mode = new_config.ipv6_mode;
                 self.proxy_mode = new_config.proxy_mode.clone();
                 let health_was_enabled = self.health_check.enabled;
                 self.health_check = new_config.health_check.clone();

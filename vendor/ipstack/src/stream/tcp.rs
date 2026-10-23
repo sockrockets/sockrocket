@@ -9,7 +9,7 @@ use crate::{
     },
     stream::tcb::{
         MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO,
-        Tcb, TcpState,
+        Tcb, TcpState, window_scale_shift,
     },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
@@ -18,7 +18,7 @@ use std::{
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU32},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -58,6 +58,10 @@ pub struct TcpConfig {
     pub max_retransmit_count: usize,
     /// TCP options
     pub options: Option<Vec<TcpOptions>>,
+    /// Live cap on bytes one flow may buffer. Every session on the stack
+    /// shares this value, so the owner can shrink it as concurrency rises.
+    /// The ceiling is still [`Self::max_unacked_bytes`] and [`Self::read_buffer_size`].
+    pub window_limit: Arc<AtomicU32>,
 }
 
 #[non_exhaustive]
@@ -65,6 +69,8 @@ pub struct TcpConfig {
 pub enum TcpOptions {
     /// Maximum segment size (MSS) for TCP connections.
     MaximumSegmentSize(u16),
+    /// RFC 7323 window scale shift, sent only on SYN.
+    WindowScale(u8),
 }
 
 impl Default for TcpConfig {
@@ -81,6 +87,7 @@ impl Default for TcpConfig {
             rto: RTO,
             max_retransmit_count: MAX_RETRANSMIT_COUNT,
             options: Default::default(),
+            window_limit: Arc::new(AtomicU32::new(MAX_UNACK)),
         }
     }
 }
@@ -181,7 +188,7 @@ impl IpStackTcpStream {
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(
+        let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             mtu,
             config.max_unacked_bytes,
@@ -189,7 +196,16 @@ impl IpStackTcpStream {
             config.max_count_for_dup_ack,
             config.rto,
             config.max_retransmit_count,
+            config.window_limit.clone(),
         );
+        // Reply with a scale only when the client offered one. Otherwise the
+        // header window stays a raw 16-bit byte count, maxing out at 64 KiB.
+        if let Some(peer) = peer_window_scale(&tcp) {
+            let bytes = config
+                .read_buffer_size
+                .max(config.max_unacked_bytes as usize);
+            tcb.enable_window_scale(peer, window_scale_shift(bytes));
+        }
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
@@ -753,6 +769,10 @@ async fn tcp_main_logic_loop(
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
+    let syn_options = {
+        let tcb = tcb.lock().unwrap();
+        syn_ack_options(config.options.as_ref(), tcb.advertised_scale())
+    };
     {
         let mut tcb = tcb.lock().unwrap();
 
@@ -770,7 +790,7 @@ async fn tcp_main_logic_loop(
             &up_packet_sender,
             network_tuple,
             &tcb,
-            config.options.as_ref(),
+            syn_options.as_ref(),
             ACK | SYN,
             None,
             None,
@@ -857,7 +877,7 @@ async fn tcp_main_logic_loop(
                 &up_packet_sender,
                 network_tuple,
                 &tcb,
-                config.options.as_ref(),
+                syn_options.as_ref(),
                 ACK | SYN,
                 Some(tcb.get_seq() - 1),
                 None,
@@ -1203,6 +1223,24 @@ fn extract_data_n_write_upstream(
     Ok(())
 }
 
+fn peer_window_scale(header: &TcpHeader) -> Option<u8> {
+    header.options_iterator().find_map(|opt| match opt {
+        Ok(TcpOptionElement::WindowScale(shift)) => Some(shift.min(14)),
+        _ => None,
+    })
+}
+
+fn syn_ack_options(
+    configured: Option<&Vec<TcpOptions>>,
+    scale: Option<u8>,
+) -> Option<Vec<TcpOptions>> {
+    let mut opts = configured.cloned().unwrap_or_default();
+    if let Some(shift) = scale {
+        opts.push(TcpOptions::WindowScale(shift));
+    }
+    if opts.is_empty() { None } else { Some(opts) }
+}
+
 /// Send a TCP packet to the downstream device, with the specified flags, sequence number, and payload.
 /// The returned value is the length of the `payload` sent, it may be shorter than the length of the incoming parameter `payload`.
 pub(crate) fn write_packet_to_device(
@@ -1279,6 +1317,9 @@ pub(crate) fn create_raw_packet(
             match opt {
                 TcpOptions::MaximumSegmentSize(mss) => {
                     tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss))
+                }
+                TcpOptions::WindowScale(shift) => {
+                    tcp_options.push(TcpOptionElement::WindowScale(*shift))
                 }
             }
         }

@@ -11,6 +11,13 @@ use crate::router::{RouteAction, Router};
 // and is never inherited by detached DNS/health tasks or read from HTTP headers.
 tokio::task_local! { static CLIENT_SOURCE: Option<std::net::IpAddr>; }
 tokio::task_local! { static TUN_DESTINATION: (Option<std::net::IpAddr>, bool); }
+tokio::task_local! { static TUN_IPV6: bool; }
+pub(crate) fn tun_ipv6() -> bool {
+    TUN_IPV6.try_with(|value| *value).unwrap_or(false)
+}
+pub(crate) async fn with_tun_family<F: Future>(ipv6: bool, future: F) -> F::Output {
+    TUN_IPV6.scope(ipv6, future).await
+}
 pub(crate) fn tun_destination() -> (Option<std::net::IpAddr>, bool) {
     TUN_DESTINATION
         .try_with(|context| *context)
@@ -62,15 +69,33 @@ pub struct RoutingOutbound {
     router: Arc<Router>,
     proxy_outbound: SharedOutbound,
     direct_outbound: SharedOutbound,
+    groups: std::collections::HashMap<String, SharedOutbound>,
 }
 
 impl RoutingOutbound {
     pub fn new(router: Arc<Router>, proxy_outbound: SharedOutbound) -> Self {
         Self {
             router,
+            groups: Default::default(),
             proxy_outbound,
             direct_outbound: SharedOutbound::direct(),
         }
+    }
+}
+
+impl RoutingOutbound {
+    pub fn with_groups(
+        mut self,
+        groups: &[crate::config::model::ProxyGroupConfig],
+        nodes: &[crate::Node],
+    ) -> Self {
+        self.groups = super::groups::build_groups(groups, nodes);
+        self
+    }
+    fn group(&self, name: &str) -> Result<&SharedOutbound> {
+        self.groups
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Routing proxy group does not exist"))
     }
 }
 
@@ -89,6 +114,7 @@ impl Outbound for RoutingOutbound {
 
             match action {
                 RouteAction::Proxy => self.proxy_outbound.0.connect(&host, port).await,
+                RouteAction::Group(name) => self.group(&name)?.0.connect(&host, port).await,
                 RouteAction::Direct => self.direct_outbound.0.connect(&host, port).await,
                 RouteAction::Reject => {
                     anyhow::bail!("Connection rejected by routing rule: {}:{}", host, port)
@@ -107,13 +133,27 @@ impl Outbound for RoutingOutbound {
             match self.router.route_resolving(&host, port).await {
                 RouteAction::Direct => self.direct_outbound.0.connect_datagram(&host, port).await,
                 RouteAction::Proxy => self.proxy_outbound.0.connect_datagram(&host, port).await,
+                RouteAction::Group(name) => {
+                    self.group(&name)?.0.connect_datagram(&host, port).await
+                }
                 RouteAction::Reject => anyhow::bail!("UDP rejected by routing rule"),
             }
         })
     }
 
+    fn with_default_proxy(&self, proxy: SharedOutbound) -> Option<SharedOutbound> {
+        Some(SharedOutbound(Arc::new(Self {
+            router: self.router.clone(),
+            proxy_outbound: proxy,
+            direct_outbound: self.direct_outbound.clone(),
+            groups: self.groups.clone(),
+        })))
+    }
     fn routing_policy(&self) -> Option<Arc<Router>> {
         Some(self.router.clone())
+    }
+    fn proxy_transport(&self) -> Option<SharedOutbound> {
+        Some(self.proxy_outbound.clone())
     }
     fn is_direct(&self) -> bool {
         self.proxy_outbound.0.is_direct()
@@ -143,6 +183,123 @@ mod tests {
         let second = Arc::new(Router::new(RuleSet::new()));
         state.replace(Some(second.clone()));
         assert!(Arc::ptr_eq(&reader.snapshot().unwrap(), &second));
+    }
+
+    struct Tagged(&'static str);
+    impl Outbound for Tagged {
+        fn connect(
+            &self,
+            _: &str,
+            _: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+            Box::pin(async move { anyhow::bail!(self.0) })
+        }
+        fn connect_datagram(
+            &self,
+            _: &str,
+            _: u16,
+        ) -> super::super::datagram::DatagramFuture<'_, super::super::datagram::BoxDatagram>
+        {
+            Box::pin(async move { anyhow::bail!(self.0) })
+        }
+        fn name(&self) -> &str {
+            "tagged"
+        }
+    }
+    #[tokio::test]
+    async fn group_tcp_udp_and_device_policy_use_the_same_exit_and_fail_closed() {
+        let mut rules = crate::parse_batch_rules(
+            "DOMAIN,example.invalid,group:Video\nSOURCE,192.0.2.9/32,MATCH,group:Device",
+            "proxy",
+        )
+        .rules;
+        assert_eq!(rules.len(), 2);
+        let router = Arc::new(Router::new(crate::rule_mode_ruleset(&rules)));
+        let mut outbound = RoutingOutbound::new(router, SharedOutbound(Arc::new(Tagged("global"))));
+        outbound
+            .groups
+            .insert("Video".into(), SharedOutbound(Arc::new(Tagged("video"))));
+        outbound
+            .groups
+            .insert("Device".into(), SharedOutbound(Arc::new(Tagged("device"))));
+        assert_eq!(
+            outbound
+                .connect("example.invalid", 443)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "video"
+        );
+        assert_eq!(
+            outbound
+                .connect_datagram("example.invalid", 443)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "video"
+        );
+        with_client_source(Some("192.0.2.9".parse().unwrap()), async {
+            assert_eq!(
+                outbound
+                    .connect("example.invalid", 443)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "video"
+            );
+            assert_eq!(
+                outbound
+                    .connect("unlisted.invalid", 443)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "device"
+            );
+            assert_eq!(
+                outbound
+                    .connect_datagram("unlisted.invalid", 443)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "device"
+            );
+        })
+        .await;
+        outbound.groups.clear();
+        assert!(
+            outbound
+                .connect("example.invalid", 443)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not exist")
+        );
+        assert!(
+            outbound
+                .connect_datagram("example.invalid", 443)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("does not exist")
+        );
+        let text = crate::format_rules_export(&rules);
+        let roundtrip = crate::parse_batch_rules(&text, "proxy");
+        assert!(roundtrip.errors.is_empty());
+        rules.sort_by(|a, b| a.source.cmp(&b.source));
+        assert!(roundtrip.rules.iter().any(|r| r.target == "group:Video"));
+        assert!(
+            roundtrip
+                .rules
+                .iter()
+                .any(|r| r.target == "group:Device" && !r.source.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -223,9 +380,7 @@ mod device_ingress_tests {
             .await
             .unwrap();
         client
-            .write_all(
-                format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
-            )
+            .write_all(b"CONNECT 203.0.113.10:443 HTTP/1.1\r\nHost: 203.0.113.10:443\r\n\r\n")
             .await
             .unwrap();
         let mut response = [0u8; 128];
@@ -249,7 +404,7 @@ mod device_ingress_tests {
         let mut hello = [0; 2];
         client.read_exact(&mut hello).await.unwrap();
         assert_eq!(hello, [5, 0]);
-        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        let mut request = vec![5, 1, 0, 1, 203, 0, 113, 10];
         request.extend(target_addr.port().to_be_bytes());
         client.write_all(&request).await.unwrap();
         let mut response = [0; 10];
@@ -262,10 +417,22 @@ mod device_ingress_tests {
         .unwrap();
         assert_eq!(response[1], 4);
         with_client_source(Some("127.0.0.1".parse().unwrap()), async {
-            assert!(outbound.0.connect_datagram("127.0.0.1", 53).await.is_err());
+            assert!(
+                outbound
+                    .0
+                    .connect_datagram("203.0.113.10", 53)
+                    .await
+                    .is_err()
+            );
         })
         .await;
-        assert!(outbound.0.connect_datagram("127.0.0.1", 53).await.is_ok());
+        assert!(
+            outbound
+                .0
+                .connect_datagram("203.0.113.10", 53)
+                .await
+                .is_ok()
+        );
         stop.send(true).unwrap();
         http_task.await.unwrap().unwrap();
         socks_task.await.unwrap().unwrap();

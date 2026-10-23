@@ -17,6 +17,8 @@
 //! overridden with `SOCKROCKET_DIR` (used by unit tests and local debugging).
 
 mod http;
+mod network_settings;
+mod proxy_groups;
 mod route_trace;
 mod rule_presets;
 mod storage;
@@ -319,6 +321,14 @@ fn load_conf() -> Result<Mapping> {
 }
 
 fn save_conf(map: &Mapping) -> Result<()> {
+    let groups: Vec<sockrocket_core::ProxyGroupConfig> = serde_yaml::from_value(
+        map.get(ykey("groups"))
+            .cloned()
+            .unwrap_or(Y::Sequence(vec![])),
+    )
+    .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
+    sockrocket_core::config::group::validate_targets(&groups, &load_routing_rules(map))
+        .map_err(anyhow::Error::msg)?;
     let text = serde_yaml::to_string(&Y::Mapping(map.clone()))?;
     storage::atomic_write(&text)
 }
@@ -449,6 +459,9 @@ fn read_only_action(action: &str) -> bool {
             | "get_direct_domains"
             | "get_rules"
             | "trace_route"
+            | "proxy_groups"
+            | "network_settings"
+            | "dns_test"
             | "export_rules"
     )
 }
@@ -507,6 +520,13 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "add_direct_domain" => act_add_direct_domain(post),
         "del_direct_domain" => act_del_direct_domain(post),
         "set_direct_server" => act_set_direct_server(post),
+        "proxy_groups" => proxy_groups::get(),
+        "save_proxy_group" => proxy_groups::save(post),
+        "delete_proxy_group" => proxy_groups::delete(post),
+        "save_device_policy" => proxy_groups::device(post),
+        "network_settings" => network_settings::get(),
+        "save_network_settings" => network_settings::save(post),
+        "dns_test" => network_settings::test(post),
         "get_rules" => act_get_rules(),
         "add_rule_preset" => rule_presets::add(post),
         "trace_route" => route_trace::act_trace_route(post),
@@ -559,6 +579,9 @@ fn act_status() -> J {
             .unwrap_or_else(|| "rule".into())
             .to_ascii_lowercase(),
         "rules_revision":route_trace::rules_revision(&map),
+        "network_revision":network_settings::revision(&map),
+        "ipv6_mode":conf_str(&map,"ipv6_mode").unwrap_or_else(||"compatibility".into()),
+        "ipv6_active":network_settings::ipv6_active(running, transparent_proxy, conf_str(&map,"ipv6_mode").as_deref()==Some("dual_stack")),
         "transparent_proxy": transparent_proxy,
         "dns_hijack": dns_hijack,
         "cn_ipset_direct": conf_bool(&map, "cn_ipset_direct", false),
@@ -2190,7 +2213,7 @@ fn act_get_rules() -> J {
             })
         })
         .collect();
-    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2202,7 +2225,7 @@ fn act_add_rule(post: &J) -> J {
         return err_msg("Invalid rule type");
     }
     let target = post.get("target").and_then(|v| v.as_str()).unwrap_or("");
-    if !RULE_TARGETS.contains(&target) {
+    if !proxy_groups::valid_target(target) {
         return err_msg("Invalid target action (direct / proxy / reject)");
     }
     let pattern = match valid_rule_pattern(
@@ -2314,7 +2337,7 @@ fn act_update_rule(post: &J) -> J {
     }
     let typ = post.get("rule_type").and_then(J::as_str).unwrap_or("");
     let target = post.get("target").and_then(J::as_str).unwrap_or("");
-    if !RULE_TYPES.contains(&typ) || !RULE_TARGETS.contains(&target) {
+    if !RULE_TYPES.contains(&typ) || !proxy_groups::valid_target(target) {
         return err_msg("Invalid rule type or action");
     }
     let pattern =
@@ -2503,7 +2526,7 @@ fn act_batch_add_rules(post: &J) -> J {
         .get("target")
         .and_then(|v| v.as_str())
         .unwrap_or("proxy");
-    if !RULE_TARGETS.contains(&default_target) {
+    if !proxy_groups::valid_target(default_target) {
         return err_msg("Invalid target action (direct / proxy / reject)");
     }
     let replace = post
@@ -2632,7 +2655,24 @@ fn act_apply_rule_scene(post: &J) -> J {
         "domestic_direct" => "Domestic direct",
         other => other,
     };
-    let incoming = scene.rules_in_group(group_label);
+    let mut incoming = scene.rules_in_group(group_label);
+    if let Some(target) = post.get("target").and_then(J::as_str) {
+        if !proxy_groups::valid_target(target) {
+            return err_msg("Invalid strategy target");
+        }
+        for rule in &mut incoming {
+            if rule.target == "proxy" {
+                rule.target = target.into();
+            }
+        }
+    }
+    let source = match requested_rule_source(post, "") {
+        Ok(v) => v,
+        Err(e) => return err_msg(&e),
+    };
+    for rule in &mut incoming {
+        rule.source.clone_from(&source);
+    }
     let n = incoming.len();
     let stats = sockrocket_core::merge_batch_rules(
         &mut existing,
@@ -2756,7 +2796,7 @@ fn act_replace_rule_group(post: &J) -> J {
         .get("target")
         .and_then(|v| v.as_str())
         .unwrap_or("proxy");
-    if !RULE_TARGETS.contains(&target) {
+    if !proxy_groups::valid_target(target) {
         return err_msg("Invalid target action (direct / proxy / reject)");
     }
     let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -3343,6 +3383,134 @@ mod tests {
     }
 
     #[test]
+    fn structured_network_policy_preserves_stop_and_private_configuration() {
+        let env = TestEnv::new(SAMPLE);
+        fs::write(env.dir.join("stopped"), "").unwrap();
+        fs::write(env.dir.join("scripts/sockrocket.sh"), "#!/bin/sh\nexit 7\n").unwrap();
+        let before = load_conf().unwrap();
+        let settings = network_settings::get();
+        assert_eq!(settings["ok"], true, "{settings}");
+        let body =
+            json!({"dns":settings["dns"],"ipv6_mode":"dual_stack","revision":settings["revision"]});
+        let saved = dispatch("save_network_settings", &body);
+        assert_eq!(saved["ok"], true, "{saved}");
+        assert_eq!(saved["applied"], false);
+        assert!(env.dir.join("stopped").exists());
+        let after = load_conf().unwrap();
+        for field in ["nodes", "subscriptions", "dns_direct_server", "mode"] {
+            assert_eq!(before.get(ykey(field)), after.get(ykey(field)));
+        }
+        assert!(after.get(ykey("dns")).is_some());
+        let bytes = fs::read(env.dir.join("config.yaml")).unwrap();
+        assert_eq!(
+            dispatch("save_network_settings", &body)["error_code"],
+            "network_config_stale"
+        );
+        assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), bytes);
+        let mut bad = body;
+        bad["dns"]["direct_servers"] =
+            json!(["https://secret:password@resolver.example.test/dns-query?private=token"]);
+        let reply = dispatch("save_network_settings", &bad);
+        assert_eq!(reply["error_code"], "dns_config_invalid");
+        let reply = reply.to_string();
+        assert!(!reply.contains("password") && !reply.contains("private=token"));
+        assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn proxy_group_api_preserves_privacy_references_and_device_inheritance() {
+        let env = TestEnv::new(SAMPLE);
+        fs::write(env.dir.join("stopped"), "manual").unwrap();
+        let state = dispatch("proxy_groups", &json!({}));
+        assert_eq!(state["ok"], true);
+        let rendered = state.to_string();
+        assert!(!rendered.contains("a.example.com") && !rendered.contains("00000000-0000"));
+        let fp = state["nodes"][0]["fingerprint"].clone();
+        assert_eq!(fp.as_str().unwrap().len(), 64);
+        let body = json!({"revision":state["revision"],"group":{"name":"Video","type":"select","members":[fp],"current":fp}});
+        assert_eq!(dispatch("save_proxy_group", &body)["ok"], true);
+        assert_eq!(
+            dispatch("save_proxy_group", &body)["ok"],
+            false,
+            "stale editor must not overwrite"
+        );
+        let rules = dispatch(
+            "add_rule",
+            &json!({"rule_type":"domain-suffix","pattern":"example.invalid","target":"group:Video"}),
+        );
+        assert_eq!(rules["ok"], true, "{rules}");
+        let trace = dispatch(
+            "trace_route",
+            &json!({"destination":"example.invalid","resolve_dns":false}),
+        );
+        assert_eq!(trace["trace"]["action"], "group:Video");
+        assert_eq!(trace["node_name"], "Node A");
+        let fresh = dispatch("proxy_groups", &json!({}));
+        assert_eq!(
+            dispatch(
+                "delete_proxy_group",
+                &json!({"revision":fresh["revision"],"name":"Video"})
+            )["ok"],
+            false
+        );
+        let renamed = dispatch(
+            "save_proxy_group",
+            &json!({"revision":fresh["revision"],"original_name":"Video","group":{"name":"Media","type":"select","members":[fp],"current":fp}}),
+        );
+        assert_eq!(renamed["ok"], true, "{renamed}");
+        assert_eq!(
+            load_routing_rules(&load_conf().unwrap())[0].target,
+            "group:Media"
+        );
+        let revision = route_trace::rules_revision(&load_conf().unwrap());
+        let saved = dispatch(
+            "save_device_policy",
+            &json!({"revision":revision,"source":"192.0.2.9","target":"group:Media"}),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        let trace = dispatch(
+            "trace_route",
+            &json!({"destination":"unlisted.example","source":"192.0.2.9","resolve_dns":false}),
+        );
+        assert_eq!(trace["trace"]["action"], "group:Media");
+        let shared_trace = dispatch(
+            "trace_route",
+            &json!({"destination":"baidu.com","source":"192.0.2.9","resolve_dns":false}),
+        );
+        assert_eq!(shared_trace["trace"]["action"], "direct");
+        let default_trace = dispatch(
+            "trace_route",
+            &json!({"destination":"baidu.com","source":"192.0.2.10","resolve_dns":false}),
+        );
+        assert_eq!(default_trace["trace"]["action"], "direct");
+        let revision = route_trace::rules_revision(&load_conf().unwrap());
+        assert_eq!(
+            dispatch(
+                "save_device_policy",
+                &json!({"revision":revision,"source":"192.0.2.9","target":"inherit"})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            load_routing_rules(&load_conf().unwrap()).len(),
+            1,
+            "inherit removes only the matching source final"
+        );
+        assert!(env.dir.join("stopped").exists());
+        let fresh = dispatch("proxy_groups", &json!({}));
+        assert!(!fresh.to_string().contains("a.example.com"));
+        let before = fs::read(env.dir.join("config.yaml")).unwrap();
+        assert_eq!(
+            dispatch(
+                "batch_add_rules",
+                &json!({"text":"DOMAIN,example.net,group:Missing","target":"proxy"})
+            )["ok"],
+            false
+        );
+        assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), before);
+    }
+
+    #[test]
     fn stop_does_not_wait_for_config_transaction() {
         let env = TestEnv::new(SAMPLE);
         let _lock = storage::MutationGuard::acquire().unwrap();
@@ -3501,7 +3669,7 @@ dns_direct_domains:
         let _env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain, pattern: example.com, target: reject, priority: 999}\n  - {rule_type: final, pattern: '*', target: direct, source: 192.0.2.8, priority: 0}"));
         let result = dispatch(
             "trace_route",
-            &json!({"destination":"http://example.com/path","source":"192.0.2.8","resolve_dns":false}),
+            &json!({"destination":"http://unlisted.example/path","source":"192.0.2.8","resolve_dns":false}),
         );
         assert_eq!(result["ok"], true);
         assert_eq!(result["port"], 80);

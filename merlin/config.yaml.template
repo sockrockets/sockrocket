@@ -30,6 +30,22 @@ proxy_mode: "rule"
 transparent_proxy: false
 dns_hijack: false
 
+# Default: compatibility — IPv4 proxy works without ISP IPv6. dual_stack is
+# optional after firmware IPv6 (Native + LAN prefix) is already working.
+# Configure DNS and this mode using the Network & DNS page.
+ipv6_mode: compatibility
+# Optional shared DNS policy (legacy dns_direct_* remains effective if omitted):
+# dns:
+#   direct_servers: ["udp://223.5.5.5:53", "udp://119.29.29.29:53"]
+#   proxy_servers: ["tls://dns.google:853", "https://cloudflare-dns.com/dns-query"]
+#   bootstrap_servers: ["223.5.5.5:53", "119.29.29.29:53"]
+#   strategy: prefer_ipv4
+#   cache_enabled: true
+#   cache_capacity: 1024
+#   cache_ttl: 0
+#   timeout_secs: 5
+#   direct_domains: []
+
 # Optional: divert China CIDRs around TUN via kernel ipset (hardware NAT).
 # Off by default; Global mode forces this off so domestic traffic still proxies.
 # cn_ipset_direct: false

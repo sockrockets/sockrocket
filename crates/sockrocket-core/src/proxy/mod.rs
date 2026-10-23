@@ -2,6 +2,7 @@ pub mod anytls;
 pub mod connector;
 pub mod datagram;
 pub mod factory;
+pub mod groups;
 pub mod health;
 pub mod http;
 mod http_forward;

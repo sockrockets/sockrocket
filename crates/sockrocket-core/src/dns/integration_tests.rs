@@ -17,6 +17,7 @@ fn config(server: DnsServer) -> DnsResolver {
         domain_rules: HashMap::new(),
         cache_ttl: 0,
         cache_enabled: false,
+        ..Default::default()
     })
 }
 #[tokio::test]
@@ -203,6 +204,7 @@ async fn published_outbound_changes_isolate_dns_cache_generations() {
         domain_rules: HashMap::new(),
         cache_ttl: 0,
         cache_enabled: true,
+        ..Default::default()
     });
     resolver.set_outbound(SharedOutbound(swappable.clone()));
     assert_eq!(
@@ -239,6 +241,7 @@ async fn zero_ttl_answers_are_not_served_from_stale_cache() {
         domain_rules: HashMap::new(),
         cache_ttl: 0,
         cache_enabled: true,
+        ..Default::default()
     });
     assert_eq!(
         resolver.resolve("example.com").await.unwrap(),
