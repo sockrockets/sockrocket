@@ -556,7 +556,7 @@ mod tests {
         other
             .extra
             .insert(SUB_URL_EXTRA_KEY.into(), "https://example.com/b".into());
-        let mut duplicate = ss("stale-copy", "192.0.2.3", 8443, "new-pw");
+        let duplicate = ss("stale-copy", "192.0.2.3", 8443, "new-pw");
         let mut config = AppConfig {
             nodes: vec![manual, old, other, duplicate],
             active_node: Some(3),

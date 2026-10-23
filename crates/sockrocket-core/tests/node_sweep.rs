@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use sockrocket_core::config::model::AppConfig;
-use sockrocket_core::proxy::connector::Outbound;
 use sockrocket_core::proxy::factory::create_outbound;
 
 const CONCURRENCY: usize = 8;

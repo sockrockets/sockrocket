@@ -5,7 +5,6 @@
 mod common;
 
 use sockrocket_core::config::model::AppConfig;
-use sockrocket_core::proxy::connector::Outbound;
 use sockrocket_core::proxy::factory::create_outbound;
 
 /// Probe REALITY client against a local xray on 127.0.0.1 (config in `.local/`).

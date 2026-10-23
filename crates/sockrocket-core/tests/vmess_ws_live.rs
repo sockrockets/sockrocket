@@ -4,7 +4,6 @@
 mod common;
 
 use sockrocket_core::config::model::*;
-use sockrocket_core::proxy::connector::Outbound;
 use sockrocket_core::proxy::factory::create_outbound;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
