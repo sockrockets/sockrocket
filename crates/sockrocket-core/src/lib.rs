@@ -101,7 +101,7 @@ pub use traffic::{
     DIRECT_TRAFFIC_ID, NodeMonthlyTraffic, NodeTrafficSnapshot, TRAFFIC_HISTORY_MONTHS,
     TrafficCounters, TrafficLedger, TrafficTarget, direct_traffic_target, note_traffic,
     public_traffic_label, publish_traffic_catalog, recent_month_keys, set_catalog_active,
-    subscription_public_id, with_traffic_scope,
+    subscription_public_id, sum_subscription_members, with_traffic_scope,
 };
 pub use update::{
     UpdateAvailability, UpdateCheck, check_for_update, compare_versions, download_file,
