@@ -7,6 +7,17 @@ Run Sockrocket on **AsusWRT-Merlin** for LAN-wide transparent proxy without per-
 ## Requirements
 
 - Asus router with **AsusWRT-Merlin** (388.x+ recommended; koolshare / official Merlin forks with software center)
+
+Upstream Merlin from [asuswrt-merlin.net](https://www.asuswrt-merlin.net/download) does not include Software Center. Flash a build that does, from [fw.koolcenter.com](https://fw.koolcenter.com/):
+
+| Line | Directory |
+|------|-----------|
+| Merlin 3004.388 | [KoolCenter_梅林改版固件_3004.388](https://fw.koolcenter.com/KoolCenter_梅林改版固件_3004.388/) |
+| Merlin 3006.102 | [KoolCenter_梅林改版固件_3006.102](https://fw.koolcenter.com/KoolCenter_梅林改版固件_3006.102/) |
+| Asus official-mod | [KoolCenter_华硕官改固件](https://fw.koolcenter.com/KoolCenter_华硕官改固件/) |
+| Older 3004.386 | [KoolCenter_梅林改版固件_3004.386](https://fw.koolcenter.com/KoolCenter_梅林改版固件_3004.386/) |
+
+Open the folder named like the model on Administration → Firmware Upgrade. Co-branded editions without their own folder use the base model. Download the newest stable file in that folder, not anything under `alpha` or `beta`. Upgrade from the router WebUI and wait for reboot. Software Center appears after that. Official-mod and Merlin builds use the same Sockrocket platform package.
 - **JFFS** and **custom scripts** enabled (Administration → System → Persistent JFFS2)
 - Offline package whose `.valid` platform tag matches your SoC (same naming style as [fancyss](https://github.com/hq450/fancyss))
 
@@ -200,6 +211,8 @@ Higher `priority` wins first; equal values keep list order. Or use the Web UI
 
 Web UI: `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`
 
+Node groups and pinned nodes apply only in rule mode. Create the group on the Nodes page, then set a routing rule's exit to that group. See [Routing](./routing.md).
+
 ---
 
 ## Service control
@@ -257,4 +270,4 @@ path above manually — otherwise only registration is cleared and files remain.
 
 - [merlin-reference.md](./merlin-reference.md) — iptables, DNS, watchdog internals  
 - [fancyss README](https://github.com/hq450/fancyss) — upstream platform / firmware notes  
-- [koolcenter](https://www.koolcenter.com/) — Merlin / 官改 firmware downloads  
+- [fw.koolcenter.com](https://fw.koolcenter.com/) — Merlin and 官改 firmware that include Software Center  

@@ -156,9 +156,11 @@ The format hint `v2ray` (Merlin / config) means this URI/base64 list. Use `v2ray
 
 In Merlin, open **Nodes → Node groups** to create a named set of nodes and choose its member. Names can contain letters (including Chinese), numbers, hyphens and underscores. The rule target selector, preset import selector and device policy selector all include these groups. A group selection does not change the global active node. Rules still need rule mode to take effect.
 
-- `select`: new TCP and UDP connections use the selected member. A deleted or unavailable selection fails explicitly instead of falling back to the global node.
-- `fallback`: new TCP connections try members in stored order, with a 3-second per-member and 10-second total setup budget. Only establishment failures trigger fallback; an established stream is never replayed. UDP uses the first available configured member and does not infer remote reachability from session creation.
-- `url-test`: uses the stored selection produced by the desktop's explicit group test (or manual selection). This version does not run a periodic background group probe on Merlin.
+- `select`: new TCP and UDP use one member. Merlin saves only that node. The desktop app can keep several members so you can switch the current one; the others are not tried in order. A missing selection fails closed and does not use the global node.
+- `fallback`: for five minutes, new TCP starts at the last member that connected. After that it starts at the first member again. If a member fails to establish, the rest are tried in list order. An established stream is not replayed. UDP stays on the first member.
+- `url-test`: for five minutes, new TCP reuses the fastest recent handshake. After that the members race, and list order does not choose the winner. UDP uses that same pick and does not start a new race.
+
+A group does nothing until a rule's exit is that group and the router is in rule mode. On Merlin: Nodes → create the group, then Routing rules → set the rule group's exit, or a single rule's action, to `分组 · name`. Direct and reject rules in that rule group stay as they are. See [Routing](./routing.md).
 
 Membership survives display-name changes. Subscription changes that replace server credentials may invalidate a member; the page shows missing members and permits replacing them. The private configuration retains existing membership identities; API responses expose only SHA-256 opaque member IDs, not credentials or endpoints. Group renames rewrite all rule references atomically, including disabled rules. Deletion is refused while any rule references a group. Limits: 64 groups and 256 members per group. Groups cannot contain other groups.
 
@@ -174,5 +176,11 @@ The addresses and domains above are documentation examples only.
 **Rules → Device default policy** manages a final rule for an IPv4/IPv6 address or CIDR. An empty source sets the global default. Selecting inherit removes final rules for that exact source, leaving destination-specific exceptions intact. Saving replaces final rules for that source; the UI asks for confirmation. Use DHCP reservations for stable device addresses, or a stable IPv6 prefix. MAC-address identities and DHCP discovery are not implemented.
 
 Evaluation order is: device destination rules → global destination rules → built-in domestic/private direct → device final → global final (proxy when absent). A device final replaces only the global fallback for that source. Domestic sites and shared destination rules still apply. Priorities within each phase still apply; overlapping device subnets use configured priority, not longest-prefix selection. Inherit means deleting that source's final rule. The flow diagram and routing query use these same saved rules and group names. A fallback group's displayed first member is a candidate, not proof of the member used by a live connection. Existing streams keep their admitted policy snapshot. DNS upstream transport remains the separately configured DNS policy using the global proxy node.
+
+## Traffic
+
+The overview counts bytes each node forwarded since this process started. A restart starts those counters again.
+
+The subscriptions page shows the last three calendar months. Every node has its own row, including manual nodes and Direct. A subscription total is the sum of the nodes that currently belong to it. The tables show subscription names, not subscription URLs.
 
 Changing a group or device policy applies through the existing restart path only if the router service is running. A manually stopped service stays stopped. This feature has local regression coverage; router deployment and live device acceptance are separate steps using a complete Software Center package.

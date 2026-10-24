@@ -180,6 +180,12 @@
 #sockrocket-plugin .flow-warning {color:var(--warning);font-size:11px;margin-top:8px;overflow-wrap:anywhere}
 #sockrocket-plugin .flow-entry,#sockrocket-plugin .flow-rules,#sockrocket-plugin .flow-exits {position:relative;display:flex;flex-direction:column;justify-content:center;gap:10px;min-width:0}
 #sockrocket-plugin .proxy-group-grid {grid-template-columns:repeat(2,minmax(0,1fr))}
+#sockrocket-plugin .pg-member-list {max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-sidebar)}
+#sockrocket-plugin .pg-member {display:flex;align-items:flex-start;gap:8px;margin:0;padding:7px 10px;border-bottom:1px solid var(--border);font-size:12px;line-height:1.4}
+#sockrocket-plugin .pg-member:last-child {border-bottom:0}
+#sockrocket-plugin .pg-member label {display:flex;align-items:flex-start;gap:8px;flex:1;min-width:0;margin:0;cursor:pointer}
+#sockrocket-plugin .pg-member input {margin-top:2px;flex:none}
+#sockrocket-plugin .pg-member-move {display:flex;gap:4px;flex:none}
 #sockrocket-plugin .flow-rules {gap:20px}
 #sockrocket-plugin .flow-box {display:flex;flex-direction:column;justify-content:center;gap:2px;min-width:0;height:68px;flex-shrink:0;padding:8px 10px;background:var(--bg-sidebar);border:1px solid var(--border);border-radius:9px;text-align:left;line-height:1.35}
 #sockrocket-plugin button.flow-box {width:100%;color:var(--text-primary)}
@@ -381,7 +387,7 @@ body.bg {min-width:0!important}
       <div class="page" id="sr-page-nodes" role="tabpanel" aria-labelledby="sr-nav-nodes">
         <div class="page-title">节点</div><p class="page-intro">查看详情不会切换节点；只有“使用”才会改变连接。测速不会切换当前节点。</p>
         <section class="card"><h3>节点分组</h3><p class="hint">为不同规则选择独立出口。分组内选择节点不会改变全局节点；节点更名后仍保留成员关系。失效成员不会自动改走其他线路。</p><div class="toolbar"><button class="btn btn-sm" onclick="editProxyGroup(-1)">新建分组</button><button class="btn btn-sm" onclick="loadProxyGroups()">刷新分组</button></div><div id="sr-proxy-group-list" style="margin-top:12px"></div>
-        <div id="sr-proxy-group-editor" hidden><h4>编辑节点分组</h4><div class="form-grid proxy-group-grid"><div class="fg"><label for="sr-pg-name">名称（必填）</label><input id="sr-pg-name" type="text" maxlength="96" placeholder="例如：视频线路"></div><div class="fg"><label for="sr-pg-type">选择方式</label><select id="sr-pg-type" onchange="updateProxyGroupMode()"><option value="select">手动选择</option><option value="fallback">TCP 建连失败时按成员顺序尝试</option><option value="url-test">按连接延迟自动选择</option></select></div><div class="fg"><label for="sr-pg-members">成员（必选，可多选）</label><select id="sr-pg-members" multiple size="7" onchange="updateProxyGroupPick()"></select><span class="hint">按住 Ctrl / ⌘ 多选。备用顺序以上方成员列表为准。</span></div><div class="fg"><label for="sr-pg-current" id="sr-pg-current-label">当前成员</label><select id="sr-pg-current"></select><span class="hint">测速模式比较成员握手并在五分钟内沿用更快的成员。备用模式记住上次成功的 TCP 成员，并定期回头尝试更靠前的成员；UDP 固定使用首个成员，不会迁移已有连接。</span><div class="toolbar"><button type="button" class="btn btn-sm" onclick="moveProxyGroupMember(-1)">成员上移</button><button type="button" class="btn btn-sm" onclick="moveProxyGroupMember(1)">成员下移</button></div></div></div><div class="toolbar"><button class="btn btn-accent" id="sr-pg-save" onclick="saveProxyGroup()">保存分组</button><button class="btn" onclick="srElement('proxy-group-editor').hidden=true">取消</button></div></div></section>
+        <div id="sr-proxy-group-editor" hidden><h4>编辑节点分组</h4><div class="form-grid proxy-group-grid"><div class="fg"><label for="sr-pg-name">名称（必填）</label><input id="sr-pg-name" type="text" maxlength="96" placeholder="例如：视频线路"></div><div class="fg"><label for="sr-pg-type">选择方式</label><select id="sr-pg-type" onchange="updateProxyGroupMode()"><option value="select">手动选择</option><option value="fallback">TCP 建连失败时按成员顺序尝试</option><option value="url-test">按连接延迟自动选择</option></select></div><div class="fg"><label id="sr-pg-members-label">使用的节点</label><div id="sr-pg-members" class="pg-member-list" role="group" aria-labelledby="sr-pg-members-label"></div><span class="hint" id="sr-pg-member-hint">只会使用这一个节点。点另一个即切换，不会自动改走其他节点。</span><div class="toolbar" id="sr-pg-member-tools" hidden><button type="button" class="btn btn-sm" onclick="setProxyGroupMembers(true)">全选</button><button type="button" class="btn btn-sm" onclick="setProxyGroupMembers(false)">清空</button></div></div></div><div class="toolbar"><button class="btn btn-accent" id="sr-pg-save" onclick="saveProxyGroup()">保存分组</button><button class="btn" onclick="srElement('proxy-group-editor').hidden=true">取消</button></div></div></section>
         <div class="toolbar">
           <button class="btn btn-accent btn-sm" id="sr-test-all-btn" onclick="testAllNodes()">全部测速</button>
           <button class="btn btn-sm" onclick="srLoadNodes()">刷新</button><button class="btn btn-sm" onclick="toggleAddNodeForm()">添加节点</button>
@@ -1815,7 +1821,7 @@ function updateSubs() {
 }
 
 
-var SR_PROXY_GROUPS=[], SR_RULE_NODES=[], PG_NODES=[], PG_REVISION=null, PG_EDIT_REVISION=null, PG_ORIGINAL='', PG_BUSY=false, PG_LOAD_GENERATION=0;
+var SR_PROXY_GROUPS=[], SR_RULE_NODES=[], PG_NODES=[], PG_REVISION=null, PG_EDIT_REVISION=null, PG_ORIGINAL='', PG_KEEP_CURRENT='', PG_BUSY=false, PG_LOAD_GENERATION=0;
 function setProxyGroupTargets(groups) {
   SR_PROXY_GROUPS=groups||[];
   if (typeof rebuildRuleTargets==='function') { rebuildRuleTargets(); return; }
@@ -1847,25 +1853,90 @@ function editProxyGroup(i){
   PG_ORIGINAL=g.name;PG_EDIT_REVISION=PG_REVISION;
   srElement('pg-name').value=g.name;srElement('pg-type').value=g.type;
   var ns=g.members.map(function(fp){return PG_NODES.find(function(n){return n.fingerprint===fp;})||{fingerprint:fp,name:'失效成员（可移除）'};}).concat(PG_NODES.filter(function(n){return g.members.indexOf(n.fingerprint)<0;}));
-  srElement('pg-members').innerHTML=ns.map(function(n){return '<option value="'+srEsc(n.fingerprint)+'"'+(g.members.indexOf(n.fingerprint)>=0?' selected':'')+'>'+srEsc(n.name)+'</option>';}).join('');
-  updateProxyGroupPick();if(g.current)srElement('pg-current').value=g.current;
+  PG_KEEP_CURRENT=g.current||'';
+  var rows=ns.map(function(n){return {value:n.fingerprint,text:n.name,selected:g.members.indexOf(n.fingerprint)>=0};});
+  if(g.type==='select')rows=proxyGroupSingleChoice(rows);
+  writeProxyGroupMembers(rows);
   updateProxyGroupMode();
   srElement('proxy-group-editor').hidden=false;
 }
-function updateProxyGroupPick(){
-  var el=srElement('pg-current'),old=el.value;
-  el.innerHTML=Array.from(srElement('pg-members').options).filter(function(o){return o.selected;}).map(function(o){return '<option value="'+srEsc(o.value)+'">'+srEsc(o.textContent)+'</option>';}).join('');
-  if(Array.from(el.options).some(function(o){return o.value===old;}))el.value=old;
+function proxyGroupMemberState(){
+  var host=srElement('pg-members');
+  if(host&&typeof host.querySelectorAll==='function'){
+    return Array.from(host.querySelectorAll('.pg-member')).map(function(row){
+      var input=row.querySelector('input');
+      var span=row.querySelector('span');
+      return {value:input.value,selected:!!input.checked,text:span?span.textContent:''};
+    });
+  }
+  return (host.options||[]).map(function(option){return {value:option.value,selected:!!option.selected,text:option.textContent||''};});
+}
+function proxyGroupSingleChoice(rows){
+  var keep=rows.find(function(row){return row.selected&&row.value===PG_KEEP_CURRENT;})||rows.find(function(row){return row.selected;});
+  rows.forEach(function(row){row.selected=!!(keep&&row.value===keep.value);});
+  if(keep)PG_KEEP_CURRENT=keep.value;
+  return rows;
+}
+function writeProxyGroupMembers(rows){
+  var type=srElement('pg-type').value,manual=type==='select',ordered=type==='fallback';
+  srElement('pg-members').innerHTML=rows.map(function(row){
+    var input=manual
+      ?'<input type="radio" value="'+srEsc(row.value)+'" name="sr-pg-pick"'+(row.selected?' checked':'')+' onchange="pickProxyGroupMember(this.value)">'
+      :'<input type="checkbox" value="'+srEsc(row.value)+'"'+(row.selected?' checked':'')+'>';
+    var move=ordered?'<span class="pg-member-move"><button type="button" class="btn btn-sm" onclick="moveProxyGroupMember(this,-1)">上移</button><button type="button" class="btn btn-sm" onclick="moveProxyGroupMember(this,1)">下移</button></span>':'';
+    return '<div class="pg-member"><label>'+input+'<span>'+srEsc(row.text)+'</span></label>'+move+'</div>';
+  }).join('');
+}
+function pickProxyGroupMember(value){PG_KEEP_CURRENT=value;}
+function setProxyGroupMember(value,selected){
+  var rows=proxyGroupMemberState(),manual=srElement('pg-type').value==='select';
+  rows.forEach(function(row){
+    if(manual)row.selected=row.value===value;
+    else if(row.value===value)row.selected=!!selected;
+  });
+  if(manual)PG_KEEP_CURRENT=value;
+  writeProxyGroupMembers(rows);
+}
+function setProxyGroupMembers(selected){
+  var rows=proxyGroupMemberState();
+  if(srElement('pg-type').value==='select'){writeProxyGroupMembers(proxyGroupSingleChoice(rows));return;}
+  rows.forEach(function(row){row.selected=!!selected;});
+  writeProxyGroupMembers(rows);
 }
 function updateProxyGroupMode(){
-  var el=srElement('pg-current-label');if(el)el.textContent=srElement('pg-type').value==='fallback'?'排序成员（首个成员优先）':'当前成员';
+  var type=srElement('pg-type').value,manual=type==='select',ordered=type==='fallback';
+  var rows=proxyGroupMemberState();
+  if(manual)rows=proxyGroupSingleChoice(rows);
+  if(rows.length)writeProxyGroupMembers(rows);
+  var label=srElement('pg-members-label');
+  if(label)label.textContent=manual?'使用的节点':(ordered?'成员（上面的先用）':'参与测速的节点');
+  var hint=srElement('pg-member-hint');
+  if(hint)hint.textContent=manual
+    ?'只会使用这一个节点。点另一个即切换，保存时也只保留这一个。'
+    :ordered
+    ?'可勾选多个。上面的先用，失败再试下一个。上次成功的会暂时沿用，并回头尝试更靠前的；UDP 固定走第一个。'
+    :'可勾选多个。这些节点一起比延迟，五分钟内沿用更快的那个。顺序不决定用哪一个。';
+  var tools=srElement('pg-member-tools');
+  if(tools)tools.hidden=manual;
 }
-function moveProxyGroupMember(direction){
-  var select=srElement('pg-members'),current=srElement('pg-current').value;
-  var chosen=Array.from(select.options).filter(function(o){return o.selected;}),at=chosen.findIndex(function(o){return o.value===current;}),to=at+direction;
-  if(at<0||to<0||to>=chosen.length)return;
-  if(direction<0)select.insertBefore(chosen[at],chosen[to]);else select.insertBefore(chosen[to],chosen[at]);
-  updateProxyGroupPick();
+function proxyGroupCurrent(){
+  var chosen=proxyGroupMemberState().filter(function(row){return row.selected;});
+  if(!chosen.length)return null;
+  if(srElement('pg-type').value!=='select'&&chosen.some(function(row){return row.value===PG_KEEP_CURRENT;}))return PG_KEEP_CURRENT;
+  return chosen[0].value;
+}
+function moveProxyGroupMember(value,direction){
+  if(value&&typeof value.closest==='function'){
+    var row=value.closest('.pg-member');
+    var input=row&&row.querySelector('input');
+    value=input?input.value:'';
+  }
+  var rows=proxyGroupMemberState();
+  var at=rows.findIndex(function(row){return row.value===value;});
+  var to=at+direction;
+  if(at<0||to<0||to>=rows.length)return;
+  var swap=rows[at];rows[at]=rows[to];rows[to]=swap;
+  writeProxyGroupMembers(rows);
 }
 function mutateProxyGroup(action,body){
   if(PG_BUSY)return;PG_BUSY=true;PG_LOAD_GENERATION++;srElement('pg-save').disabled=true;
@@ -1873,7 +1944,7 @@ function mutateProxyGroup(action,body){
   srApi(action,body,done,done,60000);
 }
 function saveProxyGroup(){
-  mutateProxyGroup('save_proxy_group',{revision:PG_EDIT_REVISION,original_name:PG_ORIGINAL,group:{name:srElement('pg-name').value.trim(),type:srElement('pg-type').value,members:Array.from(srElement('pg-members').options).filter(function(o){return o.selected;}).map(function(o){return o.value;}),current:srElement('pg-current').value||null}});
+  mutateProxyGroup('save_proxy_group',{revision:PG_EDIT_REVISION,original_name:PG_ORIGINAL,group:{name:srElement('pg-name').value.trim(),type:srElement('pg-type').value,members:proxyGroupMemberState().filter(function(row){return row.selected;}).map(function(row){return row.value;}),current:proxyGroupCurrent()}});
 }
 function deleteProxyGroup(i){var g=SR_PROXY_GROUPS[i];if(!g||!confirm('删除分组 '+g.name+'？被规则引用时会拒绝删除。'))return;mutateProxyGroup('delete_proxy_group',{revision:PG_REVISION,name:g.name});}
 function renderDevicePolicies(){

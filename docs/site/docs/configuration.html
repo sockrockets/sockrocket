@@ -42,12 +42,14 @@
         <a href="#basics">基础</a>
         <a href="#dns">DNS 与 IPv6</a>
         <a href="#rules">规则顺序</a>
+        <a href="#traffic">用量</a>
         <a href="#cli">命令行</a>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <a href="#en-basics">Basics</a>
         <a href="#en-dns">DNS &amp; IPv6</a>
         <a href="#en-rules">Rule order</a>
+        <a href="#en-traffic">Traffic</a>
         <a href="#en-cli">CLI</a>
       </div>
       <div class="toc-group"><strong>MORE</strong>
@@ -71,7 +73,9 @@
           <li>在 Softcenter「网络与 DNS」页保存时，运行中的服务会<strong>就地重新应用防火墙</strong>，不会无故重启代理；服务停止时只保存配置。</li>
         </ul>
         <h2 id="rules">规则顺序</h2>
-        <p>规则模式下匹配顺序是：设备目的规则 → 共享规则（含国内直连）→ 设备兜底 → 全局兜底。设备设为「兜底 → 拒绝」时，国内与局域网仍可按共享规则直连。</p>
+        <p>规则模式下匹配顺序是：设备目的规则 → 共享规则（含国内直连）→ 设备兜底 → 全局兜底。出口可以是全局节点、某一个节点，或一个节点分组。分组怎么生效，见 <a href="routing.html">分流</a>。</p>
+        <h2 id="traffic">用量</h2>
+        <p>概览统计的是本次进程启动以来各节点转发的流量，重启后重新累计。订阅页按自然月显示最近三个月：每个节点一行，包括手动节点和直连。订阅合计是当前属于它的节点之和；直连、以及还没有归属订阅的节点，只出现在节点表里。页面只显示订阅名称，不显示地址。</p>
         <h2 id="cli">命令行最小示例</h2>
         <pre><code>sockrocket-cli --init config.yaml
 sockrocket-cli config.yaml</code></pre>
@@ -91,7 +95,9 @@ sockrocket-cli config.yaml</code></pre>
           <li>Saving Network &amp; DNS reapplies the firewall in place without restarting a running proxy.</li>
         </ul>
         <h2 id="en-rules">Rule order</h2>
-        <p>Device destination rules → shared rules (including China direct) → device final → global final.</p>
+        <p>Device destination rules → shared rules (including China direct) → device final → global final. An exit can be the global node, one node, or a node group. See <a href="routing.html">Routing</a> for when a group takes effect.</p>
+        <h2 id="en-traffic">Traffic</h2>
+        <p>The overview counts bytes forwarded since this process started and starts over after a restart. The subscriptions page shows the last three calendar months per node, including manual nodes and Direct. A subscription total is the sum of nodes that currently belong to it. Direct traffic and nodes with no subscription stay in the node table. The page shows subscription names only.</p>
         <h2 id="en-cli">CLI</h2>
         <pre><code>sockrocket-cli --init config.yaml
 sockrocket-cli config.yaml</code></pre>
