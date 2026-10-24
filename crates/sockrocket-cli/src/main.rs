@@ -10,8 +10,9 @@ use anyhow::{Context, Result, bail};
 use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
-    SharedOutbound, SwappableOutbound, TunProxy, apply_subscription_refresh, create_outbound,
-    fetch_subscription, flush_system_dns_cache, normalize_node_names, resolve_to_ips,
+    SharedOutbound, SwappableOutbound, TrafficLedger, TunProxy, apply_subscription_refresh,
+    create_outbound, fetch_subscription, flush_system_dns_cache, node_public_id,
+    normalize_node_names, publish_traffic_catalog, resolve_to_ips, set_catalog_active,
     set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
 
@@ -253,6 +254,15 @@ async fn async_main() -> Result<()> {
 
     // Start HTTP/SOCKS5 proxy service
     let mut service = ProxyService::with_outbound(shared_outbound.clone());
+    let traffic_ledger = {
+        let path = Path::new(&config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("traffic.yaml");
+        TrafficLedger::load_or_new(path)
+    };
+    service.stats().set_ledger(Some(traffic_ledger.clone()));
+    sync_traffic_node(&traffic_ledger, &config, active_index);
     service
         .start(&config.listen_addr, config.socks_port, config.http_port)
         .await?;
@@ -380,6 +390,7 @@ async fn async_main() -> Result<()> {
         );
         if let Some(mut rx) = service.health_events() {
             let health_config_path = config_path.clone();
+            let traffic_ledger = traffic_ledger.clone();
             tokio::spawn(async move {
                 while rx.changed().await.is_ok() {
                     match rx.borrow().clone() {
@@ -435,6 +446,16 @@ async fn async_main() -> Result<()> {
                             // comes up on the working node instead of the dead
                             // one (which would cost failure_threshold probes
                             // of downtime before switching again).
+                            // The outbound already points at the new node.
+                            let target = set_catalog_active(&node_public_id(&node_key), &node_name);
+                            traffic_ledger.set_current_node(
+                                Some(target.id.clone()),
+                                Some(target.name.clone()),
+                            );
+                            traffic_ledger.set_current_subscription(
+                                target.subscription_id.clone(),
+                                target.subscription_name.clone(),
+                            );
                             if let Err(e) = persist_active_node(&health_config_path, &node_key) {
                                 tracing::warn!("failed to persist active_node: {e:#}");
                             }
@@ -730,6 +751,7 @@ async fn async_main() -> Result<()> {
                                         })
                                         .await;
                                 }
+                                sync_traffic_node(&traffic_ledger, &new_config, new_index);
                                 tracing::info!(
                                     "config reloaded: {} node(s), active index {:?} (listeners unchanged)",
                                     new_config.nodes.len(),
@@ -786,6 +808,10 @@ async fn async_main() -> Result<()> {
         tun.stop().await;
     }
     service.stop().await;
+
+    if let Err(error) = traffic_ledger.flush() {
+        tracing::warn!("traffic ledger flush on shutdown failed: {error:#}");
+    }
 
     // Routes first: a stalled proxy command must not leave traffic pointed at
     // a TUN device that is about to disappear. Only a proxy this process
@@ -1130,6 +1156,26 @@ fn ipv6_reload_decision(
         Ipv6Reload::Reapply
     } else {
         Ipv6Reload::Apply
+    }
+}
+
+fn sync_traffic_node(ledger: &TrafficLedger, config: &AppConfig, active_index: Option<usize>) {
+    let direct = config.proxy_mode == ProxyMode::Direct;
+    publish_traffic_catalog(&config.nodes, &config.subscriptions, active_index, direct);
+    if direct {
+        ledger.set_current_node(None, None);
+        return;
+    }
+    match active_index.and_then(|index| config.nodes.get(index)) {
+        Some(node) => {
+            let target = set_catalog_active(
+                &node_public_id(&sockrocket_core::node_fingerprint(node)),
+                &node.name,
+            );
+            ledger.set_current_node(Some(target.id), Some(target.name));
+            ledger.set_current_subscription(target.subscription_id, target.subscription_name);
+        }
+        None => ledger.set_current_node(None, None),
     }
 }
 

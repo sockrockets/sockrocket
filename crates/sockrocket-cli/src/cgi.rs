@@ -1819,7 +1819,70 @@ fn act_stats() -> J {
     )
     .map(|out| out.contains("MARK"))
     .unwrap_or(false);
-    json!({"ok": true, "uptime": uptime, "pid": pid_val, "dns_active": dns_active, "fw_active": fw_active})
+    let traffic_path = sockrocket_dir().join("traffic.yaml");
+    let traffic_nodes: Vec<J> = sockrocket_core::TrafficLedger::read_file(&traffic_path)
+        .unwrap_or_default()
+        .into_iter()
+        .take(40)
+        .map(|snap| {
+            json!({
+                "id": snap.id,
+                "name": sockrocket_core::public_traffic_label(&snap.name, if snap.id == sockrocket_core::DIRECT_TRAFFIC_ID { "直连" } else { "节点" }),
+                "session_up": snap.session.up,
+                "session_down": snap.session.down,
+                "session_total": snap.session.total(),
+            })
+        })
+        .collect();
+    let month_keys = sockrocket_core::recent_month_keys(3);
+    let recent = |rows: Vec<sockrocket_core::NodeMonthlyTraffic>, include_id: bool| -> Vec<J> {
+        rows.into_iter()
+            .take(40)
+            .map(|row| {
+                let fallback = if row.id == sockrocket_core::DIRECT_TRAFFIC_ID {
+                    "直连"
+                } else if include_id {
+                    "节点"
+                } else {
+                    "订阅"
+                };
+                json!({
+                    "id": if include_id { row.id } else { String::new() },
+                    "name": sockrocket_core::public_traffic_label(&row.name, fallback),
+                    "months": row.months.iter().map(|(key, counters)| json!({
+                        "key": key,
+                        "up": counters.up,
+                        "down": counters.down,
+                        "total": counters.total(),
+                    })).collect::<Vec<_>>(),
+                    "total_up": row.total.up,
+                    "total_down": row.total.down,
+                    "total": row.total.total(),
+                })
+            })
+            .collect()
+    };
+    let recent_months =
+        sockrocket_core::TrafficLedger::read_recent_months(&traffic_path, 3).unwrap_or_default();
+    let recent_subscriptions =
+        sockrocket_core::TrafficLedger::read_recent_subscriptions(&traffic_path, 3)
+            .unwrap_or_default();
+    let session_started =
+        sockrocket_core::TrafficLedger::read_session_started(&traffic_path).unwrap_or(0);
+    json!({
+        "ok": true,
+        "uptime": uptime,
+        "pid": pid_val,
+        "dns_active": dns_active,
+        "fw_active": fw_active,
+        "traffic": {
+            "session_started": session_started,
+            "nodes": traffic_nodes,
+            "recent_month_keys": month_keys,
+            "recent_months": recent(recent_months, true),
+            "recent_subscriptions": recent(recent_subscriptions, false),
+        }
+    })
 }
 
 fn vm_rss_kb(pid: &str) -> u64 {

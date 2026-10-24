@@ -7,6 +7,7 @@ pub mod qr;
 pub mod router;
 pub mod share_server;
 pub mod system_proxy;
+pub mod traffic;
 pub mod update;
 
 pub use config::clash::parse_clash_config;
@@ -95,6 +96,12 @@ pub use share_server::{
 pub use system_proxy::{
     DEFAULT_BYPASS, SystemProxyConfig, clear_system_proxy, flush_system_dns_cache,
     get_system_proxy, set_system_proxy, set_system_proxy_with_bypass, system_proxy_supported,
+};
+pub use traffic::{
+    DIRECT_TRAFFIC_ID, NodeMonthlyTraffic, NodeTrafficSnapshot, TRAFFIC_HISTORY_MONTHS,
+    TrafficCounters, TrafficLedger, TrafficTarget, direct_traffic_target, note_traffic,
+    public_traffic_label, publish_traffic_catalog, recent_month_keys, set_catalog_active,
+    subscription_public_id, with_traffic_scope,
 };
 pub use update::{
     UpdateAvailability, UpdateCheck, check_for_update, compare_versions, download_file,

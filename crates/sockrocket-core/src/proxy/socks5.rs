@@ -63,7 +63,7 @@ impl Socks5Server {
                     let stats = self.stats.clone();
                     connections.spawn(async move {
                         let _slot = slot;
-                        let result = super::routing::with_client_source(Some(peer.ip()), handle_socks5(stream, outbound, stats.clone())).await;
+                        let result = super::routing::with_client_source(Some(peer.ip()), crate::traffic::with_traffic_scope(handle_socks5(stream, outbound, stats.clone()))).await;
                         if let Err(e) = result {
                             tracing::debug!("SOCKS5 connection from {} error: {}", peer, e);
                         }

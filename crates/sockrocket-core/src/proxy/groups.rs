@@ -81,9 +81,14 @@ impl GroupOutbound {
         timeout: Duration,
     ) -> Result<BoxProxyStream> {
         let member = &self.members[index];
-        tokio::time::timeout(timeout, async { member.get()?.0.connect(host, port).await })
-            .await
-            .map_err(|_| anyhow::anyhow!("Proxy group member timed out"))?
+        let stream =
+            tokio::time::timeout(timeout, async { member.get()?.0.connect(host, port).await })
+                .await
+                .map_err(|_| anyhow::anyhow!("Proxy group member timed out"))?;
+        if stream.is_ok() {
+            crate::traffic::note_node(&member.node);
+        }
+        stream
     }
     async fn connect_fastest(&self, host: &str, port: u16) -> Result<BoxProxyStream> {
         let mut tasks = tokio::task::JoinSet::new();
@@ -109,6 +114,7 @@ impl GroupOutbound {
         let (index, stream) = winner
             .ok_or_else(|| anyhow::anyhow!("Proxy group unavailable: no member connected"))?;
         self.remember(index);
+        crate::traffic::note_node(&self.members[index].node);
         Ok(stream)
     }
 }
@@ -181,12 +187,17 @@ impl Outbound for GroupOutbound {
             } else {
                 0
             };
-            tokio::time::timeout(
+            let member = &self.members[index];
+            let datagram = tokio::time::timeout(
                 Duration::from_secs(10),
-                self.members[index].get()?.0.connect_datagram(&host, port),
+                member.get()?.0.connect_datagram(&host, port),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("Proxy group UDP setup timed out"))?
+            .map_err(|_| anyhow::anyhow!("Proxy group UDP setup timed out"))?;
+            if datagram.is_ok() {
+                crate::traffic::note_node(&member.node);
+            }
+            datagram
         })
     }
     fn name(&self) -> &str {
@@ -204,7 +215,10 @@ impl Outbound for PinnedOutbound {
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
         let member = Arc::clone(&self.0);
         let host = host.to_string();
-        Box::pin(async move { member.get()?.0.connect(&host, port).await })
+        Box::pin(async move {
+            crate::traffic::note_node(&member.node);
+            member.get()?.0.connect(&host, port).await
+        })
     }
 
     fn connect_datagram(
@@ -214,7 +228,10 @@ impl Outbound for PinnedOutbound {
     ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
         let member = Arc::clone(&self.0);
         let host = host.to_string();
-        Box::pin(async move { member.get()?.0.connect_datagram(&host, port).await })
+        Box::pin(async move {
+            crate::traffic::note_node(&member.node);
+            member.get()?.0.connect_datagram(&host, port).await
+        })
     }
 
     fn name(&self) -> &str {
