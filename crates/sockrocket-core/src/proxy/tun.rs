@@ -786,9 +786,10 @@ impl TunProxy {
                         let flow_window = window_limit.clone();
                         streams.spawn(async move {
                             let _slot = StreamSlot(active, tcp_counter, flow_window);
-                            if let Err(e) =
-                                handle_tun_stream(stream, outbound, resolver, fakeip, router, stats)
-                                    .await
+                            if let Err(e) = crate::traffic::with_traffic_scope(handle_tun_stream(
+                                stream, outbound, resolver, fakeip, router, stats,
+                            ))
+                            .await
                             {
                                 tracing::debug!("TUN stream error: {}", e);
                             }
