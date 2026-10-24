@@ -96,6 +96,15 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
 
 {
  const f=fixture(),c=f.context;
+ c.SR_STATE.ruleRows=[rule(0,{group:'Phone',source:'192.0.2.10'}),rule(1,{group:'Laptop',source:'192.0.2.11'}),rule(2,{group:'Shared'}),rule(3,{group:'Fallback',rule_type:'final'})];
+ c.renderRuleFlow();
+ const fromSource=Array.from(f.element('rule-flow').innerHTML.matchAll(/<path class="branch" d="M 220 /g));
+ assert.equal(fromSource.length,1,'ordered rules enter through the first stage only');
+ console.log('PASS: source connects only to the first rule stage');
+}
+
+{
+ const f=fixture(),c=f.context;
  c.SR_PROXY_GROUPS=[{name:'Video',selected_node:'Example B'},{name:'Work',selected_node:'Example C'}];
  c.RULE_TARGET_LABEL['group:Video']='Video';c.RULE_TARGET_LABEL['group:Work']='Work';
  c.SR_STATE.ruleRows=[rule(0,{group:'Video rules',target:'group:Video'}),rule(1,{group:'Work rules',target:'group:Work'})];
