@@ -121,10 +121,18 @@ impl Outbound for RoutingOutbound {
             tracing::debug!("Route: {}:{} -> {:?}", host, port, action);
 
             match action {
-                RouteAction::Proxy => self.proxy_outbound.0.connect(&host, port).await,
+                RouteAction::Proxy => {
+                    if let Some(target) = crate::traffic::active_traffic_target() {
+                        crate::traffic::note_traffic(target);
+                    }
+                    self.proxy_outbound.0.connect(&host, port).await
+                }
                 RouteAction::Group(name) => self.group(&name)?.0.connect(&host, port).await,
                 RouteAction::Node(id) => self.node(&id)?.0.connect(&host, port).await,
-                RouteAction::Direct => self.direct_outbound.0.connect(&host, port).await,
+                RouteAction::Direct => {
+                    crate::traffic::note_traffic(crate::traffic::direct_traffic_target());
+                    self.direct_outbound.0.connect(&host, port).await
+                }
                 RouteAction::Reject => {
                     anyhow::bail!("Connection rejected by routing rule: {}:{}", host, port)
                 }
@@ -140,8 +148,16 @@ impl Outbound for RoutingOutbound {
         let host = host.to_owned();
         Box::pin(async move {
             match self.router.route_resolving(&host, port).await {
-                RouteAction::Direct => self.direct_outbound.0.connect_datagram(&host, port).await,
-                RouteAction::Proxy => self.proxy_outbound.0.connect_datagram(&host, port).await,
+                RouteAction::Direct => {
+                    crate::traffic::note_traffic(crate::traffic::direct_traffic_target());
+                    self.direct_outbound.0.connect_datagram(&host, port).await
+                }
+                RouteAction::Proxy => {
+                    if let Some(target) = crate::traffic::active_traffic_target() {
+                        crate::traffic::note_traffic(target);
+                    }
+                    self.proxy_outbound.0.connect_datagram(&host, port).await
+                }
                 RouteAction::Group(name) => {
                     self.group(&name)?.0.connect_datagram(&host, port).await
                 }

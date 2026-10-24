@@ -10,6 +10,7 @@ Readable pages on the marketing site (not raw GitHub Markdown):
 |------|-------------|
 | [Docs hub](./site/docs/) | Index of user-facing guides |
 | [Getting started](./site/docs/getting-started.html) | Install, import, connect |
+| [Routing](./site/docs/routing.html) | Rule mode, exits, node groups, presets and device defaults |
 | [Merlin install](./site/docs/merlin.html) | Package pick + Softcenter install |
 | [Configuration](./site/docs/configuration.html) | Everyday settings overview |
 | [Protocols](./site/docs/protocols.html) | Protocol matrix and limits |
@@ -19,6 +20,7 @@ Readable pages on the marketing site (not raw GitHub Markdown):
 | Document | Description |
 |----------|-------------|
 | [Getting started](./getting-started.md) | Same content as the site guide, Markdown form |
+| [Routing](./routing.md) | Rule mode, node exits, node groups, presets and device defaults |
 | [Configuration](./configuration.md) | Full config file format and options |
 | [Protocols](./protocols.md) | Detailed protocol and transport notes |
 | [Merlin plugin](./merlin.md) | Full model tables and troubleshooting |

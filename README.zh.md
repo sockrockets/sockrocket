@@ -13,6 +13,7 @@
   <a href="https://sockrockets.github.io/sockrocket/">网站</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
   <a href="https://github.com/sockrockets/sockrocket/releases/latest">下载最新版</a> ·
   <a href="docs/getting-started.md">使用指南</a> ·
+  <a href="docs/routing.md">分流</a> ·
   <a href="docs/merlin.md">Merlin 路由器</a> ·
   <a href="https://github.com/sockrockets/sockrocket/issues">反馈问题</a>
 </p>
@@ -29,10 +30,9 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 | --- | --- |
 | 原生协议 | Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS、WireGuard |
 | 节点与订阅 | 导入节点链接或 Clash / V2Ray / sing-box 订阅，更新、搜索、去重与延迟测试 |
-| 分流规则 | 规则、全局、直连模式；按域名、IP、GeoIP、端口选择出口 |
-| 策略组 | 手动选择、URL 测速与故障切换 |
+| 分流 | 规则、全局、直连。出口是全局节点、单个节点，或节点分组。见[分流](docs/routing.md) |
 | 流量接管 | 系统代理适合常用应用；TUN 用于需要接管更多流量的场景 |
-| 连接与日志 | 查看连接状态、流量统计和诊断信息 |
+| 连接与用量 | 概览统计本次进程启动以来的流量。订阅页按节点和订阅显示最近三个自然月 |
 | 多端复用 | 桌面 GUI、CLI 与 Merlin WebUI，共用 Rust 内核 |
 | 多语言 | 中文、English、Tiếng Việt |
 
@@ -61,7 +61,7 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 ### 规则可以查看，也可以逐条修改
 
-按匹配条件、出口与启用状态检查规则；需要调整时使用单条编辑、分组管理或匹配测试。规则顺序和优先级会影响最终路由。
+按匹配条件、出口与启用状态检查规则。规则顺序和优先级会影响最终路由。规则分组是规则的文件夹；节点分组是出口。只有规则模式会看它们。
 
 ![规则列表设计预览：匹配条件、出口与编辑入口](docs/images/readme/rules.png)
 
@@ -71,17 +71,42 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 ![批量规则设计预览：文本编辑、校验与确认](docs/images/readme/rules-bulk.png)
 
+## 一条规则走哪里
+
+全局模式走页面顶部当前选中的节点。直连不走代理。只有规则模式会看规则。
+
+| 出口 | 跟着谁走 |
+| --- | --- |
+| 全局节点 | 顶部当前节点，包括健康检查自动切换 |
+| 单个节点 | 只走这一个。换顶部节点时它不动 |
+| 节点分组 | 这个分组的成员和策略。分组里换成员，不改变全局节点 |
+
+手动分组只用一个节点。备用按列表顺序尝试，五分钟内从上次连上的成员开始，UDP 固定走第一个。测速把更快的握手保留五分钟，列表顺序不决定用哪一个。分组要生效，规则的出口必须选成它。步骤见[分流](docs/routing.md)。
+
+## Merlin 页面上
+
+桌面端共用这一套内核。下面这些操作在路由器 WebUI 里。
+
+| 页面 | 能做什么 |
+| --- | --- |
+| 概览 | 启动会同时打开 DNS 接管和透明代理。运行中可以分别关掉。这里的用量是本次进程启动以来的 |
+| 节点 | 使用一个节点，或建节点分组。钉住的节点不存在时直接失败，不会改走全局节点。健康检查自动切换只移动全局节点 |
+| 订阅 | 更新订阅。近三个月包含手动节点和直连。订阅合计是当前属于它的节点之和。不显示订阅地址 |
+| 分流规则 | 给一组规则选出口，检查某个网站会命中哪里（不发起连接），或添加预设。预设添加后是停用的：AI、海外视频、Telegram 网页、开发工具、Apple、Microsoft、国内站点。名单是常见域名，不是全部地址 |
+| 设备兜底 | 给一台设备或一个网段单独的最终出口。其余设备仍走共用规则。请用固定 DHCP 地址。继承全局会删掉这个来源的最终规则，目的例外还在 |
+| 网络与 DNS | 默认 IPv4 兼容，不要求运营商开通 IPv6。双栈只在固件已经有 IPv6 地址和 LAN 前缀时再开。保存会就地重做防火墙，不重启正在运行的代理 |
+
 ## 下载与第一次连接
 
-从 [GitHub Releases](https://github.com/sockrockets/sockrocket/releases/latest) 下载适合系统和架构的文件。
+下面每个文件名都是[最新发行版](https://github.com/sockrockets/sockrocket/releases/latest)里的那个文件。[网站下载表](https://sockrockets.github.io/sockrocket/#download)用同样的文件名，打开页面时会落到当前版本。路由器安装包按固件平台列在那里。
 
 | 系统 | 桌面安装包 |
 | --- | --- |
-| macOS · Apple Silicon | `sockrocket-macos-aarch64.dmg` |
-| macOS · Intel | `sockrocket-macos-x86_64.dmg` |
-| Windows · x86_64 | `sockrocket-windows-x86_64.zip` |
-| Linux · x86_64 | `sockrocket-linux-x86_64.tar.gz` |
-| Linux · ARM64 | `sockrocket-linux-aarch64.tar.gz` |
+| macOS · Apple Silicon | [sockrocket-macos-aarch64.dmg](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-macos-aarch64.dmg) |
+| macOS · Intel | [sockrocket-macos-x86_64.dmg](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-macos-x86_64.dmg) |
+| Windows · x86_64 | [sockrocket-windows-x86_64.zip](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-windows-x86_64.zip) |
+| Linux · x86_64 | [sockrocket-linux-x86_64.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-linux-x86_64.tar.gz) |
+| Linux · ARM64 | [sockrocket-linux-aarch64.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-linux-aarch64.tar.gz) |
 
 1. 安装并打开客户端。macOS 将应用拖入「应用程序」后运行；Windows 解压后运行；Linux 解压后按包内说明安装或启动。
 2. 在「订阅」中添加你自己的订阅，或在「节点」中导入节点链接。
@@ -99,10 +124,11 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 *实际界面脱敏截图；运行指标为截图时的状态，不代表实时状态。*
 
-1. 按固件平台和 CPU 架构选择 `sockrocket-merlin-<platform>.tar.gz`，不要仅根据机型名称猜测。
-2. 按[Merlin 安装指南](docs/merlin.md)配置 JFFS 与自定义脚本，并安装对应软件包。
-3. 在路由器本机页面配置订阅，先验证节点可用，再开启所需的 DNS / 透明代理功能。
-4. 更新前备份配置；确认手动停止与网络恢复正常后再投入使用。
+1. 菜单里还没有软件中心时，先到 [fw.koolcenter.com](https://fw.koolcenter.com/) 按机型下载梅林改版或官改固件并刷入。原版 Merlin 没有软件中心。
+2. 按固件平台和 CPU 架构选择 `sockrocket-merlin-<platform>.tar.gz`，不要仅根据机型名称猜测。
+3. 按[Merlin 安装指南](docs/merlin.md)配置 JFFS 与自定义脚本，并安装对应软件包。
+4. 在路由器本机页面配置订阅，先验证节点可用，再开启所需的 DNS / 透明代理功能。要让节点分组接管一部分流量，保持规则模式，并把对应规则的出口选成这个分组。
+5. 更新前备份配置；确认手动停止与网络恢复正常后再投入使用。
 
 ```sh
 /jffs/addons/sockrocket/scripts/sockrocket.sh status
@@ -143,6 +169,8 @@ sockrocket-cli config.yaml
 | 显示已连接但网页打不开 | 分别检查节点连通性、系统代理 / TUN、DNS 与路由规则 |
 | 订阅失败或没有节点 | 在本机核对地址、格式、服务器响应与解析结果 |
 | 只有部分网站不可达 | 检查命中的规则、直连出口及 DNS，避免多个客户端同时接管 |
+| 分组建了但流量没走它 | 概览要停在规则模式，并且某条规则的出口是「分组 · 名字」。全局和直连不看分组 |
+| 重启后用量像是清空了 | 概览从这次进程启动重新累计。近三个月在订阅页 |
 
 ## 社区与联系方式
 
@@ -159,7 +187,7 @@ sockrocket-cli config.yaml
 
 - [Issues](https://github.com/sockrockets/sockrocket/issues)：报告缺陷。
 - [Discussions](https://github.com/sockrockets/sockrocket/discussions)：使用讨论。
-- [文档目录](docs/README.md)：配置、协议、架构和开发说明。
+- [文档目录](docs/README.md)：分流、配置、协议、架构和开发说明。
 
 ## 许可
 

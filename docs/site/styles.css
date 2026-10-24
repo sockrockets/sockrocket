@@ -83,6 +83,7 @@ h3{font-size:19px;line-height:1.4;font-weight:620}
 .merlin-layout>div>p:not(.eyebrow):not(.merlin-small){font-size:14px;color:#aab7c9;max-width:390px;margin:24px 0}
 .light{background:#f0f5fc;color:#243750;padding:13px 19px;font-size:12px}
 .merlin-small{font-size:10px;color:#8a9bb0;margin-top:20px;max-width:340px}
+.merlin-small a{color:#d6e6ff}
 .network{padding:4px 20px}
 .network-devices{display:flex;justify-content:space-around;color:#cedaec;font-size:32px;text-align:center}
 .network-devices span{width:80px}
@@ -107,6 +108,7 @@ h3{font-size:19px;line-height:1.4;font-weight:620}
 .download-base code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;color:#243750;background:#eef3f9;border-radius:6px;padding:6px 8px;overflow-wrap:anywhere}
 #download h3{font-size:18px;margin:8px 0 8px}
 .file-lead{font-size:13px;color:var(--muted);max-width:720px;margin-bottom:8px}
+.file-lead a{color:var(--blue);font-weight:600}
 .file-note{font-size:12px;color:var(--muted);margin:4px 0 28px}
 .file-note a,.doc-table a{color:var(--blue);font-weight:600}
 .doc-table a:hover{text-decoration:underline}
@@ -282,6 +284,7 @@ footer>div{gap:16px;font-size:11px}
 .protocol-cards p{font-size:13px;color:var(--muted)}
 .protocol-cards .protocol-detail{border-top:1px solid var(--line);padding-top:14px;margin-top:18px;font-size:12px;color:#526882}
 .protocol-boundaries{display:flex;align-items:center;justify-content:space-between;gap:28px;margin-top:20px}
+.later-links{justify-content:flex-start;gap:22px;margin-top:22px}
 .protocol-boundaries p{font-size:12px;color:var(--muted);max-width:760px}
 .protocol-boundaries a{font-size:12px;flex-shrink:0;color:var(--blue)}
 @media(max-width:720px){

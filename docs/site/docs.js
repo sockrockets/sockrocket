@@ -48,6 +48,11 @@ const titleByPage = {
     en: 'Merlin install guide · Sockrocket',
     vi: 'Hướng dẫn Merlin · Sockrocket',
   },
+  routing: {
+    zh: '分流 · Sockrocket',
+    en: 'Routing · Sockrocket',
+    vi: 'Định tuyến · Sockrocket',
+  },
   configuration: {
     zh: '配置说明 · Sockrocket',
     en: 'Configuration · Sockrocket',

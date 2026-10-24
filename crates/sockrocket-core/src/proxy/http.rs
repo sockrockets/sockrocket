@@ -63,7 +63,7 @@ impl HttpProxyServer {
                     let stats = self.stats.clone();
                     connections.spawn(async move {
                         let _slot = slot;
-                        let result = super::routing::with_client_source(Some(peer.ip()), handle_http(stream, outbound, stats.clone())).await;
+                        let result = super::routing::with_client_source(Some(peer.ip()), crate::traffic::with_traffic_scope(handle_http(stream, outbound, stats.clone()))).await;
                         if let Err(e) = result {
                             tracing::debug!("HTTP proxy connection from {} error: {}", peer, e);
                         }

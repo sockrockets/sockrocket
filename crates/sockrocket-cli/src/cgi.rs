@@ -1770,6 +1770,52 @@ fn act_logs_clear() -> J {
     json!({"ok": true, "msg": "Log cleared"})
 }
 
+/// Subscription table = current members' node history, not the side ledger.
+/// The side ledger misses traffic recorded before a node was linked to a subscription.
+fn subscription_month_rows(
+    nodes: &[sockrocket_core::NodeMonthlyTraffic],
+    traffic_path: &std::path::Path,
+) -> Vec<sockrocket_core::NodeMonthlyTraffic> {
+    let Ok(cfg) = load_app_config() else {
+        return sockrocket_core::TrafficLedger::read_recent_subscriptions(traffic_path, 3)
+            .unwrap_or_default();
+    };
+    let subscription_names: Vec<(String, String)> = cfg
+        .subscriptions
+        .iter()
+        .map(|sub| {
+            (
+                sockrocket_core::subscription_public_id(&sub.url),
+                sub.name.clone(),
+            )
+        })
+        .collect();
+    let known: std::collections::HashSet<&str> = subscription_names
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let membership: Vec<(String, String)> = cfg
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let url = node
+                .extra
+                .get(sockrocket_core::SUB_URL_EXTRA_KEY)
+                .map(String::as_str)
+                .filter(|url| !url.is_empty())?;
+            let sub_id = sockrocket_core::subscription_public_id(url);
+            if !known.contains(sub_id.as_str()) {
+                return None;
+            }
+            Some((
+                sockrocket_core::node_public_id(&sockrocket_core::node_fingerprint(node)),
+                sub_id,
+            ))
+        })
+        .collect();
+    sockrocket_core::sum_subscription_members(nodes, &membership, &subscription_names)
+}
+
 fn act_stats() -> J {
     let running = is_running();
     let mut uptime = "stopped".to_string();
@@ -1819,7 +1865,68 @@ fn act_stats() -> J {
     )
     .map(|out| out.contains("MARK"))
     .unwrap_or(false);
-    json!({"ok": true, "uptime": uptime, "pid": pid_val, "dns_active": dns_active, "fw_active": fw_active})
+    let traffic_path = sockrocket_dir().join("traffic.yaml");
+    let traffic_nodes: Vec<J> = sockrocket_core::TrafficLedger::read_file(&traffic_path)
+        .unwrap_or_default()
+        .into_iter()
+        .take(40)
+        .map(|snap| {
+            json!({
+                "id": snap.id,
+                "name": sockrocket_core::public_traffic_label(&snap.name, if snap.id == sockrocket_core::DIRECT_TRAFFIC_ID { "直连" } else { "节点" }),
+                "session_up": snap.session.up,
+                "session_down": snap.session.down,
+                "session_total": snap.session.total(),
+            })
+        })
+        .collect();
+    let month_keys = sockrocket_core::recent_month_keys(3);
+    let recent = |rows: Vec<sockrocket_core::NodeMonthlyTraffic>, include_id: bool| -> Vec<J> {
+        rows.into_iter()
+            .take(40)
+            .map(|row| {
+                let fallback = if row.id == sockrocket_core::DIRECT_TRAFFIC_ID {
+                    "直连"
+                } else if include_id {
+                    "节点"
+                } else {
+                    "订阅"
+                };
+                json!({
+                    "id": if include_id { row.id } else { String::new() },
+                    "name": sockrocket_core::public_traffic_label(&row.name, fallback),
+                    "months": row.months.iter().map(|(key, counters)| json!({
+                        "key": key,
+                        "up": counters.up,
+                        "down": counters.down,
+                        "total": counters.total(),
+                    })).collect::<Vec<_>>(),
+                    "total_up": row.total.up,
+                    "total_down": row.total.down,
+                    "total": row.total.total(),
+                })
+            })
+            .collect()
+    };
+    let recent_months =
+        sockrocket_core::TrafficLedger::read_recent_months(&traffic_path, 3).unwrap_or_default();
+    let recent_subscriptions = subscription_month_rows(&recent_months, &traffic_path);
+    let session_started =
+        sockrocket_core::TrafficLedger::read_session_started(&traffic_path).unwrap_or(0);
+    json!({
+        "ok": true,
+        "uptime": uptime,
+        "pid": pid_val,
+        "dns_active": dns_active,
+        "fw_active": fw_active,
+        "traffic": {
+            "session_started": session_started,
+            "nodes": traffic_nodes,
+            "recent_month_keys": month_keys,
+            "recent_months": recent(recent_months, true),
+            "recent_subscriptions": recent(recent_subscriptions, false),
+        }
+    })
 }
 
 fn vm_rss_kb(pid: &str) -> u64 {

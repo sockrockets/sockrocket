@@ -97,6 +97,7 @@ struct StatsInner {
     tun: std::sync::Mutex<Option<TunDiagnostics>>,
     completed: AtomicU64,
     interrupted: AtomicU64,
+    ledger: std::sync::Mutex<Option<std::sync::Arc<crate::traffic::TrafficLedger>>>,
 }
 
 impl Default for ProxyStats {
@@ -114,6 +115,7 @@ impl Default for ProxyStats {
                 bytes_sent: AtomicU64::new(0),
                 bytes_received: AtomicU64::new(0),
                 recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ledger: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -163,14 +165,45 @@ impl ProxyStats {
             .fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Accumulate bytes into the shared totals. Called by connection handlers
-    /// (via [`ProxyStats::close_connection`]) — kept public(crate) for tests.
-    #[allow(dead_code)] // only exercised from tests on some build configs
+    /// Attach the durable per-node traffic ledger. `None` stops recording.
+    pub fn set_ledger(&self, ledger: Option<std::sync::Arc<crate::traffic::TrafficLedger>>) {
+        if let Ok(mut slot) = self.inner.ledger.lock() {
+            *slot = ledger;
+        }
+    }
+
+    /// Accumulate bytes into the shared totals and the traffic ledger.
     pub(crate) fn add_bytes(&self, sent: u64, received: u64) {
+        self.add_bytes_for(sent, received, None);
+    }
+
+    pub(crate) fn add_bytes_for(
+        &self,
+        sent: u64,
+        received: u64,
+        target: Option<crate::traffic::TrafficTarget>,
+    ) {
+        if sent == 0 && received == 0 {
+            return;
+        }
         self.inner.bytes_sent.fetch_add(sent, Ordering::Relaxed);
         self.inner
             .bytes_received
             .fetch_add(received, Ordering::Relaxed);
+        let Some(ledger) = self
+            .inner
+            .ledger
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+        else {
+            return;
+        };
+        if let Some(target) = target.or_else(crate::traffic::current_traffic_target) {
+            ledger.record_target(&target, sent, received);
+        } else {
+            ledger.record(sent, received);
+        }
     }
 
     pub fn reset(&self) {
@@ -228,10 +261,8 @@ impl ProxyStats {
     /// the GUI speed readouts — previously only `add_bytes` did that and it
     /// had no callers, so the totals stayed at 0 forever.
     pub fn close_connection(&self, id: u64, bytes_up: u64, bytes_down: u64) {
-        self.inner.bytes_sent.fetch_add(bytes_up, Ordering::Relaxed);
-        self.inner
-            .bytes_received
-            .fetch_add(bytes_down, Ordering::Relaxed);
+        // Remainder not yet counted by ObservedIo / uploaded().
+        self.add_bytes(bytes_up, bytes_down);
         // Ring front always holds the highest id (total-1); a record with the
         // given id sits at offset (total-1 - id) while still retained.
         if let Ok(mut recent) = self.inner.recent.lock() {
@@ -518,6 +549,23 @@ mod tests {
         stats.close_connection(b, 200, 2000);
         assert_eq!(stats.bytes_sent(), 300);
         assert_eq!(stats.bytes_received(), 3000);
+    }
+
+    #[test]
+    fn ledger_receives_bytes_from_stats() {
+        let stats = ProxyStats::default();
+        let ledger = crate::traffic::TrafficLedger::memory_only();
+        ledger.set_current_node(Some("node-a".into()), Some("Node A".into()));
+        stats.set_ledger(Some(ledger.clone()));
+        stats.add_bytes(10, 20);
+        stats.close_connection(stats.record_connection("x:443".into(), "HTTP"), 5, 7);
+        let snaps = ledger.snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].id, "node-a");
+        assert_eq!(snaps[0].session.up, 15);
+        assert_eq!(snaps[0].session.down, 27);
+        assert_eq!(stats.bytes_sent(), 15);
+        assert_eq!(stats.bytes_received(), 27);
     }
 }
 

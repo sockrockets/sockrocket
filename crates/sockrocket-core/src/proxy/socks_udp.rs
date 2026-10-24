@@ -143,6 +143,7 @@ pub(super) async fn serve(
                     socket.clone(),
                     stats.clone(),
                 );
+                let traffic = crate::traffic::current_traffic_target();
                 let header = packet[..offset].to_vec();
                 let task = tokio::spawn(async move {
                     let _permit = permit;
@@ -154,7 +155,7 @@ pub(super) async fn serve(
                                 if n+header.len() > 65507 { continue; }
                                 let mut response = header.clone(); response.extend_from_slice(&body[..n]);
                                 if socket.send_to(&response,source).await.is_err() { break; }
-                                stats.add_bytes(0,n as u64); *active.lock().unwrap()=Instant::now();
+                                stats.add_bytes_for(0, n as u64, traffic.clone()); *active.lock().unwrap()=Instant::now();
                             }
                             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                                 if active.lock().unwrap().elapsed() >= Duration::from_secs(30) { break; }
