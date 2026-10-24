@@ -363,8 +363,8 @@ ipv6_proxy_start() {
         # Keep on-link LAN traffic out of the transparent internet path.
         ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
     done
-    # Device scopes are marked before the stream-only QUIC bypass, so a
-    # device whose group can carry UDP still reaches userspace for real-address QUIC.
+    # Device scopes are marked before other LAN policy so the userspace
+    # router sees their source even when a kernel direct shortcut is enabled.
     local device_sources device_source device_proto
     device_sources=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-rule-sources-v6 "$SOCKROCKET_CONF" 2>/dev/null) || {
         ipv6_proxy_stop
@@ -386,9 +386,9 @@ ipv6_proxy_start() {
         ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" -j SOCKROCKET_IPV6_DEVICES || { ipv6_proxy_stop; return 1; }
         ip6tables -t mangle -A "$IPV6_MANGLE" -m mark --mark "$TUN_MARK" -j RETURN || { ipv6_proxy_stop; return 1; }
     fi
-    if ! "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
-        ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" ! -d 2001:2:0:4765::/96 -p udp --dport 443 -j RETURN || { ipv6_proxy_stop; return 1; }
-    fi
+    # Real-address QUIC must reach userspace too. A stream-only proxy responds
+    # with port unreachable there, allowing TCP fallback without bypassing
+    # global or destination rules.
     for proto in tcp udp; do
         ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" -p "$proto" -j MARK --set-mark "$TUN_MARK" || { ipv6_proxy_stop; return 1; }
     done
@@ -804,16 +804,9 @@ do_start() {
         fi
     fi
 
-    # Fake-IP QUIC always reaches the proxy, which proxies it, sends it
-    # direct, or answers port unreachable for a stream-only route. When no
-    # route can carry UDP, QUIC to real addresses (domestic answers) stays on
-    # the kernel fast path instead of costing userspace CPU for nothing.
-    if ! "$SOCKROCKET_DIR/sockrocket-cli" --supports-udp "$SOCKROCKET_CONF" >/dev/null 2>&1; then
-        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" ! -d 198.18.0.0/16 -p udp --dport 443 -j RETURN || {
-            flush_chains
-            return 1
-        }
-    fi
+    # Real-address QUIC must also reach the router. Bypassing all non-Fake-IP
+    # addresses leaks global/reject traffic when a client uses DoH or a cached
+    # real address and the selected proxy has no UDP transport.
     # Optional: CN-range bypass BEFORE the MARK rules (hardware NAT for
     # domestic traffic). Gated by the cn_ipset_direct config toggle.
     if [ "$(get_conf cn_ipset_direct)" = "true" ]; then

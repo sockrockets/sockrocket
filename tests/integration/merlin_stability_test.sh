@@ -274,10 +274,11 @@ test_policy_routing_staged_and_idempotent() {
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'native fake-IP UDP is not rejected'
     : > "$SANDBOX/kernel.calls"
     printf '#!/bin/sh\n[ "$1" = --dump-rule-sources ] && exit 0\nexit 1\n' > "$SOCKROCKET_DIR/sockrocket-cli"
+    printf '\nproxy_mode: global\n' >> "$SOCKROCKET_CONF"
     do_start
-    check 1 "$(grep -c -- '! -d 198.18.0.0/16 -p udp --dport 443 -j RETURN' "$SANDBOX/kernel.calls")" 'stream-only node keeps real-address QUIC on the kernel path'
+    check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'global mode with stream-only node keeps real-address QUIC in userspace policy'
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'stream-only fake-IP UDP reaches userspace'
-    # Device policies must reach userspace before CN bypass or QUIC fallback.
+    # Device policies must reach userspace before the optional CN bypass.
     LAN_SUBNET="192.0.2.0/24"
     : > "$SANDBOX/kernel.calls"
     printf '#!/bin/sh\ncase "$1" in --dump-rule-sources) printf "192.0.2.10/32\\n192.0.2.0/24\\n";; *) exit 1;; esac\n' > "$SOCKROCKET_DIR/sockrocket-cli"
@@ -289,8 +290,7 @@ test_policy_routing_staged_and_idempotent() {
     device_line=$(awk '/-A SOCKROCKET_MANGLE -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
     cn_line=$(awk '/--match-set sockrocket_cn dst/{print NR;exit}' "$SANDBOX/kernel.calls")
     [ -n "$device_line" ] && [ -n "$cn_line" ] && [ "$device_line" -lt "$cn_line" ] || { echo 'device policies bypassed' >&2;exit 1; }
-    quic_line=$(awk '/-A SOCKROCKET_MANGLE .*--dport 443 -j RETURN/{print NR;exit}' "$SANDBOX/kernel.calls")
-    [ -n "$quic_line" ] && [ "$device_line" -lt "$quic_line" ] || { echo 'device policies bypassed by the stream-only QUIC path' >&2;exit 1; }
+    check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'real-address QUIC cannot bypass device or global policy'
     flush_chains
     check 2 "$(grep -c -- '-X SOCKROCKET_DEVICES' "$SANDBOX/kernel.calls")" 'device chain removed on rebuild and explicit cleanup'
     : > "$SANDBOX/kernel.calls"

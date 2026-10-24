@@ -1642,7 +1642,9 @@ function renderSubscriptionNotes(result) {
   // Older saved jobs embedded the metadata-only note in their success message.
   if (!hint && result && result.ok !== false) hint = String(result.msg || '').indexOf('Hysteria2 uses native QUIC TLS; browser fingerprint hints were retained as metadata') >= 0;
   var chrome = Array.isArray(notes) && notes.indexOf('hysteria2_chrome_quic_profile') >= 0;
+  var fixedPort = Array.isArray(notes) && notes.indexOf('hysteria2_mport_fixed_port') >= 0;
   var text = [];
+  if (fixedPort) text.push('部分 Hysteria2 节点带有多端口跳跃配置，已按订阅地址中的固定端口导入；当前版本不会定期切换端口。若网络限制持续使用同一 UDP 端口，这些节点仍可能无法连接。');
   if (chrome) text.push('已启用 Chrome 115 基线 QUIC 握手模拟（fp=chrome / chrome115，ALPN h3），包含 TLS 指纹、连接 ID 和传输参数。此基线不模拟 ALPS、浏览器 HTTP/3 请求及首包分帧；证书校验保持原样。');
   if (hint) text.push('其他浏览器指纹提示已保留，但不用于模拟对应浏览器的 QUIC 指纹；证书校验保持原样。');
   srElement('sub-notes-text').textContent = text.join(' ');

@@ -179,8 +179,8 @@ test ! -f "$FIXTURE/dns" || fail 'IPv6 DNS redirect kept without a listener'
 ! guard_installed || fail 'guard kept without transparent proxy'
 do_dns_start || fail 'IPv4 DNS without transparent proxy'
 test ! -f "$FIXTURE/dns" || fail 'IPv6 DNS redirected without transparent proxy'
-# Device scopes are marked before stream-only QUIC stays on the kernel path.
-printf 'ipv6_mode: dual_stack\ndns_hijack: true\ntransparent_proxy: true\n' > "$SOCKROCKET_CONF"
+# Device scopes and real-address QUIC both reach userspace policy.
+printf 'ipv6_mode: dual_stack\ndns_hijack: true\ntransparent_proxy: true\nproxy_mode: global\n' > "$SOCKROCKET_CONF"
 /bin/cat > "$SOCKROCKET_DIR/sockrocket-cli" <<'EOF'
 #!/bin/sh
 case "$1" in
@@ -194,8 +194,8 @@ chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
 FORWARDING=1
 ipv6_guard_start || fail 'IPv6 device rules did not install'
 device_line=$(awk '/SOCKROCKET_IPV6_DEVICES/{print NR; exit}' "$CALLS")
-quic_line=$(awk '/--dport 443 -j RETURN/{print NR; exit}' "$CALLS")
-test -n "$device_line" && test -n "$quic_line" && test "$device_line" -lt "$quic_line" || fail 'IPv6 device policy follows the QUIC bypass'
+test -n "$device_line" || fail 'IPv6 device policy is missing'
+! grep -q -- '--dport 443 -j RETURN' "$CALLS" || fail 'IPv6 real-address QUIC bypassed userspace'
 grep -q -- '-A SOCKROCKET_IPV6_DEVICES -s 2001:db8:9::/64 -p udp -j MARK' "$CALLS" || fail 'IPv6 device UDP was not marked'
 ipv6_proxy_stop || fail 'IPv6 device chain cleanup'
 grep -q -- '-X SOCKROCKET_IPV6_DEVICES' "$CALLS" || fail 'IPv6 device chain was left behind'

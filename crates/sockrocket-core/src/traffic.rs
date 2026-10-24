@@ -7,9 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,8 @@ pub const TRAFFIC_HISTORY_MONTHS: u32 = 6;
 /// Attribute for Direct mode / no selected node.
 pub const DIRECT_TRAFFIC_ID: &str = "direct";
 
-const PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(10);
+// A single background writer keeps flash I/O off proxy read/write polls.
+const PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrafficCounters {
@@ -260,8 +261,9 @@ pub struct TrafficLedger {
     subscriptions: Mutex<BTreeMap<String, SubHistory>>,
     session_started: u64,
     path: Option<PathBuf>,
-    dirty: AtomicBool,
-    last_persist: Mutex<Option<Instant>>,
+    generation: AtomicU64,
+    persisted_generation: AtomicU64,
+    persist_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for TrafficLedger {
@@ -297,13 +299,32 @@ impl TrafficLedger {
             subscriptions: Mutex::new(subscriptions),
             session_started: unix_now(),
             path: Some(path),
-            dirty: AtomicBool::new(true),
-            last_persist: Mutex::new(None),
+            generation: AtomicU64::new(1),
+            persisted_generation: AtomicU64::new(0),
+            persist_lock: Mutex::new(()),
         });
         // Replace the previous process session immediately so readers do not
         // keep showing the last run until the next byte sample.
         if let Err(error) = ledger.flush() {
             tracing::debug!("traffic ledger startup flush failed: {error:#}");
+        }
+        let weak = Arc::downgrade(&ledger);
+        if let Err(error) = std::thread::Builder::new()
+            .name("sockrocket-traffic-save".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(PERSIST_INTERVAL);
+                    let Some(ledger) = weak.upgrade() else { break };
+                    if ledger.generation.load(Ordering::Acquire)
+                        != ledger.persisted_generation.load(Ordering::Acquire)
+                        && let Err(error) = ledger.flush()
+                    {
+                        tracing::debug!("traffic ledger persist skipped/failed: {error:#}");
+                    }
+                }
+            })
+        {
+            tracing::warn!("traffic ledger background writer unavailable: {error}");
         }
         ledger
     }
@@ -320,8 +341,9 @@ impl TrafficLedger {
             subscriptions: Mutex::new(BTreeMap::new()),
             session_started: unix_now(),
             path: None,
-            dirty: AtomicBool::new(false),
-            last_persist: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            persisted_generation: AtomicU64::new(0),
+            persist_lock: Mutex::new(()),
         })
     }
 
@@ -461,8 +483,7 @@ impl TrafficLedger {
             bucket.up = bucket.up.saturating_add(up);
             bucket.down = bucket.down.saturating_add(down);
         }
-        self.dirty.store(true, Ordering::Relaxed);
-        self.maybe_persist();
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     pub fn session_started(&self) -> u64 {
@@ -541,6 +562,8 @@ impl TrafficLedger {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
+        let _persist = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = self.generation.load(Ordering::Acquire);
         let session = self.session.lock().map(|g| g.clone()).unwrap_or_default();
         let mut history = self.history.lock().map(|g| g.clone()).unwrap_or_default();
         let mut subscriptions = self
@@ -562,27 +585,9 @@ impl TrafficLedger {
             std::fs::create_dir_all(parent)?;
         }
         crate::config::storage::atomic_write_private(path, &text, true)?;
-        self.dirty.store(false, Ordering::Relaxed);
-        if let Ok(mut last) = self.last_persist.lock() {
-            *last = Some(Instant::now());
-        }
+        self.persisted_generation
+            .store(generation, Ordering::Release);
         Ok(())
-    }
-
-    fn maybe_persist(&self) {
-        if !self.dirty.load(Ordering::Relaxed) {
-            return;
-        }
-        let Ok(last) = self.last_persist.lock() else {
-            return;
-        };
-        if last.is_some_and(|t| t.elapsed() < PERSIST_MIN_INTERVAL) {
-            return;
-        }
-        drop(last);
-        if let Err(error) = self.flush() {
-            tracing::debug!("traffic ledger persist skipped/failed: {error:#}");
-        }
     }
 
     /// Read a previously written file without starting a live session (CGI).
@@ -807,7 +812,11 @@ pub fn sum_subscription_members(
 
 impl Drop for TrafficLedger {
     fn drop(&mut self) {
-        let _ = self.flush();
+        if self.generation.load(Ordering::Acquire)
+            != self.persisted_generation.load(Ordering::Acquire)
+        {
+            let _ = self.flush();
+        }
     }
 }
 
@@ -963,6 +972,24 @@ pub async fn with_traffic_scope<F: std::future::Future>(future: F) -> F::Output 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_traffic_does_not_write_on_the_proxy_path() {
+        let dir = std::env::temp_dir().join(format!("sockrocket-traffic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("traffic.yaml");
+        let ledger = TrafficLedger::load_or_new(&path);
+        let before = std::fs::read(&path).unwrap();
+        ledger.record(25, 75);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        ledger.flush().unwrap();
+        assert_eq!(
+            TrafficLedger::read_file(&path).unwrap()[0].history.total(),
+            100
+        );
+        drop(ledger);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn records_session_and_history_then_survives_reopen() {

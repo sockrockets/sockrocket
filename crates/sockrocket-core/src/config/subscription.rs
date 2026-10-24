@@ -106,6 +106,9 @@ pub async fn fetch_subscription_report(sub: &Subscription) -> Result<Subscriptio
         if !matches!(node.protocol, ProxyProtocol::Hysteria2 { .. }) {
             continue;
         }
+        if node.extra.contains_key(v2ray::HY2_MPORT) {
+            compatibility_notes.push("hysteria2_mport_fixed_port");
+        }
         let note = match v2ray::hysteria2_fingerprint(node) {
             Some("chrome" | "chrome115") => "hysteria2_chrome_quic_profile",
             Some("none" | "") | None => continue,
@@ -115,6 +118,8 @@ pub async fn fetch_subscription_report(sub: &Subscription) -> Result<Subscriptio
             compatibility_notes.push(note);
         }
     }
+    compatibility_notes.sort_unstable();
+    compatibility_notes.dedup();
     Ok(SubscriptionFetchReport {
         nodes,
         skipped_entries,

@@ -89,6 +89,10 @@ notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_c
 assert.equal(notes.element('sub-notes').hidden,false);
 assert.match(notes.element('sub-notes-text').textContent,/已启用 Chrome 115/);
 assert.match(notes.element('sub-notes-text').textContent,/不模拟 ALPS/);
+notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_mport_fixed_port']});
+assert.equal(notes.element('sub-notes').hidden,false);
+assert.match(notes.element('sub-notes-text').textContent,/固定端口导入/);
+assert.match(notes.element('sub-notes-text').textContent,/不会定期切换端口/);
 notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:[]});
 assert.equal(notes.element('sub-notes').hidden,true);
 console.log('PASS: optional names, invalid-address rejection and informational compatibility notes');

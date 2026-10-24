@@ -211,7 +211,7 @@ pub fn node_fingerprint(node: &Node) -> String {
         ),
         ProxyProtocol::Trojan { password, .. } => format!("trojan|{}", password),
         ProxyProtocol::Hysteria2 { password, .. } => format!(
-            "hy2|{}|{}|{}|{}|{}|{}",
+            "hy2|{}|{}|{}|{}|{}|{}|{}",
             password,
             node.extra
                 .get(super::v2ray::TLS_CERT_PIN)
@@ -227,6 +227,10 @@ pub fn node_fingerprint(node: &Node) -> String {
                 .unwrap_or(""),
             node.extra
                 .get(super::v2ray::HY2_FAST_OPEN)
+                .map(String::as_str)
+                .unwrap_or(""),
+            node.extra
+                .get(super::v2ray::HY2_MPORT)
                 .map(String::as_str)
                 .unwrap_or(""),
             serde_json::to_string(&node.transport).unwrap_or_default()
