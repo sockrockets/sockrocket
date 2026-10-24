@@ -8,6 +8,11 @@ on:
       - "crates/sockrocket-gui/assets/logo*.svg"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
+  # Republish after a release so the site is the default branch, while
+  # download links resolve to that release at view time.
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -20,6 +25,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -27,6 +33,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.repository.default_branch || github.sha }}
 
       - name: Prepare site
         run: |

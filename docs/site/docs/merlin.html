@@ -7,6 +7,7 @@
 <link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../styles.css">
 <script defer src="../docs.js"></script>
+<script defer src="../release.js"></script>
 </head>
 <body data-page="merlin">
 <a class="skip" href="#main" data-t="skip">跳转到内容</a>
@@ -39,15 +40,19 @@
     <aside class="doc-toc">
       <strong>ON THIS PAGE</strong>
       <div class="doc-locale" data-locale="zh">
+        <a href="#firmware">固件</a>
         <a href="#requirements">准备</a>
         <a href="#packages">选包</a>
         <a href="#install">安装</a>
+        <a href="#pages">页面</a>
         <a href="#after">安装后</a>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
+        <a href="#en-firmware">Firmware</a>
         <a href="#en-requirements">Requirements</a>
         <a href="#en-packages">Packages</a>
         <a href="#en-install">Install</a>
+        <a href="#en-pages">Pages</a>
         <a href="#en-after">After</a>
       </div>
       <div class="toc-group"><strong>MORE</strong>
@@ -58,6 +63,25 @@
     </aside>
     <article class="doc-article">
       <div class="doc-locale" data-locale="zh">
+        <h2 id="firmware">先刷出软件中心</h2>
+        <p>插件在<strong>软件中心</strong>里离线安装。原版 <a href="https://www.asuswrt-merlin.net/download">AsusWRT-Merlin</a> 没有这个菜单。带软件中心的固件在 KoolCenter 下载服务器，按机型进目录：</p>
+        <p><a href="https://fw.koolcenter.com/">https://fw.koolcenter.com/</a></p>
+        <div class="doc-table"><table>
+          <thead><tr><th>固件</th><th>目录</th></tr></thead>
+          <tbody>
+            <tr><td>梅林改版 3004.388</td><td><a href="https://fw.koolcenter.com/KoolCenter_梅林改版固件_3004.388/">KoolCenter_梅林改版固件_3004.388</a></td></tr>
+            <tr><td>梅林改版 3006.102</td><td><a href="https://fw.koolcenter.com/KoolCenter_梅林改版固件_3006.102/">KoolCenter_梅林改版固件_3006.102</a></td></tr>
+            <tr><td>华硕官改</td><td><a href="https://fw.koolcenter.com/KoolCenter_华硕官改固件/">KoolCenter_华硕官改固件</a></td></tr>
+            <tr><td>更早的 3004.386</td><td><a href="https://fw.koolcenter.com/KoolCenter_梅林改版固件_3004.386/">KoolCenter_梅林改版固件_3004.386</a></td></tr>
+          </tbody>
+        </table></div>
+        <ol>
+          <li>打开和机型同名的目录。名称以路由器「系统管理 → 固件升级」里显示的型号为准。没有单独目录的联名版，用基础型号的目录。</li>
+          <li>下载该目录里日期最新的稳定固件。不要进入 <code>alpha</code> 或 <code>beta</code>。</li>
+          <li>WebUI → <strong>系统管理 → 固件升级</strong>，上传这个文件，等路由器自己重启。中途不要断电。</li>
+          <li>重启后菜单里会出现软件中心。再到<strong>系统设置</strong>打开 JFFS 和自定义脚本，然后按下面的平台安装 Sockrocket。</li>
+        </ol>
+        <p>官改和梅林改版使用同一个平台包。平台看 CPU，不看刷的是哪一条固件线。</p>
         <h2 id="requirements">准备</h2>
         <ul>
           <li>Asus 路由器，固件为 <strong>AsusWRT-Merlin</strong>（建议 388.x+，含软件中心）。</li>
@@ -83,9 +107,18 @@
           <li>从上表直接下载对应的 <code>sockrocket-merlin-&lt;platform&gt;.tar.gz</code>，并用 <a href="https://github.com/sockrockets/sockrocket/releases/latest/download/SHA256SUMS-merlin.txt">SHA256SUMS-merlin.txt</a> 校验。</li>
           <li>路由器 WebUI → <strong>软件中心</strong> → <strong>离线安装</strong>，上传该包。</li>
           <li>安装完成后打开 Sockrocket 入口（或 Softcenter 菜单中的模块页）。</li>
-          <li>在页面里添加订阅或节点，开启透明代理 / DNS 劫持（按需）。</li>
+          <li>在页面里添加订阅或节点，开启透明代理 / DNS 劫持（按需）。要让某个节点分组接管一部分流量，概览保持<strong>规则</strong>，再到分流规则里把出口选成这个分组。见 <a href="routing.html">分流</a>。</li>
         </ol>
         <p>也可用 SSH 解压后执行 <code>sh sockrocket/install.sh</code>（可选传入平台标签）。日常更推荐软件中心。</p>
+        <h2 id="pages">装好之后，页面上有什么</h2>
+        <ul>
+          <li><strong>概览</strong>：启动或停止。启动会同时打开 DNS 接管和透明代理；运行中可以分别关掉。这里也能看到本次启动以来各节点的流量。</li>
+          <li><strong>节点</strong>：使用某一个节点，或新建节点分组。手动分组只保留一个节点。备用和测速可以多个，顺序只对备用有意义。</li>
+          <li><strong>订阅</strong>：更新订阅。近三个月的节点用量和订阅合计也在这里。合计是当前成员之和，不显示订阅地址。</li>
+          <li><strong>分流规则</strong>：给一组规则选出口（全局节点、单个节点或节点分组），检查某个网站会命中哪里，或添加默认停用的常用预设。</li>
+          <li><strong>网络与 DNS</strong>：默认 IPv4 兼容。只有固件已经有 IPv6 地址和 LAN 前缀时，再考虑双栈。</li>
+        </ul>
+        <p>分组要接管流量，概览保持规则模式，并把分流规则的出口选成它。见 <a href="routing.html">分流</a>。</p>
         <h2 id="after">安装后注意</h2>
         <ul>
           <li>默认 IPv6 模式为<strong>兼容</strong>：不依赖运营商是否开通 IPv6；只有固件已有 IPv6 时再考虑双栈。</li>
@@ -94,6 +127,25 @@
         </ul>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
+        <h2 id="en-firmware">Flash a firmware that includes Software Center</h2>
+        <p>The plugin is installed offline from <strong>Software Center</strong>. Upstream <a href="https://www.asuswrt-merlin.net/download">AsusWRT-Merlin</a> does not add that menu. Firmware that does is on the KoolCenter download server, one folder per model:</p>
+        <p><a href="https://fw.koolcenter.com/">https://fw.koolcenter.com/</a></p>
+        <div class="doc-table"><table>
+          <thead><tr><th>Line</th><th>Directory</th></tr></thead>
+          <tbody>
+            <tr><td>Merlin build 3004.388</td><td><a href="https://fw.koolcenter.com/KoolCenter_梅林改版固件_3004.388/">KoolCenter_梅林改版固件_3004.388</a></td></tr>
+            <tr><td>Merlin build 3006.102</td><td><a href="https://fw.koolcenter.com/KoolCenter_梅林改版固件_3006.102/">KoolCenter_梅林改版固件_3006.102</a></td></tr>
+            <tr><td>Asus official-mod</td><td><a href="https://fw.koolcenter.com/KoolCenter_华硕官改固件/">KoolCenter_华硕官改固件</a></td></tr>
+            <tr><td>Older 3004.386</td><td><a href="https://fw.koolcenter.com/KoolCenter_梅林改版固件_3004.386/">KoolCenter_梅林改版固件_3004.386</a></td></tr>
+          </tbody>
+        </table></div>
+        <ol>
+          <li>Open the folder named like the model shown under Administration → Firmware Upgrade. A co-branded edition without its own folder uses the base model.</li>
+          <li>Download the newest stable file in that folder. Leave <code>alpha</code> and <code>beta</code> alone.</li>
+          <li>WebUI → <strong>Administration → Firmware Upgrade</strong>. Upload the file and wait for the router to reboot. Do not power it off.</li>
+          <li>Software Center appears after reboot. Enable JFFS and custom scripts under System, then install the Sockrocket package for your platform below.</li>
+        </ol>
+        <p>Official-mod and Merlin builds use the same platform package. The platform follows the CPU, not which firmware line you flashed.</p>
         <h2 id="en-requirements">Requirements</h2>
         <ul>
           <li>Asus router on <strong>AsusWRT-Merlin</strong> (388.x+ recommended) with Software Center.</li>
@@ -119,8 +171,17 @@
           <li>Download the matching package from the table. Check it with <a href="https://github.com/sockrockets/sockrocket/releases/latest/download/SHA256SUMS-merlin.txt">SHA256SUMS-merlin.txt</a>.</li>
           <li>Router WebUI → Software Center → Offline install → upload the archive.</li>
           <li>Open the Sockrocket module and add your subscription or nodes.</li>
-          <li>Enable transparent proxy / DNS hijack as needed.</li>
+          <li>Enable transparent proxy / DNS hijack as needed. To send some traffic through a node group, stay in <strong>Rule</strong> mode and set that rule's exit to the group. See <a href="routing.html">Routing</a>.</li>
         </ol>
+        <h2 id="en-pages">What the pages do</h2>
+        <ul>
+          <li><strong>Overview</strong>: start or stop. Start turns on DNS interception and transparent proxy together; either can be turned off while running. This page also shows bytes forwarded since this process started.</li>
+          <li><strong>Nodes</strong>: use one node, or create a node group. A manual group keeps one node. Fallback and URL test can include several; order matters for fallback.</li>
+          <li><strong>Subscriptions</strong>: update subscriptions. The last three calendar months are here too. A subscription total is the sum of its current nodes. Addresses are not shown.</li>
+          <li><strong>Routing rules</strong>: set a rule group's exit to the global node, one node, or a node group. Check where a site would match, or add the built-in presets, which start disabled.</li>
+          <li><strong>Network &amp; DNS</strong>: compatibility is the default. Consider dual-stack only after the firmware already has an IPv6 address and a LAN prefix.</li>
+        </ul>
+        <p>A group carries traffic only in Rule mode, and only after a rule's exit names it. See <a href="routing.html">Routing</a>.</p>
         <h2 id="en-after">After install</h2>
         <ul>
           <li>Default IPv6 mode is <strong>compatibility</strong> — no ISP IPv6 required.</li>

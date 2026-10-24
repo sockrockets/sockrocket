@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Sockrocket 分流：规则模式、全局节点、单个节点和节点分组。">
+<title>分流 · Sockrocket</title>
+<link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../styles.css">
+<script defer src="../docs.js"></script>
+</head>
+<body data-page="routing">
+<a class="skip" href="#main" data-t="skip">跳转到内容</a>
+<header class="header"><div class="nav wrap">
+  <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
+  <nav aria-label="Main navigation">
+    <a href="../index.html#merlin">Merlin</a>
+    <a href="../index.html#download" data-t="navDownload">下载</a>
+    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
+    <a href="./" data-t="navDocs" aria-current="page">文档</a>
+    <a href="../index.html#community" data-t="navCommunity">社区</a>
+  </nav>
+  <div class="nav-tools"><label class="sr-only" for="language">Language</label><select id="language"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select>
+  <a class="github" href="https://github.com/sockrockets/sockrocket" aria-label="GitHub"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true"><path d="M12 .8a11.2 11.2 0 0 0-3.54 21.83c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.03-.7.08-.69.08-.69 1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.93.1-.73.39-1.22.71-1.5-2.5-.29-5.13-1.25-5.13-5.54 0-1.22.44-2.22 1.16-3-.12-.28-.5-1.42.11-2.96 0 0 .95-.3 3.08 1.15a10.7 10.7 0 0 1 5.6 0c2.14-1.45 3.08-1.15 3.08-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3 0 4.3-2.63 5.25-5.14 5.53.4.35.76 1.03.76 2.08v3.1c0 .3.21.65.78.54A11.2 11.2 0 0 0 12 .8Z"/></svg></a></div>
+</div></header>
+<main id="main" class="wrap">
+  <header class="doc-hero">
+    <div class="doc-locale" data-locale="zh">
+      <p class="eyebrow"><span class="dot"></span>分流</p>
+      <h1>先选规则模式，再决定这条流量走哪。</h1>
+      <p class="lead">分组建好以后不会自己接管流量。只有规则模式会看规则，并且规则的出口要写成这个分组或这个节点。</p>
+    </div>
+    <div class="doc-locale" data-locale="en" hidden>
+      <p class="eyebrow"><span class="dot"></span>Routing</p>
+      <h1>Choose rule mode, then choose where that traffic goes.</h1>
+      <p class="lead">A group does not take over traffic by itself. Only rule mode reads rules, and a rule's exit has to name that group or that node.</p>
+    </div>
+  </header>
+  <div class="doc-layout">
+    <aside class="doc-toc">
+      <strong>ON THIS PAGE</strong>
+      <div class="doc-locale" data-locale="zh">
+        <a href="#modes">三种模式</a>
+        <a href="#exits">三种出口</a>
+        <a href="#groups">节点分组</a>
+        <a href="#enable">让分组生效</a>
+        <a href="#presets">预设与设备</a>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <a href="#en-modes">Three modes</a>
+        <a href="#en-exits">Three exits</a>
+        <a href="#en-groups">Node groups</a>
+        <a href="#en-enable">Use a group</a>
+        <a href="#en-presets">Presets and devices</a>
+      </div>
+      <div class="toc-group"><strong>MORE</strong>
+        <a href="configuration.html">配置</a>
+        <a href="merlin.html">Merlin</a>
+        <a href="./">文档首页</a>
+      </div>
+    </aside>
+    <article class="doc-article">
+      <div class="doc-locale" data-locale="zh">
+        <h2 id="modes">三种模式</h2>
+        <ul>
+          <li><strong>规则</strong>：按分流规则决定出口。节点分组和「钉在某一个节点」只在这个模式里生效。</li>
+          <li><strong>全局</strong>：代理流量都走概览顶部当前选中的节点。</li>
+          <li><strong>直连</strong>：不走代理节点。</li>
+        </ul>
+        <h2 id="exits">三种出口</h2>
+        <div class="doc-table"><table>
+          <thead><tr><th>出口</th><th>跟着谁走</th></tr></thead>
+          <tbody>
+            <tr><td>全局节点（规则里也叫「代理」）</td><td>概览顶部当前节点。换顶部节点，这些规则一起换。</td></tr>
+            <tr><td>节点 · 名字</td><td>只走这一个节点。换顶部节点时它不动。</td></tr>
+            <tr><td>分组 · 名字</td><td>走这个节点分组。分组里换成员，不会改顶部的全局节点。</td></tr>
+          </tbody>
+        </table></div>
+        <p>某一条规则要固定在一条线上，直接选「节点 · 名字」就够了。好几处规则要共用同一个出口、以后想一处改掉，再用手动分组。</p>
+        <h2 id="groups">节点分组</h2>
+        <p>在<strong>节点</strong>页新建。它和分流规则里的规则分组不是一回事：规则分组是规则的文件夹，节点分组是出口。</p>
+        <ul>
+          <li><strong>手动选择</strong>：只会使用选中的那一个节点，保存时也只保留这一个。</li>
+          <li><strong>备用</strong>：可以勾选多个，顺序就是尝试顺序。五分钟内从上次连上的成员开始；之后再从第一个开始。这个成员建连失败，就按顺序试剩下的。UDP 固定走第一个。已经建立的连接不会被搬走。</li>
+          <li><strong>测速</strong>：可以勾选多个。五分钟内沿用刚才更快的那个；过期后这些节点一起比握手。顺序不决定用哪一个。</li>
+        </ul>
+        <p>成员失效不会悄悄改走全局节点。分组里切换成员，也不改变顶部当前节点。</p>
+        <h2 id="enable">让分组生效</h2>
+        <ol>
+          <li>概览里选择<strong>规则</strong>。</li>
+          <li>在节点页建好分组。</li>
+          <li>打开<strong>分流规则</strong>。把这一组规则的<strong>分组出口</strong>选成「分组 · 名字」，或在单条规则的处理方式里选同一个分组。</li>
+        </ol>
+        <p>分组出口会改掉原来走代理、节点或分组的规则。这一组里的直连和拒绝保持不变。</p>
+        <h2 id="presets">预设、设备与去向检查</h2>
+        <ul>
+          <li><strong>常用预设</strong>：AI 服务、海外视频、Telegram 网页、开发工具、Apple 直连、Microsoft 直连、国内站点。添加后是停用的，再由你打开。它们覆盖常见域名，不是这些服务的全部地址；Telegram 数据中心的 IP 仍按 IP 规则或兜底走。</li>
+          <li><strong>设备兜底</strong>：给一台设备或一个网段单独的最终出口。没单独设置的设备继续用全部设备的规则。请给设备固定 DHCP 地址。选「继承全局」会删掉这个来源的最终规则，目的域名和 IP 例外还在。</li>
+          <li><strong>去向检查</strong>：输入网站，看命中哪一条、为什么、走哪个出口。不修改规则，不发起代理连接，也不保存查询记录。</li>
+        </ul>
+        <p>匹配顺序是：这台设备的目的规则 → 全部设备的目的规则 → 国内直连 → 这台设备的兜底，否则全局兜底。</p>
+      </div>
+      <div class="doc-locale" data-locale="en" hidden>
+        <h2 id="en-modes">Three modes</h2>
+        <ul>
+          <li><strong>Rule</strong>: rules choose the exit. Node groups and a pinned node apply only here.</li>
+          <li><strong>Global</strong>: proxied traffic uses the node selected at the top of the overview.</li>
+          <li><strong>Direct</strong>: no proxy node.</li>
+        </ul>
+        <h2 id="en-exits">Three exits</h2>
+        <div class="doc-table"><table>
+          <thead><tr><th>Exit</th><th>What it follows</th></tr></thead>
+          <tbody>
+            <tr><td>Global node (also labeled Proxy)</td><td>The overview's current node. Changing it moves every rule that uses this exit.</td></tr>
+            <tr><td>Node · name</td><td>That node only. The overview selection does not move it.</td></tr>
+            <tr><td>Group · name</td><td>That node group. Changing a member does not change the global node.</td></tr>
+          </tbody>
+        </table></div>
+        <p>Pin a node when one rule should stay on that line. Use a manual group when several rules should share one exit you can change in one place.</p>
+        <h2 id="en-groups">Node groups</h2>
+        <p>Create one on the <strong>Nodes</strong> page. A rule group on the Routing page is a folder of rules. A node group is an exit.</p>
+        <ul>
+          <li><strong>Manual</strong>: one node. Saving keeps only that node.</li>
+          <li><strong>Fallback</strong>: several nodes, in list order. For five minutes, new TCP starts at the last member that connected, then it starts at the first again. If that member fails to connect, the rest are tried in order. UDP stays on the first. An open connection is not moved.</li>
+          <li><strong>URL test</strong>: several nodes. For five minutes, new TCP reuses the fastest recent handshake. After that the members race, and order does not choose the winner.</li>
+        </ul>
+        <p>A missing member is not replaced by the global node.</p>
+        <h2 id="en-enable">Use a group</h2>
+        <ol>
+          <li>On the overview, choose <strong>Rule</strong>.</li>
+          <li>Create the group on the Nodes page.</li>
+          <li>On <strong>Routing rules</strong>, set that rule group's exit to Group · name, or set one rule's action to the same group.</li>
+        </ol>
+        <p>The rule-group exit rewrites rules that were already using a proxy, a node, or a group. Direct and reject rules in that folder stay as they are.</p>
+        <h2 id="en-presets">Presets, devices and the routing check</h2>
+        <ul>
+          <li><strong>Presets</strong>: AI services, overseas video, Telegram web, developer tools, Apple direct, Microsoft direct and domestic sites. They are added disabled. The lists are common domains, not every endpoint. Telegram data-center IPs still follow IP rules or the final rule.</li>
+          <li><strong>Device default</strong>: a final exit for one device or prefix. Devices without one keep the shared rules. Use a DHCP reservation. Inherit removes that source's final rule and leaves destination exceptions.</li>
+          <li><strong>Routing check</strong>: enter a site and see which rule matched and which exit it uses. It does not change rules, open a proxy connection, or store the query.</li>
+        </ul>
+        <p>Order: this device's destination rules → shared destination rules → domestic direct → this device's final, otherwise the global final.</p>
+      </div>
+      <div class="doc-next">
+        <a href="configuration.html">→ 配置说明</a>
+        <a href="merlin.html">← Merlin</a>
+        <a href="./">文档首页</a>
+      </div>
+    </article>
+  </div>
+</main>
+<footer class="wrap"><a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="27" height="27" alt=""><span>Sockrocket</span></a><p data-t="footer">开源 Rust 代理客户端 · Apache-2.0</p><div><a href="./" data-t="docs">文档</a><a href="https://t.me/sockrocket">Telegram</a><a href="https://github.com/sockrockets/sockrocket">GitHub</a></div></footer>
+</body>
+</html>

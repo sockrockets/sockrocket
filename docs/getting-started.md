@@ -75,6 +75,8 @@ sockrocket-gui
 2. **Nodes** — pick a node
 3. **Home** — **Connect**
 
+In rule mode, a rule exit can be the global node, one node, or a node group. See [Routing](./routing.md).
+
 ---
 
 ## Verify connectivity

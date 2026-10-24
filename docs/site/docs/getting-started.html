@@ -7,6 +7,7 @@
 <link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../styles.css">
 <script defer src="../docs.js"></script>
+<script defer src="../release.js"></script>
 </head>
 <body data-page="getting-started">
 <a class="skip" href="#main" data-t="skip">跳转到内容</a>
@@ -51,6 +52,7 @@
         <a href="#en-verify">Verify</a>
       </div>
       <div class="toc-group"><strong>MORE</strong>
+        <a href="routing.html">分流</a>
         <a href="merlin.html">Merlin</a>
         <a href="configuration.html">配置 / Config</a>
         <a href="./">文档首页</a>
@@ -81,7 +83,7 @@ sockrocket-cli config.yaml</code></pre>
         <h2 id="connect">3. 连接</h2>
         <ol>
           <li>选择一个节点，可先测延迟。</li>
-          <li>按需要选择规则 / 全局 / 直连模式。</li>
+          <li>按需要选择规则 / 全局 / 直连。规则模式下，出口可以是全局节点、某一个节点，或一个<a href="routing.html">节点分组</a>。</li>
           <li>点击连接。默认系统代理即可覆盖多数应用。</li>
           <li>需要接管更多流量时，再启用 TUN，并按系统提示授权。</li>
         </ol>
@@ -114,7 +116,7 @@ sockrocket-cli config.yaml</code></pre>
         <h2 id="en-connect">3. Connect</h2>
         <ol>
           <li>Pick a node; latency test is optional.</li>
-          <li>Choose Rule, Global or Direct.</li>
+          <li>Choose Rule, Global or Direct. In rule mode an exit can be the global node, one node, or a <a href="routing.html">node group</a>.</li>
           <li>Connect. System proxy covers most apps.</li>
           <li>Enable TUN (and authorize) only when you need broader capture.</li>
         </ol>
