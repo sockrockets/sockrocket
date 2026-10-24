@@ -1770,6 +1770,52 @@ fn act_logs_clear() -> J {
     json!({"ok": true, "msg": "Log cleared"})
 }
 
+/// Subscription table = current members' node history, not the side ledger.
+/// The side ledger misses traffic recorded before a node was linked to a subscription.
+fn subscription_month_rows(
+    nodes: &[sockrocket_core::NodeMonthlyTraffic],
+    traffic_path: &std::path::Path,
+) -> Vec<sockrocket_core::NodeMonthlyTraffic> {
+    let Ok(cfg) = load_app_config() else {
+        return sockrocket_core::TrafficLedger::read_recent_subscriptions(traffic_path, 3)
+            .unwrap_or_default();
+    };
+    let subscription_names: Vec<(String, String)> = cfg
+        .subscriptions
+        .iter()
+        .map(|sub| {
+            (
+                sockrocket_core::subscription_public_id(&sub.url),
+                sub.name.clone(),
+            )
+        })
+        .collect();
+    let known: std::collections::HashSet<&str> = subscription_names
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let membership: Vec<(String, String)> = cfg
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let url = node
+                .extra
+                .get(sockrocket_core::SUB_URL_EXTRA_KEY)
+                .map(String::as_str)
+                .filter(|url| !url.is_empty())?;
+            let sub_id = sockrocket_core::subscription_public_id(url);
+            if !known.contains(sub_id.as_str()) {
+                return None;
+            }
+            Some((
+                sockrocket_core::node_public_id(&sockrocket_core::node_fingerprint(node)),
+                sub_id,
+            ))
+        })
+        .collect();
+    sockrocket_core::sum_subscription_members(nodes, &membership, &subscription_names)
+}
+
 fn act_stats() -> J {
     let running = is_running();
     let mut uptime = "stopped".to_string();
@@ -1864,9 +1910,7 @@ fn act_stats() -> J {
     };
     let recent_months =
         sockrocket_core::TrafficLedger::read_recent_months(&traffic_path, 3).unwrap_or_default();
-    let recent_subscriptions =
-        sockrocket_core::TrafficLedger::read_recent_subscriptions(&traffic_path, 3)
-            .unwrap_or_default();
+    let recent_subscriptions = subscription_month_rows(&recent_months, &traffic_path);
     let session_started =
         sockrocket_core::TrafficLedger::read_session_started(&traffic_path).unwrap_or(0);
     json!({

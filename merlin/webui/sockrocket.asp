@@ -464,8 +464,8 @@ body.bg {min-width:0!important}
           <div class="rows" id="sr-sub-list"><div class="hint">正在加载…</div></div>
           <div class="hint">更新失败时保留现有节点。订阅地址默认隐藏，请勿分享包含地址的截图。</div>
         </div>
-        <section class="card" id="sr-sub-traffic-card"><h3>近三个月节点用量</h3><p class="hint" style="margin-bottom:12px">按自然月累计。手动添加、未归属订阅的节点也会出现在这里。</p><div id="sr-sub-traffic-months"><div class="hint">暂无用量记录</div></div></section>
-        <section class="card" id="sr-sub-link-traffic-card"><h3>近三个月订阅用量</h3><p class="hint" style="margin-bottom:12px">同一订阅下的节点合计。只显示订阅名称，不显示订阅地址。</p><div id="sr-sub-link-traffic"><div class="hint">暂无用量记录</div></div></section>
+        <section class="card" id="sr-sub-traffic-card"><h3>近三个月节点用量</h3><p class="hint" style="margin-bottom:12px">每个节点按自然月单独累计，订阅里的节点也列在这里。直连和未归属订阅的节点同样显示。</p><div id="sr-sub-traffic-months"><div class="hint">暂无用量记录</div></div></section>
+        <section class="card" id="sr-sub-link-traffic-card"><h3>近三个月订阅用量</h3><p class="hint" style="margin-bottom:12px">把上面属于同一订阅的节点加总。直连和未归属订阅的节点不算在内。只显示订阅名称，不显示订阅地址。</p><div id="sr-sub-link-traffic"><div class="hint">暂无用量记录</div></div></section>
         <details class="card" id="sr-sub-notes" hidden>
           <summary>兼容说明</summary>
           <p class="hint" id="sr-sub-notes-text"></p>

@@ -739,6 +739,72 @@ impl TrafficLedger {
     }
 }
 
+/// Add each node's monthly totals into the subscription that currently owns it.
+///
+/// The side ledger can miss bytes recorded before a node was tied to a
+/// subscription. The subscriptions page promises the sum of member nodes, so
+/// that table is derived from node history plus the current config.
+///
+/// `membership` is `(node_public_id, subscription_public_id)`.
+/// `subscription_names` is `(subscription_public_id, display_name)`.
+/// Direct and nodes that do not belong to a listed subscription are omitted.
+pub fn sum_subscription_members(
+    nodes: &[NodeMonthlyTraffic],
+    membership: &[(String, String)],
+    subscription_names: &[(String, String)],
+) -> Vec<NodeMonthlyTraffic> {
+    let names: BTreeMap<&str, &str> = subscription_names
+        .iter()
+        .map(|(id, name)| (id.as_str(), name.as_str()))
+        .collect();
+    let owners: BTreeMap<&str, &str> = membership
+        .iter()
+        .filter(|(_, sub_id)| names.contains_key(sub_id.as_str()))
+        .map(|(node_id, sub_id)| (node_id.as_str(), sub_id.as_str()))
+        .collect();
+    let mut totals: BTreeMap<&str, BTreeMap<String, TrafficCounters>> = BTreeMap::new();
+    for node in nodes {
+        let Some(sub_id) = owners.get(node.id.as_str()).copied() else {
+            continue;
+        };
+        let months = totals.entry(sub_id).or_default();
+        for (key, counters) in &node.months {
+            months
+                .entry(key.clone())
+                .or_default()
+                .add(counters.up, counters.down);
+        }
+    }
+    let mut out = Vec::new();
+    for (sub_id, months) in totals {
+        let mut total = TrafficCounters::default();
+        let months: Vec<(String, TrafficCounters)> = months
+            .into_iter()
+            .map(|(key, counters)| {
+                total.add(counters.up, counters.down);
+                (key, counters)
+            })
+            .collect();
+        if total.total() == 0 {
+            continue;
+        }
+        let name = public_traffic_label(names.get(sub_id).copied().unwrap_or(""), "订阅");
+        out.push(NodeMonthlyTraffic {
+            id: sub_id.to_string(),
+            name,
+            months,
+            total,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.total
+            .total()
+            .cmp(&a.total.total())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
 impl Drop for TrafficLedger {
     fn drop(&mut self) {
         let _ = self.flush();
@@ -1051,6 +1117,50 @@ mod tests {
         assert_eq!(rows[0].months[2].1.total(), 300);
         assert_eq!(rows[0].total.total(), 400);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn subscription_table_sums_current_members_and_skips_direct() {
+        let node = |id: &str, up: u64, down: u64| NodeMonthlyTraffic {
+            id: id.into(),
+            name: id.into(),
+            months: vec![("2026-10".into(), TrafficCounters { up, down })],
+            total: TrafficCounters { up, down },
+        };
+        let rows = vec![
+            node("alpha", 100, 200),
+            node("beta", 5, 5),
+            node("direct", 9, 9),
+            node("solo", 7, 1),
+        ];
+        let summed = sum_subscription_members(
+            &rows,
+            &[
+                ("alpha".into(), "sub-a".into()),
+                ("beta".into(), "sub-a".into()),
+                ("solo".into(), "sub-b".into()),
+            ],
+            &[
+                ("sub-a".into(), "订阅A".into()),
+                ("sub-b".into(), "订阅B".into()),
+            ],
+        );
+        assert_eq!(summed.len(), 2);
+        assert_eq!(summed[0].name, "订阅A");
+        assert_eq!(summed[0].total.total(), 310);
+        assert_eq!(summed[1].name, "订阅B");
+        assert_eq!(summed[1].total.total(), 8);
+        let hidden = sum_subscription_members(
+            &rows,
+            &[("alpha".into(), "sub-a".into())],
+            &[(
+                "sub-a".into(),
+                "https://provider.example/sub?token=secret".into(),
+            )],
+        );
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].name, "订阅");
+        assert_eq!(hidden[0].total.total(), 300);
     }
 
     #[test]
