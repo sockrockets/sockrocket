@@ -459,7 +459,7 @@ body.bg {min-width:0!important}
             </div>
             <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" id="sr-sub-add" onclick="addSub()">添加</button></div>
           </div>
-          <p class="hint">只需填写订阅地址。名称留空自动命名，格式默认自动识别；批量更新会跳过错误地址并保留对应的已有节点。</p>
+          <p class="hint">只需填写订阅地址。名称留空自动命名，格式默认自动识别；批量更新会跳过错误地址并保留对应的已有节点。HTTP 地址会明文传输访问令牌和节点内容；供应商支持时请优先使用 HTTPS。</p>
         </div>
         <div class="card">
           <div class="toolbar">
@@ -688,9 +688,9 @@ body.bg {min-width:0!important}
 
 <script>
 /* ══ API ═══════════════════════════════════════════════════════════ */
-/* Three transports, auto-detected at boot:
- *   'http' — sockrocket-cli's built-in API server (http://<router>:18188/api),
- *            always-on, works whether or not the proxy daemon is running
+/* Firmware transports, auto-detected at boot. The built-in HTTP API is
+ * loopback-only and token-protected; a browser cannot connect to it directly.
+ * The legacy 'http' transport branch below is retained for older pages.
  *   'cgi'  — legacy: direct CGI at /cgi-bin/sockrocket.cgi (the stock Merlin
  *            httpd does NOT execute user CGIs; kept for old installs)
  *   'ksc'  — koolcenter software center (read-only /www): POST /_api/

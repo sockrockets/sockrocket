@@ -233,13 +233,15 @@ fi
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 install_default_config() {
     if [ -f "$SOCKROCKET_CONF" ]; then
+        chmod 600 "$SOCKROCKET_CONF" || err "Could not make the existing configuration private"
         ok "Existing config and proxy state preserved"
         return 0
     fi
     info "Generating default config (proxy stopped)..."
     # Persist Stop before any boot/retry hook can launch the daemon.
     : > "$SOCKROCKET_DIR/stopped" || err "Could not persist the default stopped state"
-    xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF" || err "Could not install default config"
+    (umask 077; xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF") || err "Could not install default config"
+    chmod 600 "$SOCKROCKET_CONF" || err "Could not make the default configuration private"
     ok "Default config at $SOCKROCKET_CONF"
 }
 
@@ -249,7 +251,12 @@ install_common_files() {
     mkdir -p "$SOCKROCKET_DIR" "$SOCKROCKET_SCRIPTS" "$CGI_BIN" /jffs/scripts /jffs/configs/dnsmasq.d 2>/dev/null
 
     if [ -f "$SOCKROCKET_CONF" ]; then
-        xcp "$SOCKROCKET_CONF" "$SOCKROCKET_CONF.bak"
+        chmod 600 "$SOCKROCKET_CONF" || err "Could not make the existing configuration private"
+        [ ! -L "$SOCKROCKET_CONF.bak" ] || err "Configuration backup path must not be a symlink"
+        [ ! -f "$SOCKROCKET_CONF.bak" ] || \
+            chmod 600 "$SOCKROCKET_CONF.bak" || err "Could not make the configuration backup private"
+        (umask 077; xcp "$SOCKROCKET_CONF" "$SOCKROCKET_CONF.bak") || err "Could not back up the configuration"
+        chmod 600 "$SOCKROCKET_CONF.bak" || err "Could not make the configuration backup private"
         ok "Existing config backed up to $SOCKROCKET_CONF.bak"
     fi
 

@@ -59,14 +59,33 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         run(prelude + defaults + '\ninstall_default_config\n')
         assert not (root / 'stopped').exists()
         assert config.read_bytes() == b'fixture configuration retained\n'
+        assert config.stat().st_mode & 0o777 == 0o600, 'existing config must become private'
         (root / 'stopped').touch()
         run(prelude + defaults + '\ninstall_default_config\n')
         assert (root / 'stopped').exists()
+        backup = root / 'config.yaml.bak'
+        backup.write_bytes(b'old backup\n')
+        config.chmod(0o644)
+        backup.chmod(0o644)
+        backup_start = source.index('    if [ -f "$SOCKROCKET_CONF" ]; then', source.index('install_common_files() {'))
+        backup_end = source.index('    info "Installing sockrocket-cli binary..."', backup_start)
+        run(prelude + source[backup_start:backup_end])
+        assert config.stat().st_mode & 0o777 == 0o600, 'upgrade config must become private'
+        assert backup.stat().st_mode & 0o777 == 0o600, 'upgrade backup must become private'
+        assert backup.read_bytes() == config.read_bytes()
+        backup.unlink()
+        unrelated = root / 'unrelated'
+        unrelated.write_bytes(b'leave this file untouched\n')
+        backup.symlink_to(unrelated)
+        assert run(prelude + source[backup_start:backup_end], check=False).returncode != 0
+        assert unrelated.read_bytes() == b'leave this file untouched\n', 'backup must not follow a symlink'
+        backup.unlink()
         # Fresh install has no proxy start intent, even after delayed retries.
         config.unlink()
         (root / 'stopped').unlink()
         run(prelude + defaults + '\ninstall_default_config\n')
         assert config.read_bytes() == b'fresh default configuration\n'
+        assert config.stat().st_mode & 0o777 == 0o600, 'fresh config must start private'
         assert (root / 'stopped').exists()
         # A mounted JFFS directory is insufficient when Merlin has disabled
         # execution of custom scripts; fail before publishing hook-dependent files.

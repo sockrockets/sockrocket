@@ -130,10 +130,9 @@ kill_stray_apis() {
 }
 
 # ── Web UI API bridge (always-on, independent of the proxy daemon) ──────────
-# The router's httpd cannot execute user CGIs (/cgi-bin/sockrocket.cgi always 404s
-# on stock Merlin), so the Web UI talks to `sockrocket-cli api` — a tiny HTTP JSON
-# server on port 18188. It must stay up even while the proxy is stopped,
-# otherwise the UI has no way to start the service again.
+# Keep the token-protected loopback API alive while the proxy is stopped.
+# Browser requests use firmware CGI or Software Center RPC; the browser cannot
+# reach this API directly from the LAN.
 API_PID="$SOCKROCKET_DIR/sockrocket-api.pid"
 DEFAULT_API_PORT=18188
 
