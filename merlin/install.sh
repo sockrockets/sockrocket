@@ -224,6 +224,12 @@ if [ "$UPDATE_ONLY" = "true" ]; then
     exit 0
 fi
 
+# Merlin only dispatches /jffs/scripts/* when this NVRAM switch is enabled.
+# A mounted JFFS directory alone does not prove that installed hooks will run.
+if have nvram && [ "$(nvram get jffs2_scripts 2>/dev/null)" = "0" ]; then
+    err "JFFS custom scripts are disabled. Enable them in Administration -> System before installing Sockrocket, then rerun install.sh."
+fi
+
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 install_default_config() {
     if [ -f "$SOCKROCKET_CONF" ]; then
@@ -388,12 +394,17 @@ fi
 '[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
 '
 
-    # A DHCP lease renew may replace resolv.dnsmasq without another WAN
-    # connected event. Keep this path DNS-only to avoid rebuilding live rules.
+    # DHCPv4 renew can replace resolv.dnsmasq without another WAN event.
+    # DHCPv6/RA updates can also replace the LAN IPv6 prefix, so refresh only
+    # the IPv6 policy and DNS on those events (not the whole IPv4 firewall).
     install_hook "/jffs/scripts/dhcpc-event" \
-'case "$1" in
-    bound|renew) [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
-        /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns ;;
+'case "$1:$2" in
+    bound:6|renew:6|stopped:6|unbound:6|updated:*|rebound:*|informed:*|ra-updated:*)
+        [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+            /jffs/addons/sockrocket/scripts/sockrocket.sh dhcpv6-restore ;;
+    bound:*|renew:*)
+        [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+            /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns ;;
 esac
 '
 }

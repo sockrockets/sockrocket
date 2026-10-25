@@ -232,6 +232,34 @@ test_wan_reconnect_restores_rules_and_dns_safely() {
     check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'disabled DNS hijack never re-pins'
 }
 
+test_dhcpv6_prefix_change_reconciles_ipv6_without_ipv4_rebuild() {
+    printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    export SANDBOX
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    printf '\nipv6_mode: dual_stack\n' >> "$SOCKROCKET_CONF"
+    do_dhcpv6_restore
+    check ipv6-apply "$(cat "$SANDBOX/firewall.calls")" 'DHCPv6 event reconciles only IPv6 policy'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'DHCPv6 event re-pins DNS'
+
+    : > "$SANDBOX/firewall.calls"
+    pin_dns_upstream() { return 1; }
+    if do_dhcpv6_restore; then echo 'DNS pin failure was hidden' >&2; exit 1; fi
+    check ipv6-apply "$(cat "$SANDBOX/firewall.calls")" 'DNS failure does not block IPv6 policy repair'
+
+    : > "$SANDBOX/firewall.calls"
+    printf 'server=198.51.100.53\n' > "$SOCKROCKET_RESOLV_FILE"
+    touch "$SOCKROCKET_DIR/stopped"
+    do_dhcpv6_restore
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'manual Stop blocks DHCPv6 restore'
+    check 'server=198.51.100.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'manual Stop keeps firmware DNS'
+
+    rm -f "$SOCKROCKET_DIR/stopped"
+    echo fault > "$DEGRADED_FILE"
+    do_dhcpv6_restore
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'fail-open blocks DHCPv6 restore'
+    check 'server=198.51.100.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'fail-open keeps firmware DNS'
+}
+
 test_reapply_respects_fail_open_and_clears_stale_ipv6_dns() {
     printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
     export SANDBOX
@@ -534,6 +562,7 @@ run_test test_command_failure_exit_status
 run_test test_nat_restore_reinstalls_dns_without_undoing_fail_open
 run_test test_firewall_event_respects_degraded_and_stopped
 run_test test_wan_reconnect_restores_rules_and_dns_safely
+run_test test_dhcpv6_prefix_change_reconciles_ipv6_without_ipv4_rebuild
 run_test test_reapply_respects_fail_open_and_clears_stale_ipv6_dns
 run_test test_policy_routing_staged_and_idempotent
 echo "$PASS stability scenarios passed"

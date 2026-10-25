@@ -68,6 +68,12 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         run(prelude + defaults + '\ninstall_default_config\n')
         assert config.read_bytes() == b'fresh default configuration\n'
         assert (root / 'stopped').exists()
+        # A mounted JFFS directory is insufficient when Merlin has disabled
+        # execution of custom scripts; fail before publishing hook-dependent files.
+        jffs_guard = source[source.index('# Merlin only dispatches /jffs/scripts/*'):
+                            source.index('# ── Shared helpers', source.index('# Merlin only dispatches /jffs/scripts/*'))]
+        assert run('have() { :; }\nnvram() { echo 0; }\n' + jffs_guard, check=False).returncode != 0
+        run('have() { :; }\nnvram() { echo 1; }\n' + jffs_guard)
         # Exercise the installed boot wrapper, not a hand-written duplicate.
         a = source.index("    printf '%s\\n' \\\n", source.index('# koolshare startup wrapper'))
         b = source.index('    chmod +x "$KS_SCRIPTS/${MODULE}_config.sh"', a)
@@ -125,15 +131,24 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         event('wan-start')
         event('dhcpc-event', 'renew')
         event('dhcpc-event', 'bound')
+        event('dhcpc-event', 'renew', '4')
+        event('dhcpc-event', 'bound', '6')
+        event('dhcpc-event', 'unbound', '6')
+        event('dhcpc-event', 'stopped', '6')
+        event('dhcpc-event', 'updated', '6')
+        event('dhcpc-event', 'rebound', '6')
+        event('dhcpc-event', 'ra-updated', '6')
         event('dhcpc-event', 'deconfig')
         event('firewall-start', 'ppp0')
         event('nat-start')
         event('services-start')
         event('service-event', 'restart', 'Sockrocket')
         assert (root / 'hook-calls').read_text().splitlines() == [
-            'wan-restore', 'wan-restore', 'pin-dns', 'pin-dns',
+            'wan-restore', 'wan-restore', 'pin-dns', 'pin-dns', 'pin-dns',
+            'dhcpv6-restore', 'dhcpv6-restore', 'dhcpv6-restore',
+            'dhcpv6-restore', 'dhcpv6-restore', 'dhcpv6-restore',
             'firewall-restore', 'nat-restore', 'boot', 'restart',
-        ], 'WAN and DHCP events must dispatch once after idempotent installation'
+        ], 'WAN and DHCPv4/DHCPv6 events must dispatch once after idempotent installation'
     finally:
         old.terminate()
         old.wait()

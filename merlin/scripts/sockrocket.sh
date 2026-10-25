@@ -1691,6 +1691,27 @@ do_pin_dns_event() {
     pin_dns_upstream
 }
 
+# DHCPv6 and router-advertisement changes can replace LAN prefixes without a
+# firewall-start event. Reconcile IPv6 DNS/policy immediately; the periodic
+# watchdog remains a retry path if the firmware has not finished applying it.
+do_dhcpv6_restore() {
+    local failed=0
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ -f "$DEGRADED_FILE" ] && return 0
+    is_running || return 0
+    [ "$(count_section nodes)" != "0" ] || return 0
+    pin_dns_upstream || failed=1
+    if [ "$(conf_bool transparent_proxy true)" = "true" ] && \
+        [ "$(get_config_value ipv6_mode)" = "dual_stack" ]; then
+        if [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ]; then
+            "$SOCKROCKET_DIR/scripts/iptables.sh" ipv6-apply || failed=1
+        else
+            failed=1
+        fi
+    fi
+    return "$failed"
+}
+
 do_watchdog() {
     local issues=0
     sync_softcenter_state
@@ -2024,6 +2045,9 @@ case "$1" in
         ;;
     pin-dns)
         run_locked 5 do_pin_dns_event
+        ;;
+    dhcpv6-restore)
+        run_locked 5 do_dhcpv6_restore
         ;;
     wan-restore)
         run_locked 5 do_wan_restore

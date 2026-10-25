@@ -47,6 +47,8 @@ Unlike fancyss’s single `fancyss_hnd` tree, Sockrocket uses **`hnd_v8` for BCM
 
 Full model tables: [docs/merlin.md](../docs/merlin.md).
 
+The [Merlin compatibility notes](../docs/architecture/merlin-compatibility.md) distinguish implemented behavior from device and network configurations that still require router validation. In particular, transparent interception currently targets the primary LAN, not separate Merlin 3006 Guest Network Pro / SDN bridges.
+
 Requires Merlin **384+**, JFFS custom scripts, SSH.
 
 ## Install
@@ -185,7 +187,7 @@ API and config I/O are implemented in Rust (serde YAML); router-specific keys ar
 | `/jffs/scripts/nat-start` | Restore DNS interception after NAT rebuild |
 | `/jffs/scripts/wan-event` | Restore policy route and DNS after WAN connects (PPPoE, DHCP, static IP) |
 | `/jffs/scripts/wan-start` | Legacy Merlin WAN connection fallback |
-| `/jffs/scripts/dhcpc-event` | Re-pin DNS after DHCP lease bound or renew |
+| `/jffs/scripts/dhcpc-event` | Re-pin DNS after DHCPv4 lease changes; refresh IPv6 policy and DNS after DHCPv6 / RA updates |
 | `/jffs/scripts/services-start` | Start Sockrocket |
 | `/jffs/scripts/service-event` | Service restart hook |
 
