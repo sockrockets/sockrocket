@@ -121,10 +121,19 @@ test_merlin_3006_main_dns_isolated_from_sdn() {
     check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'SDN upstream preserved on failed start'
     printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
     apply_postconf=0
-    # The router waits out rc's delayed postconf. This mock never applies it.
+    # rc returned without calling the hook. The control script applies the
+    # same edit itself, so a skipped callback does not drop LAN DNS.
     SOCKROCKET_DNS_ISOLATION_WAIT=0
-    if update_dnsmasq start; then echo '3006 DNS activated when postconf did not run' >&2; exit 1; fi
-    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'unapplied postconf rolls back private upstream'
+    update_dnsmasq start
+    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(grep '^servers-file=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'skipped hook still isolates main upstream'
+    update_dnsmasq stop
+    # A helper that cannot rewrite the config still fails open.
+    printf '#!/bin/sh\nexit 1\n' > "$SANDBOX/fail-postconf.sh"
+    chmod +x "$SANDBOX/fail-postconf.sh"
+    SOCKROCKET_DNS_POSTCONF_SCRIPT="$SANDBOX/fail-postconf.sh"
+    if update_dnsmasq start; then echo '3006 DNS activated when isolation edit failed' >&2; exit 1; fi
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'failed isolation rolls back private upstream'
+    SOCKROCKET_DNS_POSTCONF_SCRIPT="$SANDBOX/dnsmasq-postconf.sh"
     apply_postconf=1
     printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNS_UPSTREAM_FILE"
     printf 'servers-file=/tmp/resolv.dnsmasq\nserver=1.1.1.1\n' > "$SANDBOX/dnsmasq-1.conf"

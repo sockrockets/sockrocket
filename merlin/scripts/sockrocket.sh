@@ -18,6 +18,9 @@ SOCKROCKET_LOCK="$SOCKROCKET_DIR/sockrocket.lock"
 # toggles still express user intent and are re-applied when the probe recovers.
 DEGRADED_FILE="$SOCKROCKET_DIR/.lan_degraded"
 WOUT_FAILS_FILE="$SOCKROCKET_DIR/.wout_fails"
+# Epoch seconds before which fail-open recovery must not restart dnsmasq.
+# A missed isolation check used to retry every few seconds and keep LAN DNS down.
+RECOVER_AFTER_FILE="$SOCKROCKET_DIR/.recover_after"
 SUPERVISOR_PID="$SOCKROCKET_DIR/sockrocket-supervisor.pid"
 GUARD_PID_FILE="$SOCKROCKET_DIR/sockrocket-guard.pid"
 # Crash forensics ("black box"): text history on jffs (tiny). Optional core
@@ -569,12 +572,30 @@ update_dnsmasq() {
             # matches on the first read and does not sleep.
             if merlin_3006; then
                 wait_limit="${SOCKROCKET_DNS_ISOLATION_WAIT:-15}"
+                # rc often returns before dnsmasq.postconf, and a later writer
+                # can put the firmware servers-file back. Apply the hook's
+                # edit here as well so one missed callback does not restart
+                # dnsmasq again and drop the LAN onto a poisoned resolver.
+                local main_config private_file helper main_pid
+                main_config="${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}"
+                private_file="${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
+                helper="${SOCKROCKET_DNS_POSTCONF_SCRIPT:-$SOCKROCKET_DIR/scripts/dnsmasq-postconf.sh}"
                 while :; do
-                    if grep -Fx \
-                        "servers-file=${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" \
-                        "${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}" >/dev/null 2>&1; then
+                    if grep -Fx "servers-file=${private_file}" "$main_config" >/dev/null 2>&1; then
                         isolated=1
                         break
+                    fi
+                    if [ -x "$helper" ] && [ -f "$private_file" ]; then
+                        "$helper" "$main_config" >/dev/null 2>&1 || true
+                        if grep -Fx "servers-file=${private_file}" "$main_config" >/dev/null 2>&1; then
+                            isolated=1
+                            main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
+                            case "$main_pid" in
+                                ''|*[!0-9]*) ;;
+                                *) kill -HUP "$main_pid" 2>/dev/null || true ;;
+                            esac
+                            break
+                        fi
                     fi
                     [ "$waited" -ge "$wait_limit" ] && break
                     waited=$((waited + 1))
@@ -1654,11 +1675,29 @@ memory_used_pct() {
     ' "${SOCKROCKET_MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null
 }
 
+recover_waiting() {
+    local now until
+    [ -f "$RECOVER_AFTER_FILE" ] || return 1
+    now=$(date +%s 2>/dev/null || echo 0)
+    until=$(cat "$RECOVER_AFTER_FILE" 2>/dev/null)
+    case "$until" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$now" -lt "$until" ]
+}
+
+hold_recover() {
+    local now
+    now=$(date +%s 2>/dev/null || echo 0)
+    echo $((now + ${1:-60})) > "$RECOVER_AFTER_FILE" 2>/dev/null || true
+}
+
 # Re-apply transparent proxy + DNS hijack from config after a fail-open, once
 # the daemon and outbound path look healthy again.
 try_recover_lan_proxy() {
     [ -f "$DEGRADED_FILE" ] || return 0
     [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    if recover_waiting; then
+        return 0
+    fi
     is_running || return 0
     [ "$(count_section nodes)" != "0" ] || return 1
     # Hysteresis: watchdog degrades at 85%; only re-arm below 80%.
@@ -1695,11 +1734,12 @@ try_recover_lan_proxy() {
     fi
     if [ "$want_dns" = "true" ]; then
         if ! update_dnsmasq start; then
+            hold_recover 60
             enter_lan_degraded "recovery DNS setup failed"
             return 1
         fi
     fi
-    rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
+    rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE" "$RECOVER_AFTER_FILE"
     ok "LAN proxy path restored after fail-open"
 }
 
