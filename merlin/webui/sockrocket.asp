@@ -1575,10 +1575,12 @@ function srLoadSubs() {
     var subs = d.subs;
     SR_STATE.subs = subs;
     if (!subs.length) { el.innerHTML = '<div class="hint">还没有订阅，请先添加订阅。</div>'; return; }
-    el.innerHTML = subs.map(function (s) {
+    var shared = Number(d.shared_nodes || 0);
+    var sharedHint = shared > 0 ? '<div class="hint">其中 ' + shared + ' 个节点由多个订阅共用，节点列表中各只显示一次。</div>' : '';
+    el.innerHTML = sharedHint + subs.map(function (s) {
       return '<div class="row">' +
         '<span class="badge acc">' + srEsc(s.format || 'auto') + '</span>' +
-        '<span class="r-name">' + srEsc(s.name) + '<span class="r-sub">订阅地址已隐藏</span></span>' +
+        '<span class="r-name">' + srEsc(s.name) + '<span class="r-sub">已导入 ' + Number(s.node_count || 0) + ' 个节点 · 订阅地址已隐藏</span></span>' +
         '<button class="btn btn-sm" onclick="inspectSubscription(' + Number(s.index) + ')">详情</button>' +
         '<button class="btn btn-sm" onclick="event.stopPropagation();renameSub(' + Number(s.index) + ')" title="重命名订阅">重命名</button>' +
         '<button class="btn btn-sm" onclick="event.stopPropagation();copySubUrl(' + Number(s.index) + ')" title="复制私有订阅地址">复制地址</button>' +

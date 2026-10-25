@@ -801,6 +801,20 @@ fn act_subscriptions() -> J {
     let Ok(map) = load_conf() else {
         return json!({"subs": []});
     };
+    let mut node_counts = std::collections::HashMap::<String, usize>::new();
+    let mut shared_nodes = 0usize;
+    for value in conf_seq(&map, "nodes") {
+        let Ok(node) = serde_yaml::from_value::<sockrocket_core::Node>(value.clone()) else {
+            continue;
+        };
+        let sources = sockrocket_core::config::dedup::subscription_sources(&node);
+        if sources.len() > 1 {
+            shared_nodes += 1;
+        }
+        for source in sources {
+            *node_counts.entry(source).or_default() += 1;
+        }
+    }
     let subs: Vec<J> = conf_seq(&map, "subscriptions")
         .iter()
         .enumerate()
@@ -809,11 +823,14 @@ fn act_subscriptions() -> J {
                 Some(Y::String(v)) => v.clone(),
                 _ => String::new(),
             };
-            json!({"index": i, "name": get("name"), "url": get("url"),
+            let url = get("url");
+            let count = node_counts.get(&url).copied().unwrap_or(0);
+            json!({"index": i, "name": get("name"), "url": url,
+                   "node_count": count,
                    "format": match get("format") { f if f.is_empty() => "auto".into(), f => f }})
         })
         .collect();
-    json!({"subs": subs})
+    json!({"subs": subs, "shared_nodes": shared_nodes})
 }
 
 fn sub_entry(name: &str, url: &str, format: &str) -> Y {
@@ -4140,6 +4157,40 @@ dns_direct_domains:
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0]["name"], J::from("Sub 2"));
+    }
+
+    #[test]
+    fn subscription_list_counts_nodes_shared_across_sources() {
+        let _env = TestEnv::new(SAMPLE);
+        let mut config = load_app_config().unwrap();
+        let first = config.subscriptions[0].url.clone();
+        let second = "https://example.invalid/second".to_string();
+        config.subscriptions.push(sockrocket_core::Subscription {
+            name: "Sub 2".into(),
+            url: second.clone(),
+            format: "auto".into(),
+            last_updated: None,
+            refresh_interval_hours: 24,
+        });
+        let node = |server| {
+            sockrocket_core::parse_proxy_uri(&format!(
+                "ss://aes-128-gcm:synthetic@{server}:8388#synthetic"
+            ))
+            .unwrap()
+        };
+        sockrocket_core::apply_subscription_refresh(
+            &mut config,
+            vec![
+                (first, vec![node("shared.invalid"), node("first.invalid")]),
+                (second, vec![node("shared.invalid"), node("second.invalid")]),
+            ],
+        );
+        persist_subscription_state(&config).unwrap();
+        let result = act_subscriptions();
+        assert_eq!(result["subs"][0]["node_count"], 2);
+        assert_eq!(result["subs"][1]["node_count"], 2);
+        assert_eq!(result["shared_nodes"], 1);
+        assert_eq!(load_app_config().unwrap().nodes.len(), 5);
     }
 
     #[test]

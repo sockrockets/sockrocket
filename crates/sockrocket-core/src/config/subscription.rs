@@ -100,7 +100,7 @@ pub async fn fetch_subscription_report(sub: &Subscription) -> Result<Subscriptio
     // The URL has to travel with the nodes: a later refresh replaces this
     // source, and a restart has to know which subscription they belong to.
     super::dedup::tag_subscription_nodes(&mut nodes, &sub.url);
-    let skipped_entries = uri_entry_count(&content).saturating_sub(nodes.len());
+    let skipped_entries = subscription_entry_count(&content).saturating_sub(nodes.len());
     let mut compatibility_notes = Vec::new();
     for node in &nodes {
         if !matches!(node.protocol, ProxyProtocol::Hysteria2 { .. }) {
@@ -127,7 +127,7 @@ pub async fn fetch_subscription_report(sub: &Subscription) -> Result<Subscriptio
     })
 }
 
-fn uri_entry_count(content: &str) -> usize {
+fn subscription_entry_count(content: &str) -> usize {
     let count = |text: &str| {
         text.lines()
             .filter(|line| {
@@ -136,9 +136,16 @@ fn uri_entry_count(content: &str) -> usize {
             })
             .count()
     };
+    let clash_count = |text: &str| {
+        serde_yaml::from_str::<serde_yaml::Value>(text)
+            .ok()
+            .and_then(|value| value.get("proxies")?.as_sequence().map(Vec::len))
+            .unwrap_or(0)
+    };
     let content = content.trim_start_matches('\u{feff}').trim();
     match detect_format(content) {
         SubFormat::PlainLines => count(content),
+        SubFormat::Clash => clash_count(content),
         SubFormat::Base64Lines => {
             let clean: String = content
                 .chars()
@@ -152,8 +159,11 @@ fn uri_entry_count(content: &str) -> usize {
             decoded
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
-                .filter(|text| detect_format(text) == SubFormat::PlainLines)
-                .map_or(0, |text| count(&text))
+                .map_or(0, |text| match detect_format(&text) {
+                    SubFormat::PlainLines => count(&text),
+                    SubFormat::Clash => clash_count(&text),
+                    _ => 0,
+                })
         }
         _ => 0,
     }
@@ -338,12 +348,22 @@ mod tests {
     }
 
     #[test]
-    fn import_diagnostics_count_uri_entries_without_config_urls() {
+    fn import_diagnostics_count_uri_and_clash_entries_without_config_urls() {
         let lines = "# comment\nss://example.invalid\nunsupported://example.invalid\n";
-        assert_eq!(uri_entry_count(lines), 2);
-        assert_eq!(uri_entry_count(&general_purpose::STANDARD.encode(lines)), 2);
+        assert_eq!(subscription_entry_count(lines), 2);
         assert_eq!(
-            uri_entry_count("proxies: []\nurl: https://example.invalid"),
+            subscription_entry_count(&general_purpose::STANDARD.encode(lines)),
+            2
+        );
+        let clash = "proxies:\n  - {name: good, type: ss, server: good.invalid, port: 8388, cipher: aes-128-gcm, password: synthetic}\n  - {name: bad, type: unsupported, server: bad.invalid, port: 443}\n";
+        assert_eq!(subscription_entry_count(clash), 2);
+        assert_eq!(parse_subscription_content(clash, "auto").unwrap().len(), 1);
+        assert_eq!(
+            subscription_entry_count(&general_purpose::STANDARD.encode(clash)),
+            2
+        );
+        assert_eq!(
+            subscription_entry_count("proxies: []\nurl: https://example.invalid"),
             0
         );
     }
