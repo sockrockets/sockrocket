@@ -37,7 +37,8 @@ pub use config::rules_batch::{
 };
 pub use config::singbox::{parse_singbox_config, parse_singbox_outbound};
 pub use config::subscription::{
-    SUB_FETCH_TIMEOUT_SECS, detect_format, fetch_subscription, parse_subscription_content,
+    SUB_FETCH_TIMEOUT_SECS, detect_format, fetch_subscription, fetch_subscription_with,
+    parse_subscription_content,
 };
 pub use config::v2ray::{
     node_to_share_uri, parse_hysteria2_uri, parse_proxy_uri, parse_ss_uri, parse_trojan_uri,

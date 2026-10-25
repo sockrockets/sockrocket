@@ -43,7 +43,7 @@ serde_yaml = "0.9"
 # Networking (default-features off: we only need rustls + json; this drops
 # native-tls/openssl, the `charset` transcoding, and the macOS system-config
 # watcher. HTTPS still works via rustls; responses are decoded as UTF-8.)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "socks"] }
 
 # Crypto & proxy
 # default-features off drops the hickory DNS resolver stack; we only use

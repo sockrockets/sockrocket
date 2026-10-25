@@ -1,3 +1,7 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose;
@@ -37,9 +41,18 @@ pub fn validate_subscription_url(input: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch a subscription URL and parse it into nodes
+/// Fetch a subscription URL and parse it into nodes.
 pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
-    Ok(fetch_subscription_report(sub).await?.nodes)
+    fetch_subscription_with(sub, None).await
+}
+
+/// Same as [`fetch_subscription`], with a local SOCKS fallback when direct
+/// download fails. `socks` is `127.0.0.1:<socks_port>` while the daemon is up.
+pub async fn fetch_subscription_with(
+    sub: &Subscription,
+    socks: Option<SocketAddr>,
+) -> Result<Vec<Node>> {
+    Ok(fetch_subscription_report_with(sub, socks).await?.nodes)
 }
 
 /// Safe import diagnostics: counts only, never subscription entries or credentials.
@@ -51,46 +64,15 @@ pub struct SubscriptionFetchReport {
 }
 
 pub async fn fetch_subscription_report(sub: &Subscription) -> Result<SubscriptionFetchReport> {
+    fetch_subscription_report_with(sub, None).await
+}
+
+pub async fn fetch_subscription_report_with(
+    sub: &Subscription,
+    socks: Option<SocketAddr>,
+) -> Result<SubscriptionFetchReport> {
     validate_subscription_url(&sub.url)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(SUB_FETCH_TIMEOUT_SECS))
-        .user_agent("Sockrocket/0.1")
-        .build()
-        .context("Failed to create HTTP client")?;
-
-    let mut response = client
-        .get(&sub.url)
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .context("Failed to fetch subscription")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("Subscription returned HTTP {}", status);
-    }
-
-    anyhow::ensure!(
-        response
-            .content_length()
-            .is_none_or(|length| length <= MAX_SUBSCRIPTION_BYTES as u64),
-        "Subscription exceeds the 8 MiB size limit"
-    );
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .context("Failed to read subscription body")?
-    {
-        anyhow::ensure!(
-            chunk.len() <= MAX_SUBSCRIPTION_BYTES.saturating_sub(body.len()),
-            "Subscription exceeds the 8 MiB size limit"
-        );
-        body.extend_from_slice(&chunk);
-    }
-    let content = String::from_utf8(body).context("Subscription is not valid UTF-8")?;
+    let content = download_subscription(&sub.url, socks).await?;
 
     let mut nodes = parse_subscription_content(&content, &sub.format)?;
     anyhow::ensure!(
@@ -125,6 +107,190 @@ pub async fn fetch_subscription_report(sub: &Subscription) -> Result<Subscriptio
         skipped_entries,
         compatibility_notes,
     })
+}
+
+const DIRECT_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const PROXY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct BodyError {
+    transport: bool,
+    error: anyhow::Error,
+}
+
+/// Direct download first, then the local SOCKS port.
+///
+/// fancyss resolves the subscription host at 223.5.5.5 and fetches that
+/// address from the WAN. On Merlin the system resolver is this process, so
+/// a normal lookup returns a fake-IP and the download is sent through the
+/// current node. Domestic A records stay on the WAN. A connect failure
+/// retries through local SOCKS, which resolves the name on the far side.
+async fn download_subscription(url: &str, socks: Option<SocketAddr>) -> Result<String> {
+    let direct = subscription_client(None)?;
+    match fetch_body(&direct, url).await {
+        Ok(body) => Ok(body),
+        Err(error) if error.transport => {
+            let Some(socks) = socks else {
+                return Err(error.error);
+            };
+            if !socks_accepts(socks).await {
+                return Err(error.error);
+            }
+            tracing::info!("subscription direct download failed; using the local proxy");
+            let proxy = subscription_client(Some(socks))?;
+            fetch_body(&proxy, url).await.map_err(|error| error.error)
+        }
+        Err(error) => Err(error.error),
+    }
+}
+
+fn subscription_client(socks: Option<SocketAddr>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(if socks.is_some() {
+            PROXY_FETCH_TIMEOUT
+        } else {
+            DIRECT_FETCH_TIMEOUT
+        })
+        .user_agent("Sockrocket/0.1")
+        .redirect(reqwest::redirect::Policy::limited(5));
+    if let Some(socks) = socks {
+        let proxy = reqwest::Proxy::all(format!("socks5h://{socks}"))
+            .context("Failed to configure subscription proxy")?;
+        builder = builder.proxy(proxy);
+    } else {
+        let domestic_first = std::fs::read_to_string("/etc/resolv.conf")
+            .is_ok_and(|text| crate::proxy::transport::nameservers_are_self_loop(&text));
+        builder = builder.dns_resolver(Arc::new(SubscriptionResolver { domestic_first }));
+    }
+    builder.build().context("Failed to create HTTP client")
+}
+
+async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyError> {
+    let mut response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let transport = error.status().is_none();
+            return Err(BodyError {
+                transport,
+                error: anyhow::Error::from(error.without_url())
+                    .context("Failed to fetch subscription"),
+            });
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Err(BodyError {
+            transport: false,
+            error: anyhow::anyhow!("Subscription returned HTTP {status}"),
+        });
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SUBSCRIPTION_BYTES as u64)
+    {
+        return Err(BodyError {
+            transport: false,
+            error: anyhow::anyhow!("Subscription exceeds the 8 MiB size limit"),
+        });
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if chunk.len() > MAX_SUBSCRIPTION_BYTES.saturating_sub(body.len()) {
+                    return Err(BodyError {
+                        transport: false,
+                        error: anyhow::anyhow!("Subscription exceeds the 8 MiB size limit"),
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return Err(BodyError {
+                    transport: true,
+                    error: anyhow::Error::from(error.without_url())
+                        .context("Failed to read subscription body"),
+                });
+            }
+        }
+    }
+    String::from_utf8(body).map_err(|error| BodyError {
+        transport: false,
+        error: anyhow::Error::from(error).context("Subscription is not valid UTF-8"),
+    })
+}
+
+async fn socks_accepts(addr: SocketAddr) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+struct SubscriptionResolver {
+    domestic_first: bool,
+}
+
+impl reqwest::dns::Resolve for SubscriptionResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().trim_end_matches('.').to_owned();
+        let domestic_first = self.domestic_first;
+        Box::pin(async move {
+            let ips = resolve_subscription_host(&host, domestic_first).await;
+            if ips.is_empty() {
+                return Err(Box::new(std::io::Error::other(
+                    "subscription DNS returned no address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: reqwest::dns::Addrs =
+                Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+            Ok(addrs)
+        })
+    }
+}
+
+async fn resolve_subscription_host(host: &str, domestic_first: bool) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse() {
+        return subscription_addresses([ip]);
+    }
+    if domestic_first && let Some(ip) = domestic_a(host).await {
+        return subscription_addresses([ip]);
+    }
+    let Ok(addrs) = tokio::net::lookup_host((host, 0u16)).await else {
+        return Vec::new();
+    };
+    subscription_addresses(addrs.map(|addr| addr.ip()))
+}
+
+async fn domestic_a(host: &str) -> Option<IpAddr> {
+    let ali = "223.5.5.5:53".parse().unwrap();
+    let tencent = "119.29.29.29:53".parse().unwrap();
+    let (first, second) = tokio::join!(
+        crate::dns::lookup_a_udp(ali, host),
+        crate::dns::lookup_a_udp(tencent, host),
+    );
+    first.or(second)
+}
+
+fn subscription_addresses(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for ip in ips {
+        let IpAddr::V4(v4) = ip else {
+            continue;
+        };
+        if crate::dns::fakeip::is_fake_ip(v4) || v4.is_unspecified() {
+            continue;
+        }
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
 }
 
 fn subscription_entry_count(content: &str) -> usize {
@@ -451,6 +617,23 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].name, "SS-1");
         assert_eq!(nodes[1].name, "SS-2");
+    }
+
+    #[test]
+    fn subscription_addresses_keep_real_ipv4_only() {
+        let ips = subscription_addresses([
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 8)),
+            IpAddr::V6("2001:db8::1".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        ]);
+        assert_eq!(
+            ips,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            ]
+        );
     }
 
     #[test]

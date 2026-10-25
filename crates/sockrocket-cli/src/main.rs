@@ -12,7 +12,8 @@ use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
     SharedOutbound, SwappableOutbound, TrafficLedger, TunProxy, apply_subscription_refresh,
-    create_outbound, fetch_subscription, flush_system_dns_cache, node_fingerprint, node_public_id,
+    create_outbound, fetch_subscription_with, flush_system_dns_cache, node_fingerprint,
+    node_public_id,
     normalize_node_names, publish_traffic_catalog, resolve_to_ips, set_catalog_active,
     set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
@@ -1069,7 +1070,8 @@ async fn resolve_config(
 
     let mut refreshed = Vec::new();
     for subscription in &config.subscriptions {
-        match fetch_subscription(subscription).await {
+        let socks = std::net::SocketAddr::from(([127, 0, 0, 1], config.socks_port));
+        match fetch_subscription_with(subscription, Some(socks)).await {
             Ok(nodes) if nodes.is_empty() => {
                 tracing::warn!(
                     "Subscription '{}' fetched OK but produced 0 nodes (check format / content)",
