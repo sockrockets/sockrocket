@@ -13,9 +13,8 @@ use sockrocket_core::{
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
     SharedOutbound, SwappableOutbound, TrafficLedger, TunProxy, apply_subscription_refresh,
     create_outbound, fetch_subscription_with, flush_system_dns_cache, node_fingerprint,
-    node_public_id,
-    normalize_node_names, publish_traffic_catalog, resolve_to_ips, set_catalog_active,
-    set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
+    node_public_id, normalize_node_names, publish_traffic_catalog, resolve_to_ips,
+    set_catalog_active, set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
 
 fn main() -> Result<()> {

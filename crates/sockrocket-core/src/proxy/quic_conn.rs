@@ -109,7 +109,12 @@ const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// True when a used QUIC path is too slow to keep. High latency, or a window
 /// that collapsed and is still losing packets.
-pub(crate) fn path_should_retire(sent: u64, lost: u64, rtt: std::time::Duration, cwnd: u64) -> bool {
+pub(crate) fn path_should_retire(
+    sent: u64,
+    lost: u64,
+    rtt: std::time::Duration,
+    cwnd: u64,
+) -> bool {
     if sent < RETIRE_MIN_SENT {
         return false;
     }
@@ -412,8 +417,18 @@ mod tests {
     fn young_or_quiet_quic_paths_stay_cached() {
         use std::time::Duration;
         assert!(!path_should_retire(10, 10, Duration::from_secs(3), 1_000));
-        assert!(!path_should_retire(1_000, 0, Duration::from_millis(200), 8_000));
-        assert!(!path_should_retire(1_000, 10, Duration::from_millis(400), 64_000));
+        assert!(!path_should_retire(
+            1_000,
+            0,
+            Duration::from_millis(200),
+            8_000
+        ));
+        assert!(!path_should_retire(
+            1_000,
+            10,
+            Duration::from_millis(400),
+            64_000
+        ));
     }
 
     #[test]
@@ -425,7 +440,12 @@ mod tests {
             Duration::from_millis(1000),
             200_000
         ));
-        assert!(path_should_retire(400, 100, Duration::from_millis(200), 8_000));
+        assert!(path_should_retire(
+            400,
+            100,
+            Duration::from_millis(200),
+            8_000
+        ));
         assert!(!path_should_retire(
             400,
             100,
