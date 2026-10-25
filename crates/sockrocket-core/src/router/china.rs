@@ -232,6 +232,17 @@ const CHINA_DOMAIN_SUFFIXES: &[&str] = &[
     "zj.cn",
     "js.cn",
     "gd.cn",
+    // Accelerators geolocate the WAN address of their own API. A proxied
+    // login is reported as overseas and the client switches to the
+    // international build. These names use domestic DNS and stay direct
+    // even when that DNS returns a CDN address missing from geoip:CN.
+    "leigod.com",
+    "leigod.cn",
+    "leigodjsq.com",
+    "nn.com",
+    "nnbooster.com",
+    // Chiphell rejects connections whose source address is not in China.
+    "chiphell.com",
 ];
 
 /// Keywords that indicate China-specific traffic.
@@ -274,6 +285,8 @@ mod tests {
             "CDN-heavy domestic names must be on the shared list"
         );
         assert!(dns.iter().any(|s| s == "hdslb.com"));
+        assert!(dns.iter().any(|s| s == "leigod.com"));
+        assert!(dns.iter().any(|s| s == "chiphell.com"));
     }
 
     #[test]
@@ -295,6 +308,16 @@ mod tests {
             router.route("example.cn", 80),
             RouteAction::Direct,
             ".cn should be direct"
+        );
+        assert_eq!(
+            router.route("webapi.leigod.com", 443),
+            RouteAction::Direct,
+            "Leigod API must egress from the WAN, or the client switches to the overseas build"
+        );
+        assert_eq!(
+            router.route("www.chiphell.com", 443),
+            RouteAction::Direct,
+            "Chiphell rejects non-China source addresses"
         );
     }
 
