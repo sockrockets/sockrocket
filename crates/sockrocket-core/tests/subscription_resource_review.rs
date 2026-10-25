@@ -10,6 +10,7 @@ fn sub(url: String) -> Subscription {
         format: "clash".into(),
         last_updated: None,
         refresh_interval_hours: 24,
+        refresh_revision: String::new(),
     }
 }
 async fn serve(headers: String, body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {

@@ -124,6 +124,7 @@ fn slow_refresh_does_not_block_edits_or_restore_a_deleted_subscription() {
         format: "auto".into(),
         last_updated: None,
         refresh_interval_hours: 24,
+        refresh_revision: String::new(),
     });
     fs::write(
         fixture.0.join("config.yaml"),
@@ -186,6 +187,7 @@ fn partial_delete_during_refresh_counts_only_saved_nodes() {
         format: "auto".into(),
         last_updated: None,
         refresh_interval_hours: 24,
+        refresh_revision: String::new(),
     });
     config.subscriptions.push(sockrocket_core::Subscription {
         name: "Kept".into(),
@@ -193,6 +195,7 @@ fn partial_delete_during_refresh_counts_only_saved_nodes() {
         format: "auto".into(),
         last_updated: None,
         refresh_interval_hours: 24,
+        refresh_revision: String::new(),
     });
     fs::write(
         fixture.0.join("config.yaml"),
@@ -397,6 +400,7 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         });
         let mut nodes = vec![
             sockrocket_core::config::v2ray::parse_ss_uri(&format!(
@@ -716,6 +720,7 @@ fn invalid_addresses_are_skipped_without_losing_existing_nodes_or_reporting_succ
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         })
         .collect();
     config.nodes = vec![

@@ -2004,6 +2004,7 @@ impl AppState {
                 format: "auto".to_string(),
                 last_updated: None,
                 refresh_interval_hours: 24,
+                refresh_revision: sockrocket_core::config::storage::new_subscription_revision(),
             });
             self.schedule_persist(cx);
         }
@@ -2018,6 +2019,7 @@ impl AppState {
             format: "auto".to_string(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: sockrocket_core::config::storage::new_subscription_revision(),
         };
 
         cx.spawn(async move |weak, cx| {
@@ -2055,6 +2057,8 @@ impl AppState {
                         if let Some(existing) = this.subscriptions.iter_mut().find(|s| s.url == url)
                         {
                             existing.last_updated = Some(now);
+                            existing.refresh_revision =
+                                sockrocket_core::config::storage::new_subscription_revision();
                         } else {
                             this.subscriptions.push(Subscription {
                                 name: format!("Sub {}", this.subscriptions.len() + 1),
@@ -2062,6 +2066,8 @@ impl AppState {
                                 format: "auto".to_string(),
                                 last_updated: Some(now),
                                 refresh_interval_hours: 24,
+                                refresh_revision:
+                                    sockrocket_core::config::storage::new_subscription_revision(),
                             });
                         }
                         this.schedule_persist(cx);

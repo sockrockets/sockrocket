@@ -73,8 +73,9 @@ fn detach_sources(nodes: &mut Vec<Node>, removed: &HashSet<String>) {
 /// Fresh nodes win fingerprint ties, so an updated password replaces the
 /// saved copy. Hand-added nodes (no subscription tag) and nodes from a
 /// subscription that failed to refresh stay. Returns whether anything was
-/// applied. Also records `last_updated` on the refreshed subscriptions and
-/// keeps `active_node` pointing at the same server when it still exists.
+/// applied. Also records `last_updated`, rotates the refresh revision so older
+/// downloads are rejected, and keeps `active_node` pointing at the same server
+/// when it still exists.
 pub fn apply_subscription_refresh(
     config: &mut AppConfig,
     refreshed: Vec<(String, Vec<Node>)>,
@@ -118,6 +119,7 @@ pub fn apply_subscription_refresh(
     for subscription in &mut config.subscriptions {
         if urls.contains(&subscription.url) {
             subscription.last_updated = Some(now);
+            subscription.refresh_revision = super::storage::new_subscription_revision();
         }
     }
     true
@@ -578,6 +580,7 @@ mod tests {
                     format: "auto".into(),
                     last_updated: None,
                     refresh_interval_hours: 24,
+                    refresh_revision: String::new(),
                 },
                 Subscription {
                     name: "B".into(),
@@ -585,6 +588,7 @@ mod tests {
                     format: "auto".into(),
                     last_updated: None,
                     refresh_interval_hours: 24,
+                    refresh_revision: String::new(),
                 },
             ],
             ..AppConfig::default()
@@ -648,6 +652,7 @@ mod provenance_review {
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         }
     }
     #[test]

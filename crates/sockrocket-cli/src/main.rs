@@ -1010,7 +1010,7 @@ async fn load_config(path: &str) -> Result<AppConfig> {
                 Path::new(path),
                 refreshed,
             ) {
-                Ok(current) => current,
+                Ok(commit) => commit.config,
                 Err(error) => {
                     tracing::warn!(
                         "Subscription save failed; preserving disk configuration: {error}"
@@ -1039,7 +1039,14 @@ async fn load_config(path: &str) -> Result<AppConfig> {
 /// occurrence, which is the older entry.
 async fn resolve_config(
     mut config: AppConfig,
-) -> Result<(AppConfig, bool, Vec<(String, Vec<sockrocket_core::Node>)>)> {
+) -> Result<(
+    AppConfig,
+    bool,
+    Vec<(
+        sockrocket_core::config::storage::SubscriptionRefreshSnapshot,
+        Vec<sockrocket_core::Node>,
+    )>,
+)> {
     tracing::info!(
         "Fetching {} subscription(s) from config",
         config.subscriptions.len()
@@ -1060,7 +1067,13 @@ async fn resolve_config(
                     nodes.len(),
                     subscription.name
                 );
-                refreshed.push((subscription.url.clone(), nodes));
+                refreshed.push((
+                    sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
+                        url: subscription.url.clone(),
+                        revision: subscription.refresh_revision.clone(),
+                    },
+                    nodes,
+                ));
             }
             Err(e) => {
                 // One bad URL must not prevent the daemon (or other subs) from starting.
@@ -1073,7 +1086,13 @@ async fn resolve_config(
         }
     }
 
-    let changed = apply_subscription_refresh(&mut config, refreshed.clone());
+    let changed = apply_subscription_refresh(
+        &mut config,
+        refreshed
+            .iter()
+            .map(|(source, nodes)| (source.url.clone(), nodes.clone()))
+            .collect(),
+    );
     normalize_node_names(&mut config.nodes);
     Ok((config, changed, refreshed))
 }
@@ -1481,6 +1500,7 @@ mod tests {
                 format: "auto".into(),
                 last_updated: Some(1),
                 refresh_interval_hours: 24,
+                refresh_revision: String::new(),
             }],
             ..AppConfig::default()
         };

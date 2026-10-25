@@ -785,8 +785,8 @@ fn validate_advanced_config(text: &str) -> Result<()> {
     let raw: Y = serde_yaml::from_str(text)?;
     let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
     let transparent = raw
-        .get("transparent_proxy")
-        .and_then(Y::as_bool)
+        .as_mapping()
+        .map(|map| effective_toggles(map).0)
         .unwrap_or(true);
     anyhow::ensure!(
         !transparent
@@ -838,6 +838,10 @@ fn sub_entry(name: &str, url: &str, format: &str) -> Y {
     m.insert(ykey("name"), Y::String(name.to_string()));
     m.insert(ykey("url"), Y::String(url.to_string()));
     m.insert(ykey("format"), Y::String(format.to_string()));
+    m.insert(
+        ykey("refresh_revision"),
+        Y::String(sockrocket_core::config::storage::new_subscription_revision()),
+    );
     Y::Mapping(m)
 }
 
@@ -855,6 +859,7 @@ fn fetch_sub_nodes(
         format: format.to_string(),
         last_updated: None,
         refresh_interval_hours: 24,
+        refresh_revision: String::new(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -919,7 +924,7 @@ fn act_add_sub(post: &J) -> J {
     ) {
         return err_msg("Unsupported subscription format");
     }
-    let name = {
+    let (name, revision) = {
         // Only the read/modify/commit step needs the configuration lock.
         // Downloading under this lock made every other edit time out.
         let Ok(_transaction) = storage::MutationGuard::acquire() else {
@@ -953,12 +958,18 @@ fn act_add_sub(post: &J) -> J {
         } else {
             name.to_owned()
         };
-        seq.push(sub_entry(&name, url, format));
+        let entry = sub_entry(&name, url, format);
+        let revision = entry
+            .get(ykey("refresh_revision"))
+            .and_then(Y::as_str)
+            .expect("new subscriptions have a refresh revision")
+            .to_owned();
+        seq.push(entry);
         map.insert(ykey("subscriptions"), Y::Sequence(seq));
         if let Err(e) = save_conf(&map) {
             return json!({"ok": false, "msg": format!("Save failed: {e}")});
         }
-        name
+        (name, revision)
     };
 
     // Fetch + parse here (not only on restart) so the Web UI can show a real
@@ -982,12 +993,18 @@ fn act_add_sub(post: &J) -> J {
             let fetched = nodes.len();
             let saved = sockrocket_core::config::storage::commit_subscription_refresh(
                 &conf_path(),
-                vec![(url.to_string(), nodes)],
+                vec![(
+                    sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
+                        url: url.to_string(),
+                        revision,
+                    },
+                    nodes,
+                )],
             )
             .map_err(|error| error.to_string());
             match saved {
-                Ok(cfg) if cfg.subscriptions.iter().any(|source| source.url == url) => {
-                    let total = cfg.nodes.len();
+                Ok(commit) if commit.applied_urls.iter().any(|source| source == url) => {
+                    let total = commit.config.nodes.len();
                     if let Err(error) = run_sh("restart") {
                         return err_msg(&error.to_string());
                     }
@@ -999,7 +1016,7 @@ fn act_add_sub(post: &J) -> J {
                     })
                 }
                 Ok(_) => json!({"ok":false,"error_code":"subscription_removed",
-                    "msg":"订阅在下载期间被删除；下载结果已丢弃，现有节点保持不变"}),
+                    "msg":"订阅在下载期间被删除或已由另一任务更新；过期下载已丢弃，现有节点保持不变"}),
                 Err(e) => json!({
                     "ok": false,
                     "msg": format!("Parsed {fetched} node(s) but failed to save: {e}")
@@ -1127,7 +1144,13 @@ fn act_update_subs() -> J {
                         report.skipped_entries
                     ));
                 }
-                refreshed.push((url, report.nodes));
+                refreshed.push((
+                    sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
+                        url,
+                        revision: get("refresh_revision"),
+                    },
+                    report.nodes,
+                ));
             }
             Err(e) => {
                 skipped_subscriptions += 1;
@@ -1158,9 +1181,9 @@ fn act_update_subs() -> J {
     subscription_jobs::progress(subs.len(), subs.len(), "applying");
     let fetched_by_url: std::collections::HashMap<_, _> = refreshed
         .iter()
-        .map(|(url, nodes)| (url.clone(), nodes.len()))
+        .map(|(source, nodes)| (source.url.clone(), nodes.len()))
         .collect();
-    let cfg = match sockrocket_core::config::storage::commit_subscription_refresh(
+    let commit = match sockrocket_core::config::storage::commit_subscription_refresh(
         &conf_path(),
         refreshed,
     ) {
@@ -1169,22 +1192,20 @@ fn act_update_subs() -> J {
             return json!({"ok": false, "msg": format!("Fetched nodes but save failed: {error}")});
         }
     };
-    let applied: Vec<_> = fetched_by_url
-        .keys()
-        .filter(|url| cfg.subscriptions.iter().any(|source| source.url == **url))
-        .cloned()
-        .collect();
+    let applied = &commit.applied_urls;
     if applied.is_empty() {
         return json!({"ok":false,"error_code":"subscriptions_removed",
-            "msg":"订阅在下载期间被删除；下载结果已丢弃，现有节点保持不变"});
+            "msg":"订阅在下载期间被删除或已由另一任务更新；过期下载已丢弃，现有节点保持不变"});
     }
     let fetched: usize = applied.iter().map(|url| fetched_by_url[url]).sum();
     let dropped = fetched_by_url.len() - applied.len();
     if dropped > 0 {
         skipped_subscriptions += dropped;
-        errors.push(format!("{dropped} 个订阅在下载期间被删除，其节点已丢弃"));
+        errors.push(format!(
+            "{dropped} 个订阅在下载期间被删除或已由另一任务更新，其过期节点已丢弃"
+        ));
     }
-    let total = cfg.nodes.len();
+    let total = commit.config.nodes.len();
     if let Err(error) = run_sh("restart") {
         return err_msg(&error.to_string());
     }
@@ -4171,6 +4192,7 @@ dns_direct_domains:
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         });
         let node = |server| {
             sockrocket_core::parse_proxy_uri(&format!(
@@ -4806,6 +4828,17 @@ dns_direct_domains:
         let r = act_save_config(&json!({"config": bad_dns}));
         assert_eq!(r["ok"], J::Bool(false), "unusable DNS policy rejected: {r}");
         assert!(fs::read_to_string(conf_path()).unwrap().contains("Node A"));
+
+        let legacy_socks = B64.encode(format!(
+            "{}\ndns:\n  strategy: ipv6_only\nipv6_mode: compatibility\n",
+            SAMPLE.replace("mode: \"tun\"", "mode: \"socks\"")
+        ));
+        let r = act_save_config(&json!({"config": legacy_socks}));
+        assert_eq!(
+            r["ok"],
+            J::Bool(true),
+            "legacy SOCKS mode remains valid: {r}"
+        );
 
         let good = B64.encode(SAMPLE.replace("Node A", "Node A2"));
         let r = act_save_config(&json!({"config": good}));
