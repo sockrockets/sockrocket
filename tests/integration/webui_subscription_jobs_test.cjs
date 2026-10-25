@@ -89,6 +89,20 @@ notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_c
 assert.equal(notes.element('sub-notes').hidden,false);
 assert.match(notes.element('sub-notes-text').textContent,/已启用 Chrome 115/);
 assert.match(notes.element('sub-notes-text').textContent,/不模拟 ALPS/);
+notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_mport_fixed_port']});
+assert.equal(notes.element('sub-notes').hidden,false);
+assert.match(notes.element('sub-notes-text').textContent,/固定端口导入/);
+assert.match(notes.element('sub-notes-text').textContent,/不会定期切换端口/);
 notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:[]});
 assert.equal(notes.element('sub-notes').hidden,true);
 console.log('PASS: optional names, invalid-address rejection and informational compatibility notes');
+const counted=fixture();counted.context.srLoadSubs();
+counted.request('subscriptions')[2]({subs:[
+  {index:0,name:'First',format:'auto',node_count:71,url:'https://example.invalid/private-one'},
+  {index:1,name:'Second',format:'clash',node_count:89,url:'https://example.invalid/private-two'}
+],shared_nodes:6});
+assert.match(counted.element('sub-list').innerHTML,/已导入 71 个节点/);
+assert.match(counted.element('sub-list').innerHTML,/已导入 89 个节点/);
+assert.match(counted.element('sub-list').innerHTML,/6 个节点由多个订阅共用/);
+assert.doesNotMatch(counted.element('sub-list').innerHTML,/private-one|private-two/);
+console.log('PASS: per-subscription counts and shared-node explanation');

@@ -59,15 +59,40 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         run(prelude + defaults + '\ninstall_default_config\n')
         assert not (root / 'stopped').exists()
         assert config.read_bytes() == b'fixture configuration retained\n'
+        assert config.stat().st_mode & 0o777 == 0o600, 'existing config must become private'
         (root / 'stopped').touch()
         run(prelude + defaults + '\ninstall_default_config\n')
         assert (root / 'stopped').exists()
+        backup = root / 'config.yaml.bak'
+        backup.write_bytes(b'old backup\n')
+        config.chmod(0o644)
+        backup.chmod(0o644)
+        backup_start = source.index('    if [ -f "$SOCKROCKET_CONF" ]; then', source.index('install_common_files() {'))
+        backup_end = source.index('    info "Installing sockrocket-cli binary..."', backup_start)
+        run(prelude + source[backup_start:backup_end])
+        assert config.stat().st_mode & 0o777 == 0o600, 'upgrade config must become private'
+        assert backup.stat().st_mode & 0o777 == 0o600, 'upgrade backup must become private'
+        assert backup.read_bytes() == config.read_bytes()
+        backup.unlink()
+        unrelated = root / 'unrelated'
+        unrelated.write_bytes(b'leave this file untouched\n')
+        backup.symlink_to(unrelated)
+        assert run(prelude + source[backup_start:backup_end], check=False).returncode != 0
+        assert unrelated.read_bytes() == b'leave this file untouched\n', 'backup must not follow a symlink'
+        backup.unlink()
         # Fresh install has no proxy start intent, even after delayed retries.
         config.unlink()
         (root / 'stopped').unlink()
         run(prelude + defaults + '\ninstall_default_config\n')
         assert config.read_bytes() == b'fresh default configuration\n'
+        assert config.stat().st_mode & 0o777 == 0o600, 'fresh config must start private'
         assert (root / 'stopped').exists()
+        # A mounted JFFS directory is insufficient when Merlin has disabled
+        # execution of custom scripts; fail before publishing hook-dependent files.
+        jffs_guard = source[source.index('# Merlin only dispatches /jffs/scripts/*'):
+                            source.index('# ── Shared helpers', source.index('# Merlin only dispatches /jffs/scripts/*'))]
+        assert run('have() { :; }\nnvram() { echo 0; }\n' + jffs_guard, check=False).returncode != 0
+        run('have() { :; }\nnvram() { echo 1; }\n' + jffs_guard)
         # Exercise the installed boot wrapper, not a hand-written duplicate.
         a = source.index("    printf '%s\\n' \\\n", source.index('# koolshare startup wrapper'))
         b = source.index('    chmod +x "$KS_SCRIPTS/${MODULE}_config.sh"', a)
@@ -98,7 +123,54 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         assert response == 'Sockrocket stopped' and 'PID' not in response
         subprocess.run(['sh', str(status_path), '123'], env=requested, check=True)
         assert '--data Sockrocket stopped http://127.0.0.1:3030/_resp/123' in (root / 'response').read_text()
+
+        # Install the actual Merlin hook bodies in a sandbox. This caught a
+        # shift-2 regression that wrote marker-only, nonfunctional scripts.
+        hook_dir = root / 'hooks'
+        hook_dir.mkdir()
+        (hook_dir / 'wan-event').write_text('#!/bin/sh\n: # another add-on hook\n')
+        control.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$SOCKROCKET_DIR/hook-calls"\n')
+        control.chmod(0o700)
+        hook_helper = source[source.index('install_hook() {'):source.index('# Bring up API')]
+        wan_helper = source[source.index('install_wan_hooks() {'):source.index('ks_install() {')]
+        hook_calls = source[source.index('    install_hook "/jffs/scripts/firewall-start"'):source.index('    # Post-install validation')]
+        hook_script = (wan_helper + hook_calls).replace('/jffs/scripts/', str(hook_dir) + '/')
+        hook_script = hook_script.replace('/jffs/addons/sockrocket/scripts/sockrocket.sh', str(control))
+        assert source.count('    install_wan_hooks\n') == 2, 'both standard and koolcenter installs need WAN hooks'
+        assert source.count('    install_dns_postconf_hook\n') == 2, 'both install modes need isolated 3006 DNS'
+        run('ok() { :; }\n' + hook_helper + hook_script)
+        run('ok() { :; }\n' + hook_helper + hook_script)
+        assert ': # another add-on hook' in (hook_dir / 'wan-event').read_text()
+        assert (hook_dir / 'dnsmasq.postconf').read_text().count('dnsmasq-postconf.sh "$1"') == 1
+
+        def event(name, *args):
+            subprocess.run(['sh', str(hook_dir / name), *args], env=env, check=True)
+
+        event('wan-event', '0', 'connecting')
+        event('wan-event', '0', 'connected')
+        event('wan-event', '1', 'disconnected')
+        event('wan-start')
+        event('dhcpc-event', 'renew')
+        event('dhcpc-event', 'bound')
+        event('dhcpc-event', 'renew', '4')
+        event('dhcpc-event', 'bound', '6')
+        event('dhcpc-event', 'unbound', '6')
+        event('dhcpc-event', 'stopped', '6')
+        event('dhcpc-event', 'updated', '6')
+        event('dhcpc-event', 'rebound', '6')
+        event('dhcpc-event', 'ra-updated', '6')
+        event('dhcpc-event', 'deconfig')
+        event('firewall-start', 'ppp0')
+        event('nat-start')
+        event('services-start')
+        event('service-event', 'restart', 'Sockrocket')
+        assert (root / 'hook-calls').read_text().splitlines() == [
+            'wan-restore', 'wan-restore', 'pin-dns', 'pin-dns', 'pin-dns',
+            'dhcpv6-restore', 'dhcpv6-restore', 'dhcpv6-restore',
+            'dhcpv6-restore', 'dhcpv6-restore', 'dhcpv6-restore',
+            'firewall-restore', 'nat-restore', 'boot', 'restart',
+        ], 'WAN and DHCPv4/DHCPv6 events must dispatch once after idempotent installation'
     finally:
         old.terminate()
         old.wait()
-print('PASS: atomic upgrade, API restart, fresh install stopped, preserved upgrade intent and boot wrapper')
+print('PASS: atomic upgrade, preserved install intent, boot wrapper and WAN event hooks')

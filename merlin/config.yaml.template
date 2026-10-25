@@ -9,8 +9,9 @@ socks_port: 1080
 http_port: 1087
 dns_port: 5300             # Sockrocket built-in DNS listen port (dnsmasq forwards DNS queries here)
 dns_direct_server: "114.114.114.114"   # DNS server for direct domains (China ISP DNS)
-# api_port: 18188          # JSON API port for the Web UI (browser accesses http://<router>:18188/api;
-                           # change only if the default port is taken; run sockrocket.sh api-restart to apply)
+# api_port: 18188          # Internal loopback-only, token-protected API port.
+                           # The browser uses firmware CGI / Software Center RPC instead.
+                           # Change only if occupied; run sockrocket.sh api-restart to apply.
 
 # -- Proxy mode ----------------------------------------------------------------
 # tun    : TUN transparent proxy (recommended, needs TUN device permission)

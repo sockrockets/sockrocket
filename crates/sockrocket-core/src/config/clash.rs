@@ -317,6 +317,7 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
         other => anyhow::bail!("Unsupported proxy type: {}", other),
     };
 
+    let port = resolve_port(proxy)?;
     let mut extra = HashMap::new();
     if let Some(pin) = &proxy.fingerprint {
         let key = match proxy.proxy_type.as_str() {
@@ -328,6 +329,10 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
         extra.insert(key.into(), pin.iter().map(|b| format!("{b:02x}")).collect());
     }
     if matches!(proxy.proxy_type.as_str(), "hysteria2" | "hy2") {
+        if let Some(ports) = &proxy.ports {
+            super::v2ray::validate_hysteria2_mport(ports, port)?;
+            extra.insert(super::v2ray::HY2_MPORT.into(), ports.clone());
+        }
         for (value, key) in [
             (&proxy.up, super::v2ray::HY2_UP),
             (&proxy.down, super::v2ray::HY2_DOWN),
@@ -348,7 +353,7 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
     Ok(Node {
         name: super::model::decode_display_name(&proxy.name),
         server: proxy.server.clone(),
-        port: resolve_port(proxy)?,
+        port,
         protocol,
         transport,
         latency_ms: None,

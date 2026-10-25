@@ -99,18 +99,59 @@ impl MutationGuard {
     }
 }
 
+/// A snapshot identifies the exact subscription version that was downloaded.
+#[derive(Clone)]
+pub struct SubscriptionRefreshSnapshot {
+    pub url: String,
+    pub revision: String,
+}
+
+pub struct SubscriptionRefreshCommit {
+    pub config: super::model::AppConfig,
+    pub applied_urls: Vec<String>,
+}
+
+pub fn new_subscription_revision() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Fetches happen outside this transaction. Re-read current sources before
-/// merging results so a source deleted during download cannot reappear.
+/// merging results so deleted, replaced, or more recently refreshed sources
+/// cannot receive an older download.
 pub fn commit_subscription_refresh(
     path: &std::path::Path,
-    refreshed: Vec<(String, Vec<super::model::Node>)>,
-) -> Result<super::model::AppConfig> {
+    refreshed: Vec<(SubscriptionRefreshSnapshot, Vec<super::model::Node>)>,
+) -> Result<SubscriptionRefreshCommit> {
     let _guard = MutationGuard::acquire(path)?;
     let mut current = super::model::AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
-    if super::dedup::apply_subscription_refresh(&mut current, refreshed) {
+    let applicable: Vec<_> = refreshed
+        .into_iter()
+        .filter(|(snapshot, nodes)| {
+            !nodes.is_empty()
+                && current.subscriptions.iter().any(|source| {
+                    source.url == snapshot.url && source.refresh_revision == snapshot.revision
+                })
+        })
+        .collect();
+    let mut applied_urls: Vec<_> = applicable
+        .iter()
+        .map(|(snapshot, _)| snapshot.url.clone())
+        .collect();
+    applied_urls.sort_unstable();
+    applied_urls.dedup();
+    if super::dedup::apply_subscription_refresh(
+        &mut current,
+        applicable
+            .into_iter()
+            .map(|(snapshot, nodes)| (snapshot.url, nodes))
+            .collect(),
+    ) {
         write_nodes_and_subscriptions(path, &current)?;
     }
-    Ok(current)
+    Ok(SubscriptionRefreshCommit {
+        config: current,
+        applied_urls,
+    })
 }
 
 pub fn atomic_write_private(
@@ -216,6 +257,7 @@ mod tests {
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         });
         config.nodes.push(Node {
             name: "Example A".into(),
@@ -285,6 +327,7 @@ mod tests {
             format: "auto".into(),
             last_updated: Some(1),
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         });
         config.nodes.push(node_for_persist());
         config.active_node = Some(0);
@@ -295,6 +338,59 @@ mod tests {
         assert!(text.contains("mode:"));
         assert!(text.contains("https://example.com/sub/demo"));
         assert!(text.contains("192.0.2.1"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_refresh_cannot_replace_newer_or_readded_subscription() {
+        use crate::config::model::{AppConfig, Subscription};
+        let dir = std::env::temp_dir().join(format!(
+            "sockrocket-refresh-revision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let url = "https://example.invalid/sub";
+        let mut config = AppConfig::default();
+        config.subscriptions.push(Subscription {
+            name: "Legacy".into(),
+            url: url.into(),
+            format: "auto".into(),
+            last_updated: None,
+            refresh_interval_hours: 24,
+            refresh_revision: String::new(),
+        });
+        fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let first_revision = config.subscriptions[0].refresh_revision.clone();
+        assert!(first_revision.is_empty());
+        let source = SubscriptionRefreshSnapshot {
+            url: url.into(),
+            revision: first_revision.clone(),
+        };
+        let mut first = node_for_persist();
+        first.server = "newer.invalid".into();
+        let applied =
+            commit_subscription_refresh(&path, vec![(source.clone(), vec![first])]).unwrap();
+        assert_eq!(applied.applied_urls, [url]);
+        assert_ne!(
+            applied.config.subscriptions[0].refresh_revision,
+            first_revision
+        );
+
+        let mut older = node_for_persist();
+        older.server = "older.invalid".into();
+        let stale = commit_subscription_refresh(&path, vec![(source.clone(), vec![older.clone()])])
+            .unwrap();
+        assert!(stale.applied_urls.is_empty());
+        assert_eq!(stale.config.nodes[0].server, "newer.invalid");
+
+        let mut replacement = stale.config;
+        replacement.nodes.clear();
+        replacement.subscriptions[0].refresh_revision = new_subscription_revision();
+        write_nodes_and_subscriptions(&path, &replacement).unwrap();
+        let readded = commit_subscription_refresh(&path, vec![(source, vec![older])]).unwrap();
+        assert!(readded.applied_urls.is_empty());
+        assert!(readded.config.nodes.is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -205,6 +205,11 @@ impl FakeIpPool {
 
     /// Flush the domain↔IP map to disk. No-op when persistence is disabled.
     pub fn persist(&self) -> std::io::Result<()> {
+        let mut last = self.last_persist.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_locked(&mut last)
+    }
+
+    fn persist_locked(&self, last: &mut Option<Instant>) -> std::io::Result<()> {
         let Some(path) = self.persist_path.as_ref() else {
             return Ok(());
         };
@@ -222,24 +227,21 @@ impl FakeIpPool {
         for (ip, domain) in rows {
             out.push_str(&format!("{ip} {domain}\n"));
         }
-        let tmp = path.with_extension("store.tmp");
-        fs::write(&tmp, out)?;
-        fs::rename(&tmp, path)?;
-        if let Ok(mut last) = self.last_persist.lock() {
-            *last = Some(Instant::now());
-        }
+        // The guard covers snapshot and commit, so concurrent allocations or
+        // shutdown saves cannot rename a shared temporary file out from under
+        // another writer. The shared atomic writer uses a private unique temp.
+        crate::config::storage::atomic_write_private(path, &out, false)
+            .map_err(std::io::Error::other)?;
+        *last = Some(Instant::now());
         Ok(())
     }
 
     fn maybe_persist(&self) {
-        let Ok(last) = self.last_persist.lock() else {
-            return;
-        };
+        let mut last = self.last_persist.lock().unwrap_or_else(|e| e.into_inner());
         if last.is_some_and(|t| t.elapsed() < PERSIST_MIN_INTERVAL) {
             return;
         }
-        drop(last);
-        if let Err(e) = self.persist() {
+        if let Err(e) = self.persist_locked(&mut last) {
             tracing::debug!("fake-IP persist skipped/failed: {e}");
         }
     }
@@ -419,5 +421,41 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_keep_a_complete_mapping() {
+        let dir = std::env::temp_dir().join(format!("sockrocket-fakeip-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fakeip.store");
+        let pool = FakeIpPool::load_or_new(&path);
+        let mappings: Vec<_> = (0..128)
+            .map(|i| {
+                let name = format!("d{i}.example.invalid");
+                let ip = pool.allocate(&name);
+                (name, ip)
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let saves: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..4 {
+                        pool.persist().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for save in saves {
+            save.join().unwrap();
+        }
+        let restored = FakeIpPool::load_or_new(&path);
+        for (name, ip) in mappings {
+            assert_eq!(restored.lookup(ip).as_deref(), Some(name.as_str()));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

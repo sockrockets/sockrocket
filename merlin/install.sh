@@ -224,16 +224,24 @@ if [ "$UPDATE_ONLY" = "true" ]; then
     exit 0
 fi
 
+# Merlin only dispatches /jffs/scripts/* when this NVRAM switch is enabled.
+# A mounted JFFS directory alone does not prove that installed hooks will run.
+if have nvram && [ "$(nvram get jffs2_scripts 2>/dev/null)" = "0" ]; then
+    err "JFFS custom scripts are disabled. Enable them in Administration -> System before installing Sockrocket, then rerun install.sh."
+fi
+
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 install_default_config() {
     if [ -f "$SOCKROCKET_CONF" ]; then
+        chmod 600 "$SOCKROCKET_CONF" || err "Could not make the existing configuration private"
         ok "Existing config and proxy state preserved"
         return 0
     fi
     info "Generating default config (proxy stopped)..."
     # Persist Stop before any boot/retry hook can launch the daemon.
     : > "$SOCKROCKET_DIR/stopped" || err "Could not persist the default stopped state"
-    xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF" || err "Could not install default config"
+    (umask 077; xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF") || err "Could not install default config"
+    chmod 600 "$SOCKROCKET_CONF" || err "Could not make the default configuration private"
     ok "Default config at $SOCKROCKET_CONF"
 }
 
@@ -243,7 +251,12 @@ install_common_files() {
     mkdir -p "$SOCKROCKET_DIR" "$SOCKROCKET_SCRIPTS" "$CGI_BIN" /jffs/scripts /jffs/configs/dnsmasq.d 2>/dev/null
 
     if [ -f "$SOCKROCKET_CONF" ]; then
-        xcp "$SOCKROCKET_CONF" "$SOCKROCKET_CONF.bak"
+        chmod 600 "$SOCKROCKET_CONF" || err "Could not make the existing configuration private"
+        [ ! -L "$SOCKROCKET_CONF.bak" ] || err "Configuration backup path must not be a symlink"
+        [ ! -f "$SOCKROCKET_CONF.bak" ] || \
+            chmod 600 "$SOCKROCKET_CONF.bak" || err "Could not make the configuration backup private"
+        (umask 077; xcp "$SOCKROCKET_CONF" "$SOCKROCKET_CONF.bak") || err "Could not back up the configuration"
+        chmod 600 "$SOCKROCKET_CONF.bak" || err "Could not make the configuration backup private"
         ok "Existing config backed up to $SOCKROCKET_CONF.bak"
     fi
 
@@ -254,6 +267,7 @@ install_common_files() {
     info "Installing control scripts..."
     xcp "$SCRIPT_DIR/scripts/sockrocket.sh"       "$SOCKROCKET_SCRIPTS/sockrocket.sh"
     xcp "$SCRIPT_DIR/scripts/iptables.sh"  "$SOCKROCKET_SCRIPTS/iptables.sh"
+    xcp "$SCRIPT_DIR/scripts/dnsmasq-postconf.sh" "$SOCKROCKET_SCRIPTS/dnsmasq-postconf.sh"
     xcp "$SCRIPT_DIR/scripts/dnsmasq.conf" "$SOCKROCKET_SCRIPTS/dnsmasq.conf.template"
     [ -f "$SCRIPT_DIR/scripts/sockrocket_api.sh" ] && xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh"
     xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh"
@@ -269,7 +283,7 @@ install_common_files() {
         xcp "$SCRIPT_DIR/uninstall.sh" "$SOCKROCKET_DIR/uninstall.sh"
         chmod +x "$SOCKROCKET_DIR/uninstall.sh" 2>/dev/null || true
     fi
-    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh" 2>/dev/null
+    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/dnsmasq-postconf.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh" 2>/dev/null
     ok "Control scripts installed"
 
     info "Installing CGI backend..."
@@ -295,7 +309,7 @@ install_common_files() {
 # install_hook <script> <content...> — pure-shell, no sed/grep/awk.
 install_hook() {
     local script="$1"
-    shift 2>/dev/null  # discard script path (and legacy marker arg if present)
+    shift  # discard only the script path; the next argument is the hook body
     local content="$*"
 
     # Create script if missing
@@ -372,6 +386,49 @@ post_install_start() {
     fi
 }
 
+# Both standard Merlin and koolcenter run on the same firmware WAN event API.
+# Install these hooks in either package mode so dial-up changes are handled.
+install_wan_hooks() {
+    # Merlin 384.15+ reports PPPoE/DHCP/static WAN connections here. Rebuild
+    # our private policy route and re-pin DNS after the firmware's WAN update.
+    install_hook "/jffs/scripts/wan-event" \
+'if [ "$2" = "connected" ] && [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ]; then
+    /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
+fi
+'
+
+    # Older Merlin releases still use wan-start for the connected event.
+    install_hook "/jffs/scripts/wan-start" \
+'[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
+'
+
+    # DHCPv4 renew can replace resolv.dnsmasq without another WAN event.
+    # DHCPv6/RA updates can also replace the LAN IPv6 prefix, so refresh only
+    # the IPv6 policy and DNS on those events (not the whole IPv4 firewall).
+    install_hook "/jffs/scripts/dhcpc-event" \
+'case "$1:$2" in
+    bound:6|renew:6|stopped:6|unbound:6|updated:*|rebound:*|informed:*|ra-updated:*)
+        [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+            /jffs/addons/sockrocket/scripts/sockrocket.sh dhcpv6-restore ;;
+    bound:*|renew:*)
+        [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+            /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns ;;
+esac
+'
+}
+
+install_dns_postconf_hook() {
+    # Merlin 3006 SDNs may use /tmp/resolv.dnsmasq too. Only the main
+    # dnsmasq config is redirected to Sockrocket's private upstream file.
+    install_hook "/jffs/scripts/dnsmasq.postconf" \
+'if [ -f /jffs/configs/dnsmasq.d/sockrocket.conf ] && \
+   [ -f /tmp/sockrocket-resolv.dnsmasq ] && \
+   [ -x /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh ]; then
+    /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh "$1"
+fi
+'
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # koolshare / koolcenter install path
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,6 +501,8 @@ ks_install() {
     # Register with koolshare init.d for auto-start
     xlink "$KS_SCRIPTS/${MODULE}_config.sh" "$KS_INIT/S98${MODULE}.sh"
     ok "Registered koolshare startup hook"
+    install_wan_hooks
+    install_dns_postconf_hook
 
     # Register plugin metadata in dbus (software center status)
     if have dbus; then
@@ -509,12 +568,8 @@ merlin_install() {
 '# Boot checks the persistent Stop marker under the lifecycle lock.
 [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh boot
 '
-
-    # WAN (re)configuration regenerates /tmp/resolv.dnsmasq with the ISP DNS
-    # servers, undoing the hijack's upstream pin — re-pin after every WAN up.
-    install_hook "/jffs/scripts/wan-start" \
-'[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns
-'
+    install_wan_hooks
+    install_dns_postconf_hook
 
     install_hook "/jffs/scripts/service-event" \
 'if [ "$1" = "restart" ] && [ "$2" = "Sockrocket" ]; then

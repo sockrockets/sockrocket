@@ -459,7 +459,7 @@ body.bg {min-width:0!important}
             </div>
             <div class="fg"><label>&nbsp;</label><button class="btn btn-success btn-sm" id="sr-sub-add" onclick="addSub()">添加</button></div>
           </div>
-          <p class="hint">只需填写订阅地址。名称留空自动命名，格式默认自动识别；批量更新会跳过错误地址并保留对应的已有节点。</p>
+          <p class="hint">只需填写订阅地址。名称留空自动命名，格式默认自动识别；批量更新会跳过错误地址并保留对应的已有节点。HTTP 地址会明文传输访问令牌和节点内容；供应商支持时请优先使用 HTTPS。</p>
         </div>
         <div class="card">
           <div class="toolbar">
@@ -688,9 +688,9 @@ body.bg {min-width:0!important}
 
 <script>
 /* ══ API ═══════════════════════════════════════════════════════════ */
-/* Three transports, auto-detected at boot:
- *   'http' — sockrocket-cli's built-in API server (http://<router>:18188/api),
- *            always-on, works whether or not the proxy daemon is running
+/* Firmware transports, auto-detected at boot. The built-in HTTP API is
+ * loopback-only and token-protected; a browser cannot connect to it directly.
+ * The legacy 'http' transport branch below is retained for older pages.
  *   'cgi'  — legacy: direct CGI at /cgi-bin/sockrocket.cgi (the stock Merlin
  *            httpd does NOT execute user CGIs; kept for old installs)
  *   'ksc'  — koolcenter software center (read-only /www): POST /_api/
@@ -1575,10 +1575,12 @@ function srLoadSubs() {
     var subs = d.subs;
     SR_STATE.subs = subs;
     if (!subs.length) { el.innerHTML = '<div class="hint">还没有订阅，请先添加订阅。</div>'; return; }
-    el.innerHTML = subs.map(function (s) {
+    var shared = Number(d.shared_nodes || 0);
+    var sharedHint = shared > 0 ? '<div class="hint">其中 ' + shared + ' 个节点由多个订阅共用，节点列表中各只显示一次。</div>' : '';
+    el.innerHTML = sharedHint + subs.map(function (s) {
       return '<div class="row">' +
         '<span class="badge acc">' + srEsc(s.format || 'auto') + '</span>' +
-        '<span class="r-name">' + srEsc(s.name) + '<span class="r-sub">订阅地址已隐藏</span></span>' +
+        '<span class="r-name">' + srEsc(s.name) + '<span class="r-sub">已导入 ' + Number(s.node_count || 0) + ' 个节点 · 订阅地址已隐藏</span></span>' +
         '<button class="btn btn-sm" onclick="inspectSubscription(' + Number(s.index) + ')">详情</button>' +
         '<button class="btn btn-sm" onclick="event.stopPropagation();renameSub(' + Number(s.index) + ')" title="重命名订阅">重命名</button>' +
         '<button class="btn btn-sm" onclick="event.stopPropagation();copySubUrl(' + Number(s.index) + ')" title="复制私有订阅地址">复制地址</button>' +
@@ -1642,7 +1644,9 @@ function renderSubscriptionNotes(result) {
   // Older saved jobs embedded the metadata-only note in their success message.
   if (!hint && result && result.ok !== false) hint = String(result.msg || '').indexOf('Hysteria2 uses native QUIC TLS; browser fingerprint hints were retained as metadata') >= 0;
   var chrome = Array.isArray(notes) && notes.indexOf('hysteria2_chrome_quic_profile') >= 0;
+  var fixedPort = Array.isArray(notes) && notes.indexOf('hysteria2_mport_fixed_port') >= 0;
   var text = [];
+  if (fixedPort) text.push('部分 Hysteria2 节点带有多端口跳跃配置，已按订阅地址中的固定端口导入；当前版本不会定期切换端口。若网络限制持续使用同一 UDP 端口，这些节点仍可能无法连接。');
   if (chrome) text.push('已启用 Chrome 115 基线 QUIC 握手模拟（fp=chrome / chrome115，ALPN h3），包含 TLS 指纹、连接 ID 和传输参数。此基线不模拟 ALPS、浏览器 HTTP/3 请求及首包分帧；证书校验保持原样。');
   if (hint) text.push('其他浏览器指纹提示已保留，但不用于模拟对应浏览器的 QUIC 指纹；证书校验保持原样。');
   srElement('sub-notes-text').textContent = text.join(' ');

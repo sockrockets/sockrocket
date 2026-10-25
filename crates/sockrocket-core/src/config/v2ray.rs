@@ -311,6 +311,8 @@ pub(crate) const TLS_CERT_PIN: &str = "tls_certificate_sha256";
 pub(crate) const HY2_UP: &str = "hysteria2_up_mbps";
 pub(crate) const HY2_DOWN: &str = "hysteria2_down_mbps";
 pub(crate) const HY2_FAST_OPEN: &str = "hysteria2_fast_open";
+/// Preserved for export; Sockrocket currently connects on the URI's fixed port.
+pub(crate) const HY2_MPORT: &str = "hysteria2_mport";
 // Legacy storage key: keep reading it so saved imports gain the implementation.
 pub(crate) const HY2_CLIENT_FP_HINT: &str = "hysteria2_client_fingerprint_hint";
 
@@ -516,7 +518,33 @@ pub fn parse_proxy_uri(uri: &str) -> Result<Node> {
     }
 }
 
-/// Parse a hysteria2:// or hy2:// share link
+/// Validate the advertised hopping range before using the URI's fixed port.
+pub(crate) fn validate_hysteria2_mport(value: &str, fixed_port: u16) -> Result<()> {
+    let mut includes_fixed_port = false;
+    anyhow::ensure!(!value.is_empty(), "Invalid Hysteria2 mport range");
+    for part in value.split(',') {
+        let (start, end) = if let Some((start, end)) = part.split_once('-') {
+            (start, end)
+        } else {
+            (part, part)
+        };
+        let start: u16 = start
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 mport range"))?;
+        let end: u16 = end
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 mport range"))?;
+        anyhow::ensure!(start > 0 && start <= end, "Invalid Hysteria2 mport range");
+        includes_fixed_port |= (start..=end).contains(&fixed_port);
+    }
+    anyhow::ensure!(
+        includes_fixed_port,
+        "Hysteria2 fixed port is outside mport range"
+    );
+    Ok(())
+}
+
+/// Parse a hysteria2:// or hy2:// share link.
 pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
     anyhow::ensure!(
         uri.starts_with("hysteria2://") || uri.starts_with("hy2://"),
@@ -552,8 +580,9 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
                     | "downmbps"
                     | "fastopen"
                     | "fp"
+                    | "mport"
             ),
-            "Unsupported Hysteria2 option; obfuscation and port hopping were not silently ignored"
+            "Unsupported Hysteria2 option; obfuscation and unknown extensions are not ignored"
         );
         anyhow::ensure!(
             params
@@ -563,6 +592,11 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         );
     }
     let mut extra = HashMap::new();
+    let port = parsed.port().unwrap_or(443);
+    if let Some(mport) = params.get("mport") {
+        validate_hysteria2_mport(mport, port)?;
+        extra.insert(HY2_MPORT.into(), mport.clone());
+    }
     import_tls_pin(&params, &mut extra)?;
     // Browser profile and certificate pin are separate settings. Chrome uses
     // the versioned QUIC profile; other recognized hints retain an explicit
@@ -616,7 +650,6 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         .context("Missing Hysteria2 host")?
         .trim_matches(['[', ']'])
         .to_owned();
-    let port = parsed.port().unwrap_or(443);
     anyhow::ensure!(port != 0, "Invalid Hysteria2 port");
     Ok(Node {
         name: decode_fragment_name(parsed.fragment()).unwrap_or_else(|| "Hysteria2".into()),
@@ -1409,6 +1442,7 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 (HY2_UP, "upmbps"),
                 (HY2_DOWN, "downmbps"),
                 (HY2_FAST_OPEN, "fastopen"),
+                (HY2_MPORT, "mport"),
             ] {
                 if let Some(value) = node.extra.get(field) {
                     extra_params.push(format!("{query}={}", urlencoding::encode(value)));
@@ -1829,6 +1863,37 @@ mod native_protocol_regressions {
         assert!(
             parse_hysteria2_uri(
                 "hy2://auth@vpn.example.invalid?obfs=salamander&obfs-password=secret"
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn hysteria_mport_imports_on_fixed_port_with_explicit_metadata() {
+        let node = parse_hysteria2_uri(
+            "hy2://synthetic@example.invalid:35000?mport=35000-39000&sni=tls.example.invalid",
+        )
+        .unwrap();
+        assert_eq!(node.port, 35000);
+        assert_eq!(
+            node.extra.get(HY2_MPORT).map(String::as_str),
+            Some("35000-39000")
+        );
+        let shared = parse_hysteria2_uri(&node_to_share_uri(&node)).unwrap();
+        assert_eq!(shared.extra.get(HY2_MPORT), node.extra.get(HY2_MPORT));
+        let clash = crate::export_clash_config(&[node]);
+        let restored = super::super::clash::parse_clash_config(&clash).unwrap();
+        assert_eq!(restored[0].port, 35000);
+        assert_eq!(
+            restored[0].extra.get(HY2_MPORT).map(String::as_str),
+            Some("35000-39000")
+        );
+        for mport in ["", "35000-", "39000-35000", "35001-39000", "0-35000"] {
+            let uri = format!("hy2://synthetic@example.invalid:35000?mport={mport}");
+            assert!(parse_hysteria2_uri(&uri).is_err(), "{mport}");
+        }
+        assert!(
+            parse_hysteria2_uri(
+                "hy2://synthetic@example.invalid:35000?mport=35000-39000&obfs=salamander"
             )
             .is_err()
         );

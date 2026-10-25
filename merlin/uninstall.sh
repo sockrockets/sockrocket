@@ -110,12 +110,16 @@ remove_hook /jffs/scripts/firewall-start
 remove_hook /jffs/scripts/services-start
 remove_hook /jffs/scripts/service-event
 remove_hook /jffs/scripts/wan-start
+remove_hook /jffs/scripts/wan-event
+remove_hook /jffs/scripts/dhcpc-event
 remove_hook /jffs/scripts/nat-start
+remove_hook /jffs/scripts/dnsmasq.postconf
 ok "Hooks cleaned"
 
 # ── dnsmasq / DNS pin ─────────────────────────────────────────────────────────
 info "Restoring DNS..."
 rm -f /jffs/configs/dnsmasq.d/sockrocket.conf
+rm -f /tmp/sockrocket-resolv.dnsmasq
 RESOLV=/tmp/resolv.dnsmasq
 BAK=/tmp/resolv.dnsmasq.Sockrocket-bak
 if [ -s "$BAK" ]; then
@@ -229,7 +233,8 @@ do
 done
 
 for script in /jffs/scripts/firewall-start /jffs/scripts/services-start \
-              /jffs/scripts/service-event /jffs/scripts/wan-start /jffs/scripts/nat-start; do
+              /jffs/scripts/service-event /jffs/scripts/wan-start /jffs/scripts/wan-event \
+              /jffs/scripts/dhcpc-event /jffs/scripts/nat-start; do
     if [ -f "$script" ] && grep -qi sockrocket "$script" 2>/dev/null; then
         warn "STILL PRESENT: sockrocket refs in $script"
         sed -i '/sockrocket/d' "$script" 2>/dev/null || true

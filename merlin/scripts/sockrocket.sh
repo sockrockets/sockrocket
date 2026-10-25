@@ -130,10 +130,9 @@ kill_stray_apis() {
 }
 
 # ── Web UI API bridge (always-on, independent of the proxy daemon) ──────────
-# The router's httpd cannot execute user CGIs (/cgi-bin/sockrocket.cgi always 404s
-# on stock Merlin), so the Web UI talks to `sockrocket-cli api` — a tiny HTTP JSON
-# server on port 18188. It must stay up even while the proxy is stopped,
-# otherwise the UI has no way to start the service again.
+# Keep the token-protected loopback API alive while the proxy is stopped.
+# Browser requests use firmware CGI or Software Center RPC; the browser cannot
+# reach this API directly from the LAN.
 API_PID="$SOCKROCKET_DIR/sockrocket-api.pid"
 DEFAULT_API_PORT=18188
 
@@ -378,25 +377,65 @@ migrate_toggle_keys() {
     } > "$tmp" && mv "$tmp" "$SOCKROCKET_CONF"
 }
 
-# Pin dnsmasq's upstream server file (servers-file) to Sockrocket's DNS listener.
+# Pin the main dnsmasq upstream to Sockrocket's DNS listener.
 #
-# The firmware generates /tmp/resolv.dnsmasq with the ISP's DNS servers.
-# dnsmasq load-balances queries across ALL configured servers and favours the
-# fastest responder — so the ISP's GFW-poisoned answers (google.com →
-# poisoned A/AAAA records) consistently beat the clean proxied ones from the
-# Sockrocket listener. Overwriting the file and SIGHUPing dnsmasq leaves the Sockrocket
-# listener as the ONLY upstream. The firmware regenerates the file whenever
-# dnsmasq restarts, the WAN reconfigures, or the hijack is removed, so the
-# default behaviour self-restores outside hijack mode.
+# Merlin 3006 SDNs can share /tmp/resolv.dnsmasq with the main LAN. On 3006,
+# dnsmasq.postconf points only the main instance at a private servers-file.
+# Older firmware keeps the original shared-file pin and backup path below.
 pin_dns_upstream() {
     local dns_port dns_conf="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf"
     local resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
     local bak_file="${resolv_file}.Sockrocket-bak"
+    local private_file="${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
+    # A leftover dnsmasq snippet alone is not permission to point LAN DNS at
+    # this process. Degraded recovery deliberately calls this before clearing
+    # its fail-open marker, so only the event entry point checks that marker.
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ "$(conf_bool dns_hijack false)" = "true" ] || return 0
+    is_running || return 0
     [ -f "$dns_conf" ] || return 0
     dns_port=$(get_config_value dns_port)
     dns_port=${dns_port:-5300}
     # Only pin while our listener is actually answering.
     netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" || return 0
+    if merlin_3006; then
+        # SDN instances can read the firmware's shared resolv.dnsmasq. Give
+        # only the main instance a private servers-file via dnsmasq.postconf.
+        local hook="${SOCKROCKET_DNS_POSTCONF_HOOK:-/jffs/scripts/dnsmasq.postconf}"
+        local helper="${SOCKROCKET_DNS_POSTCONF_SCRIPT:-$SOCKROCKET_DIR/scripts/dnsmasq-postconf.sh}"
+        local main_pid
+        [ -x "$helper" ] && grep -q 'dnsmasq-postconf.sh' "$hook" 2>/dev/null || {
+            log_error "Merlin 3006 DNS postconf hook missing; DNS interception disabled"
+            return 1
+        }
+        if [ "$(cat "$private_file" 2>/dev/null)" = "server=127.0.0.1#${dns_port}" ]; then
+            # dnsmasq runs as nobody. A 0600 file is an empty upstream list
+            # until the main instance is told to read it again.
+            case "$(ls -l "$private_file" 2>/dev/null)" in
+                -rw-r--r--*) return 0 ;;
+            esac
+            chmod 644 "$private_file" || return 1
+            main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
+            case "$main_pid" in ''|*[!0-9]*) ;; *) kill -HUP "$main_pid" 2>/dev/null || true ;; esac
+            return 0
+        fi
+        # Merlin can ship BusyBox without a mktemp applet in PATH. An
+        # exclusive, private directory also keeps the temporary file safe
+        # from symlinks while allowing an atomic rename on the same filesystem.
+        local private_tmp="${private_file}.$$"
+        (umask 077; mkdir "$private_tmp") || return 1
+        printf 'server=127.0.0.1#%s\n' "$dns_port" > "$private_tmp/upstream" && \
+            chmod 644 "$private_tmp/upstream" && mv -f "$private_tmp/upstream" "$private_file" || {
+            rm -f "$private_tmp/upstream"
+            rmdir "$private_tmp" 2>/dev/null || true
+            return 1
+        }
+        rmdir "$private_tmp" 2>/dev/null || true
+        main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
+        case "$main_pid" in ''|*[!0-9]*) ;; *) kill -HUP "$main_pid" 2>/dev/null || true ;; esac
+        ok "Main LAN dnsmasq upstream isolated from Merlin 3006 SDNs"
+        return 0
+    fi
     # Skip rewriting a matching pin, but heal permissions from older builds.
     if [ "$(cat "$resolv_file" 2>/dev/null)" = "server=127.0.0.1#${dns_port}" ]; then
         # Older versions wrote 0600; matching contents do not imply readable
@@ -424,6 +463,10 @@ pin_dns_upstream() {
         chmod 644 "${resolv_file}.new" && mv -f "${resolv_file}.new" "$resolv_file" || { rm -f "${resolv_file}.new"; return 1; }
     kill -HUP "$(pidof dnsmasq)" 2>/dev/null
     ok "dnsmasq upstream pinned to 127.0.0.1#${dns_port} (LAN queries no longer go through ISP DNS)"
+}
+
+merlin_3006() {
+    case "$(nvram get firmver 2>/dev/null)" in 3.0.0.6*) return 0 ;; *) return 1 ;; esac
 }
 
 # Restore dnsmasq's original upstream servers when the hijack is removed.
@@ -476,6 +519,7 @@ update_dnsmasq() {
     local DNSMASQ_CONF_DIR="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}"
     local SOCKROCKET_DNSMASQ="$DNSMASQ_CONF_DIR/sockrocket.conf"
     local TEMPLATE="$SOCKROCKET_DIR/scripts/dnsmasq.conf.template"
+    local isolated=0 waited=0 wait_limit
 
     mkdir -p "$DNSMASQ_CONF_DIR"
 
@@ -494,12 +538,22 @@ update_dnsmasq() {
             return 1
         fi
         router_ip=$(nvram get lan_ipaddr 2>/dev/null)
-        # nvram exits 0 with an empty value for unset keys — the `||`
-        # fallback would not trigger, so default on empty explicitly.
-        [ -n "$router_ip" ] || router_ip="192.168.1.1"
+        [ -n "$router_ip" ] || {
+            log_error "Primary LAN address unavailable; DNS interception disabled"
+            update_dnsmasq stop
+            return 1
+        }
+        if merlin_3006 && grep -q '^server=127.0.0.1#' "${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}" 2>/dev/null; then
+            # Upgrade from the old shared-file pin before a new SDN starts.
+            unpin_dns_upstream || return 1
+        fi
         sed -e "s/__DNS_PORT__/$dns_port/g" \
             -e "s/__ROUTER_IP__/$router_ip/g" \
             "$TEMPLATE" > "$SOCKROCKET_DNSMASQ"
+        if merlin_3006 && ! pin_dns_upstream; then
+            update_dnsmasq stop
+            return 1
+        fi
         # NOTE: the old dns_direct_domains bypass (dnsmasq server=/ entries
         # straight to the domestic resolver) was removed: it
         # short-circuited Sockrocket's resolver, so those names never entered the
@@ -509,6 +563,29 @@ update_dnsmasq() {
         # listener, whose china-split serves domestic names from
         # 223.5.5.5/119.29.29.29 itself.
         if service restart_dnsmasq >/dev/null 2>&1; then
+            # Some firmware builds return from rc before dnsmasq.postconf
+            # rewrites the main config; others are already done. Poll the
+            # result instead of assuming either timing. A synchronous build
+            # matches on the first read and does not sleep.
+            if merlin_3006; then
+                wait_limit="${SOCKROCKET_DNS_ISOLATION_WAIT:-15}"
+                while :; do
+                    if grep -Fx \
+                        "servers-file=${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" \
+                        "${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}" >/dev/null 2>&1; then
+                        isolated=1
+                        break
+                    fi
+                    [ "$waited" -ge "$wait_limit" ] && break
+                    waited=$((waited + 1))
+                    sleep 1
+                done
+                if [ "$isolated" != 1 ]; then
+                    log_error "Merlin 3006 main dnsmasq did not use isolated upstream"
+                    update_dnsmasq stop
+                    return 1
+                fi
+            fi
             if ! pin_dns_upstream; then
                 update_dnsmasq stop
                 return 1
@@ -533,9 +610,11 @@ update_dnsmasq() {
     elif [ "$action" = "stop" ]; then
         local changed=0 resolv_file
         [ -f "$SOCKROCKET_DNSMASQ" ] && changed=1
+        [ -f "${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" ] && changed=1
         resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
         grep -q '^server=127.0.0.1#' "$resolv_file" 2>/dev/null && changed=1
         rm -f "$SOCKROCKET_DNSMASQ"
+        rm -f "${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
         [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
             "$SOCKROCKET_DIR/scripts/iptables.sh" dns-stop >/dev/null 2>&1 || true
         # Unpin BEFORE restarting dnsmasq, so the restarted daemon reads the
@@ -1667,6 +1746,45 @@ do_firewall_restore() {
     return 0
 }
 
+# PPPoE reconnects and DHCP/static WAN transitions can change the firmware's
+# routing policy independently of firewall-start. Reapply our private TUN
+# policy after the WAN is connected; this neither binds to ppp0/eth* nor
+# restarts the daemon, so the same path works for every dial-up mode.
+do_wan_restore() {
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ -f "$DEGRADED_FILE" ] && return 0
+    is_running || return 0
+    [ "$(count_section nodes)" != "0" ] || return 0
+    do_firewall_restore || return 1
+    pin_dns_upstream
+}
+
+do_pin_dns_event() {
+    [ -f "$DEGRADED_FILE" ] && return 0
+    pin_dns_upstream
+}
+
+# DHCPv6 and router-advertisement changes can replace LAN prefixes without a
+# firewall-start event. Reconcile IPv6 DNS/policy immediately; the periodic
+# watchdog remains a retry path if the firmware has not finished applying it.
+do_dhcpv6_restore() {
+    local failed=0
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ -f "$DEGRADED_FILE" ] && return 0
+    is_running || return 0
+    [ "$(count_section nodes)" != "0" ] || return 0
+    pin_dns_upstream || failed=1
+    if [ "$(conf_bool transparent_proxy true)" = "true" ] && \
+        [ "$(get_config_value ipv6_mode)" = "dual_stack" ]; then
+        if [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ]; then
+            "$SOCKROCKET_DIR/scripts/iptables.sh" ipv6-apply || failed=1
+        else
+            failed=1
+        fi
+    fi
+    return "$failed"
+}
+
 do_watchdog() {
     local issues=0
     sync_softcenter_state
@@ -1862,14 +1980,22 @@ do_watchdog() {
                     "$SOCKROCKET_DIR/scripts/iptables.sh" dns-start >> "$SOCKROCKET_LOG" 2>&1
                 issues=$((issues + 1))
             fi
-            # WAN reconfiguration / dhcp renew regenerates resolv.dnsmasq
-            # with ISP servers, silently un-pinning the upstream. Re-pin.
+            # Reconcile the main LAN upstream; 3006 must leave the shared
+            # resolv.dnsmasq file for SDNs on their firmware DNS path.
             local resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
+            merlin_3006 && resolv_file="${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
             local before
             before=$(cat "$resolv_file" 2>/dev/null)
             pin_dns_upstream
             [ "$(cat "$resolv_file" 2>/dev/null)" != "$before" ] && \
-                log_warn "Watchdog: dnsmasq upstream was unpinned (ISP DNS had returned) — re-pinned to Sockrocket"
+                log_warn "Watchdog: main dnsmasq upstream restored to Sockrocket"
+            if merlin_3006 && ! grep -Fx \
+                "servers-file=${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" \
+                "${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}" >/dev/null 2>&1; then
+                log_warn "Watchdog: Merlin 3006 main dnsmasq lost its isolated upstream — restarting DNS"
+                update_dnsmasq start || enter_lan_degraded "3006 DNS upstream isolation unavailable"
+                issues=$((issues + 1))
+            fi
         else
             local fails=0
             [ -f "$fail_file" ] && fails=$(cat "$fail_file" 2>/dev/null)
@@ -1999,7 +2125,13 @@ case "$1" in
         run_locked 15 do_dns_off
         ;;
     pin-dns)
-        run_locked 5 pin_dns_upstream
+        run_locked 5 do_pin_dns_event
+        ;;
+    dhcpv6-restore)
+        run_locked 5 do_dhcpv6_restore
+        ;;
+    wan-restore)
+        run_locked 5 do_wan_restore
         ;;
     proxy-off)
         run_locked 15 do_proxy_off

@@ -473,15 +473,18 @@ pub use http::{DEFAULT_API_PORT, serve_api};
 // === Actions ===
 
 fn dispatch(action: &str, post: &J) -> J {
-    let _transaction =
-        if matches!(action, "stop" | "subscription_start") || read_only_action(action) {
-            None
-        } else {
-            match storage::MutationGuard::acquire() {
-                Ok(guard) => Some(guard),
-                Err(e) => return err_msg(&format!("Configuration transaction failed: {e}")),
-            }
-        };
+    let _transaction = if matches!(
+        action,
+        "stop" | "subscription_start" | "add_sub" | "update_subs"
+    ) || read_only_action(action)
+    {
+        None
+    } else {
+        match storage::MutationGuard::acquire() {
+            Ok(guard) => Some(guard),
+            Err(e) => return err_msg(&format!("Configuration transaction failed: {e}")),
+        }
+    };
     dispatch_inner(action, post)
 }
 
@@ -748,11 +751,12 @@ fn act_save_config(post: &J) -> J {
     if bytes.is_empty() {
         return err_msg("Invalid config data (empty)");
     }
-    // Validate against the real config schema — the same structure sockrocket-cli
-    // itself parses on startup. Unknown merlin-only keys are tolerated by
-    // serde and preserved verbatim on the next CGI-driven edit.
-    let text = String::from_utf8_lossy(&bytes);
-    if let Err(e) = serde_yaml::from_str::<sockrocket_core::AppConfig>(&text) {
+    // Use the startup parser, including rule/group target validation. A
+    // structurally valid YAML file can still prevent the daemon from starting.
+    let Ok(text) = String::from_utf8(bytes) else {
+        return err_msg("Invalid config data (UTF-8 decode failed)");
+    };
+    if let Err(e) = validate_advanced_config(&text) {
         return json!({"ok": false, "msg": format!("Config validation failed: {e}")});
     }
     if let Err(error) =
@@ -768,10 +772,49 @@ fn act_save_config(post: &J) -> J {
     json!({"ok": true, "msg": "Config saved and validated"})
 }
 
+fn validate_advanced_config(text: &str) -> Result<()> {
+    let config = sockrocket_core::AppConfig::from_yaml_str(text)?;
+    if !config.nodes.is_empty() {
+        anyhow::ensure!(
+            config
+                .active_node
+                .is_none_or(|index| index < config.nodes.len()),
+            "active_node is out of range"
+        );
+    }
+    let raw: Y = serde_yaml::from_str(text)?;
+    let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
+    let transparent = raw
+        .as_mapping()
+        .map(|map| effective_toggles(map).0)
+        .unwrap_or(true);
+    anyhow::ensure!(
+        !transparent
+            || config.ipv6_mode != sockrocket_core::config::dns::Ipv6Mode::Compatibility
+            || dns.strategy != sockrocket_core::config::dns::AddressStrategy::Ipv6Only,
+        "IPv6-only DNS requires dual_stack in Merlin transparent mode"
+    );
+    Ok(())
+}
+
 fn act_subscriptions() -> J {
     let Ok(map) = load_conf() else {
         return json!({"subs": []});
     };
+    let mut node_counts = std::collections::HashMap::<String, usize>::new();
+    let mut shared_nodes = 0usize;
+    for value in conf_seq(&map, "nodes") {
+        let Ok(node) = serde_yaml::from_value::<sockrocket_core::Node>(value.clone()) else {
+            continue;
+        };
+        let sources = sockrocket_core::config::dedup::subscription_sources(&node);
+        if sources.len() > 1 {
+            shared_nodes += 1;
+        }
+        for source in sources {
+            *node_counts.entry(source).or_default() += 1;
+        }
+    }
     let subs: Vec<J> = conf_seq(&map, "subscriptions")
         .iter()
         .enumerate()
@@ -780,11 +823,14 @@ fn act_subscriptions() -> J {
                 Some(Y::String(v)) => v.clone(),
                 _ => String::new(),
             };
-            json!({"index": i, "name": get("name"), "url": get("url"),
+            let url = get("url");
+            let count = node_counts.get(&url).copied().unwrap_or(0);
+            json!({"index": i, "name": get("name"), "url": url,
+                   "node_count": count,
                    "format": match get("format") { f if f.is_empty() => "auto".into(), f => f }})
         })
         .collect();
-    json!({"subs": subs})
+    json!({"subs": subs, "shared_nodes": shared_nodes})
 }
 
 fn sub_entry(name: &str, url: &str, format: &str) -> Y {
@@ -792,6 +838,10 @@ fn sub_entry(name: &str, url: &str, format: &str) -> Y {
     m.insert(ykey("name"), Y::String(name.to_string()));
     m.insert(ykey("url"), Y::String(url.to_string()));
     m.insert(ykey("format"), Y::String(format.to_string()));
+    m.insert(
+        ykey("refresh_revision"),
+        Y::String(sockrocket_core::config::storage::new_subscription_revision()),
+    );
     Y::Mapping(m)
 }
 
@@ -809,6 +859,7 @@ fn fetch_sub_nodes(
         format: format.to_string(),
         last_updated: None,
         refresh_interval_hours: 24,
+        refresh_revision: String::new(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -867,45 +918,59 @@ fn act_add_sub(post: &J) -> J {
         return json!({"ok":false,"error_code":"subscription_url_invalid","stage":"validate_subscription",
             "cause":"InvalidUrl","msg":"订阅地址无效，未保存。","hint":"填写完整的 http 或 https 订阅地址；名称和格式可以留空。"});
     }
-    let Ok(mut map) = load_conf() else {
-        return err_msg("Config file not found");
-    };
-    let mut seq = match map.remove(ykey("subscriptions")) {
-        Some(Y::Sequence(s)) => s,
-        _ => Vec::new(),
-    };
     if !matches!(
         format,
         "auto" | "clash" | "v2ray" | "singbox" | "sing-box" | "base64"
     ) {
         return err_msg("Unsupported subscription format");
     }
-    if seq
-        .iter()
-        .any(|item| item.get(ykey("url")).and_then(Y::as_str) == Some(url))
-    {
-        return json!({"ok":false,"error_code":"subscription_exists","stage":"validate_subscription",
-            "cause":"DuplicateSubscription","msg":"该订阅已存在，请更新已有订阅。",
-            "hint":"在“我的订阅”中点击“全部更新”，无需重复添加；不会覆盖已有节点。"});
-    }
-    let name = if name.is_empty() {
-        let used: std::collections::HashSet<_> = seq
+    let (name, revision) = {
+        // Only the read/modify/commit step needs the configuration lock.
+        // Downloading under this lock made every other edit time out.
+        let Ok(_transaction) = storage::MutationGuard::acquire() else {
+            return err_msg("Configuration transaction busy; retry shortly");
+        };
+        let Ok(mut map) = load_conf() else {
+            return err_msg("Config file not found");
+        };
+        let mut seq = match map.remove(ykey("subscriptions")) {
+            Some(Y::Sequence(s)) => s,
+            _ => Vec::new(),
+        };
+        if seq
             .iter()
-            .filter_map(|entry| entry.get(ykey("name")).and_then(Y::as_str))
-            .collect();
-        let mut number = seq.len() + 1;
-        while used.contains(format!("订阅 {number}").as_str()) {
-            number += 1;
+            .any(|item| item.get(ykey("url")).and_then(Y::as_str) == Some(url))
+        {
+            return json!({"ok":false,"error_code":"subscription_exists","stage":"validate_subscription",
+                "cause":"DuplicateSubscription","msg":"该订阅已存在，请更新已有订阅。",
+                "hint":"在“我的订阅”中点击“全部更新”，无需重复添加；不会覆盖已有节点。"});
         }
-        format!("订阅 {number}")
-    } else {
-        name.to_owned()
+        let name = if name.is_empty() {
+            let used: std::collections::HashSet<_> = seq
+                .iter()
+                .filter_map(|entry| entry.get(ykey("name")).and_then(Y::as_str))
+                .collect();
+            let mut number = seq.len() + 1;
+            while used.contains(format!("订阅 {number}").as_str()) {
+                number += 1;
+            }
+            format!("订阅 {number}")
+        } else {
+            name.to_owned()
+        };
+        let entry = sub_entry(&name, url, format);
+        let revision = entry
+            .get(ykey("refresh_revision"))
+            .and_then(Y::as_str)
+            .expect("new subscriptions have a refresh revision")
+            .to_owned();
+        seq.push(entry);
+        map.insert(ykey("subscriptions"), Y::Sequence(seq));
+        if let Err(e) = save_conf(&map) {
+            return json!({"ok": false, "msg": format!("Save failed: {e}")});
+        }
+        (name, revision)
     };
-    seq.push(sub_entry(&name, url, format));
-    map.insert(ykey("subscriptions"), Y::Sequence(seq));
-    if let Err(e) = save_conf(&map) {
-        return json!({"ok": false, "msg": format!("Save failed: {e}")});
-    }
 
     // Fetch + parse here (not only on restart) so the Web UI can show a real
     // error instead of "saved but still 0 nodes" after a silent background fail.
@@ -926,16 +991,20 @@ fn act_add_sub(post: &J) -> J {
             subscription_jobs::progress(1, 1, "applying");
             let nodes = report.nodes;
             let fetched = nodes.len();
-            let saved = (|| {
-                let mut cfg = load_app_config()?;
-                sockrocket_core::apply_subscription_refresh(
-                    &mut cfg,
-                    vec![(url.to_string(), nodes)],
-                );
-                persist_subscription_state(&cfg)
-            })();
+            let saved = sockrocket_core::config::storage::commit_subscription_refresh(
+                &conf_path(),
+                vec![(
+                    sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
+                        url: url.to_string(),
+                        revision,
+                    },
+                    nodes,
+                )],
+            )
+            .map_err(|error| error.to_string());
             match saved {
-                Ok(total) => {
+                Ok(commit) if commit.applied_urls.iter().any(|source| source == url) => {
+                    let total = commit.config.nodes.len();
                     if let Err(error) = run_sh("restart") {
                         return err_msg(&error.to_string());
                     }
@@ -946,6 +1015,8 @@ fn act_add_sub(post: &J) -> J {
                         "compatibility_notes": compatibility_notes
                     })
                 }
+                Ok(_) => json!({"ok":false,"error_code":"subscription_removed",
+                    "msg":"订阅在下载期间被删除或已由另一任务更新；过期下载已丢弃，现有节点保持不变"}),
                 Err(e) => json!({
                     "ok": false,
                     "msg": format!("Parsed {fetched} node(s) but failed to save: {e}")
@@ -1022,8 +1093,14 @@ fn act_rename_sub(post: &J) -> J {
 }
 
 fn act_update_subs() -> J {
-    let Ok(map) = load_conf() else {
-        return err_msg("Config file not found");
+    let map = {
+        let Ok(_transaction) = storage::MutationGuard::acquire() else {
+            return err_msg("Configuration transaction busy; retry shortly");
+        };
+        let Ok(map) = load_conf() else {
+            return err_msg("Config file not found");
+        };
+        map
     };
     let subs = conf_seq(&map, "subscriptions");
     if subs.is_empty() {
@@ -1067,7 +1144,13 @@ fn act_update_subs() -> J {
                         report.skipped_entries
                     ));
                 }
-                refreshed.push((url, report.nodes));
+                refreshed.push((
+                    sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
+                        url,
+                        revision: get("refresh_revision"),
+                    },
+                    report.nodes,
+                ));
             }
             Err(e) => {
                 skipped_subscriptions += 1;
@@ -1096,35 +1179,51 @@ fn act_update_subs() -> J {
     }
 
     subscription_jobs::progress(subs.len(), subs.len(), "applying");
-    let fetched: usize = refreshed.iter().map(|(_, nodes)| nodes.len()).sum();
-    let saved = (|| {
-        let mut cfg = load_app_config()?;
-        sockrocket_core::apply_subscription_refresh(&mut cfg, refreshed);
-        persist_subscription_state(&cfg)
-    })();
-    match saved {
-        Ok(total) => {
-            if let Err(error) = run_sh("restart") {
-                return err_msg(&error.to_string());
-            }
-            let warn = if errors.is_empty() {
-                String::new()
-            } else {
-                format!("（部分内容未更新：{}）", errors.join("; "))
-            };
-            compatibility_notes.sort_unstable();
-            compatibility_notes.dedup();
-            json!({
-                "ok": true,
-                "msg": format!("已更新 {fetched} 个节点，共 {total} 个，设置已应用{warn}"),
-                "node_count": total,
-                "compatibility_notes": compatibility_notes,
-                "skipped_subscriptions": skipped_subscriptions,
-                "warnings": errors
-            })
+    let fetched_by_url: std::collections::HashMap<_, _> = refreshed
+        .iter()
+        .map(|(source, nodes)| (source.url.clone(), nodes.len()))
+        .collect();
+    let commit = match sockrocket_core::config::storage::commit_subscription_refresh(
+        &conf_path(),
+        refreshed,
+    ) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            return json!({"ok": false, "msg": format!("Fetched nodes but save failed: {error}")});
         }
-        Err(e) => json!({"ok": false, "msg": format!("Fetched nodes but save failed: {e}")}),
+    };
+    let applied = &commit.applied_urls;
+    if applied.is_empty() {
+        return json!({"ok":false,"error_code":"subscriptions_removed",
+            "msg":"订阅在下载期间被删除或已由另一任务更新；过期下载已丢弃，现有节点保持不变"});
     }
+    let fetched: usize = applied.iter().map(|url| fetched_by_url[url]).sum();
+    let dropped = fetched_by_url.len() - applied.len();
+    if dropped > 0 {
+        skipped_subscriptions += dropped;
+        errors.push(format!(
+            "{dropped} 个订阅在下载期间被删除或已由另一任务更新，其过期节点已丢弃"
+        ));
+    }
+    let total = commit.config.nodes.len();
+    if let Err(error) = run_sh("restart") {
+        return err_msg(&error.to_string());
+    }
+    let warn = if errors.is_empty() {
+        String::new()
+    } else {
+        format!("（部分内容未更新：{}）", errors.join("; "))
+    };
+    compatibility_notes.sort_unstable();
+    compatibility_notes.dedup();
+    json!({
+        "ok": true,
+        "msg": format!("已更新 {fetched} 个节点，共 {total} 个，设置已应用{warn}"),
+        "node_count": total,
+        "compatibility_notes": compatibility_notes,
+        "skipped_subscriptions": skipped_subscriptions,
+        "warnings": errors
+    })
 }
 
 fn socks_port() -> u16 {
@@ -4082,6 +4181,41 @@ dns_direct_domains:
     }
 
     #[test]
+    fn subscription_list_counts_nodes_shared_across_sources() {
+        let _env = TestEnv::new(SAMPLE);
+        let mut config = load_app_config().unwrap();
+        let first = config.subscriptions[0].url.clone();
+        let second = "https://example.invalid/second".to_string();
+        config.subscriptions.push(sockrocket_core::Subscription {
+            name: "Sub 2".into(),
+            url: second.clone(),
+            format: "auto".into(),
+            last_updated: None,
+            refresh_interval_hours: 24,
+            refresh_revision: String::new(),
+        });
+        let node = |server| {
+            sockrocket_core::parse_proxy_uri(&format!(
+                "ss://aes-128-gcm:synthetic@{server}:8388#synthetic"
+            ))
+            .unwrap()
+        };
+        sockrocket_core::apply_subscription_refresh(
+            &mut config,
+            vec![
+                (first, vec![node("shared.invalid"), node("first.invalid")]),
+                (second, vec![node("shared.invalid"), node("second.invalid")]),
+            ],
+        );
+        persist_subscription_state(&config).unwrap();
+        let result = act_subscriptions();
+        assert_eq!(result["subs"][0]["node_count"], 2);
+        assert_eq!(result["subs"][1]["node_count"], 2);
+        assert_eq!(result["shared_nodes"], 1);
+        assert_eq!(load_app_config().unwrap().nodes.len(), 5);
+    }
+
+    #[test]
     fn deleting_subscription_drops_its_nodes_and_keeps_the_url_list() {
         let env = TestEnv::new(SAMPLE);
         let path = env.dir.join("config.yaml");
@@ -4678,6 +4812,33 @@ dns_direct_domains:
         let r = act_save_config(&json!({"config": bad}));
         assert_eq!(r["ok"], J::Bool(false), "schema violation rejected: {r}");
         assert!(fs::read_to_string(conf_path()).unwrap().contains("Node A"));
+
+        let invalid_target = B64.encode(SAMPLE.replace("rules: []", "rules:\n  - rule_type: domain-suffix\n    pattern: example.invalid\n    target: group:missing\n    enabled: true"));
+        let r = act_save_config(&json!({"config": invalid_target}));
+        assert_eq!(r["ok"], J::Bool(false), "missing group rejected: {r}");
+        assert!(fs::read_to_string(conf_path()).unwrap().contains("Node A"));
+
+        let bad_index = B64.encode(SAMPLE.replace("active_node: 0", "active_node: 99"));
+        let r = act_save_config(&json!({"config": bad_index}));
+        assert_eq!(r["ok"], J::Bool(false), "unusable node index rejected: {r}");
+
+        let bad_dns = B64.encode(format!(
+            "{SAMPLE}\ndns:\n  strategy: ipv6_only\nipv6_mode: compatibility\n"
+        ));
+        let r = act_save_config(&json!({"config": bad_dns}));
+        assert_eq!(r["ok"], J::Bool(false), "unusable DNS policy rejected: {r}");
+        assert!(fs::read_to_string(conf_path()).unwrap().contains("Node A"));
+
+        let legacy_socks = B64.encode(format!(
+            "{}\ndns:\n  strategy: ipv6_only\nipv6_mode: compatibility\n",
+            SAMPLE.replace("mode: \"tun\"", "mode: \"socks\"")
+        ));
+        let r = act_save_config(&json!({"config": legacy_socks}));
+        assert_eq!(
+            r["ok"],
+            J::Bool(true),
+            "legacy SOCKS mode remains valid: {r}"
+        );
 
         let good = B64.encode(SAMPLE.replace("Node A", "Node A2"));
         let r = act_save_config(&json!({"config": good}));

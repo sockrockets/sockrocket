@@ -484,6 +484,9 @@ pub struct Subscription {
     /// How often to auto-refresh (hours). 0 = manual only. Default: 24.
     #[serde(default = "default_refresh_hours")]
     pub refresh_interval_hours: u64,
+    /// Opaque revision used to reject refreshes fetched from an older source.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub refresh_revision: String,
 }
 
 fn default_refresh_hours() -> u64 {

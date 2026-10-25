@@ -1,5 +1,6 @@
 mod cgi;
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::IpAddr;
@@ -11,7 +12,7 @@ use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
     SharedOutbound, SwappableOutbound, TrafficLedger, TunProxy, apply_subscription_refresh,
-    create_outbound, fetch_subscription, flush_system_dns_cache, node_public_id,
+    create_outbound, fetch_subscription, flush_system_dns_cache, node_fingerprint, node_public_id,
     normalize_node_names, publish_traffic_catalog, resolve_to_ips, set_catalog_active,
     set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
@@ -124,6 +125,20 @@ async fn async_main() -> Result<()> {
             for source in sources {
                 println!("{source}");
             }
+        }
+        return Ok(());
+    }
+
+    // Public addresses of the nodes this process can dial. iptables returns
+    // these before MARK so a LAN device running its own proxy is not wrapped
+    // again, and so traffic to the proxy server cannot loop into the TUN.
+    if let Some(index) = args.iter().position(|arg| arg == "--dump-proxy-endpoints") {
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
+        for ip in proxy_bypass_endpoints(&config) {
+            println!("{ip}");
         }
         return Ok(());
     }
@@ -1010,7 +1025,7 @@ async fn load_config(path: &str) -> Result<AppConfig> {
                 Path::new(path),
                 refreshed,
             ) {
-                Ok(current) => current,
+                Ok(commit) => commit.config,
                 Err(error) => {
                     tracing::warn!(
                         "Subscription save failed; preserving disk configuration: {error}"
@@ -1039,7 +1054,14 @@ async fn load_config(path: &str) -> Result<AppConfig> {
 /// occurrence, which is the older entry.
 async fn resolve_config(
     mut config: AppConfig,
-) -> Result<(AppConfig, bool, Vec<(String, Vec<sockrocket_core::Node>)>)> {
+) -> Result<(
+    AppConfig,
+    bool,
+    Vec<(
+        sockrocket_core::config::storage::SubscriptionRefreshSnapshot,
+        Vec<sockrocket_core::Node>,
+    )>,
+)> {
     tracing::info!(
         "Fetching {} subscription(s) from config",
         config.subscriptions.len()
@@ -1060,7 +1082,13 @@ async fn resolve_config(
                     nodes.len(),
                     subscription.name
                 );
-                refreshed.push((subscription.url.clone(), nodes));
+                refreshed.push((
+                    sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
+                        url: subscription.url.clone(),
+                        revision: subscription.refresh_revision.clone(),
+                    },
+                    nodes,
+                ));
             }
             Err(e) => {
                 // One bad URL must not prevent the daemon (or other subs) from starting.
@@ -1073,7 +1101,13 @@ async fn resolve_config(
         }
     }
 
-    let changed = apply_subscription_refresh(&mut config, refreshed.clone());
+    let changed = apply_subscription_refresh(
+        &mut config,
+        refreshed
+            .iter()
+            .map(|(source, nodes)| (source.url.clone(), nodes.clone()))
+            .collect(),
+    );
     normalize_node_names(&mut config.nodes);
     Ok((config, changed, refreshed))
 }
@@ -1286,6 +1320,88 @@ fn make_outbound_factory(router: Option<Arc<Router>>, config: &AppConfig) -> Out
     })
 }
 
+/// Addresses iptables should leave on the WAN. The active node and each group's
+/// current pick are resolved; other nodes contribute only when their server
+/// field is already an IP, so a large subscription does not stall firewall
+/// setup on DNS. Fake-IP, loopback and private ranges are omitted.
+fn proxy_bypass_endpoints(config: &AppConfig) -> Vec<IpAddr> {
+    const LIMIT: usize = 64;
+    let mut hosts = Vec::new();
+    let mut seen_hosts = HashSet::new();
+    let mut push_host = |server: &str| {
+        if seen_hosts.insert(server.to_string()) {
+            hosts.push(server.to_string());
+        }
+    };
+    if let Some(node) = config.active_node.and_then(|index| config.nodes.get(index)) {
+        push_host(&node.server);
+    }
+    for group in &config.groups {
+        let fingerprint = group
+            .current
+            .clone()
+            .or_else(|| group.members.first().cloned());
+        let Some(fingerprint) = fingerprint else {
+            continue;
+        };
+        if let Some(node) = config
+            .nodes
+            .iter()
+            .find(|node| node_fingerprint(node) == fingerprint)
+        {
+            push_host(&node.server);
+        }
+    }
+    for node in &config.nodes {
+        if node.server.parse::<IpAddr>().is_ok() {
+            push_host(&node.server);
+        }
+    }
+    let mut ips = Vec::new();
+    let mut seen_ips = HashSet::new();
+    for host in hosts {
+        for ip in resolve_to_ips(&host) {
+            if !is_direct_proxy_endpoint(ip) || !seen_ips.insert(ip) {
+                continue;
+            }
+            ips.push(ip);
+            if ips.len() == LIMIT {
+                return ips;
+            }
+        }
+    }
+    ips
+}
+
+fn is_direct_proxy_endpoint(ip: IpAddr) -> bool {
+    if sockrocket_core::dns::fakeip::fake_ipv4(ip).is_some() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(addr) => {
+            let [first, second, _, _] = addr.octets();
+            let cgnat = first == 100 && (64..128).contains(&second);
+            !(addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_private()
+                || addr.is_link_local()
+                || addr.is_multicast()
+                || addr.is_broadcast()
+                || cgnat)
+        }
+        IpAddr::V6(addr) => {
+            let first = addr.segments()[0];
+            let unique_local = (first & 0xfe00) == 0xfc00;
+            let link_local = (first & 0xffc0) == 0xfe80;
+            !(addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_multicast()
+                || unique_local
+                || link_local)
+        }
+    }
+}
+
 /// Resolve proxy server hostnames to IP addresses (v4 and v6) for TUN route bypass.
 async fn collect_proxy_ips(config: &AppConfig, active_index: Option<usize>) -> Vec<IpAddr> {
     let mut ips = Vec::new();
@@ -1322,7 +1438,7 @@ fn protocol_name(protocol: &ProxyProtocol) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sockrocket_core::{Node, TransportConfig, TransportType};
+    use sockrocket_core::{GroupType, Node, ProxyGroupConfig, TransportConfig, TransportType};
 
     fn sample_node(name: &str) -> Node {
         Node {
@@ -1345,6 +1461,36 @@ mod tests {
             tags: vec![],
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn proxy_bypass_lists_public_node_addresses_only() {
+        let mut active = sample_node("active");
+        active.server = "203.0.113.10".into();
+        let mut outlet = sample_node("outlet");
+        outlet.server = "203.0.113.20".into();
+        let outlet_id = node_fingerprint(&outlet);
+        let mut fake = sample_node("fake");
+        fake.server = "198.18.4.4".into();
+        let mut lan = sample_node("lan");
+        lan.server = "10.1.2.3".into();
+        let mut literal = sample_node("literal");
+        literal.server = "192.0.2.9".into();
+        let config = AppConfig {
+            nodes: vec![active, outlet, fake, lan, literal],
+            active_node: Some(0),
+            groups: vec![ProxyGroupConfig {
+                name: "proxy".into(),
+                gtype: GroupType::Select,
+                members: vec![outlet_id.clone()],
+                current: Some(outlet_id),
+            }],
+            ..AppConfig::default()
+        };
+        let ips = proxy_bypass_endpoints(&config);
+        let expected =
+            ["203.0.113.10", "203.0.113.20", "192.0.2.9"].map(|ip| ip.parse::<IpAddr>().unwrap());
+        assert_eq!(ips, expected);
     }
 
     #[test]
@@ -1481,6 +1627,7 @@ mod tests {
                 format: "auto".into(),
                 last_updated: Some(1),
                 refresh_interval_hours: 24,
+                refresh_revision: String::new(),
             }],
             ..AppConfig::default()
         };

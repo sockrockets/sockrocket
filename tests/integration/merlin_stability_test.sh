@@ -43,7 +43,7 @@ YAML
     printf '#!/bin/sh\nexit 0\n' > "$SOCKROCKET_BIN"
     chmod +x "$SOCKROCKET_BIN"
     logger() { :; }
-    nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; *) echo 192.168.1.1 ;; esac; }
+    nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; *) echo 192.168.1.1 ;; esac; }
     pidof() { :; }
     netstat() { echo 'udp 0 0 127.0.0.1:5300 0.0.0.0:*'; }
     service() { echo "$*" >> "$SANDBOX/service.calls"; }
@@ -83,6 +83,94 @@ test_repeated_cleanup_does_not_restart_dns() {
     check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'upstream restored'
 }
 
+test_merlin_3006_main_dns_isolated_from_sdn() {
+    # RT-AX86U Pro firmware may omit the mktemp command entirely.
+    mktemp() { echo 'unexpected mktemp call' >&2; return 127; }
+    SOCKROCKET_DNS_UPSTREAM_FILE="$SANDBOX/main-upstream"
+    SOCKROCKET_DNS_MAIN_CONFIG="$SANDBOX/dnsmasq.conf"
+    SOCKROCKET_DNS_POSTCONF_HOOK="$SANDBOX/dnsmasq.postconf"
+    SOCKROCKET_DNS_POSTCONF_SCRIPT="$SANDBOX/dnsmasq-postconf.sh"
+    export SOCKROCKET_DNS_UPSTREAM_FILE SOCKROCKET_DNS_MAIN_CONFIG
+    cp "$ROOT/merlin/scripts/dnsmasq-postconf.sh" "$SOCKROCKET_DNS_POSTCONF_SCRIPT"
+    chmod +x "$SOCKROCKET_DNS_POSTCONF_SCRIPT"
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    apply_postconf=1
+    nvram() { case "$2" in firmver) echo 3.0.0.6 ;; lan_ipaddr) echo 192.168.50.1 ;; esac; }
+    service() {
+        echo "$*" >> "$SANDBOX/service.calls"
+        printf 'servers-file=/tmp/resolv.dnsmasq\n' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+        if [ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] &&
+           [ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] &&
+           [ -f "$SOCKROCKET_DNS_POSTCONF_HOOK" ] &&
+           [ "$apply_postconf" = 1 ]; then
+            "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+        fi
+    }
+    update_dnsmasq start
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'shared SDN upstream preserved'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_DNS_UPSTREAM_FILE")" 'main LAN has private upstream'
+    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq uses private upstream'
+    update_dnsmasq stop
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'private upstream removed on stop'
+    check 'servers-file=/tmp/resolv.dnsmasq' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq restored on stop'
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'SDN upstream unchanged on stop'
+    # A binary-only update without the new postconf hook must fail open.
+    rm "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    if update_dnsmasq start; then echo '3006 DNS activated without postconf hook' >&2; exit 1; fi
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'no orphan private upstream'
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'SDN upstream preserved on failed start'
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    apply_postconf=0
+    # The router waits out rc's delayed postconf. This mock never applies it.
+    SOCKROCKET_DNS_ISOLATION_WAIT=0
+    if update_dnsmasq start; then echo '3006 DNS activated when postconf did not run' >&2; exit 1; fi
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'unapplied postconf rolls back private upstream'
+    apply_postconf=1
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNS_UPSTREAM_FILE"
+    printf 'servers-file=/tmp/resolv.dnsmasq\nserver=1.1.1.1\n' > "$SANDBOX/dnsmasq-1.conf"
+    "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SANDBOX/dnsmasq-1.conf"
+    check 'servers-file=/tmp/resolv.dnsmasq
+server=1.1.1.1' "$(cat "$SANDBOX/dnsmasq-1.conf")" 'SDN dnsmasq config untouched'
+    printf '%s\n' \
+        'servers-file=/tmp/resolv.dnsmasq ' \
+        'server=1.1.1.1' \
+        'server=127.0.0.1#5453' \
+        'server=/router.asus.com/192.168.50.1' \
+        'address=/use-application-dns.net/' \
+        > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(grep '^servers-file=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'trailing space still isolates main upstream'
+    check 0 "$(grep -c '^server=1\.1\.1\.1$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'ISP server= cannot outrun Sockrocket'
+    check 0 "$(grep -c '^server=127\.0\.0\.1#5453$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'Stubby server= cannot outrun Sockrocket'
+    check 'server=/router.asus.com/192.168.50.1' "$(grep '^server=/' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'domain DNS override kept'
+    check 'address=/use-application-dns.net/' "$(grep '^address=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'address rule kept'
+    printf '%s\n' 'servers-file=/tmp/fork-resolv.dnsmasq' 'server=9.9.9.9' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(grep '^servers-file=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'non-stock main servers-file still isolates'
+    check 0 "$(grep -c '^server=9\.9\.9\.9$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'fork upstream server= cannot outrun Sockrocket'
+    # An upgrade must restore the old shared-file pin before starting SDNs.
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_RESOLV_FILE"
+    printf 'server=192.0.2.53\n' > "$SOCKROCKET_RESOLV_FILE.Sockrocket-bak"
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    update_dnsmasq start
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'legacy shared pin migrated'
+    printf '4242\n' > "$SANDBOX/main.pid"
+    SOCKROCKET_DNS_MAIN_PID="$SANDBOX/main.pid"
+    export SOCKROCKET_DNS_MAIN_PID
+    : > "$SANDBOX/hup"
+    kill() { echo "$*" >> "$SANDBOX/hup"; }
+    chmod 600 "$SOCKROCKET_DNS_UPSTREAM_FILE"
+    pin_dns_upstream
+    check '-HUP 4242' "$(cat "$SANDBOX/hup")" 'unreadable private upstream reloads main dnsmasq'
+    case "$(ls -l "$SOCKROCKET_DNS_UPSTREAM_FILE")" in
+        -rw-r--r--*) ;;
+        *) echo 'private upstream stayed unreadable' >&2; exit 1 ;;
+    esac
+    : > "$SANDBOX/hup"
+    pin_dns_upstream
+    check empty "$(test -s "$SANDBOX/hup" && echo nonempty || echo empty)" 'readable private upstream is left running'
+}
+
 test_lost_listener_unpins_dns() {
     update_dnsmasq start
     netstat() { :; }
@@ -119,6 +207,7 @@ test_memory_pressure_delays_recovery() {
     printf 'MemTotal: 100000 kB\nMemAvailable: 22000 kB\n' > "$SOCKROCKET_MEMINFO_FILE"
     try_recover_lan_proxy
     check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'recovery below threshold'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'recovery pins DNS before clearing degraded marker'
 }
 
 test_old_kernel_memory_fallback() {
@@ -194,6 +283,71 @@ test_firewall_event_respects_degraded_and_stopped() {
     check absent "$([ -f "$SANDBOX/firewall.calls" ] && echo present || echo absent)" 'manual stop survives firewall rebuild'
 }
 
+test_wan_reconnect_restores_rules_and_dns_safely() {
+    printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    export SANDBOX
+    wait_for_tun() { return 0; }
+    wait_for_dns() { return 0; }
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    do_wan_restore
+    check start "$(head -1 "$SANDBOX/firewall.calls")" 'WAN reconnect restores transparent routing'
+    check dns-start "$(tail -1 "$SANDBOX/firewall.calls")" 'WAN reconnect restores DNS interception'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'WAN reconnect re-pins DNS'
+
+    printf 'server=198.51.100.53\n' > "$SOCKROCKET_RESOLV_FILE"
+    pin_dns_upstream
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'DHCP renew re-pins DNS'
+    check 'server=198.51.100.53' "$(cat "$SOCKROCKET_RESOLV_FILE.Sockrocket-bak")" 'fresh WAN DNS saved for Stop'
+
+    : > "$SANDBOX/firewall.calls"
+    printf 'server=198.51.100.54\n' > "$SOCKROCKET_RESOLV_FILE"
+    touch "$SOCKROCKET_DIR/stopped"
+    do_wan_restore
+    pin_dns_upstream
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'manual Stop keeps WAN rules down'
+    check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'manual Stop keeps firmware DNS'
+
+    rm -f "$SOCKROCKET_DIR/stopped"
+    echo fault > "$DEGRADED_FILE"
+    do_wan_restore
+    do_pin_dns_event
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'fail-open keeps WAN rules down'
+    check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'fail-open keeps firmware DNS'
+
+    rm -f "$DEGRADED_FILE"
+    sed -i.bak 's/^dns_hijack: true/dns_hijack: false/' "$SOCKROCKET_CONF"
+    pin_dns_upstream
+    check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'disabled DNS hijack never re-pins'
+}
+
+test_dhcpv6_prefix_change_reconciles_ipv6_without_ipv4_rebuild() {
+    printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    export SANDBOX
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    printf '\nipv6_mode: dual_stack\n' >> "$SOCKROCKET_CONF"
+    do_dhcpv6_restore
+    check ipv6-apply "$(cat "$SANDBOX/firewall.calls")" 'DHCPv6 event reconciles only IPv6 policy'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'DHCPv6 event re-pins DNS'
+
+    : > "$SANDBOX/firewall.calls"
+    pin_dns_upstream() { return 1; }
+    if do_dhcpv6_restore; then echo 'DNS pin failure was hidden' >&2; exit 1; fi
+    check ipv6-apply "$(cat "$SANDBOX/firewall.calls")" 'DNS failure does not block IPv6 policy repair'
+
+    : > "$SANDBOX/firewall.calls"
+    printf 'server=198.51.100.53\n' > "$SOCKROCKET_RESOLV_FILE"
+    touch "$SOCKROCKET_DIR/stopped"
+    do_dhcpv6_restore
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'manual Stop blocks DHCPv6 restore'
+    check 'server=198.51.100.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'manual Stop keeps firmware DNS'
+
+    rm -f "$SOCKROCKET_DIR/stopped"
+    echo fault > "$DEGRADED_FILE"
+    do_dhcpv6_restore
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'fail-open blocks DHCPv6 restore'
+    check 'server=198.51.100.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'fail-open keeps firmware DNS'
+}
+
 test_reapply_respects_fail_open_and_clears_stale_ipv6_dns() {
     printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
     export SANDBOX
@@ -234,6 +388,7 @@ test_policy_routing_staged_and_idempotent() {
     }
     do_start
     do_start
+    check 2 "$(grep -c -- '-A SOCKROCKET_MANGLE -i br0 -s 192.168.1.0/24 -p tcp' "$SANDBOX/kernel.calls")" 'capture stays on the primary LAN bridge'
     check 1 "$(grep -c '^ip rule add ' "$SANDBOX/kernel.calls")" 'policy rule not duplicated on reapply'
     check 2 "$(grep -c '^ip route replace 198.18.0.0/16 dev sockrocket-tun$' "$SANDBOX/kernel.calls")" 'Fake-IP reply reverse route installed'
     check 0 "$(grep -c '^ip route replace unreachable 198.18.0.0/16' "$SANDBOX/kernel.calls" || true)" 'active TUN never rejects Fake-IP source route'
@@ -274,11 +429,12 @@ test_policy_routing_staged_and_idempotent() {
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'native fake-IP UDP is not rejected'
     : > "$SANDBOX/kernel.calls"
     printf '#!/bin/sh\n[ "$1" = --dump-rule-sources ] && exit 0\nexit 1\n' > "$SOCKROCKET_DIR/sockrocket-cli"
+    printf '\nproxy_mode: global\n' >> "$SOCKROCKET_CONF"
     do_start
-    check 1 "$(grep -c -- '! -d 198.18.0.0/16 -p udp --dport 443 -j RETURN' "$SANDBOX/kernel.calls")" 'stream-only node keeps real-address QUIC on the kernel path'
+    check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'global mode with stream-only node keeps real-address QUIC in userspace policy'
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'stream-only fake-IP UDP reaches userspace'
-    # Device policies must reach userspace before CN bypass or QUIC fallback.
-    LAN_SUBNET="192.0.2.0/24"
+    # Device policies must reach userspace before the optional CN bypass.
+    nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; *) echo 192.0.2.1 ;; esac; }
     : > "$SANDBOX/kernel.calls"
     printf '#!/bin/sh\ncase "$1" in --dump-rule-sources) printf "192.0.2.10/32\\n192.0.2.0/24\\n";; *) exit 1;; esac\n' > "$SOCKROCKET_DIR/sockrocket-cli"
     do_ipset_start() { iptables -t mangle -A "$MANGLE_CHAIN" -m set --match-set sockrocket_cn dst -j RETURN; }
@@ -286,11 +442,10 @@ test_policy_routing_staged_and_idempotent() {
     do_start
     check 4 "$(grep -c '^-*iptables -t mangle -A SOCKROCKET_DEVICES -s ' "$SANDBOX/kernel.calls")" 'both TCP and UDP device scopes marked'
     check 0 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD ' "$SANDBOX/kernel.calls" || true)" 'QUIC is not a LAN-wide kernel switch'
-    device_line=$(awk '/-A SOCKROCKET_MANGLE -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
+    device_line=$(awk '/-A SOCKROCKET_MANGLE -i br0 -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
     cn_line=$(awk '/--match-set sockrocket_cn dst/{print NR;exit}' "$SANDBOX/kernel.calls")
     [ -n "$device_line" ] && [ -n "$cn_line" ] && [ "$device_line" -lt "$cn_line" ] || { echo 'device policies bypassed' >&2;exit 1; }
-    quic_line=$(awk '/-A SOCKROCKET_MANGLE .*--dport 443 -j RETURN/{print NR;exit}' "$SANDBOX/kernel.calls")
-    [ -n "$quic_line" ] && [ "$device_line" -lt "$quic_line" ] || { echo 'device policies bypassed by the stream-only QUIC path' >&2;exit 1; }
+    check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'real-address QUIC cannot bypass device or global policy'
     flush_chains
     check 2 "$(grep -c -- '-X SOCKROCKET_DEVICES' "$SANDBOX/kernel.calls")" 'device chain removed on rebuild and explicit cleanup'
     : > "$SANDBOX/kernel.calls"
@@ -298,6 +453,69 @@ test_policy_routing_staged_and_idempotent() {
     if do_start; then echo 'invalid source export hidden' >&2;exit 1;fi
     check 0 "$(grep -c -- '-A PREROUTING -j SOCKROCKET_MANGLE' "$SANDBOX/kernel.calls" || true)" 'source validation failure never attaches LAN marks'
 
+}
+
+test_proxy_endpoints_leave_directly() {
+    sed '/^case "\$1" in/,$d' "$ROOT/merlin/scripts/iptables.sh" > "$SANDBOX/iptables-functions.sh"
+    . "$SANDBOX/iptables-functions.sh"
+    SOCKROCKET_DIR="$SANDBOX/plugin"
+    SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
+    detect_tun_dev() { echo sockrocket-tun; }
+    iptables() {
+        echo "iptables $*" >> "$SANDBOX/kernel.calls"
+        case " $* " in *' -C '*) return 1 ;; esac
+        return 0
+    }
+    ip6tables() {
+        echo "ip6tables $*" >> "$SANDBOX/kernel.calls"
+        case " $* " in *' -C '*) return 1 ;; esac
+        return 0
+    }
+    ip() { echo "ip $*" >> "$SANDBOX/kernel.calls"; return 0; }
+    printf '#!/bin/sh\ncase "$1" in --dump-proxy-endpoints) printf "203.0.113.10\\n198.18.0.5\\n10.1.1.1\\n2001:db8::10\\nfe80::1\\nnot-an-ip\\n";; esac\nexit 0\n' \
+        > "$SOCKROCKET_DIR/sockrocket-cli"
+    chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
+    : > "$SANDBOX/kernel.calls"
+    do_start
+    check 1 "$(grep -c -- '-A SOCKROCKET_MANGLE -d 203.0.113.10 -j RETURN' "$SANDBOX/kernel.calls")" 'node address leaves directly'
+    check 0 "$(grep -c -- '-d 198.18.0.5 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'Fake-IP is not a direct endpoint'
+    check 0 "$(grep -c -- '-d 10.1.1.1 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'private node address is not added twice'
+    check 0 "$(grep -c -- 'not-an-ip' "$SANDBOX/kernel.calls" || true)" 'endpoint dump cannot inject iptables arguments'
+    endpoint_line=$(awk '/-d 203.0.113.10 -j RETURN/{print NR; exit}' "$SANDBOX/kernel.calls")
+    mark_line=$(awk '/-A SOCKROCKET_MANGLE -i br0 .* -j MARK/{print NR; exit}' "$SANDBOX/kernel.calls")
+    [ -n "$endpoint_line" ] && [ -n "$mark_line" ] && [ "$endpoint_line" -lt "$mark_line" ] \
+        || { echo 'node bypass is after the LAN mark' >&2; exit 1; }
+}
+
+test_primary_lan_scope_validation() {
+    sed '/^case "\$1" in/,$d' "$ROOT/merlin/scripts/iptables.sh" > "$SANDBOX/iptables-functions.sh"
+    . "$SANDBOX/iptables-functions.sh"
+    lan_ip=10.42.7.1 lan_mask=255.255.255.128 lan_bridge=br5
+    nvram() { case "$2" in lan_ipaddr) echo "$lan_ip" ;; lan_netmask) echo "$lan_mask" ;; lan_ifname) echo "$lan_bridge" ;; ipv6_service) echo disabled ;; esac; }
+    load_lan_scope
+    check 10.42.7.0/25 "$LAN_SUBNET" 'non-default LAN subnet computed'
+    check br5 "$LAN_IFACE" 'LAN bridge taken from firmware'
+    iptables() { echo "iptables $*" >> "$SANDBOX/invalid-kernel.calls"; return 0; }
+    ip6tables() { echo "ip6tables $*" >> "$SANDBOX/invalid-kernel.calls"; return 1; }
+    ip() { echo "ip $*" >> "$SANDBOX/invalid-kernel.calls"; return 0; }
+    detect_tun_dev() { echo sockrocket-tun; }
+    for bad in '999.1.1.1|255.255.255.0' '010.42.7.1|255.255.255.0' \
+        '10.42.7.1|255.0.255.0' '10.42.7.1|255.255.0.255' \
+        '10.42.7.1|0.0.0.0' '|255.255.255.0' '10.42.7.1|'; do
+        lan_ip=${bad%%|*}; lan_mask=${bad#*|}
+        if load_lan_scope; then echo "accepted invalid LAN: $bad" >&2; exit 1; fi
+        if do_start; then echo "started with invalid LAN: $bad" >&2; exit 1; fi
+        if do_dns_start; then echo "DNS captured invalid LAN: $bad" >&2; exit 1; fi
+    done
+    lan_ip=10.42.7.1 lan_mask=255.255.255.0 lan_bridge='br0 -j ACCEPT'
+    if load_lan_scope; then echo 'accepted invalid LAN interface' >&2; exit 1; fi
+    check absent "$([ -f "$SANDBOX/invalid-kernel.calls" ] && echo present || echo absent)" 'invalid LAN cannot change firewall'
+    # Stop must still remove owned rules when NVRAM becomes unreadable.
+    do_stop
+    grep -q 'iptables -t mangle -D PREROUTING -j SOCKROCKET_MANGLE' "$SANDBOX/invalid-kernel.calls"
+    if grep -q 'iptables -D FORWARD -s  ' "$SANDBOX/invalid-kernel.calls"; then
+        echo 'cleanup used an empty legacy source' >&2; exit 1
+    fi
 }
 
 test_startup_failure_never_enables_dns() {
@@ -470,6 +688,7 @@ test_softcenter_state_tracks_proxy_not_api_or_saved_intent() {
 }
 
 run_test test_boot_keeps_fresh_install_and_manual_stop_disabled
+run_test test_primary_lan_scope_validation
 run_test test_softcenter_state_tracks_proxy_not_api_or_saved_intent
 run_test test_background_restart_preserves_manual_stop
 run_test test_existing_dns_pin_permissions_healed
@@ -485,6 +704,7 @@ run_test test_startup_failure_never_enables_dns
 run_test test_dns_nat_failure_rolls_back
 run_test test_dns_failure_rolls_back
 run_test test_repeated_cleanup_does_not_restart_dns
+run_test test_merlin_3006_main_dns_isolated_from_sdn
 run_test test_lost_listener_unpins_dns
 run_test test_missing_tun_never_recovers
 run_test test_firewall_failure_never_recovers
@@ -495,6 +715,9 @@ run_test test_degraded_start_still_creates_tun
 run_test test_command_failure_exit_status
 run_test test_nat_restore_reinstalls_dns_without_undoing_fail_open
 run_test test_firewall_event_respects_degraded_and_stopped
+run_test test_wan_reconnect_restores_rules_and_dns_safely
+run_test test_dhcpv6_prefix_change_reconciles_ipv6_without_ipv4_rebuild
 run_test test_reapply_respects_fail_open_and_clears_stale_ipv6_dns
 run_test test_policy_routing_staged_and_idempotent
+run_test test_proxy_endpoints_leave_directly
 echo "$PASS stability scenarios passed"

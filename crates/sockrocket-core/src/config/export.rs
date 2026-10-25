@@ -308,6 +308,9 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             apply_ws_and_tls(&mut m, node, "sni");
         }
         ProxyProtocol::Hysteria2 { password, udp } => {
+            if let Some(ports) = node.extra.get(super::v2ray::HY2_MPORT) {
+                put(&mut m, "ports", s(ports));
+            }
             if let Some(fp) = super::v2ray::hysteria2_fingerprint(node) {
                 put(&mut m, "client-fingerprint", s(fp));
             }

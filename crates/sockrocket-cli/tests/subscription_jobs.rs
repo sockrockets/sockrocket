@@ -111,6 +111,146 @@ fn private_file(path: &Path) {
     #[cfg(not(unix))]
     let _ = path;
 }
+
+#[test]
+fn slow_refresh_does_not_block_edits_or_restore_a_deleted_subscription() {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/slow", listener.local_addr().unwrap());
+    let mut config = sockrocket_core::AppConfig::default();
+    config.subscriptions.push(sockrocket_core::Subscription {
+        name: "Original".into(),
+        url: endpoint,
+        format: "auto".into(),
+        last_updated: None,
+        refresh_interval_hours: 24,
+        refresh_revision: String::new(),
+    });
+    fs::write(
+        fixture.0.join("config.yaml"),
+        serde_yaml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        connection.read(&mut request).unwrap();
+        arrived_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@new.invalid:8388#new";
+        write!(
+            connection,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let launch = fixture.call("subscription_start", json!({"action":"update_subs"}));
+    assert_eq!(launch["ok"], true);
+    arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        fixture.call("rename_sub", json!({"index":0,"name":"Renamed"}))["ok"],
+        true
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        fixture.call("subscriptions", json!({}))["subs"][0]["name"],
+        "Renamed"
+    );
+    assert_eq!(fixture.call("del_sub", json!({"index":0}))["ok"], true);
+    release_tx.send(()).unwrap();
+    let finished = fixture.finish(&launch["job"]["id"]);
+    assert_eq!(finished["result"]["error_code"], "subscriptions_removed");
+    let saved = sockrocket_core::AppConfig::from_yaml_str(
+        &fs::read_to_string(fixture.0.join("config.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert!(saved.subscriptions.is_empty());
+    assert!(saved.nodes.is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn partial_delete_during_refresh_counts_only_saved_nodes() {
+    let fixture = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let kept = format!("http://{addr}/kept");
+    let mut config = sockrocket_core::AppConfig::default();
+    config.subscriptions.push(sockrocket_core::Subscription {
+        name: "Slow".into(),
+        url: format!("http://{addr}/slow"),
+        format: "auto".into(),
+        last_updated: None,
+        refresh_interval_hours: 24,
+        refresh_revision: String::new(),
+    });
+    config.subscriptions.push(sockrocket_core::Subscription {
+        name: "Kept".into(),
+        url: kept.clone(),
+        format: "auto".into(),
+        last_updated: None,
+        refresh_interval_hours: 24,
+        refresh_revision: String::new(),
+    });
+    fs::write(
+        fixture.0.join("config.yaml"),
+        serde_yaml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        connection.read(&mut request).unwrap();
+        arrived_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@removed.invalid:8388#removed";
+        write!(
+            connection,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        connection.read(&mut request).unwrap();
+        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@kept.invalid:8388#kept";
+        write!(
+            connection,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let launch = fixture.call("subscription_start", json!({"action":"update_subs"}));
+    assert_eq!(launch["ok"], true);
+    arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(fixture.call("del_sub", json!({"index":0}))["ok"], true);
+    release_tx.send(()).unwrap();
+    let finished = fixture.finish(&launch["job"]["id"]);
+    assert_eq!(finished["result"]["ok"], true, "{finished}");
+    let msg = finished["result"]["msg"].as_str().unwrap();
+    assert!(msg.contains("已更新 1 个节点"), "{msg}");
+    assert!(msg.contains("1 个订阅在下载期间被删除"), "{msg}");
+    let saved = sockrocket_core::AppConfig::from_yaml_str(
+        &fs::read_to_string(fixture.0.join("config.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved.subscriptions.len(), 1);
+    assert_eq!(saved.subscriptions[0].url, kept);
+    assert_eq!(saved.nodes.len(), 1);
+    assert_eq!(saved.nodes[0].server, "kept.invalid");
+    server.join().unwrap();
+}
+
 #[test]
 fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
     let fixture = Fixture::new();
@@ -132,7 +272,7 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
         released.store(true, Ordering::SeqCst);
         release.expect("test must release HTTP body after launch and duplicate responses");
         // Synthetic public documentation endpoint/credentials only.
-        let body = "hy2://synthetic@example.invalid:443?fp=chrome#fixture";
+        let body = "hy2://synthetic@example.invalid:443?fp=chrome&mport=443-445#fixture";
         write!(
             connection,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -178,7 +318,10 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
     assert_eq!(finished["result"]["node_count"], 1);
     assert_eq!(
         finished["result"]["compatibility_notes"],
-        json!(["hysteria2_chrome_quic_profile"])
+        json!([
+            "hysteria2_chrome_quic_profile",
+            "hysteria2_mport_fixed_port"
+        ])
     );
     assert!(
         !finished["result"]["msg"]
@@ -257,6 +400,7 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         });
         let mut nodes = vec![
             sockrocket_core::config::v2ray::parse_ss_uri(&format!(
@@ -576,6 +720,7 @@ fn invalid_addresses_are_skipped_without_losing_existing_nodes_or_reporting_succ
             format: "auto".into(),
             last_updated: None,
             refresh_interval_hours: 24,
+            refresh_revision: String::new(),
         })
         .collect();
     config.nodes = vec![
