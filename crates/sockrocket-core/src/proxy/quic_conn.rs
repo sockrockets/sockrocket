@@ -98,20 +98,69 @@ impl<V: Clone> SingleFlight<V> {
     }
 }
 
+/// A quiet or young connection may have a small window. Retire only after it
+/// has carried enough traffic to show that the path itself is stuck.
+const RETIRE_MIN_SENT: u64 = 300;
+const RETIRE_RTT: std::time::Duration = std::time::Duration::from_millis(1000);
+const RETIRE_CWND: u64 = 12_000;
+/// How long a path must stay in the stuck condition before it is replaced.
+/// One slow sample is normal; a restart is what users do after it stays slow.
+const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// True when a used QUIC path is too slow to keep. High latency, or a window
+/// that collapsed and is still losing packets.
+pub(crate) fn path_should_retire(sent: u64, lost: u64, rtt: std::time::Duration, cwnd: u64) -> bool {
+    if sent < RETIRE_MIN_SENT {
+        return false;
+    }
+    if rtt >= RETIRE_RTT {
+        return true;
+    }
+    cwnd < RETIRE_CWND && lost.saturating_mul(5) > sent
+}
+
 /// Cached QUIC connection state (endpoint + connection pair).
 pub struct QuicConnectionState {
     inner: SingleFlight<(quinn::Endpoint, quinn::Connection)>,
+    slow_since: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl QuicConnectionState {
     pub fn new() -> Self {
         Self {
             inner: SingleFlight::new(),
+            slow_since: std::sync::Mutex::new(None),
         }
     }
 
-    fn conn_is_live((_, conn): &(quinn::Endpoint, quinn::Connection)) -> bool {
-        conn.close_reason().is_none()
+    fn usable(
+        slow_since: &std::sync::Mutex<Option<std::time::Instant>>,
+        (_, conn): &(quinn::Endpoint, quinn::Connection),
+    ) -> bool {
+        if conn.close_reason().is_some() {
+            return false;
+        }
+        let path = conn.stats().path;
+        let sick = path_should_retire(path.sent_packets, path.lost_packets, path.rtt, path.cwnd);
+        let mut since = slow_since.lock().unwrap_or_else(|e| e.into_inner());
+        if !sick {
+            *since = None;
+            return true;
+        }
+        let started = *since.get_or_insert_with(std::time::Instant::now);
+        if started.elapsed() < RETIRE_AFTER {
+            return true;
+        }
+        *since = None;
+        tracing::warn!(
+            rtt_ms = path.rtt.as_millis() as u64,
+            cwnd = path.cwnd,
+            lost_packets = path.lost_packets,
+            sent_packets = path.sent_packets,
+            "QUIC path stayed slow; opening a new connection"
+        );
+        conn.close(quinn::VarInt::from_u32(0), b"slow path");
+        false
     }
 
     /// Get a live cached connection, or establish one (serialized so that
@@ -126,9 +175,10 @@ impl QuicConnectionState {
     {
         // The endpoint stays alive inside the cache; the local binding is
         // just the destructure of the cached tuple.
+        let slow_since = &self.slow_since;
         let (_endpoint, conn) = self
             .inner
-            .get_or_connect(Self::conn_is_live, connect)
+            .get_or_connect(|pair| Self::usable(slow_since, pair), connect)
             .await?;
         Ok(conn)
     }
@@ -357,6 +407,32 @@ mod tests {
         );
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn young_or_quiet_quic_paths_stay_cached() {
+        use std::time::Duration;
+        assert!(!path_should_retire(10, 10, Duration::from_secs(3), 1_000));
+        assert!(!path_should_retire(1_000, 0, Duration::from_millis(200), 8_000));
+        assert!(!path_should_retire(1_000, 10, Duration::from_millis(400), 64_000));
+    }
+
+    #[test]
+    fn a_used_quic_path_is_retired_when_latency_or_loss_stays_bad() {
+        use std::time::Duration;
+        assert!(path_should_retire(
+            400,
+            0,
+            Duration::from_millis(1000),
+            200_000
+        ));
+        assert!(path_should_retire(400, 100, Duration::from_millis(200), 8_000));
+        assert!(!path_should_retire(
+            400,
+            100,
+            Duration::from_millis(200),
+            20_000
+        ));
+    }
 
     #[test]
     fn test_prefer_socket_addrs_prefers_ipv4_and_dedups() {

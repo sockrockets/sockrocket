@@ -493,6 +493,7 @@ impl Outbound for TuicOutbound {
                         last_err =
                             anyhow::anyhow!("TUIC open_bi failed (attempt {}): {}", attempt, e);
                         tracing::debug!("{last_err} — will retry with fresh connection");
+                        conn.close(quinn::VarInt::from_u32(0), b"open_bi failed");
                         continue;
                     }
                 };
