@@ -1,4 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(test)]
+use std::net::Ipv4Addr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
