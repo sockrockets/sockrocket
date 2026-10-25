@@ -62,6 +62,7 @@ pack_one() {
   printf '%s\n' "$platform" > "$pkg/.valid"
 
   cp "$ROOT/merlin/scripts/sockrocket.sh" "$ROOT/merlin/scripts/iptables.sh" \
+     "$ROOT/merlin/scripts/dnsmasq-postconf.sh" \
      "$ROOT/merlin/scripts/dnsmasq.conf" "$ROOT/merlin/scripts/sockrocket_api.sh" \
      "$ROOT/merlin/scripts/sockrocket_status.sh" \
      "$pkg/scripts/"
@@ -73,6 +74,7 @@ pack_one() {
 
   chmod +x "$pkg/install.sh" "$pkg/uninstall.sh" \
            "$pkg/scripts/sockrocket.sh" "$pkg/scripts/iptables.sh" \
+           "$pkg/scripts/dnsmasq-postconf.sh" \
            "$pkg/scripts/sockrocket_api.sh" "$pkg/scripts/sockrocket_status.sh"
 
   local tarball="sockrocket-merlin-${platform}.tar.gz"
