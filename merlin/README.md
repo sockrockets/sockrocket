@@ -182,8 +182,14 @@ API and config I/O are implemented in Rust (serde YAML); router-specific keys ar
 | File | When |
 |------|------|
 | `/jffs/scripts/firewall-start` | Re-apply firewall rules |
+| `/jffs/scripts/nat-start` | Restore DNS interception after NAT rebuild |
+| `/jffs/scripts/wan-event` | Restore policy route and DNS after WAN connects (PPPoE, DHCP, static IP) |
+| `/jffs/scripts/wan-start` | Legacy Merlin WAN connection fallback |
+| `/jffs/scripts/dhcpc-event` | Re-pin DNS after DHCP lease bound or renew |
 | `/jffs/scripts/services-start` | Start Sockrocket |
 | `/jffs/scripts/service-event` | Service restart hook |
+
+Run the full offline `install.sh` to install updated hook scripts; `--update` replaces the binary only.
 
 ## Troubleshooting
 

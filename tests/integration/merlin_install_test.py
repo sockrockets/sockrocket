@@ -98,7 +98,43 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         assert response == 'Sockrocket stopped' and 'PID' not in response
         subprocess.run(['sh', str(status_path), '123'], env=requested, check=True)
         assert '--data Sockrocket stopped http://127.0.0.1:3030/_resp/123' in (root / 'response').read_text()
+
+        # Install the actual Merlin hook bodies in a sandbox. This caught a
+        # shift-2 regression that wrote marker-only, nonfunctional scripts.
+        hook_dir = root / 'hooks'
+        hook_dir.mkdir()
+        (hook_dir / 'wan-event').write_text('#!/bin/sh\n: # another add-on hook\n')
+        control.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$SOCKROCKET_DIR/hook-calls"\n')
+        control.chmod(0o700)
+        hook_helper = source[source.index('install_hook() {'):source.index('# Bring up API')]
+        wan_helper = source[source.index('install_wan_hooks() {'):source.index('ks_install() {')]
+        hook_calls = source[source.index('    install_hook "/jffs/scripts/firewall-start"'):source.index('    # Post-install validation')]
+        hook_script = (wan_helper + hook_calls).replace('/jffs/scripts/', str(hook_dir) + '/')
+        hook_script = hook_script.replace('/jffs/addons/sockrocket/scripts/sockrocket.sh', str(control))
+        assert source.count('    install_wan_hooks\n') == 2, 'both standard and koolcenter installs need WAN hooks'
+        run('ok() { :; }\n' + hook_helper + hook_script)
+        run('ok() { :; }\n' + hook_helper + hook_script)
+        assert ': # another add-on hook' in (hook_dir / 'wan-event').read_text()
+
+        def event(name, *args):
+            subprocess.run(['sh', str(hook_dir / name), *args], env=env, check=True)
+
+        event('wan-event', '0', 'connecting')
+        event('wan-event', '0', 'connected')
+        event('wan-event', '1', 'disconnected')
+        event('wan-start')
+        event('dhcpc-event', 'renew')
+        event('dhcpc-event', 'bound')
+        event('dhcpc-event', 'deconfig')
+        event('firewall-start', 'ppp0')
+        event('nat-start')
+        event('services-start')
+        event('service-event', 'restart', 'Sockrocket')
+        assert (root / 'hook-calls').read_text().splitlines() == [
+            'wan-restore', 'wan-restore', 'pin-dns', 'pin-dns',
+            'firewall-restore', 'nat-restore', 'boot', 'restart',
+        ], 'WAN and DHCP events must dispatch once after idempotent installation'
     finally:
         old.terminate()
         old.wait()
-print('PASS: atomic upgrade, API restart, fresh install stopped, preserved upgrade intent and boot wrapper')
+print('PASS: atomic upgrade, preserved install intent, boot wrapper and WAN event hooks')

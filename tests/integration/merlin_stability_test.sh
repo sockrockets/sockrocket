@@ -119,6 +119,7 @@ test_memory_pressure_delays_recovery() {
     printf 'MemTotal: 100000 kB\nMemAvailable: 22000 kB\n' > "$SOCKROCKET_MEMINFO_FILE"
     try_recover_lan_proxy
     check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'recovery below threshold'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'recovery pins DNS before clearing degraded marker'
 }
 
 test_old_kernel_memory_fallback() {
@@ -192,6 +193,43 @@ test_firewall_event_respects_degraded_and_stopped() {
     rm -f "$DEGRADED_FILE"; touch "$SOCKROCKET_DIR/stopped"
     do_firewall_restore
     check absent "$([ -f "$SANDBOX/firewall.calls" ] && echo present || echo absent)" 'manual stop survives firewall rebuild'
+}
+
+test_wan_reconnect_restores_rules_and_dns_safely() {
+    printf '#!/bin/sh\necho "$1" >> "$SANDBOX/firewall.calls"\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    export SANDBOX
+    wait_for_tun() { return 0; }
+    wait_for_dns() { return 0; }
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    do_wan_restore
+    check start "$(head -1 "$SANDBOX/firewall.calls")" 'WAN reconnect restores transparent routing'
+    check dns-start "$(tail -1 "$SANDBOX/firewall.calls")" 'WAN reconnect restores DNS interception'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'WAN reconnect re-pins DNS'
+
+    printf 'server=198.51.100.53\n' > "$SOCKROCKET_RESOLV_FILE"
+    pin_dns_upstream
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'DHCP renew re-pins DNS'
+    check 'server=198.51.100.53' "$(cat "$SOCKROCKET_RESOLV_FILE.Sockrocket-bak")" 'fresh WAN DNS saved for Stop'
+
+    : > "$SANDBOX/firewall.calls"
+    printf 'server=198.51.100.54\n' > "$SOCKROCKET_RESOLV_FILE"
+    touch "$SOCKROCKET_DIR/stopped"
+    do_wan_restore
+    pin_dns_upstream
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'manual Stop keeps WAN rules down'
+    check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'manual Stop keeps firmware DNS'
+
+    rm -f "$SOCKROCKET_DIR/stopped"
+    echo fault > "$DEGRADED_FILE"
+    do_wan_restore
+    do_pin_dns_event
+    check empty "$(test -s "$SANDBOX/firewall.calls" && echo nonempty || echo empty)" 'fail-open keeps WAN rules down'
+    check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'fail-open keeps firmware DNS'
+
+    rm -f "$DEGRADED_FILE"
+    sed -i.bak 's/^dns_hijack: true/dns_hijack: false/' "$SOCKROCKET_CONF"
+    pin_dns_upstream
+    check 'server=198.51.100.54' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'disabled DNS hijack never re-pins'
 }
 
 test_reapply_respects_fail_open_and_clears_stale_ipv6_dns() {
@@ -495,6 +533,7 @@ run_test test_degraded_start_still_creates_tun
 run_test test_command_failure_exit_status
 run_test test_nat_restore_reinstalls_dns_without_undoing_fail_open
 run_test test_firewall_event_respects_degraded_and_stopped
+run_test test_wan_reconnect_restores_rules_and_dns_safely
 run_test test_reapply_respects_fail_open_and_clears_stale_ipv6_dns
 run_test test_policy_routing_staged_and_idempotent
 echo "$PASS stability scenarios passed"

@@ -295,7 +295,7 @@ install_common_files() {
 # install_hook <script> <content...> — pure-shell, no sed/grep/awk.
 install_hook() {
     local script="$1"
-    shift 2>/dev/null  # discard script path (and legacy marker arg if present)
+    shift  # discard only the script path; the next argument is the hook body
     local content="$*"
 
     # Create script if missing
@@ -372,6 +372,32 @@ post_install_start() {
     fi
 }
 
+# Both standard Merlin and koolcenter run on the same firmware WAN event API.
+# Install these hooks in either package mode so dial-up changes are handled.
+install_wan_hooks() {
+    # Merlin 384.15+ reports PPPoE/DHCP/static WAN connections here. Rebuild
+    # our private policy route and re-pin DNS after the firmware's WAN update.
+    install_hook "/jffs/scripts/wan-event" \
+'if [ "$2" = "connected" ] && [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ]; then
+    /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
+fi
+'
+
+    # Older Merlin releases still use wan-start for the connected event.
+    install_hook "/jffs/scripts/wan-start" \
+'[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
+'
+
+    # A DHCP lease renew may replace resolv.dnsmasq without another WAN
+    # connected event. Keep this path DNS-only to avoid rebuilding live rules.
+    install_hook "/jffs/scripts/dhcpc-event" \
+'case "$1" in
+    bound|renew) [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+        /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns ;;
+esac
+'
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # koolshare / koolcenter install path
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,6 +470,7 @@ ks_install() {
     # Register with koolshare init.d for auto-start
     xlink "$KS_SCRIPTS/${MODULE}_config.sh" "$KS_INIT/S98${MODULE}.sh"
     ok "Registered koolshare startup hook"
+    install_wan_hooks
 
     # Register plugin metadata in dbus (software center status)
     if have dbus; then
@@ -509,12 +536,7 @@ merlin_install() {
 '# Boot checks the persistent Stop marker under the lifecycle lock.
 [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh boot
 '
-
-    # WAN (re)configuration regenerates /tmp/resolv.dnsmasq with the ISP DNS
-    # servers, undoing the hijack's upstream pin — re-pin after every WAN up.
-    install_hook "/jffs/scripts/wan-start" \
-'[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns
-'
+    install_wan_hooks
 
     install_hook "/jffs/scripts/service-event" \
 'if [ "$1" = "restart" ] && [ "$2" = "Sockrocket" ]; then

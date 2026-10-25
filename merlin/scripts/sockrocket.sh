@@ -392,6 +392,12 @@ pin_dns_upstream() {
     local dns_port dns_conf="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf"
     local resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
     local bak_file="${resolv_file}.Sockrocket-bak"
+    # A leftover dnsmasq snippet alone is not permission to point LAN DNS at
+    # this process. Degraded recovery deliberately calls this before clearing
+    # its fail-open marker, so only the event entry point checks that marker.
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ "$(conf_bool dns_hijack false)" = "true" ] || return 0
+    is_running || return 0
     [ -f "$dns_conf" ] || return 0
     dns_port=$(get_config_value dns_port)
     dns_port=${dns_port:-5300}
@@ -1667,6 +1673,24 @@ do_firewall_restore() {
     return 0
 }
 
+# PPPoE reconnects and DHCP/static WAN transitions can change the firmware's
+# routing policy independently of firewall-start. Reapply our private TUN
+# policy after the WAN is connected; this neither binds to ppp0/eth* nor
+# restarts the daemon, so the same path works for every dial-up mode.
+do_wan_restore() {
+    [ -f "$SOCKROCKET_DIR/stopped" ] && return 0
+    [ -f "$DEGRADED_FILE" ] && return 0
+    is_running || return 0
+    [ "$(count_section nodes)" != "0" ] || return 0
+    do_firewall_restore || return 1
+    pin_dns_upstream
+}
+
+do_pin_dns_event() {
+    [ -f "$DEGRADED_FILE" ] && return 0
+    pin_dns_upstream
+}
+
 do_watchdog() {
     local issues=0
     sync_softcenter_state
@@ -1999,7 +2023,10 @@ case "$1" in
         run_locked 15 do_dns_off
         ;;
     pin-dns)
-        run_locked 5 pin_dns_upstream
+        run_locked 5 do_pin_dns_event
+        ;;
+    wan-restore)
+        run_locked 5 do_wan_restore
         ;;
     proxy-off)
         run_locked 15 do_proxy_off
