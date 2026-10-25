@@ -411,13 +411,18 @@ pin_dns_upstream() {
             chmod 644 "$private_file" || return 1
             return 0
         fi
-        local private_tmp
-        private_tmp=$(mktemp "${private_file}.XXXXXX") || return 1
-        printf 'server=127.0.0.1#%s\n' "$dns_port" > "$private_tmp" && \
-            chmod 644 "$private_tmp" && mv -f "$private_tmp" "$private_file" || {
-            rm -f "$private_tmp"
+        # Merlin can ship BusyBox without a mktemp applet in PATH. An
+        # exclusive, private directory also keeps the temporary file safe
+        # from symlinks while allowing an atomic rename on the same filesystem.
+        local private_tmp="${private_file}.$$"
+        (umask 077; mkdir "$private_tmp") || return 1
+        printf 'server=127.0.0.1#%s\n' "$dns_port" > "$private_tmp/upstream" && \
+            chmod 644 "$private_tmp/upstream" && mv -f "$private_tmp/upstream" "$private_file" || {
+            rm -f "$private_tmp/upstream"
+            rmdir "$private_tmp" 2>/dev/null || true
             return 1
         }
+        rmdir "$private_tmp" 2>/dev/null || true
         local main_pid
         main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
         case "$main_pid" in ''|*[!0-9]*) ;; *) kill -HUP "$main_pid" 2>/dev/null || true ;; esac

@@ -84,6 +84,8 @@ test_repeated_cleanup_does_not_restart_dns() {
 }
 
 test_merlin_3006_main_dns_isolated_from_sdn() {
+    # RT-AX86U Pro firmware may omit the mktemp command entirely.
+    mktemp() { echo 'unexpected mktemp call' >&2; return 127; }
     SOCKROCKET_DNS_UPSTREAM_FILE="$SANDBOX/main-upstream"
     SOCKROCKET_DNS_MAIN_CONFIG="$SANDBOX/dnsmasq.conf"
     SOCKROCKET_DNS_POSTCONF_HOOK="$SANDBOX/dnsmasq.postconf"
