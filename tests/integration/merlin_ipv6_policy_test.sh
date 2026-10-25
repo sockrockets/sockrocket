@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 FIXTURE=$(mktemp -d)
 trap 'rm -rf "$FIXTURE"' EXIT
 logger() { :; }
-nvram() { case "$2" in lan_ifname) echo br0;; ipv6_service) echo native;; *) echo 192.0.2.1;; esac; }
+nvram() { case "$2" in lan_ifname) echo br0;; lan_netmask) echo 255.255.255.0;; ipv6_service) echo native;; *) echo 192.0.2.1;; esac; }
 sed '/^case "\$1" in/,$d' "$ROOT/merlin/scripts/iptables.sh" > "$FIXTURE/functions.sh"
 . "$FIXTURE/functions.sh"
 SOCKROCKET_DIR="$FIXTURE/plugin"
@@ -102,6 +102,7 @@ test "$route_line" -lt "$mark_line" || fail 'traffic exposed before routes'
 grep -q -- '-d 2001:db8:1::1/64 -j RETURN' "$CALLS" || fail 'LAN prefix not exempt'
 if grep -q -- '-p ipv6-icmp.*MARK' "$CALLS"; then fail 'ICMPv6 control traffic captured'; fi
 do_dns_start || fail 'dual-stack DNS install'
+grep -q -- '-t nat -A SOCKROCKET_DNS -i br0 -s 192.0.2.0/24 -p udp --dport 53 -j REDIRECT' "$CALLS" || fail 'IPv4 DNS escaped primary LAN bridge scope'
 test -f "$FIXTURE/dns" || fail 'IPv6 DNS missing'
 test -f "$(ipv6_state dns_active)" || fail 'IPv6 answers not armed with interception'
 grep -q -- '-t nat -A SOCKROCKET_IPV6_DNS -d 2001:db8:1::1/128 -j RETURN' "$CALLS" || fail 'router IPv6 DNS not exempt'
@@ -204,10 +205,10 @@ printf 'ipv6_mode: compatibility\ntransparent_proxy: true\n' > "$SOCKROCKET_CONF
 ipv6_guard_stop || fail 'clear guard before compatibility check'
 do_ipv6_guard || fail 'compatibility guard when firmware IPv6 is enabled'
 guard_installed || fail 'enabling firmware IPv6 left LAN IPv6 unguarded'
-nvram() { case "$2" in lan_ifname) echo br0 ;; ipv6_service) echo disabled ;; *) echo 192.0.2.1 ;; esac; }
+nvram() { case "$2" in lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; ipv6_service) echo disabled ;; *) echo 192.0.2.1 ;; esac; }
 do_ipv6_guard || fail 'compatibility guard while firmware IPv6 is disabled'
 ! guard_installed || fail 'guard kept after firmware IPv6 was disabled'
-nvram() { case "$2" in lan_ifname) echo br0 ;; ipv6_service) echo native ;; *) echo 192.0.2.1 ;; esac; }
+nvram() { case "$2" in lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; ipv6_service) echo native ;; *) echo 192.0.2.1 ;; esac; }
 do_ipv6_guard || fail 'guard returns when firmware IPv6 returns'
 guard_installed || fail 'firmware IPv6 returning did not restore the guard'
 if grep -Eq '^ip -6 route (flush|replace default.*(via|table (main|100)))' "$CALLS"; then fail 'firmware route touched'; fi

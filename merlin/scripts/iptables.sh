@@ -51,19 +51,18 @@ info()  { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${CYAN}[Soc
 ok()    { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${GREEN}[Sockrocket-iptables] ✓ %s${NC}\n" "$*"; }
 err()   { logger -t sockrocket-iptables -p daemon.err "$*"; printf "${RED}[Sockrocket-iptables] ✗ %s${NC}\n" "$*" >&2; }
 
-# LAN subnet from nvram. NOTE: `nvram get <key>` exits 0 even when the key
-# is unset and prints an empty string, so an `|| echo default` fallback does
-# NOT catch the empty case — an empty value would compute LAN_SUBNET as
-# 0.0.0.0/0 and mark ALL forwarded traffic into the TUN. Validate instead.
+# NVRAM can be temporarily empty during boot or LAN reconfiguration. Never
+# substitute a guessed subnet: that could capture another network's traffic.
 _valid_ip4() {
-    case "$1" in *.*.*.*) ;; *) return 1 ;; esac
-    case "$1" in *[!0-9.]*|*..*|.*|*.) return 1 ;; esac
-    return 0
+    awk -v addr="$1" 'BEGIN {
+        if (split(addr, octet, ".") != 4) exit 1
+        for (i = 1; i <= 4; i++) {
+            if (octet[i] !~ /^[0-9]+$/ || length(octet[i]) > 3 ||
+                (length(octet[i]) > 1 && substr(octet[i], 1, 1) == "0") ||
+                octet[i] + 0 > 255) exit 1
+        }
+    }'
 }
-ROUTER_IP=$(nvram get lan_ipaddr 2>/dev/null)
-LAN_NETMASK=$(nvram get lan_netmask 2>/dev/null)
-_valid_ip4 "$ROUTER_IP"   || ROUTER_IP="192.168.1.1"
-_valid_ip4 "$LAN_NETMASK" || LAN_NETMASK="255.255.255.0"
 
 _ip2int() { echo "$1" | awk -F. '{print ($1*16777216)+($2*65536)+($3*256)+$4}'; }
 _int2cidr() {
@@ -72,19 +71,21 @@ _int2cidr() {
     # ash and never reaches 0, spinning forever at script parse time.
     local IFS=.
     set -- $1
-    local cidr=0 o
+    local cidr=0 o seen_partial=0
     for o in "$1" "$2" "$3" "$4"; do
+        # Once a mask octet is not 255, all following octets must be zero.
+        [ "$seen_partial" = 0 ] || [ "$o" = 0 ] || return 1
         case "$o" in
             255) cidr=$((cidr+8)) ;;
-            254) cidr=$((cidr+7)) ;;
-            252) cidr=$((cidr+6)) ;;
-            248) cidr=$((cidr+5)) ;;
-            240) cidr=$((cidr+4)) ;;
-            224) cidr=$((cidr+3)) ;;
-            192) cidr=$((cidr+2)) ;;
-            128) cidr=$((cidr+1)) ;;
-            0)   ;;
-            *)   echo 24; return ;;  # non-contiguous mask: sane default
+            254) cidr=$((cidr+7)); seen_partial=1 ;;
+            252) cidr=$((cidr+6)); seen_partial=1 ;;
+            248) cidr=$((cidr+5)); seen_partial=1 ;;
+            240) cidr=$((cidr+4)); seen_partial=1 ;;
+            224) cidr=$((cidr+3)); seen_partial=1 ;;
+            192) cidr=$((cidr+2)); seen_partial=1 ;;
+            128) cidr=$((cidr+1)); seen_partial=1 ;;
+            0)   seen_partial=1 ;;
+            *)   return 1 ;;
         esac
     done
     echo "$cidr"
@@ -97,7 +98,17 @@ _network() {
     c=$(( (net>>8)&255  )); d=$(( net&255 ))
     echo "$a.$b.$c.$d"
 }
-LAN_SUBNET="$(_network "$ROUTER_IP" "$LAN_NETMASK")/$(_int2cidr "$LAN_NETMASK")"
+load_lan_scope() {
+    local prefix
+    ROUTER_IP=$(nvram get lan_ipaddr 2>/dev/null)
+    LAN_NETMASK=$(nvram get lan_netmask 2>/dev/null)
+    LAN_IFACE=$(ipv6_lan_interface) || return 1
+    _valid_ip4 "$ROUTER_IP" && _valid_ip4 "$LAN_NETMASK" || return 1
+    prefix=$(_int2cidr "$LAN_NETMASK") || return 1
+    # A /0 NVRAM value would match every forwarded IPv4 client.
+    [ "$prefix" -gt 0 ] || return 1
+    LAN_SUBNET="$(_network "$ROUTER_IP" "$LAN_NETMASK")/$prefix"
+}
 
 detect_tun_dev() {
     # Only ever the device sockrocket-cli itself creates. A generic "tun[0-9]" probe
@@ -732,6 +743,10 @@ flush_chains() {
 }
 
 do_start() {
+    if ! load_lan_scope; then
+        err "Invalid primary LAN address, netmask or interface — transparent proxy NOT enabled"
+        return 1
+    fi
     # No-op cleanly when TUN is absent (firewall-start after reboot before the
     # daemon is up). Do not flush anything in that case — preserves DNS NAT.
     TUN_DEV=$(detect_tun_dev)
@@ -797,7 +812,7 @@ do_start() {
                     -j MARK --set-mark "$TUN_MARK" || { flush_chains; return 1; }
             done
         done
-        if ! iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -j SOCKROCKET_DEVICES \
+        if ! iptables -t mangle -A "$MANGLE_CHAIN" -i "$LAN_IFACE" -s "$LAN_SUBNET" -j SOCKROCKET_DEVICES \
             || ! iptables -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$TUN_MARK" -j RETURN; then
             flush_chains
             return 1
@@ -814,7 +829,7 @@ do_start() {
     fi
     # Mark all other LAN-originated TCP+UDP; policy routing sends them into TUN.
     for proto in tcp udp; do
-        iptables -t mangle -A "$MANGLE_CHAIN" -s "$LAN_SUBNET" -p "$proto" \
+        iptables -t mangle -A "$MANGLE_CHAIN" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
             -j MARK --set-mark "$TUN_MARK" || {
                 flush_chains
                 return 1
@@ -899,11 +914,15 @@ do_start() {
 # Router-originated queries traverse OUTPUT, not PREROUTING, so dnsmasq's own
 # upstreams (direct server + Sockrocket listener) are never looped back.
 do_dns_start() {
+    if ! load_lan_scope; then
+        err "Invalid primary LAN address, netmask or interface — DNS interception NOT enabled"
+        return 1
+    fi
     if ! {
         { iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || iptables -t nat -F "$DNS_CHAIN"; } &&
         iptables -t nat -A "$DNS_CHAIN" -d "$ROUTER_IP" -j RETURN &&
-        iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p udp --dport 53 -j REDIRECT --to-ports 53 &&
-        iptables -t nat -A "$DNS_CHAIN" -s "$LAN_SUBNET" -p tcp --dport 53 -j REDIRECT --to-ports 53 &&
+        iptables -t nat -A "$DNS_CHAIN" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p udp --dport 53 -j REDIRECT --to-ports 53 &&
+        iptables -t nat -A "$DNS_CHAIN" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p tcp --dport 53 -j REDIRECT --to-ports 53 &&
         { iptables -t nat -C PREROUTING -j "$DNS_CHAIN" 2>/dev/null ||
           iptables -t nat -A PREROUTING -j "$DNS_CHAIN"; }
     }; then
@@ -931,6 +950,9 @@ do_dns_stop() {
 do_stop() {
     info "Removing transparent proxy rules..."
     local cleanup_rc=0
+    # Cleanup must still work after NVRAM has become invalid. Only the legacy
+    # source-specific rule needs the old LAN scope; owned chains do not.
+    load_lan_scope || LAN_SUBNET=""
     ipv6_guard_stop || cleanup_rc=1
 
     # TCP rules
@@ -956,8 +978,10 @@ do_stop() {
     iptables -D FORWARD -i sockrocket-tun -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i tun0 -j ACCEPT 2>/dev/null || true
     # Fake-IP QUIC fail-fast reject (see do_start).
-    iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
-        -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    if [ -n "$LAN_SUBNET" ]; then
+        iptables -D FORWARD -s "$LAN_SUBNET" -d 198.18.0.0/16 -p udp \
+            -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+    fi
 
     # CN ipset bypass (may be absent — destroy is idempotent)
     do_ipset_stop 2>/dev/null || true

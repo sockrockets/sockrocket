@@ -43,7 +43,7 @@ YAML
     printf '#!/bin/sh\nexit 0\n' > "$SOCKROCKET_BIN"
     chmod +x "$SOCKROCKET_BIN"
     logger() { :; }
-    nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; *) echo 192.168.1.1 ;; esac; }
+    nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; *) echo 192.168.1.1 ;; esac; }
     pidof() { :; }
     netstat() { echo 'udp 0 0 127.0.0.1:5300 0.0.0.0:*'; }
     service() { echo "$*" >> "$SANDBOX/service.calls"; }
@@ -300,6 +300,7 @@ test_policy_routing_staged_and_idempotent() {
     }
     do_start
     do_start
+    check 2 "$(grep -c -- '-A SOCKROCKET_MANGLE -i br0 -s 192.168.1.0/24 -p tcp' "$SANDBOX/kernel.calls")" 'capture stays on the primary LAN bridge'
     check 1 "$(grep -c '^ip rule add ' "$SANDBOX/kernel.calls")" 'policy rule not duplicated on reapply'
     check 2 "$(grep -c '^ip route replace 198.18.0.0/16 dev sockrocket-tun$' "$SANDBOX/kernel.calls")" 'Fake-IP reply reverse route installed'
     check 0 "$(grep -c '^ip route replace unreachable 198.18.0.0/16' "$SANDBOX/kernel.calls" || true)" 'active TUN never rejects Fake-IP source route'
@@ -345,7 +346,7 @@ test_policy_routing_staged_and_idempotent() {
     check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'global mode with stream-only node keeps real-address QUIC in userspace policy'
     check 0 "$(grep -c -- '-I FORWARD 1 -s .*198.18.*-p udp' "$SANDBOX/kernel.calls" || true)" 'stream-only fake-IP UDP reaches userspace'
     # Device policies must reach userspace before the optional CN bypass.
-    LAN_SUBNET="192.0.2.0/24"
+    nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; *) echo 192.0.2.1 ;; esac; }
     : > "$SANDBOX/kernel.calls"
     printf '#!/bin/sh\ncase "$1" in --dump-rule-sources) printf "192.0.2.10/32\\n192.0.2.0/24\\n";; *) exit 1;; esac\n' > "$SOCKROCKET_DIR/sockrocket-cli"
     do_ipset_start() { iptables -t mangle -A "$MANGLE_CHAIN" -m set --match-set sockrocket_cn dst -j RETURN; }
@@ -353,7 +354,7 @@ test_policy_routing_staged_and_idempotent() {
     do_start
     check 4 "$(grep -c '^-*iptables -t mangle -A SOCKROCKET_DEVICES -s ' "$SANDBOX/kernel.calls")" 'both TCP and UDP device scopes marked'
     check 0 "$(grep -c '^iptables -A SOCKROCKET_UDP_GUARD ' "$SANDBOX/kernel.calls" || true)" 'QUIC is not a LAN-wide kernel switch'
-    device_line=$(awk '/-A SOCKROCKET_MANGLE -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
+    device_line=$(awk '/-A SOCKROCKET_MANGLE -i br0 -s .* -j SOCKROCKET_DEVICES/{print NR;exit}' "$SANDBOX/kernel.calls")
     cn_line=$(awk '/--match-set sockrocket_cn dst/{print NR;exit}' "$SANDBOX/kernel.calls")
     [ -n "$device_line" ] && [ -n "$cn_line" ] && [ "$device_line" -lt "$cn_line" ] || { echo 'device policies bypassed' >&2;exit 1; }
     check 0 "$(grep -c -- '--dport 443 -j RETURN' "$SANDBOX/kernel.calls" || true)" 'real-address QUIC cannot bypass device or global policy'
@@ -364,6 +365,37 @@ test_policy_routing_staged_and_idempotent() {
     if do_start; then echo 'invalid source export hidden' >&2;exit 1;fi
     check 0 "$(grep -c -- '-A PREROUTING -j SOCKROCKET_MANGLE' "$SANDBOX/kernel.calls" || true)" 'source validation failure never attaches LAN marks'
 
+}
+
+test_primary_lan_scope_validation() {
+    sed '/^case "\$1" in/,$d' "$ROOT/merlin/scripts/iptables.sh" > "$SANDBOX/iptables-functions.sh"
+    . "$SANDBOX/iptables-functions.sh"
+    lan_ip=10.42.7.1 lan_mask=255.255.255.128 lan_bridge=br5
+    nvram() { case "$2" in lan_ipaddr) echo "$lan_ip" ;; lan_netmask) echo "$lan_mask" ;; lan_ifname) echo "$lan_bridge" ;; ipv6_service) echo disabled ;; esac; }
+    load_lan_scope
+    check 10.42.7.0/25 "$LAN_SUBNET" 'non-default LAN subnet computed'
+    check br5 "$LAN_IFACE" 'LAN bridge taken from firmware'
+    iptables() { echo "iptables $*" >> "$SANDBOX/invalid-kernel.calls"; return 0; }
+    ip6tables() { echo "ip6tables $*" >> "$SANDBOX/invalid-kernel.calls"; return 1; }
+    ip() { echo "ip $*" >> "$SANDBOX/invalid-kernel.calls"; return 0; }
+    detect_tun_dev() { echo sockrocket-tun; }
+    for bad in '999.1.1.1|255.255.255.0' '010.42.7.1|255.255.255.0' \
+        '10.42.7.1|255.0.255.0' '10.42.7.1|255.255.0.255' \
+        '10.42.7.1|0.0.0.0' '|255.255.255.0' '10.42.7.1|'; do
+        lan_ip=${bad%%|*}; lan_mask=${bad#*|}
+        if load_lan_scope; then echo "accepted invalid LAN: $bad" >&2; exit 1; fi
+        if do_start; then echo "started with invalid LAN: $bad" >&2; exit 1; fi
+        if do_dns_start; then echo "DNS captured invalid LAN: $bad" >&2; exit 1; fi
+    done
+    lan_ip=10.42.7.1 lan_mask=255.255.255.0 lan_bridge='br0 -j ACCEPT'
+    if load_lan_scope; then echo 'accepted invalid LAN interface' >&2; exit 1; fi
+    check absent "$([ -f "$SANDBOX/invalid-kernel.calls" ] && echo present || echo absent)" 'invalid LAN cannot change firewall'
+    # Stop must still remove owned rules when NVRAM becomes unreadable.
+    do_stop
+    grep -q 'iptables -t mangle -D PREROUTING -j SOCKROCKET_MANGLE' "$SANDBOX/invalid-kernel.calls"
+    if grep -q 'iptables -D FORWARD -s  ' "$SANDBOX/invalid-kernel.calls"; then
+        echo 'cleanup used an empty legacy source' >&2; exit 1
+    fi
 }
 
 test_startup_failure_never_enables_dns() {
@@ -536,6 +568,7 @@ test_softcenter_state_tracks_proxy_not_api_or_saved_intent() {
 }
 
 run_test test_boot_keeps_fresh_install_and_manual_stop_disabled
+run_test test_primary_lan_scope_validation
 run_test test_softcenter_state_tracks_proxy_not_api_or_saved_intent
 run_test test_background_restart_preserves_manual_stop
 run_test test_existing_dns_pin_permissions_healed
