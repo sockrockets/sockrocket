@@ -1023,12 +1023,11 @@ async fn handle_tun_stream_inner(
             {
                 Ok(Ok(remote)) => remote,
                 Ok(Err(error)) => {
-                    // A UDP-capable group shares the LAN QUIC path with nodes
-                    // that have no datagram transport. Port unreachable lets
-                    // those clients fall back to TCP instead of hanging.
-                    if super::connector::udp_unsupported(&error)
-                        && let Err(send_error) = udp.reject_port_unreachable()
-                    {
+                    // QUIC treats silence as "keep waiting". A refusal, a
+                    // connect error, or a missing datagram transport must
+                    // answer with port unreachable so the client falls back
+                    // to TCP instead of stalling the page.
+                    if let Err(send_error) = udp.reject_port_unreachable() {
                         tracing::debug!("TUN UDP port unreachable {}: {}", dst, send_error);
                     }
                     tracing::debug!("TUN UDP {}: {}", dst, error);
@@ -1036,6 +1035,12 @@ async fn handle_tun_stream_inner(
                     return Ok(());
                 }
                 Err(_) => {
+                    // The same blackhole as a refusal: the association budget
+                    // is already 10s, and dropping the flow without ICMP makes
+                    // HTTP/3 wait that out on every new site.
+                    if let Err(send_error) = udp.reject_port_unreachable() {
+                        tracing::debug!("TUN UDP port unreachable {}: {}", dst, send_error);
+                    }
                     tracing::debug!("TUN UDP {}: association timed out", dst);
                     let _ = udp.shutdown().await;
                     return Ok(());

@@ -374,6 +374,7 @@ ipv6_proxy_start() {
         # Keep on-link LAN traffic out of the transparent internet path.
         ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
     done
+    proxy_endpoint_returns 6 || { ipv6_proxy_stop; return 1; }
     # Device scopes are marked before other LAN policy so the userspace
     # router sees their source even when a kernel direct shortcut is enabled.
     local device_sources device_source device_proto
@@ -721,6 +722,45 @@ do_ipv6_guard() {
     ipv6_compat_guard_start
 }
 
+# Node addresses used by this router, and by a LAN device that runs its own
+# proxy against the same servers. Those flows must leave directly: marking
+# them into the TUN wraps the proxy connection a second time.
+proxy_endpoint_returns() {
+    local family="$1" dest endpoints
+    [ -x "$SOCKROCKET_DIR/sockrocket-cli" ] || return 0
+    endpoints=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-proxy-endpoints "$SOCKROCKET_CONF" 2>/dev/null) || return 0
+    for dest in $endpoints; do
+        case "$family:$dest" in
+            4:*.*.*.*)
+                _valid_ip4 "$dest" || continue
+                case "$dest" in
+                    0.*|10.*|127.*|169.254.*|192.168.*|198.18.*|198.19.*|224.*|240.*) continue ;;
+                    100.*)
+                        # 100.64.0.0/10 is already returned with the private ranges.
+                        case "$dest" in
+                            100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*) continue ;;
+                        esac
+                        ;;
+                    172.*)
+                        case "$dest" in
+                            172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) continue ;;
+                        esac
+                        ;;
+                esac
+                iptables -t mangle -A "$MANGLE_CHAIN" -d "$dest" -j RETURN || return 1
+                ;;
+            6:*:*)
+                case "$dest" in
+                    *[!0-9A-Fa-f:]*) continue ;;
+                    ::|::1|fe80:*|2001:2:0:4765:*) continue ;;
+                esac
+                ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
 flush_chains() {
     ipv6_guard_stop || return 1
     # Flush proxy chains only. NEVER flush SOCKROCKET_DNS here: firewall-start
@@ -792,6 +832,9 @@ do_start() {
             return 1
         }
     done
+    # Before device marks, so a client that proxies through one of our nodes
+    # is not captured again. Fake-IP and private ranges never qualify.
+    proxy_endpoint_returns 4 || { flush_chains; return 1; }
     # Only selected LAN sources bypass kernel CN acceleration and reach the
     # device-aware router. Private/router destinations remain excluded above.
     local device_sources device_source device_proto

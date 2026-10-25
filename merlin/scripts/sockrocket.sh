@@ -403,12 +403,20 @@ pin_dns_upstream() {
         # only the main instance a private servers-file via dnsmasq.postconf.
         local hook="${SOCKROCKET_DNS_POSTCONF_HOOK:-/jffs/scripts/dnsmasq.postconf}"
         local helper="${SOCKROCKET_DNS_POSTCONF_SCRIPT:-$SOCKROCKET_DIR/scripts/dnsmasq-postconf.sh}"
+        local main_pid
         [ -x "$helper" ] && grep -q 'dnsmasq-postconf.sh' "$hook" 2>/dev/null || {
             log_error "Merlin 3006 DNS postconf hook missing; DNS interception disabled"
             return 1
         }
         if [ "$(cat "$private_file" 2>/dev/null)" = "server=127.0.0.1#${dns_port}" ]; then
+            # dnsmasq runs as nobody. A 0600 file is an empty upstream list
+            # until the main instance is told to read it again.
+            case "$(ls -l "$private_file" 2>/dev/null)" in
+                -rw-r--r--*) return 0 ;;
+            esac
             chmod 644 "$private_file" || return 1
+            main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
+            case "$main_pid" in ''|*[!0-9]*) ;; *) kill -HUP "$main_pid" 2>/dev/null || true ;; esac
             return 0
         fi
         # Merlin can ship BusyBox without a mktemp applet in PATH. An
@@ -423,7 +431,6 @@ pin_dns_upstream() {
             return 1
         }
         rmdir "$private_tmp" 2>/dev/null || true
-        local main_pid
         main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
         case "$main_pid" in ''|*[!0-9]*) ;; *) kill -HUP "$main_pid" 2>/dev/null || true ;; esac
         ok "Main LAN dnsmasq upstream isolated from Merlin 3006 SDNs"
@@ -512,6 +519,7 @@ update_dnsmasq() {
     local DNSMASQ_CONF_DIR="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}"
     local SOCKROCKET_DNSMASQ="$DNSMASQ_CONF_DIR/sockrocket.conf"
     local TEMPLATE="$SOCKROCKET_DIR/scripts/dnsmasq.conf.template"
+    local isolated=0 waited=0 wait_limit
 
     mkdir -p "$DNSMASQ_CONF_DIR"
 
@@ -555,12 +563,28 @@ update_dnsmasq() {
         # listener, whose china-split serves domestic names from
         # 223.5.5.5/119.29.29.29 itself.
         if service restart_dnsmasq >/dev/null 2>&1; then
-            if merlin_3006 && ! grep -Fx \
-                "servers-file=${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" \
-                "${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}" >/dev/null 2>&1; then
-                log_error "Merlin 3006 main dnsmasq did not use isolated upstream"
-                update_dnsmasq stop
-                return 1
+            # Some firmware builds return from rc before dnsmasq.postconf
+            # rewrites the main config; others are already done. Poll the
+            # result instead of assuming either timing. A synchronous build
+            # matches on the first read and does not sleep.
+            if merlin_3006; then
+                wait_limit="${SOCKROCKET_DNS_ISOLATION_WAIT:-15}"
+                while :; do
+                    if grep -Fx \
+                        "servers-file=${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" \
+                        "${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}" >/dev/null 2>&1; then
+                        isolated=1
+                        break
+                    fi
+                    [ "$waited" -ge "$wait_limit" ] && break
+                    waited=$((waited + 1))
+                    sleep 1
+                done
+                if [ "$isolated" != 1 ]; then
+                    log_error "Merlin 3006 main dnsmasq did not use isolated upstream"
+                    update_dnsmasq stop
+                    return 1
+                fi
             fi
             if ! pin_dns_upstream; then
                 update_dnsmasq stop
