@@ -6,7 +6,8 @@
 //! (transport type + WS path/host + Reality public key + shadow-tls host).
 //! Display name, latency, and tags are intentionally excluded: a renamed
 //! copy of the same server is still the same server. The first occurrence
-//! wins.
+//! wins. Importing a subscription is the exception: the provider's own
+//! remarks stay, even when several of them share one endpoint.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -90,10 +91,9 @@ pub fn apply_subscription_refresh(
     if refreshed.is_empty() {
         return false;
     }
-    let active_fp = config
-        .active_node
-        .and_then(|index| config.nodes.get(index))
-        .map(node_fingerprint);
+    let active = config.active_node.and_then(|index| config.nodes.get(index));
+    let active_fp = active.map(node_fingerprint);
+    let active_name = active.map(|node| node.name.clone());
     let urls: HashSet<String> = refreshed.iter().map(|(url, _)| url.clone()).collect();
     let mut kept = std::mem::take(&mut config.nodes);
     detach_sources(&mut kept, &urls);
@@ -102,16 +102,25 @@ pub fn apply_subscription_refresh(
         tag_subscription_nodes(&mut nodes, &url);
         merged.append(&mut nodes);
     }
+    let fresh_len = merged.len();
     merged.append(&mut kept);
-    dedup_nodes(&mut merged);
+    // Distinct remarks in this download stay. A previous copy of the same
+    // endpoint, or a hand-added duplicate, still folds into the fresh list.
+    dedup_subscription_import(&mut merged, fresh_len);
+    config.active_node = active_fp.and_then(|fingerprint| {
+        let named = active_name.as_ref().and_then(|name| {
+            merged
+                .iter()
+                .position(|node| node.name == *name && node_fingerprint(node) == fingerprint)
+        });
+        named.or_else(|| {
+            merged
+                .iter()
+                .position(|node| node_fingerprint(node) == fingerprint)
+        })
+    });
     uniquify_node_names(&mut merged);
     config.nodes = merged;
-    config.active_node = active_fp.and_then(|fingerprint| {
-        config
-            .nodes
-            .iter()
-            .position(|node| node_fingerprint(node) == fingerprint)
-    });
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -285,8 +294,19 @@ fn transport_summary(transport: Option<&TransportConfig>) -> String {
     summary
 }
 
+fn merge_duplicate(retained: &mut Node, incoming: &Node) {
+    let manual = is_manual(retained) || is_manual(incoming);
+    let mut sources = subscription_sources(retained);
+    sources.extend(subscription_sources(incoming));
+    set_sources(retained, &sources);
+    if manual {
+        retained.extra.insert(MANUAL_KEY.into(), "true".into());
+    }
+}
+
 /// Remove duplicate nodes in-place, keeping the first occurrence of each
-/// fingerprint. Returns the number of nodes removed.
+/// fingerprint. Display name is not part of that identity: a renamed copy of
+/// the same server is still the same server. Returns the number removed.
 pub fn dedup_nodes(nodes: &mut Vec<Node>) -> usize {
     let before = nodes.len();
     let mut seen = HashMap::<String, usize>::new();
@@ -294,16 +314,53 @@ pub fn dedup_nodes(nodes: &mut Vec<Node>) -> usize {
     for node in std::mem::take(nodes) {
         let fingerprint = node_fingerprint(&node);
         if let Some(&index) = seen.get(&fingerprint) {
-            let retained = &mut merged[index];
-            let manual = is_manual(retained) || is_manual(&node);
-            let mut sources = subscription_sources(retained);
-            sources.extend(subscription_sources(&node));
-            set_sources(retained, &sources);
-            if manual {
-                retained.extra.insert(MANUAL_KEY.into(), "true".into());
-            }
+            merge_duplicate(&mut merged[index], &node);
         } else {
             seen.insert(fingerprint, merged.len());
+            merged.push(node);
+        }
+    }
+    *nodes = merged;
+    before - nodes.len()
+}
+
+/// Keep every distinct remark in a freshly imported subscription.
+///
+/// `nodes[..fresh_len]` is the new list. Later entries are what remained
+/// after the previous copy of those subscriptions was detached. The same
+/// endpoint under a different name stays. A leftover with the same endpoint
+/// and no other subscription folds into the first fresh remark, so refreshing
+/// cannot leave the previous names behind.
+fn dedup_subscription_import(nodes: &mut Vec<Node>, fresh_len: usize) -> usize {
+    let before = nodes.len();
+    let fresh_len = fresh_len.min(before);
+    let mut seen_named = HashMap::<String, usize>::new();
+    let mut fresh_by_fp = HashMap::<String, usize>::new();
+    let mut merged: Vec<Node> = Vec::with_capacity(before);
+    let mut incoming = std::mem::take(nodes);
+    for node in incoming.drain(..fresh_len) {
+        let fingerprint = node_fingerprint(&node);
+        let key = format!("{fingerprint}\n{}", node.name);
+        if let Some(&index) = seen_named.get(&key) {
+            merge_duplicate(&mut merged[index], &node);
+        } else {
+            fresh_by_fp.entry(fingerprint).or_insert(merged.len());
+            seen_named.insert(key, merged.len());
+            merged.push(node);
+        }
+    }
+    for node in incoming {
+        let fingerprint = node_fingerprint(&node);
+        let key = format!("{fingerprint}\n{}", node.name);
+        if let Some(&index) = seen_named.get(&key) {
+            merge_duplicate(&mut merged[index], &node);
+        } else if fresh_by_fp.contains_key(&fingerprint)
+            && (is_manual(&node) || subscription_sources(&node).is_empty())
+        {
+            let index = fresh_by_fp[&fingerprint];
+            merge_duplicate(&mut merged[index], &node);
+        } else {
+            seen_named.insert(key, merged.len());
             merged.push(node);
         }
     }
@@ -624,6 +681,54 @@ mod tests {
         assert!(config.nodes.iter().any(|node| node.name == "manual"));
         assert_eq!(config.subscriptions.len(), 1);
         assert_eq!(config.subscriptions[0].url, "https://example.com/b");
+    }
+
+    #[test]
+    fn refresh_keeps_distinct_remarks_for_one_endpoint() {
+        let mut config = AppConfig {
+            subscriptions: vec![Subscription {
+                name: "A".into(),
+                url: "https://example.com/a".into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        let fresh = vec![
+            ss("剩余流量", "192.0.2.8", 443, "same"),
+            ss("套餐到期", "192.0.2.8", 443, "same"),
+            ss("东京01", "192.0.2.8", 443, "same"),
+            ss("新加坡", "192.0.2.9", 443, "hy2"),
+            ss("新加坡2", "192.0.2.9", 443, "hy2"),
+        ];
+        assert!(apply_subscription_refresh(
+            &mut config,
+            vec![("https://example.com/a".into(), fresh)]
+        ));
+        let names: Vec<&str> = config.nodes.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["剩余流量", "套餐到期", "东京01", "新加坡", "新加坡2"]
+        );
+
+        let again = vec![
+            ss("剩余流量", "192.0.2.8", 443, "same"),
+            ss("套餐到期", "192.0.2.8", 443, "same"),
+            ss("东京01", "192.0.2.8", 443, "same"),
+            ss("新加坡", "192.0.2.9", 443, "hy2"),
+            ss("新加坡2", "192.0.2.9", 443, "hy2"),
+        ];
+        assert!(apply_subscription_refresh(
+            &mut config,
+            vec![("https://example.com/a".into(), again)]
+        ));
+        assert_eq!(
+            config.nodes.len(),
+            5,
+            "a second refresh must not double remarks"
+        );
     }
 }
 

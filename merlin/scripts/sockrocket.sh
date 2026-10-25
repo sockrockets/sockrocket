@@ -382,9 +382,11 @@ migrate_toggle_keys() {
 
 # Pin the main dnsmasq upstream to Sockrocket's DNS listener.
 #
-# Merlin 3006 SDNs can share /tmp/resolv.dnsmasq with the main LAN. On 3006,
-# dnsmasq.postconf points only the main instance at a private servers-file.
-# Older firmware keeps the original shared-file pin and backup path below.
+# Merlin 3006 SDNs can share /tmp/resolv.dnsmasq with the main LAN. On 3006
+# the private file is only the activation marker and the upstream line.
+# dnsmasq.postconf removes servers-file and resolv-file from the main config
+# and inserts server=127.0.0.1#port, which is how fancyss isolates that
+# instance. Older firmware keeps the shared-file pin and backup path below.
 pin_dns_upstream() {
     local dns_port dns_conf="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf"
     local resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
@@ -402,8 +404,8 @@ pin_dns_upstream() {
     # Only pin while our listener is actually answering.
     netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" || return 0
     if merlin_3006; then
-        # SDN instances can read the firmware's shared resolv.dnsmasq. Give
-        # only the main instance a private servers-file via dnsmasq.postconf.
+        # SDN instances can read the firmware's shared resolv.dnsmasq. The
+        # main postconf hook reads this file and does not point them at it.
         local hook="${SOCKROCKET_DNS_POSTCONF_HOOK:-/jffs/scripts/dnsmasq.postconf}"
         local helper="${SOCKROCKET_DNS_POSTCONF_SCRIPT:-$SOCKROCKET_DIR/scripts/dnsmasq-postconf.sh}"
         local main_pid
@@ -436,7 +438,9 @@ pin_dns_upstream() {
         rmdir "$private_tmp" 2>/dev/null || true
         main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
         case "$main_pid" in ''|*[!0-9]*) ;; *) kill -HUP "$main_pid" 2>/dev/null || true ;; esac
-        ok "Main LAN dnsmasq upstream isolated from Merlin 3006 SDNs"
+        # The main config is not isolated yet. restart_dnsmasq still has to
+        # run the postconf hook; this line only means the marker file exists.
+        ok "Merlin 3006 private DNS upstream file ready"
         return 0
     fi
     # Skip rewriting a matching pin, but heal permissions from older builds.
@@ -470,6 +474,54 @@ pin_dns_upstream() {
 
 merlin_3006() {
     case "$(nvram get firmver 2>/dev/null)" in 3.0.0.6*) return 0 ;; *) return 1 ;; esac
+}
+
+# The file the main dnsmasq process reads. Tests pin one path. On the router,
+# /etc/dnsmasq.conf and /tmp/etc/dnsmasq.conf are usually the same file; when
+# they differ, the main instance is the one with the main pid-file.
+main_dnsmasq_config() {
+    if [ -n "${SOCKROCKET_DNS_MAIN_CONFIG+x}" ]; then
+        printf '%s\n' "$SOCKROCKET_DNS_MAIN_CONFIG"
+        return
+    fi
+    local candidate
+    for candidate in /etc/dnsmasq.conf /tmp/etc/dnsmasq.conf; do
+        [ -f "$candidate" ] || continue
+        if grep -q '^pid-file=/var/run/dnsmasq\.pid$' "$candidate" 2>/dev/null; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    if [ -f /etc/dnsmasq.conf ]; then
+        printf '%s\n' /etc/dnsmasq.conf
+        return
+    fi
+    printf '%s\n' /tmp/etc/dnsmasq.conf
+}
+
+# True when the main config cannot fall back to the shared resolv or
+# /etc/resolv.conf and names Sockrocket as an upstream. Guest configs are
+# a different file and are not checked here.
+main_dns_isolated() {
+    local config="$1" dns_port="$2"
+    [ -s "$config" ] || return 1
+    grep -q 'servers-file' "$config" && return 1
+    grep -q 'resolv-file' "$config" && return 1
+    grep -qx 'no-resolv' "$config" || return 1
+    grep -qx "server=127.0.0.1#${dns_port}" "$config"
+}
+
+# Flags only. The config also holds DHCP ranges and names, which stay out of the log.
+main_dns_state() {
+    local config="$1" dns_port="$2"
+    local servers=no resolv=no nore=no upstream=no
+    [ -s "$config" ] || { printf 'empty'; return; }
+    grep -q 'servers-file' "$config" && servers=yes
+    grep -q 'resolv-file' "$config" && resolv=yes
+    grep -qx 'no-resolv' "$config" && nore=yes
+    grep -qx "server=127.0.0.1#${dns_port}" "$config" && upstream=yes
+    printf 'servers-file=%s resolv-file=%s no-resolv=%s sockrocket-upstream=%s' \
+        "$servers" "$resolv" "$nore" "$upstream"
 }
 
 # Restore dnsmasq's original upstream servers when the hijack is removed.
@@ -576,33 +628,54 @@ update_dnsmasq() {
                 # can put the firmware servers-file back. Apply the hook's
                 # edit here as well so one missed callback does not restart
                 # dnsmasq again and drop the LAN onto a poisoned resolver.
-                local main_config private_file helper main_pid
-                main_config="${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}"
+                local main_config private_file helper main_pid helper_rc saw_helper
                 private_file="${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
                 helper="${SOCKROCKET_DNS_POSTCONF_SCRIPT:-$SOCKROCKET_DIR/scripts/dnsmasq-postconf.sh}"
+                saw_helper=0
+                main_config=$(main_dnsmasq_config)
+                log_info "Merlin 3006 main config ${main_config}: $(main_dns_state "$main_config" "$dns_port")"
                 while :; do
-                    if grep -Fx "servers-file=${private_file}" "$main_config" >/dev/null 2>&1; then
+                    main_config=$(main_dnsmasq_config)
+                    if main_dns_isolated "$main_config" "$dns_port"; then
                         isolated=1
+                        if [ "$saw_helper" = 1 ]; then
+                            ok "Merlin 3006 main dnsmasq isolated by control script (${main_config}: $(main_dns_state "$main_config" "$dns_port"))"
+                        else
+                            ok "Merlin 3006 main dnsmasq isolated after restart (${main_config}: $(main_dns_state "$main_config" "$dns_port"))"
+                        fi
                         break
                     fi
-                    if [ -x "$helper" ] && [ -f "$private_file" ]; then
-                        "$helper" "$main_config" >/dev/null 2>&1 || true
-                        if grep -Fx "servers-file=${private_file}" "$main_config" >/dev/null 2>&1; then
+                    helper_rc=0
+                    if [ -x "$helper" ] && [ -s "$private_file" ]; then
+                        "$helper" "$main_config" >/dev/null 2>&1 || helper_rc=$?
+                        if [ "$saw_helper" = 0 ]; then
+                            log_info "Merlin 3006 DNS helper exit ${helper_rc} on ${main_config}"
+                            saw_helper=1
+                        fi
+                        if main_dns_isolated "$main_config" "$dns_port"; then
                             isolated=1
                             main_pid=$(cat "${SOCKROCKET_DNS_MAIN_PID:-/var/run/dnsmasq.pid}" 2>/dev/null)
                             case "$main_pid" in
                                 ''|*[!0-9]*) ;;
                                 *) kill -HUP "$main_pid" 2>/dev/null || true ;;
                             esac
+                            ok "Merlin 3006 main dnsmasq isolated by control script (${main_config}: $(main_dns_state "$main_config" "$dns_port"))"
                             break
                         fi
+                    elif [ "$saw_helper" = 0 ]; then
+                        log_info "Merlin 3006 DNS helper not run on ${main_config}"
+                        saw_helper=1
                     fi
                     [ "$waited" -ge "$wait_limit" ] && break
                     waited=$((waited + 1))
                     sleep 1
                 done
                 if [ "$isolated" != 1 ]; then
-                    log_error "Merlin 3006 main dnsmasq did not use isolated upstream"
+                    if [ ! -s "$main_config" ]; then
+                        log_error "Merlin 3006 main dnsmasq config was not written (${main_config})"
+                    else
+                        log_error "Merlin 3006 main dnsmasq did not use isolated upstream (${main_config}: $(main_dns_state "$main_config" "$dns_port"))"
+                    fi
                     update_dnsmasq stop
                     return 1
                 fi
@@ -2029,10 +2102,8 @@ do_watchdog() {
             pin_dns_upstream
             [ "$(cat "$resolv_file" 2>/dev/null)" != "$before" ] && \
                 log_warn "Watchdog: main dnsmasq upstream restored to Sockrocket"
-            if merlin_3006 && ! grep -Fx \
-                "servers-file=${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" \
-                "${SOCKROCKET_DNS_MAIN_CONFIG:-/etc/dnsmasq.conf}" >/dev/null 2>&1; then
-                log_warn "Watchdog: Merlin 3006 main dnsmasq lost its isolated upstream — restarting DNS"
+            if merlin_3006 && ! main_dns_isolated "$(main_dnsmasq_config)" "$dns_port"; then
+                log_warn "Watchdog: Merlin 3006 main dnsmasq lost its isolated upstream ($(main_dnsmasq_config): $(main_dns_state "$(main_dnsmasq_config)" "$dns_port")) — restarting DNS"
                 update_dnsmasq start || enter_lan_degraded "3006 DNS upstream isolation unavailable"
                 issues=$((issues + 1))
             fi

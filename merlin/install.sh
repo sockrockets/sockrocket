@@ -419,12 +419,13 @@ esac
 
 install_dns_postconf_hook() {
     # Merlin 3006 SDNs may use /tmp/resolv.dnsmasq too. Only the main
-    # dnsmasq config is redirected to Sockrocket's private upstream file.
+    # dnsmasq config loses servers-file and resolv-file. $2 is an SDN index
+    # when this hook is invoked for a guest instance; the helper leaves it.
     install_hook "/jffs/scripts/dnsmasq.postconf" \
 'if [ -f /jffs/configs/dnsmasq.d/sockrocket.conf ] && \
    [ -f /tmp/sockrocket-resolv.dnsmasq ] && \
    [ -x /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh ]; then
-    /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh "$1"
+    /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh "$1" "$2"
 fi
 '
 }

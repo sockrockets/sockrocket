@@ -505,6 +505,10 @@ impl Outbound for Hysteria2Outbound {
                             e
                         );
                         tracing::debug!("{last_err} — will retry with fresh connection");
+                        // open_bi can fail while close_reason() is still empty.
+                        // Leaving that connection cached makes the retry, and
+                        // every later flow, reuse the same stuck session.
+                        conn.close(quinn::VarInt::from_u32(0), b"open_bi failed");
                         continue;
                     }
                 };

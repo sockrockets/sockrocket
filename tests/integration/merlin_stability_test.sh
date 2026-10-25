@@ -109,7 +109,8 @@ test_merlin_3006_main_dns_isolated_from_sdn() {
     update_dnsmasq start
     check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'shared SDN upstream preserved'
     check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_DNS_UPSTREAM_FILE")" 'main LAN has private upstream'
-    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq uses private upstream'
+    check 'no-resolv
+server=127.0.0.1#5300' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq uses Sockrocket upstream'
     update_dnsmasq stop
     check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'private upstream removed on stop'
     check 'servers-file=/tmp/resolv.dnsmasq' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq restored on stop'
@@ -125,7 +126,8 @@ test_merlin_3006_main_dns_isolated_from_sdn() {
     # same edit itself, so a skipped callback does not drop LAN DNS.
     SOCKROCKET_DNS_ISOLATION_WAIT=0
     update_dnsmasq start
-    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(grep '^servers-file=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'skipped hook still isolates main upstream'
+    check 'no-resolv
+server=127.0.0.1#5300' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'skipped hook still isolates main upstream'
     update_dnsmasq stop
     # A helper that cannot rewrite the config still fails open.
     printf '#!/bin/sh\nexit 1\n' > "$SANDBOX/fail-postconf.sh"
@@ -148,15 +150,37 @@ server=1.1.1.1' "$(cat "$SANDBOX/dnsmasq-1.conf")" 'SDN dnsmasq config untouched
         'address=/use-application-dns.net/' \
         > "$SOCKROCKET_DNS_MAIN_CONFIG"
     "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
-    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(grep '^servers-file=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'trailing space still isolates main upstream'
+    check 0 "$(grep -c 'servers-file' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'trailing space still drops servers-file'
+    check 'server=127.0.0.1#5300' "$(grep '^server=127\.0\.0\.1#5300$' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'trailing space still inserts Sockrocket upstream'
     check 0 "$(grep -c '^server=1\.1\.1\.1$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'ISP server= cannot outrun Sockrocket'
     check 0 "$(grep -c '^server=127\.0\.0\.1#5453$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'Stubby server= cannot outrun Sockrocket'
     check 'server=/router.asus.com/192.168.50.1' "$(grep '^server=/' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'domain DNS override kept'
     check 'address=/use-application-dns.net/' "$(grep '^address=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'address rule kept'
-    printf '%s\n' 'servers-file=/tmp/fork-resolv.dnsmasq' 'server=9.9.9.9' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    printf '%s\n' 'servers-file=/tmp/fork-resolv.dnsmasq' 'resolv-file=/tmp/resolv.conf' 'server=9.9.9.9' > "$SOCKROCKET_DNS_MAIN_CONFIG"
     "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
-    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(grep '^servers-file=' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'non-stock main servers-file still isolates'
+    check 0 "$(grep -Ec 'servers-file|resolv-file' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'non-stock servers-file and resolv-file are removed'
+    check 'server=127.0.0.1#5300' "$(grep '^server=127\.0\.0\.1#5300$' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'non-stock main config uses Sockrocket upstream'
     check 0 "$(grep -c '^server=9\.9\.9\.9$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'fork upstream server= cannot outrun Sockrocket'
+    printf '%s\n' '  servers-file = /tmp/resolv.dnsmasq' 'server=8.8.8.8' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+    check 0 "$(grep -c 'servers-file' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'spaced servers-file is removed'
+    check 'server=127.0.0.1#5300' "$(grep '^server=127\.0\.0\.1#5300$' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'spaced servers-file still isolates'
+    printf '%s\n' 'pid-file=/var/run/dnsmasq.pid' 'server=9.9.9.9' 'server=/example.com/1.1.1.1' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+    check 0 "$(grep -c 'servers-file' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'missing servers-file does not fail the edit'
+    check 'server=127.0.0.1#5300' "$(grep '^server=127\.0\.0\.1#5300$' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'missing servers-file still inserts Sockrocket upstream'
+    check 0 "$(grep -c '^server=9\.9\.9\.9$' "$SOCKROCKET_DNS_MAIN_CONFIG" || true)" 'appended isolation still drops global server='
+    check 'server=/example.com/1.1.1.1' "$(grep '^server=/' "$SOCKROCKET_DNS_MAIN_CONFIG")" 'appended isolation keeps domain server='
+    printf '%s\n' 'pid-file=/var/run/dnsmasq.pid' 'servers-file=/tmp/resolv.dnsmasq' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG" 1
+    check 'pid-file=/var/run/dnsmasq.pid
+servers-file=/tmp/resolv.dnsmasq' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'SDN index leaves the config untouched'
+    : > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    if "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"; then
+        echo 'empty main config was edited before rc wrote it' >&2
+        exit 1
+    fi
+    check '' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'empty main config stays untouched'
     # An upgrade must restore the old shared-file pin before starting SDNs.
     printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_RESOLV_FILE"
     printf 'server=192.0.2.53\n' > "$SOCKROCKET_RESOLV_FILE.Sockrocket-bak"

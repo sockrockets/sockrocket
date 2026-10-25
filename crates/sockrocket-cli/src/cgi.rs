@@ -848,6 +848,15 @@ fn sub_entry(name: &str, url: &str, format: &str) -> Y {
 /// Fetch + parse a subscription URL on a current-thread runtime (CGI / API
 /// handlers are sync). Hard-capped at [`SUB_FETCH_TIMEOUT_SECS`] so the Web UI
 /// never waits forever on a hung airport URL.
+fn local_socks_addr() -> Option<std::net::SocketAddr> {
+    let port = load_app_config()
+        .ok()
+        .map(|config| config.socks_port)
+        .filter(|port| *port != 0)
+        .unwrap_or(1080);
+    Some(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
 fn fetch_sub_nodes(
     name: &str,
     url: &str,
@@ -869,7 +878,10 @@ fn fetch_sub_nodes(
     rt.block_on(async {
         match tokio::time::timeout(
             timeout,
-            sockrocket_core::config::subscription::fetch_subscription_report(&sub),
+            sockrocket_core::config::subscription::fetch_subscription_report_with(
+                &sub,
+                local_socks_addr(),
+            ),
         )
         .await
         {
