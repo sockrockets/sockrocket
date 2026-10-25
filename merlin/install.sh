@@ -267,6 +267,7 @@ install_common_files() {
     info "Installing control scripts..."
     xcp "$SCRIPT_DIR/scripts/sockrocket.sh"       "$SOCKROCKET_SCRIPTS/sockrocket.sh"
     xcp "$SCRIPT_DIR/scripts/iptables.sh"  "$SOCKROCKET_SCRIPTS/iptables.sh"
+    xcp "$SCRIPT_DIR/scripts/dnsmasq-postconf.sh" "$SOCKROCKET_SCRIPTS/dnsmasq-postconf.sh"
     xcp "$SCRIPT_DIR/scripts/dnsmasq.conf" "$SOCKROCKET_SCRIPTS/dnsmasq.conf.template"
     [ -f "$SCRIPT_DIR/scripts/sockrocket_api.sh" ] && xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh"
     xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh"
@@ -282,7 +283,7 @@ install_common_files() {
         xcp "$SCRIPT_DIR/uninstall.sh" "$SOCKROCKET_DIR/uninstall.sh"
         chmod +x "$SOCKROCKET_DIR/uninstall.sh" 2>/dev/null || true
     fi
-    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh" 2>/dev/null
+    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/dnsmasq-postconf.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh" 2>/dev/null
     ok "Control scripts installed"
 
     info "Installing CGI backend..."
@@ -416,6 +417,18 @@ esac
 '
 }
 
+install_dns_postconf_hook() {
+    # Merlin 3006 SDNs may use /tmp/resolv.dnsmasq too. Only the main
+    # dnsmasq config is redirected to Sockrocket's private upstream file.
+    install_hook "/jffs/scripts/dnsmasq.postconf" \
+'if [ -f /jffs/configs/dnsmasq.d/sockrocket.conf ] && \
+   [ -f /tmp/sockrocket-resolv.dnsmasq ] && \
+   [ -x /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh ]; then
+    /jffs/addons/sockrocket/scripts/dnsmasq-postconf.sh "$1"
+fi
+'
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # koolshare / koolcenter install path
 # ─────────────────────────────────────────────────────────────────────────────
@@ -489,6 +502,7 @@ ks_install() {
     xlink "$KS_SCRIPTS/${MODULE}_config.sh" "$KS_INIT/S98${MODULE}.sh"
     ok "Registered koolshare startup hook"
     install_wan_hooks
+    install_dns_postconf_hook
 
     # Register plugin metadata in dbus (software center status)
     if have dbus; then
@@ -555,6 +569,7 @@ merlin_install() {
 [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh boot
 '
     install_wan_hooks
+    install_dns_postconf_hook
 
     install_hook "/jffs/scripts/service-event" \
 'if [ "$1" = "restart" ] && [ "$2" = "Sockrocket" ]; then

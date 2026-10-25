@@ -113,11 +113,13 @@ remove_hook /jffs/scripts/wan-start
 remove_hook /jffs/scripts/wan-event
 remove_hook /jffs/scripts/dhcpc-event
 remove_hook /jffs/scripts/nat-start
+remove_hook /jffs/scripts/dnsmasq.postconf
 ok "Hooks cleaned"
 
 # ── dnsmasq / DNS pin ─────────────────────────────────────────────────────────
 info "Restoring DNS..."
 rm -f /jffs/configs/dnsmasq.d/sockrocket.conf
+rm -f /tmp/sockrocket-resolv.dnsmasq
 RESOLV=/tmp/resolv.dnsmasq
 BAK=/tmp/resolv.dnsmasq.Sockrocket-bak
 if [ -s "$BAK" ]; then

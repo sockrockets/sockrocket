@@ -83,6 +83,58 @@ test_repeated_cleanup_does_not_restart_dns() {
     check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'upstream restored'
 }
 
+test_merlin_3006_main_dns_isolated_from_sdn() {
+    SOCKROCKET_DNS_UPSTREAM_FILE="$SANDBOX/main-upstream"
+    SOCKROCKET_DNS_MAIN_CONFIG="$SANDBOX/dnsmasq.conf"
+    SOCKROCKET_DNS_POSTCONF_HOOK="$SANDBOX/dnsmasq.postconf"
+    SOCKROCKET_DNS_POSTCONF_SCRIPT="$SANDBOX/dnsmasq-postconf.sh"
+    export SOCKROCKET_DNS_UPSTREAM_FILE SOCKROCKET_DNS_MAIN_CONFIG
+    cp "$ROOT/merlin/scripts/dnsmasq-postconf.sh" "$SOCKROCKET_DNS_POSTCONF_SCRIPT"
+    chmod +x "$SOCKROCKET_DNS_POSTCONF_SCRIPT"
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    apply_postconf=1
+    nvram() { case "$2" in firmver) echo 3.0.0.6 ;; lan_ipaddr) echo 192.168.50.1 ;; esac; }
+    service() {
+        echo "$*" >> "$SANDBOX/service.calls"
+        printf 'servers-file=/tmp/resolv.dnsmasq\n' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+        if [ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] &&
+           [ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] &&
+           [ -f "$SOCKROCKET_DNS_POSTCONF_HOOK" ] &&
+           [ "$apply_postconf" = 1 ]; then
+            "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+        fi
+    }
+    update_dnsmasq start
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'shared SDN upstream preserved'
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_DNS_UPSTREAM_FILE")" 'main LAN has private upstream'
+    check "servers-file=$SOCKROCKET_DNS_UPSTREAM_FILE" "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq uses private upstream'
+    update_dnsmasq stop
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'private upstream removed on stop'
+    check 'servers-file=/tmp/resolv.dnsmasq' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'main dnsmasq restored on stop'
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'SDN upstream unchanged on stop'
+    # A binary-only update without the new postconf hook must fail open.
+    rm "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    if update_dnsmasq start; then echo '3006 DNS activated without postconf hook' >&2; exit 1; fi
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'no orphan private upstream'
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'SDN upstream preserved on failed start'
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    apply_postconf=0
+    if update_dnsmasq start; then echo '3006 DNS activated when postconf did not run' >&2; exit 1; fi
+    check absent "$([ -f "$SOCKROCKET_DNS_UPSTREAM_FILE" ] && echo present || echo absent)" 'unapplied postconf rolls back private upstream'
+    apply_postconf=1
+    printf 'servers-file=/tmp/resolv.dnsmasq\n' > "$SANDBOX/dnsmasq-1.conf"
+    if "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SANDBOX/dnsmasq-1.conf"; then
+        echo 'postconf accepted an SDN config' >&2; exit 1
+    fi
+    check 'servers-file=/tmp/resolv.dnsmasq' "$(cat "$SANDBOX/dnsmasq-1.conf")" 'SDN dnsmasq config untouched'
+    # An upgrade must restore the old shared-file pin before starting SDNs.
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_RESOLV_FILE"
+    printf 'server=192.0.2.53\n' > "$SOCKROCKET_RESOLV_FILE.Sockrocket-bak"
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    update_dnsmasq start
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'legacy shared pin migrated'
+}
+
 test_lost_listener_unpins_dns() {
     update_dnsmasq start
     netstat() { :; }
@@ -584,6 +636,7 @@ run_test test_startup_failure_never_enables_dns
 run_test test_dns_nat_failure_rolls_back
 run_test test_dns_failure_rolls_back
 run_test test_repeated_cleanup_does_not_restart_dns
+run_test test_merlin_3006_main_dns_isolated_from_sdn
 run_test test_lost_listener_unpins_dns
 run_test test_missing_tun_never_recovers
 run_test test_firewall_failure_never_recovers

@@ -137,9 +137,11 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         hook_script = (wan_helper + hook_calls).replace('/jffs/scripts/', str(hook_dir) + '/')
         hook_script = hook_script.replace('/jffs/addons/sockrocket/scripts/sockrocket.sh', str(control))
         assert source.count('    install_wan_hooks\n') == 2, 'both standard and koolcenter installs need WAN hooks'
+        assert source.count('    install_dns_postconf_hook\n') == 2, 'both install modes need isolated 3006 DNS'
         run('ok() { :; }\n' + hook_helper + hook_script)
         run('ok() { :; }\n' + hook_helper + hook_script)
         assert ': # another add-on hook' in (hook_dir / 'wan-event').read_text()
+        assert (hook_dir / 'dnsmasq.postconf').read_text().count('dnsmasq-postconf.sh "$1"') == 1
 
         def event(name, *args):
             subprocess.run(['sh', str(hook_dir / name), *args], env=env, check=True)

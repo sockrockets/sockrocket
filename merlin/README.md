@@ -188,6 +188,7 @@ API and config I/O are implemented in Rust (serde YAML); router-specific keys ar
 | `/jffs/scripts/wan-event` | Restore policy route and DNS after WAN connects (PPPoE, DHCP, static IP) |
 | `/jffs/scripts/wan-start` | Legacy Merlin WAN connection fallback |
 | `/jffs/scripts/dhcpc-event` | Re-pin DNS after DHCPv4 lease changes; refresh IPv6 policy and DNS after DHCPv6 / RA updates |
+| `/jffs/scripts/dnsmasq.postconf` | On Merlin 3006, give only the main LAN dnsmasq a private Sockrocket upstream; SDN DNS retains the firmware's shared upstream file |
 | `/jffs/scripts/services-start` | Start Sockrocket |
 | `/jffs/scripts/service-event` | Service restart hook |
 
