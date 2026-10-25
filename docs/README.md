@@ -31,6 +31,7 @@ Readable pages on the marketing site (not raw GitHub Markdown):
 | Document | Description |
 |----------|-------------|
 | [Development](./development.md) | Layout and contributing |
+| [Privacy](./privacy-protection.md) | Local data, commit identity, and what not to share |
 | [Architecture](./architecture.md) | Modules and data flow |
 | [Internals](./internals/) | Protocol depth notes for contributors |
 

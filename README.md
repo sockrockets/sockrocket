@@ -180,7 +180,9 @@ Stop with `Ctrl+C`. See the [configuration reference](docs/configuration.md) for
 
 ## Privacy and feedback
 
-Desktop design illustrations use fictional data; the Merlin capture is sanitized before export. Before sharing an Issue, log or screenshot, remove full subscription URLs and query strings, server addresses, passwords, UUIDs, tokens, QR codes, personal paths and account details. QR codes and share links can contain complete credentials.
+Configuration, backups, and runtime logs stay on the machine and use private file permissions. The management API listens on localhost only. The default log level stays at info unless a diagnostic log file is set. See [Privacy](docs/privacy-protection.md).
+
+Desktop design illustrations use fictional data; the Merlin capture is sanitized before export. Before sharing an Issue, log or screenshot, remove full subscription URLs and query strings, server addresses, passwords, UUIDs, tokens, QR codes, personal paths and account details. QR codes and share links can contain complete credentials. Commits and tags use the project identity. A `noreply` address is not personal information.
 
 - [Issues](https://github.com/sockrockets/sockrocket/issues): bug reports.
 - [Discussions](https://github.com/sockrockets/sockrocket/discussions): questions and usage.

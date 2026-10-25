@@ -31,5 +31,6 @@ sockrocket/
 1. Fork and open a PR against `main`
 2. Keep commits focused; CI must pass
 3. Do not commit secrets (use `.local/` for machine-specific env files)
+4. Follow [Privacy](./privacy-protection.md) for commit identity, tags, and what may be shared
 
 Pre-built binaries and Merlin packages are published via [GitHub Releases](https://github.com/sockrockets/sockrocket/releases).

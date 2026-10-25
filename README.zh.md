@@ -183,7 +183,9 @@ sockrocket-cli config.yaml
 
 ## 隐私与反馈
 
-桌面设计配图使用虚构数据；Merlin 实际界面截图在导出前脱敏。提交 Issue、日志或截图前，请移除订阅完整 URL、查询参数、节点地址、密码、UUID、令牌、二维码、个人路径和账户信息。二维码与分享链接也可能包含完整凭据。
+配置、备份和运行日志默认只保存在本机，并使用私有文件权限。管理接口只监听本机。默认日志是 info，只有设置了诊断日志文件时才升到 debug。完整说明见 [隐私保护](docs/privacy-protection.md)。
+
+桌面设计配图使用虚构数据；Merlin 实际界面截图在导出前脱敏。提交 Issue、日志或截图前，请移除订阅完整 URL、查询参数、节点地址、密码、UUID、令牌、二维码、个人路径和账户信息。二维码与分享链接也可能包含完整凭据。提交和标签使用项目身份；`noreply` 地址不是个人信息。
 
 - [Issues](https://github.com/sockrockets/sockrocket/issues)：报告缺陷。
 - [Discussions](https://github.com/sockrockets/sockrocket/discussions)：使用讨论。
