@@ -27,4 +27,5 @@ Resource and observability changes:
 - Include application-queued TCP bytes in the advertised receive window; bound queued chunks and packet-map entries to control tiny-segment metadata; reopen windows on consumption.
 - Keep producer waiters weakly owned and scoped to the exhausted budget; wake in round-robin order rather than waking all flows on every packet.
 - Publish anonymous TCP-state counts, receive-buffer occupancy and oldest closing age; terminate the stack on device EOF/error or a bounded write stall.
+- Count peer TCP resets separately from task errors, scoped to each stack. Established/closing peer resets are DEBUG events; handshake resets and unexpected task errors retain WARN. Publish cumulative anonymous counts in TUN health samples and diagnostics.
 - Reset UDP idle deadlines only on activity, reject undersized reads without panicking, and reject oversize writes rather than silently splitting or truncating datagrams.

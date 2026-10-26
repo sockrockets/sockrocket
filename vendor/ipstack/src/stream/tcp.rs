@@ -713,6 +713,7 @@ impl IpStackTcpStream {
         let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
         let exit_notifier = exit_task_notifier.clone();
         let config = self.config.clone();
+        let diagnostics = self.up_packet_sender.global();
         self.exit_notifier = Some(exit_task_notifier);
 
         let task_handle = tokio::spawn(async move {
@@ -732,7 +733,25 @@ impl IpStackTcpStream {
             )
             .await;
             if let Err(e) = &v {
-                log::warn!("{network_tuple} task error: {e}");
+                let state = tcb.lock().unwrap().get_state();
+                if e.kind() == std::io::ErrorKind::ConnectionReset {
+                    // The receive loop returns this kind for a peer's RST.
+                    // Browser cancellations and closed keep-alive sockets
+                    // are flow events; retain their counts without flooding
+                    // WARN. A reset before the handshake is still suspicious.
+                    let handshake = matches!(state, TcpState::Listen | TcpState::SynReceived);
+                    diagnostics.record_tcp_reset(handshake);
+                    if handshake {
+                        log::warn!(
+                            "{network_tuple} {state:?}: peer reset before TCP handshake completed"
+                        );
+                    } else {
+                        log::debug!("{network_tuple} {state:?}: peer reset TCP connection");
+                    }
+                } else {
+                    diagnostics.record_tcp_task_error();
+                    log::warn!("{network_tuple} {state:?} task error: {e}");
+                }
             }
             if v.is_err() {
                 reset.store(true, std::sync::atomic::Ordering::Release);

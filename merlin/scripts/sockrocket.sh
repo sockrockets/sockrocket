@@ -505,10 +505,10 @@ main_dnsmasq_config() {
 main_dns_isolated() {
     local config="$1" dns_port="$2"
     [ -s "$config" ] || return 1
-    grep -q 'servers-file' "$config" && return 1
-    grep -q 'resolv-file' "$config" && return 1
-    grep -qx 'no-resolv' "$config" || return 1
-    grep -qx "server=127.0.0.1#${dns_port}" "$config"
+    grep -q 'servers-file' "$config" 2>/dev/null && return 1
+    grep -q 'resolv-file' "$config" 2>/dev/null && return 1
+    grep -qx 'no-resolv' "$config" 2>/dev/null || return 1
+    grep -qx "server=127.0.0.1#${dns_port}" "$config" 2>/dev/null
 }
 
 # Flags only. The config also holds DHCP ranges and names, which stay out of the log.
@@ -516,12 +516,44 @@ main_dns_state() {
     local config="$1" dns_port="$2"
     local servers=no resolv=no nore=no upstream=no
     [ -s "$config" ] || { printf 'empty'; return; }
-    grep -q 'servers-file' "$config" && servers=yes
-    grep -q 'resolv-file' "$config" && resolv=yes
-    grep -qx 'no-resolv' "$config" && nore=yes
-    grep -qx "server=127.0.0.1#${dns_port}" "$config" && upstream=yes
+    grep -q 'servers-file' "$config" 2>/dev/null && servers=yes
+    grep -q 'resolv-file' "$config" 2>/dev/null && resolv=yes
+    grep -qx 'no-resolv' "$config" 2>/dev/null && nore=yes
+    grep -qx "server=127.0.0.1#${dns_port}" "$config" 2>/dev/null && upstream=yes
     printf 'servers-file=%s resolv-file=%s no-resolv=%s sockrocket-upstream=%s' \
         "$servers" "$resolv" "$nore" "$upstream"
+}
+
+# SIGHUP does not reload dnsmasq's main configuration. Reapply through the
+# firmware lifecycle and verify real DNS answers, keeping proxy rules on a
+# successful repair. Back off after a failed repair instead of restarting
+# DNS on every guard tick. A temporarily absent file alone is not a fault.
+heal_main_dns_isolation() {
+    local dns_port="$1" config
+    dns_port=${dns_port:-5300}
+    merlin_3006 || return 0
+    recover_waiting && return 0
+    config=$(main_dnsmasq_config)
+    if [ ! -s "$config" ]; then
+        if wait_for_main_dns; then
+            log_warn "Watchdog: Merlin 3006 main dnsmasq config not ready (${config}); DNS still answers — waiting for firmware"
+            return 0
+        fi
+        hold_recover 60
+        enter_lan_degraded "3006 main DNS config missing and listener unavailable"
+        return 1
+    fi
+    if main_dns_isolated "$config" "$dns_port"; then
+        return 0
+    fi
+    log_warn "Watchdog: Merlin 3006 main dnsmasq lost its isolated upstream (${config}: $(main_dns_state "$config" "$dns_port")) — restarting DNS to reload the config"
+    if update_dnsmasq start; then
+        log_info "Watchdog: Merlin 3006 DNS reapplied and responding; proxy rules retained"
+        return 0
+    fi
+    hold_recover 60
+    enter_lan_degraded "3006 DNS upstream isolation unavailable"
+    return 1
 }
 
 # Restore dnsmasq's original upstream servers when the hijack is removed.
@@ -566,6 +598,20 @@ dns_listener_healthy() {
     # A real answer is authoritative; a transient socket-table read must
     # not classify a responding DNS service as dead.
     "$SOCKROCKET_BIN" --dns-health "$dns_port" >/dev/null 2>&1
+}
+
+# rc may acknowledge restart_dnsmasq before the daemon has parsed its
+# config. Probe firmware DNS itself, not just Sockrocket's upstream port,
+# before exposing redirects to LAN clients.
+wait_for_main_dns() {
+    local attempt
+    for attempt in 1 2 3; do
+        if "$SOCKROCKET_BIN" --dns-health 53 >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$attempt" = 3 ] || sleep 1
+    done
+    return 1
 }
 
 update_dnsmasq() {
@@ -646,10 +692,10 @@ update_dnsmasq() {
                         break
                     fi
                     helper_rc=0
-                    if [ -x "$helper" ] && [ -s "$private_file" ]; then
+                    if [ -s "$main_config" ] && [ -x "$helper" ] && [ -s "$private_file" ]; then
                         "$helper" "$main_config" >/dev/null 2>&1 || helper_rc=$?
                         if [ "$saw_helper" = 0 ]; then
-                            log_info "Merlin 3006 DNS helper exit ${helper_rc} on ${main_config}"
+                            log_debug "Merlin 3006 DNS helper exit ${helper_rc} on ${main_config}; waiting for isolation"
                             saw_helper=1
                         fi
                         if main_dns_isolated "$main_config" "$dns_port"; then
@@ -681,6 +727,11 @@ update_dnsmasq() {
                 fi
             fi
             if ! pin_dns_upstream; then
+                update_dnsmasq stop
+                return 1
+            fi
+            if ! wait_for_main_dns; then
+                log_error "Main dnsmasq did not answer after restart — rolling back Sockrocket DNS config"
                 update_dnsmasq stop
                 return 1
             fi
@@ -1715,12 +1766,31 @@ enter_lan_degraded() {
 
 # True when SOCKS/HTTP can complete a basic outbound HTTP probe (node path alive).
 outbound_probe_ok() {
-    local http_port
+    local http_port host result status elapsed rc
+    OUTBOUND_PROBE_FAILURE=""
     http_port=$(get_config_value http_port)
     http_port=${http_port:-1087}
     if which curl >/dev/null 2>&1; then
-        curl -x "http://127.0.0.1:${http_port}" -fsS -m 5 -o /dev/null \
-            "http://www.gstatic.com/generate_204" 2>/dev/null && return 0
+        # One blocked destination must not remove the whole LAN proxy path.
+        # Bound each request, and require the expected HTTP response rather
+        # than accepting a redirect/captive portal. No credentials or peer
+        # addresses are recorded; failures are logged by the watchdog only.
+        for host in www.gstatic.com cp.cloudflare.com www.google.com; do
+            if result=$(curl --noproxy '' -x "http://127.0.0.1:${http_port}" \
+                -sS --connect-timeout 2 -m 3 -o /dev/null \
+                -w '%{http_code}/%{time_total}' "http://${host}/generate_204" 2>/dev/null); then
+                rc=0
+            else
+                rc=$?
+            fi
+            status=${result%%/*}
+            elapsed=${result#*/}
+            if [ "$rc" = 0 ] && [ "$status" = 204 ]; then
+                OUTBOUND_PROBE_FAILURE=""
+                return 0
+            fi
+            OUTBOUND_PROBE_FAILURE="${OUTBOUND_PROBE_FAILURE}${host}: curl=${rc} http=${status:-000} seconds=${elapsed:-unknown}; "
+        done
         return 1
     fi
     if which timeout >/dev/null 2>&1; then
@@ -1845,11 +1915,13 @@ do_firewall_restore() {
     is_running || return 0
     [ "$(count_section nodes)" != "0" ] || return 0
     if [ "$(conf_bool transparent_proxy true)" = "true" ]; then
-        wait_for_tun 1 || return 1
-        "$SOCKROCKET_DIR/scripts/iptables.sh" start || {
+        # start can flush the old MARK chain before a later operation fails.
+        # Without a verified path, fake-IP DNS must not remain installed.
+        if ! wait_for_tun 1 || ! "$SOCKROCKET_DIR/scripts/iptables.sh" start; then
+            hold_recover 60
             enter_lan_degraded "firewall rebuild failed"
             return 1
-        }
+        fi
     fi
     if [ "$(conf_bool dns_hijack false)" = "true" ] && \
         [ -f "${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf" ]; then
@@ -1986,10 +2058,10 @@ do_watchdog() {
                 ofails=$((ofails + 1))
                 echo "$ofails" > "$WOUT_FAILS_FILE"
                 if [ "$ofails" -ge 3 ]; then
-                    enter_lan_degraded "outbound probe failed ${ofails}x"
+                    enter_lan_degraded "outbound probe failed ${ofails}x (${OUTBOUND_PROBE_FAILURE:-details unavailable})"
                     issues=$((issues + 1))
                 else
-                    log_warn "Watchdog: outbound probe failed (${ofails}/3)"
+                    log_warn "Watchdog: outbound probe failed (${ofails}/3): ${OUTBOUND_PROBE_FAILURE:-details unavailable}"
                 fi
             fi
         fi
@@ -2103,8 +2175,7 @@ do_watchdog() {
             [ "$(cat "$resolv_file" 2>/dev/null)" != "$before" ] && \
                 log_warn "Watchdog: main dnsmasq upstream restored to Sockrocket"
             if merlin_3006 && ! main_dns_isolated "$(main_dnsmasq_config)" "$dns_port"; then
-                log_warn "Watchdog: Merlin 3006 main dnsmasq lost its isolated upstream ($(main_dnsmasq_config): $(main_dns_state "$(main_dnsmasq_config)" "$dns_port")) — restarting DNS"
-                update_dnsmasq start || enter_lan_degraded "3006 DNS upstream isolation unavailable"
+                heal_main_dns_isolation "$dns_port"
                 issues=$((issues + 1))
             fi
         else

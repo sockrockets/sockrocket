@@ -163,6 +163,11 @@ SH
 #!/bin/sh
 exit 0
 SH
+    cat > "$SANDBOX/stub/curl" <<'SH'
+#!/bin/sh
+printf '204/0.01'
+exit 0
+SH
     cat > "$SANDBOX/stub/ip" <<'SH'
 #!/bin/sh
 # `ip link show sockrocket-tun` succeeds only while the TUN marker exists.
@@ -448,8 +453,8 @@ test_ensure_tun_total_failure() {
 test_proxy_off_skips_tun_and_iptables() {
     printf '\n[10] transparent_proxy=false: no --tun, no iptables\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
-    sed -i "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/tun_dev"
     run_sockrocket start
     assert "no iptables start" "0" "$(grep -c '^iptables.sh start' "$SANDBOX/iptables.calls")"
@@ -461,8 +466,8 @@ test_proxy_off_skips_tun_and_iptables() {
 test_proxy_only() {
     printf '\n[11] transparent_proxy=true, dns_hijack=false: rules yes, hijack no\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: true/" "$SOCKROCKET_DIR/config.yaml"
-    sed -i "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: true/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/tun_dev"
     run_sockrocket start
     assert "iptables start invoked" "1" "$(grep -c '^iptables.sh start' "$SANDBOX/iptables.calls")"
@@ -475,8 +480,8 @@ test_proxy_only() {
 test_dns_without_tun() {
     printf '\n[11b] transparent_proxy=false, dns_hijack=true: no TUN, DNS hijack on\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
-    sed -i "s/^dns_hijack:.*/dns_hijack: true/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^dns_hijack:.*/dns_hijack: true/" "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/tun_dev"
     rm -f "$DNS_DIR/sockrocket.conf"
     run_sockrocket start
@@ -520,7 +525,7 @@ test_legacy_mode_tun_derives_both_on() {
     printf '\n[14] legacy config: mode=tun retains transparent routing, DNS stays opt-in\n'
     setup
     grep -v "^transparent_proxy:\|^dns_hijack:" "$SOCKROCKET_DIR/config.yaml" > "$SOCKROCKET_DIR/c2" && mv "$SOCKROCKET_DIR/c2" "$SOCKROCKET_DIR/config.yaml"
-    sed -i 's/^mode:.*/mode: "tun"/' "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak 's/^mode:.*/mode: "tun"/' "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/tun_dev"
     # setup() pre-creates the hijack file, so its presence afterwards would
     # prove nothing; drop it and let do_start re-install it.
@@ -537,7 +542,7 @@ test_legacy_mode_tun_derives_both_on() {
 test_watchdog_clears_stale_hijack_when_disabled() {
     printf '\n[15] watchdog: dns_hijack=false + stale sockrocket.conf -> removed\n'
     setup
-    sed -i "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
     touch "$DNS_DIR/sockrocket.conf"          # leftover from a previous run
     spawn_daemon                        # service is up, so no crash recovery
     run_sockrocket watchdog
@@ -562,7 +567,7 @@ test_dns_off_removes_hijack() {
 test_watchdog_selfheals_tun() {
     printf '\n[16] watchdog: TUN missing while proxying -> reload + reapply\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: true/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: true/" "$SOCKROCKET_DIR/config.yaml"
     rm -f "$SANDBOX/tun_dev"            # device gone after a reboot
     spawn_daemon
     printf '#!/bin/sh\necho "$*" >> "$SANDBOX/modprobe.calls"\ntouch "$SANDBOX/tun_dev"\nexit 0\n' > "$SANDBOX/stub/modprobe"
@@ -579,7 +584,7 @@ test_watchdog_selfheals_tun() {
 test_watchdog_skips_proxy_when_disabled() {
     printf '\n[18] watchdog: transparent_proxy=false -> never reapplies rules\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/tun_dev"          # TUN present, so only the key can stop it
     rm -f "$SANDBOX/mangle_chain"     # rules missing
     spawn_daemon
@@ -595,7 +600,7 @@ test_watchdog_skips_proxy_when_disabled() {
 test_watchdog_clears_stale_mark_when_proxy_disabled() {
     printf '\n[19] watchdog: transparent_proxy=false + stale MARK -> removed\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/mangle_chain"     # stale rules from a crashed run
     spawn_daemon
     run_sockrocket watchdog
@@ -608,8 +613,8 @@ test_watchdog_clears_stale_mark_when_proxy_disabled() {
 test_start_clears_stale_mark_when_proxy_disabled() {
     printf '\n[20] start: transparent_proxy=false + stale MARK -> removed\n'
     setup
-    sed -i "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
-    sed -i "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^transparent_proxy:.*/transparent_proxy: false/" "$SOCKROCKET_DIR/config.yaml"
+    sed -i.bak "s/^dns_hijack:.*/dns_hijack: false/" "$SOCKROCKET_DIR/config.yaml"
     touch "$SANDBOX/mangle_chain"
     rm -f "$DNS_DIR/sockrocket.conf"
     run_sockrocket start
@@ -723,6 +728,7 @@ SH
     # never reaches kill_half_dead_daemon).
     cat > "$SANDBOX/stub/curl" <<'SH'
 #!/bin/sh
+printf '204/0.01'
 exit 0
 SH
     chmod +x "$SANDBOX/stub/curl"
@@ -782,6 +788,7 @@ SH
     chmod +x "$SANDBOX/stub/netstat"
     cat > "$SANDBOX/stub/curl" <<'SH'
 #!/bin/sh
+printf '204/0.01'
 exit 0
 SH
     chmod +x "$SANDBOX/stub/curl"
