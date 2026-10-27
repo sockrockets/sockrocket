@@ -603,31 +603,32 @@ test_outbound_probe_fallback_and_failure_details() {
     # Restore the actual probe (the fixture normally stubs it).
     sed -n '/^outbound_probe_ok() {/,/^}/p' "$SOURCE" > "$SANDBOX/probe.sh"
     . "$SANDBOX/probe.sh"
-    which() { return 0; }
-    curl() {
-        echo "$*" >> "$SANDBOX/curl.calls"
-        case "$*" in
-            *www.gstatic.com*) printf '000/3.0'; return 28 ;;
-            *) printf '204/0.1'; return 0 ;;
+    nc() {
+        req=$(cat)
+        echo call >> "$SANDBOX/nc.calls"
+        case "$req" in
+            *www.gstatic.com*) printf 'HTTP/1.1 000 timeout\n' ;;
+            *) printf 'HTTP/1.1 204 No Content\n' ;;
         esac
     }
     outbound_probe_ok
-    check 2 "$(wc -l < "$SANDBOX/curl.calls" | tr -d ' ')" 'blackholed primary reaches a fallback'
+    check 2 "$(wc -l < "$SANDBOX/nc.calls" | tr -d ' ')" 'blackholed primary reaches a fallback'
     check 0 "${#OUTBOUND_PROBE_FAILURE}" 'successful fallback clears failures'
-    curl() { printf '503/0.1'; return 0; }
+    nc() { cat >/dev/null; printf 'HTTP/1.1 502 Bad Gateway\n'; }
     if outbound_probe_ok; then echo 'HTTP error treated as healthy' >&2; exit 1; fi
-    case "$OUTBOUND_PROBE_FAILURE" in *'curl=0 http=503'*) ;; *) echo 'missing HTTP failure diagnostics' >&2; exit 1 ;; esac
-    curl() { printf '000/3.0'; return 28; }
+    case "$OUTBOUND_PROBE_FAILURE" in *'raw-http=HTTP/1.1 502'*) ;; *) echo 'missing HTTP failure diagnostics' >&2; exit 1 ;; esac
+    nc() { cat >/dev/null; return 1; }
     if outbound_probe_ok; then echo 'all failed targets treated as healthy' >&2; exit 1; fi
-    case "$OUTBOUND_PROBE_FAILURE" in *'curl=28 http=000'*) ;; *) echo 'missing timeout diagnostics' >&2; exit 1 ;; esac
+    case "$OUTBOUND_PROBE_FAILURE" in *'raw-http=none'*) ;; *) echo 'missing timeout diagnostics' >&2; exit 1 ;; esac
     echo 'outbound failed' > "$DEGRADED_FILE"
     wait_for_tun() { return 0; }
     try_recover_lan_proxy
     check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'failed probes cannot re-capture LAN'
-    curl() {
-        case "$*" in
-            *www.gstatic.com*) printf '000/3.0'; return 28 ;;
-            *) printf '204/0.1'; return 0 ;;
+    nc() {
+        req=$(cat)
+        case "$req" in
+            *www.gstatic.com*) printf 'HTTP/1.1 000 timeout\n' ;;
+            *) printf 'HTTP/1.1 204 No Content\n' ;;
         esac
     }
     try_recover_lan_proxy

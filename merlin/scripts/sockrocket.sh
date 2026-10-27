@@ -1764,40 +1764,29 @@ enter_lan_degraded() {
     ensure_sshd
 }
 
-# True when SOCKS/HTTP can complete a basic outbound HTTP probe (node path alive).
+# True when the local HTTP proxy returns a real 204. Router curl often has
+# no proxy support, so this speaks HTTP directly and never calls curl.
 outbound_probe_ok() {
-    local http_port host result status elapsed rc
+    local http_port host line
     OUTBOUND_PROBE_FAILURE=""
     http_port=$(get_config_value http_port)
     http_port=${http_port:-1087}
-    if which curl >/dev/null 2>&1; then
-        # One blocked destination must not remove the whole LAN proxy path.
-        # Bound each request, and require the expected HTTP response rather
-        # than accepting a redirect/captive portal. No credentials or peer
-        # addresses are recorded; failures are logged by the watchdog only.
-        for host in www.gstatic.com cp.cloudflare.com www.google.com; do
-            if result=$(curl --noproxy '' -x "http://127.0.0.1:${http_port}" \
-                -sS --connect-timeout 2 -m 3 -o /dev/null \
-                -w '%{http_code}/%{time_total}' "http://${host}/generate_204" 2>/dev/null); then
-                rc=0
-            else
-                rc=$?
-            fi
-            status=${result%%/*}
-            elapsed=${result#*/}
-            if [ "$rc" = 0 ] && [ "$status" = 204 ]; then
+    # One blocked destination must not remove the whole LAN proxy path.
+    # Bound each request, and require the expected HTTP response rather
+    # than accepting a redirect or captive portal. No credentials or peer
+    # addresses are recorded; failures are logged by the watchdog only.
+    for host in www.gstatic.com cp.cloudflare.com www.google.com; do
+        line=$(printf 'GET http://%s/generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$host" "$host" \
+            | nc -w 5 127.0.0.1 "$http_port" 2>/dev/null | head -n 1)
+        case "$line" in
+            *' 204 '*)
                 OUTBOUND_PROBE_FAILURE=""
                 return 0
-            fi
-            OUTBOUND_PROBE_FAILURE="${OUTBOUND_PROBE_FAILURE}${host}: curl=${rc} http=${status:-000} seconds=${elapsed:-unknown}; "
-        done
-        return 1
-    fi
-    if which timeout >/dev/null 2>&1; then
-        timeout 2 sh -c "echo | nc -w1 127.0.0.1 $http_port >/dev/null 2>&1"
-    else
-        nc -w1 127.0.0.1 "$http_port" </dev/null >/dev/null 2>&1
-    fi
+                ;;
+        esac
+        OUTBOUND_PROBE_FAILURE="${OUTBOUND_PROBE_FAILURE}${host}: raw-http=${line:-none}; "
+    done
+    return 1
 }
 
 # Busybox shells on 32-bit routers must not multiply MemTotal by 100 in
