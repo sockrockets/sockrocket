@@ -25,3 +25,11 @@ The 512-session admission limit, UDP queue budgets, and memory fail-open thresho
 - Product-library/binary clippy completed with existing warnings. ARM64 musl release build completed. Shell syntax and whitespace checks passed.
 
 Deployment is validated separately against binary/script checksums, DNS on ports 53/5300, firewall consistency, API access, proxied HTTP/HTTPS, and LAN HTTPS through the router's Fake-IP route. Short post-deployment observation cannot prove long-term memory stability.
+
+## Follow-up: silent half-closed relays
+
+After 33 minutes on the first repair, the router had no admission rejects, UDP queue-drop warnings, or memory-pressure warnings. Ten retransmission failures were correctly reflected in the task-error counter. However, 56 TCP flows were in FIN_WAIT_2, with the oldest closing state about 25 minutes old. The relay used the same 1800-second inactivity allowance before and after EOF, permitting silent half-closed flows to retain their admission slots for 30 minutes.
+
+The follow-up observes EOF in either direction and caps subsequent inactivity at 60 seconds, checked at intervals of at most 30 seconds. Payload progress in either direction renews the allowance, so a long response or upload can continue. An EOF after a long established idle period gets fresh grace. Fully established connections retain their configured idle allowance. A protocol that intentionally stays half-closed and silent for more than 60 seconds may now time out; this is the explicit resource policy for TUN relays.
+
+Five added regressions cover both EOF directions, preservation of established idle time, fresh EOF grace, continued half-closed payload in either direction, and actual FIN_WAIT_2 relay/TCB reclamation. The two initial silent-flow regressions failed before the change. The complete Rust suite passed 637 tests with 15 ignored; the expanded symmetric payload test also passed independently. Product clippy, formatting/whitespace checks, and the ARM64 musl release build passed (existing warnings remain). The earlier shell/control-script checks remain applicable because this follow-up changes only the relay and its tests.

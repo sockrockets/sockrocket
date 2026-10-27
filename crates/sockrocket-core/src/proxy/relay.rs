@@ -16,6 +16,8 @@ where
 
 /// Bound abandoned TUN relays even after EOF stops polling one read half.
 /// The watchdog observes payload progress, not ACKs or spurious wakeups.
+/// After either read EOF, cap inactivity at 60 seconds (sampled every 30s).
+/// Continued payload progress preserves long responses in the other direction.
 pub async fn relay_bidirectional_with_idle_timeout<A, B>(
     a: &mut A,
     b: &mut B,
@@ -26,7 +28,7 @@ where
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     };
     use std::{
@@ -37,6 +39,7 @@ where
     struct Progress<'a, S: ?Sized> {
         stream: &'a mut S,
         bytes: Arc<AtomicU64>,
+        half_closed_at: Arc<Mutex<Option<tokio::time::Instant>>>,
     }
     impl<S: AsyncRead + Unpin + ?Sized> AsyncRead for Progress<'_, S> {
         fn poll_read(
@@ -45,10 +48,16 @@ where
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let before = buf.filled().len();
+            let can_read = buf.remaining() != 0;
             let result = Pin::new(&mut *self.stream).poll_read(cx, buf);
             let n = buf.filled().len() - before;
             if n != 0 {
                 self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+            } else if can_read && matches!(&result, Poll::Ready(Ok(()))) {
+                self.half_closed_at
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(tokio::time::Instant::now);
             }
             result
         }
@@ -78,11 +87,18 @@ where
         return Err(io::ErrorKind::InvalidInput.into());
     }
     let bytes = Arc::new(AtomicU64::new(0));
-    let mut observed = Progress {
+    let half_closed_at = Arc::new(Mutex::new(None));
+    let mut observed_a = Progress {
         stream: a,
         bytes: bytes.clone(),
+        half_closed_at: half_closed_at.clone(),
     };
-    let relay = relay_bidirectional(&mut observed, b);
+    let mut observed_b = Progress {
+        stream: b,
+        bytes: bytes.clone(),
+        half_closed_at: half_closed_at.clone(),
+    };
+    let relay = relay_bidirectional(&mut observed_a, &mut observed_b);
     tokio::pin!(relay);
     let mut tick = tokio::time::interval(idle.min(std::time::Duration::from_secs(30)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -96,8 +112,24 @@ where
                 if current != last_bytes {
                     last_bytes = current;
                     last_progress = tokio::time::Instant::now();
-                } else if last_progress.elapsed() >= idle {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "TUN relay idle timeout"));
+                } else {
+                    let eof = *half_closed_at.lock().unwrap();
+                    // A previously idle established connection gets a fresh
+                    // grace period at EOF; activity continues to extend it.
+                    let since = eof.map_or(last_progress, |at| at.max(last_progress));
+                    let limit = if eof.is_some() {
+                        idle.min(std::time::Duration::from_secs(60))
+                    } else {
+                        idle
+                    };
+                    if since.elapsed() >= limit {
+                        let message = if eof.is_some() {
+                            "TUN half-closed relay idle timeout"
+                        } else {
+                            "TUN relay idle timeout"
+                        };
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, message));
+                    }
                 }
             }
         }
