@@ -44,6 +44,9 @@ pub struct TcpConfig {
     pub close_wait_timeout: Duration,
     /// Timeout for TCP connections. Default is 60 seconds.
     pub timeout: Duration,
+    /// Deadline for completing the initial handshake, independent of I/O polls.
+    /// Default is 10 seconds; duplicate SYNs do not extend it.
+    pub handshake_timeout: Duration,
     /// Timeout for the TIME_WAIT state. Default is 2 seconds.
     pub two_msl: Duration,
     /// Maximum number of unacknowledged bytes allowed in the send buffer.
@@ -80,6 +83,7 @@ impl Default for TcpConfig {
             last_ack_timeout: LAST_ACK_TIMEOUT,
             close_wait_timeout: CLOSE_WAIT_TIMEOUT,
             timeout: TIMEOUT,
+            handshake_timeout: Duration::from_secs(10),
             two_msl: TWO_MSL,
             max_unacked_bytes: MAX_UNACK,
             read_buffer_size: READ_BUFFER_SIZE,
@@ -915,17 +919,26 @@ async fn tcp_main_logic_loop(
 
     let mut pending_fin: Option<SeqNum> = None;
     let mut peer_eof = false;
+    let handshake_deadline = tokio::time::sleep(config.handshake_timeout);
+    tokio::pin!(handshake_deadline);
 
     loop {
         let exit_notifier = exit_notifier.clone();
 
         let deadline = tcb.lock().unwrap().next_retransmit_deadline();
+        let awaiting_handshake = tcb.lock().unwrap().get_state() == TcpState::SynReceived;
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
                 break;
             }
             network_packet = stream_receiver.recv() => network_packet,
+            _ = &mut handshake_deadline, if awaiting_handshake => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TCP handshake timed out",
+                ));
+            }
             _ = retransmit_notify.notified() => continue,
             result = retransmit_when_due(&tcb, &up_packet_sender, network_tuple, deadline) => {
                 result?;
@@ -987,6 +1000,11 @@ async fn tcp_main_logic_loop(
         }
         if flags & RST == RST {
             return Err(std::io::ErrorKind::ConnectionReset.into());
+        }
+        if state == TcpState::SynReceived && (flags & ACK == 0 || incoming_ack != tcb.get_seq()) {
+            // Only an ACK of our SYN can complete the handshake. A stale
+            // ACK must not turn an abandoned SYN into a long-lived flow.
+            continue;
         }
 
         tcb.update_duplicate_ack_count(incoming_ack);

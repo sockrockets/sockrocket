@@ -298,3 +298,109 @@ async fn duplicate_ack_burst_does_not_amplify_into_a_retransmit_storm() {
     );
     assert_eq!(stack.tcp_event_counts().task_errors, 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn silent_handshake_expires_without_any_application_io_polling() {
+    let mut tcp = TcpConfig::default();
+    tcp.timeout = Duration::from_secs(1800);
+    let mut config = IpStackConfig::default();
+    config.with_tcp_config(tcp);
+    let (device, mut client) = tokio::io::duplex(65536);
+    let mut stack = IpStack::new(config, device);
+    client
+        .write_all(&packet(1000, None, true, &[]))
+        .await
+        .unwrap();
+    let IpStackStream::Tcp(mut stream) = stack.accept().await.unwrap() else {
+        panic!("TCP")
+    };
+    read_packet(&mut client).await; // SYN-ACK; no final ACK.
+    tokio::time::advance(Duration::from_secs(11)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0[1], 0, "handshake retained its slot");
+    assert_eq!(stack.tcp_event_counts().task_errors, 1);
+    timeout(Duration::from_millis(1), stream.read(&mut [0]))
+        .await
+        .expect("handshake expiry failed to publish terminal I/O")
+        .unwrap_err();
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_syn_does_not_extend_the_handshake_deadline() {
+    let (device, mut client) = tokio::io::duplex(65536);
+    let mut stack = IpStack::new(IpStackConfig::default(), device);
+    client
+        .write_all(&packet(1000, None, true, &[]))
+        .await
+        .unwrap();
+    let _stream = stack.accept().await.unwrap();
+    read_packet(&mut client).await;
+    tokio::time::advance(Duration::from_secs(9)).await;
+    client
+        .write_all(&packet(1000, None, true, &[]))
+        .await
+        .unwrap();
+    let synack = read_packet(&mut client).await;
+    let Some(TransportSlice::Tcp(tcp)) = SlicedPacket::from_ip(&synack).unwrap().transport else {
+        panic!("SYN-ACK")
+    };
+    assert!(tcp.syn() && tcp.ack());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0[1], 0);
+    assert_eq!(stack.tcp_event_counts().task_errors, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_final_ack_cannot_bypass_handshake_expiry() {
+    let mut tcp = TcpConfig::default();
+    tcp.handshake_timeout = Duration::from_millis(100);
+    let mut config = IpStackConfig::default();
+    config.with_tcp_config(tcp);
+    let (device, mut client) = tokio::io::duplex(65536);
+    let mut stack = IpStack::new(config, device);
+    client
+        .write_all(&packet(1000, None, true, &[]))
+        .await
+        .unwrap();
+    let _stream = stack.accept().await.unwrap();
+    let synack = read_packet(&mut client).await;
+    let Some(TransportSlice::Tcp(tcp)) = SlicedPacket::from_ip(&synack).unwrap().transport else {
+        panic!("SYN-ACK")
+    };
+    let stale = tcp.sequence_number(); // Does not acknowledge the SYN byte.
+    client
+        .write_all(&packet(1001, Some(stale), false, &[]))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0[1], 1);
+    assert_eq!(stack.tcp_health().0[2], 0, "stale ACK completed handshake");
+    tokio::time::advance(Duration::from_millis(150)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0[1], 0);
+    assert_eq!(stack.tcp_health().0[2], 0);
+    assert_eq!(stack.tcp_event_counts().task_errors, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_handshake_disarms_its_deadline() {
+    let (stack, mut client, mut stream, _) = connected(3).await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0[2], 1);
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    stream.write_all(b"alive").await.unwrap();
+    let data = read_packet(&mut client).await;
+    assert_eq!(payload(&data), b"alive");
+}

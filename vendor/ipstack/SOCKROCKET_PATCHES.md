@@ -22,6 +22,7 @@ TCP lifecycle changes in src/stream/tcp.rs:
 - Keep local FIN shutdown separate from peer FIN, validate final ACKs, support simultaneous close, and retry FIN with its original sequence number while a stream remains alive.
 - Drive payload retransmission from an independent Tokio deadline, including after a local write when no inbound packets arrive. Retain unacknowledged bytes through the final retry's full timeout; exhaustion fails the flow, clears buffered payload, wakes pending I/O, and releases the relay/session instead of silently dropping bytes.
 - Count a retransmission only after successful queueing, wait for device queue capacity without spending the retry budget, and bound each retry turn. Apply capped exponential backoff, pause data retries for a zero receive window, and send only one fast retransmission per duplicate-ACK run.
+- Bound initial handshakes with an independent configurable deadline (10 seconds by default), even without application I/O polling. Duplicate SYNs do not renew it; only an ACK of the SYN byte can establish the connection. Expiry uses the same terminal error, wakeup and cleanup path as failed payload retries.
 
 Resource and observability changes:
 
