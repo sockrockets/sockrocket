@@ -4,25 +4,27 @@ const assert = require('node:assert/strict');
 const {webcrypto} = require('node:crypto');
 const source = fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 function fixture() {
-  const requests=[], timers=new Map(), elements={}, messages=[], copied=[]; let next=0;
+  const requests=[], timers=new Map(), elements={}, messages=[], copied=[], nodeLoads=[], timerDelays=[]; let next=0;
   const element=id => elements[id] ||= {value:({'sub-name':'fixture','sub-url':'https://example.invalid/subscription','sub-format':'auto'})[id] || '',disabled:false};
   const context=vm.createContext({srElement:element, srApi:(...args)=>requests.push(args),
     window:{crypto:webcrypto}, Uint8Array, URL,
-    srCopyText:(text)=>copied.push(text), srShowMsg:(message)=>messages.push(message), toastResp(){}, srLoadNodes(){}, refreshStatus(){},
-    setTimeout(cb){const id=++next;timers.set(id,cb);return id;},clearTimeout:id=>timers.delete(id),
+    srCopyText:(text)=>copied.push(text), srShowMsg:(message)=>messages.push(message), toastResp(){}, srLoadNodes(){nodeLoads.push(true);}, refreshStatus(){},
+    setTimeout(cb,delay){const id=++next;timers.set(id,cb);timerDelays.push(delay);return id;},clearTimeout:id=>timers.delete(id),
     SR_STATE:{},SR_PAGE_LOADED:{},srEsc:value=>value});
   vm.runInContext(source.slice(source.indexOf('function srLoadSubs()'),source.indexOf('/* ══ Routing rules')),context);
   const request=action=>{const index=requests.findIndex(r=>r[0]===action); assert.ok(index>=0,action);return requests.splice(index,1)[0];};
   const tick=()=>{const [id,cb]=timers.entries().next().value;timers.delete(id);cb();};
-  return {context,requests,request,tick,element,messages,copied};
+  return {context,requests,request,tick,element,messages,copied,nodeLoads,timerDelays};
 }
 const f=fixture();f.context.addSub();
 let start=f.request('subscription_start');
 assert.equal(start[1].action,'add_sub');assert.equal(start[4],12000);
 assert.equal(f.element('sub-add').disabled,true);
 start[2]({ok:true,job:{id:'fixture-job',state:'running',stage:'fetching',total:4,completed:0}});
+assert.equal(f.timerDelays.at(-1),500,'short imports should not wait two seconds for their first progress check');
 f.tick();let poll=f.request('subscription_job');assert.equal(poll[1].id,'fixture-job');
 poll[3]();assert.equal(f.element('sub-update').disabled,true,'lost poll must not report terminal failure');
+assert.equal(f.timerDelays.at(-1),2000,'transport failures retain the slower retry cadence');
 f.tick();poll=f.request('subscription_job');poll[2]({ok:true,job:{id:'fixture-job',state:'running',stage:'applying',total:4,completed:4}});
 f.element('sub-url').value='https://example.invalid/new-input';
 f.tick();f.request('subscription_job')[2]({ok:true,job:{id:'fixture-job',state:'finished',result:{ok:true}}});
@@ -106,3 +108,21 @@ assert.match(counted.element('sub-list').innerHTML,/已导入 89 个节点/);
 assert.match(counted.element('sub-list').innerHTML,/6 个节点由多个订阅共用/);
 assert.doesNotMatch(counted.element('sub-list').innerHTML,/private-one|private-two/);
 console.log('PASS: per-subscription counts and shared-node explanation');
+
+const visible=fixture();
+visible.context.acceptSubscriptionJob({ok:true,job:{id:'saved-job',state:'running',stage:'saving',total:1,completed:1}});
+assert.equal(visible.nodeLoads.length,0,'uncommitted nodes must not be shown as imported');
+visible.context.acceptSubscriptionJob({ok:true,job:{id:'saved-job',state:'running',stage:'applying',nodes_saved:true,total:1,completed:1}});
+assert.equal(visible.nodeLoads.length,1,'saved nodes should appear before service apply finishes');
+visible.request('subscriptions');
+assert.match(visible.messages.at(-1),/已保存/);
+visible.context.acceptSubscriptionJob({ok:true,job:{id:'saved-job',state:'running',stage:'applying',nodes_saved:true,total:1,completed:1}});
+assert.equal(visible.nodeLoads.length,1,'polling must not repeatedly fetch an unchanged node list');
+assert.equal(visible.requests.length,0);
+assert.equal(visible.element('sub-add').disabled,true,'showing nodes must not report apply completion');
+console.log('PASS: saved nodes visible during apply, without repeated reloads or premature success');
+const legacy=fixture();
+legacy.context.acceptSubscriptionJob({ok:true,job:{id:'old-job',state:'running',stage:'applying'}});
+assert.equal(legacy.nodeLoads.length,0,'old backends cannot confirm that nodes have been saved');
+assert.doesNotMatch(legacy.messages.at(-1),/节点已保存/);
+console.log('PASS: older backend progress does not falsely confirm saved nodes');

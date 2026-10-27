@@ -256,29 +256,44 @@ pub async fn http_latency_test(outbound: &SharedOutbound, timeout_secs: u64) -> 
     // Share one deadline across fallback targets so a slow Reality handshake
     // does not get retried 3× with a full timeout each (which looked like
     // "most nodes timeout" on Merlin batch tests).
-    let measure_deadline = std::time::Instant::now() + timeout;
+    let measure_deadline = tokio::time::Instant::now() + timeout;
     let targets: &[(&str, u16)] = &[
         ("www.gstatic.com", 80),
         ("cp.cloudflare.com", 80),
-        ("dns.google", 80),
+        ("www.google.com", 80),
     ];
     let start = std::time::Instant::now();
-    let mut stream = None;
-    let mut last_err: Option<anyhow::Error> = None;
+    // Start fallback targets at staggered times without cancelling a slow
+    // primary. Splitting the deadline into three short timeouts rejects a
+    // working two-second response when the caller allowed five seconds.
+    // At most three exchanges run, all bounded by the same deadline; dropping
+    // the JoinSet on success/cancellation aborts the remaining exchanges.
+    let mut probes = tokio::task::JoinSet::new();
     for (i, &(host, port)) in targets.iter().enumerate() {
-        let rem = measure_deadline.saturating_duration_since(std::time::Instant::now());
-        if rem < std::time::Duration::from_millis(250) {
-            break;
-        }
-        if i > 0 {
-            tracing::debug!("http_latency_test: trying fallback target {host}");
-        }
-        match tokio::time::timeout(rem, outbound.connect(host, port)).await {
-            Ok(Ok(s)) => {
-                stream = Some(s);
+        let outbound = outbound.clone();
+        let launch_at = measure_deadline - timeout + timeout * i as u32 / targets.len() as u32;
+        probes.spawn(async move {
+            tokio::time::sleep_until(launch_at).await;
+            if i > 0 {
+                tracing::debug!("http_latency_test: trying fallback target {host}");
+            }
+            http_probe_exchange(&outbound, host, port).await
+        });
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    loop {
+        let result = match tokio::time::timeout_at(measure_deadline, probes.join_next()).await {
+            Ok(Some(Ok(result))) => result,
+            Ok(Some(Err(error))) => Err(error.into()),
+            Ok(None) => break,
+            Err(_) => {
+                last_err = Some(anyhow::anyhow!("HTTP probe timed out"));
                 break;
             }
-            Ok(Err(e)) => {
+        };
+        match result {
+            Ok(()) => return Ok(start.elapsed().as_millis() as u32),
+            Err(e) => {
                 // Handshake / protocol failure will repeat on every target
                 // through the same outbound — don't burn the rest of the budget.
                 let msg = format!("{e:#}");
@@ -292,49 +307,261 @@ pub async fn http_latency_test(outbound: &SharedOutbound, timeout_secs: u64) -> 
                     break;
                 }
             }
-            Err(_) => {
-                last_err = Some(anyhow::anyhow!("connection timed out"));
-                // Timeout may be destination-specific; try next with remaining.
-            }
         }
     }
-    let mut stream = match stream {
-        Some(s) => s,
-        None => {
-            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("connection timed out")));
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("HTTP probe timed out")))
+}
+
+async fn http_probe_exchange(outbound: &SharedOutbound, host: &str, port: u16) -> Result<()> {
+    let mut stream = outbound.connect(host, port).await?;
+    let request =
+        format!("GET /generate_204 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    // Bound memory even if a peer sends an endless or malformed header.
+    let mut response = [0u8; 4096];
+    let mut used = 0;
+    loop {
+        let read = stream.read(&mut response[used..]).await?;
+        anyhow::ensure!(
+            read > 0,
+            "HTTP probe response ended before complete headers"
+        );
+        used += read;
+        if let Some(end) = response[..used].windows(4).position(|b| b == b"\r\n\r\n") {
+            let line_end = response[..end + 2]
+                .windows(2)
+                .position(|b| b == b"\r\n")
+                .unwrap();
+            let line = std::str::from_utf8(&response[..line_end])?;
+            let mut fields = line.split_ascii_whitespace();
+            anyhow::ensure!(
+                matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")),
+                "Invalid HTTP probe response"
+            );
+            let status = fields.next().unwrap_or("");
+            anyhow::ensure!(
+                status.len() == 3 && status.bytes().all(|b| b.is_ascii_digit()),
+                "Invalid HTTP probe response status"
+            );
+            let status: u16 = status.parse()?;
+            anyhow::ensure!(
+                status == 204,
+                "HTTP probe expected status 204, received {status}"
+            );
+            return Ok(());
         }
-    };
-
-    // Bounded write (see warmup comment): never hang the caller on a wedged
-    // stream — this probe drives the health-check failover loop.
-    let write_budget = measure_deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .min(std::time::Duration::from_secs(5));
-    if write_budget < std::time::Duration::from_millis(100) {
-        return Err(anyhow::anyhow!("probe write timed out"));
+        anyhow::ensure!(
+            used < response.len(),
+            "HTTP probe response headers too large"
+        );
     }
-    tokio::time::timeout(
-        write_budget,
-        stream.write_all(
-            b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n",
-        ),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("probe write timed out"))??;
-    let mut buf = [0u8; 128];
-    let read_budget = measure_deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .min(std::time::Duration::from_secs(3));
-    if read_budget >= std::time::Duration::from_millis(50) {
-        let _ = tokio::time::timeout(read_budget, stream.read(&mut buf)).await;
-    }
-
-    Ok(start.elapsed().as_millis() as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::connector::{BoxProxyStream, Outbound};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    struct HttpProbeOutbound {
+        reply: &'static [u8],
+        primary_reply: Option<&'static [u8]>,
+        primary_connect_stalls: bool,
+        reply_delay: std::time::Duration,
+        requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl Outbound for HttpProbeOutbound {
+        fn connect(
+            &self,
+            host: &str,
+            _port: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+            let host = host.to_owned();
+            let stalls = self.primary_connect_stalls && host == "www.gstatic.com";
+            let requests = self.requests.clone();
+            let reply_delay = self.reply_delay;
+            let reply = if host == "www.gstatic.com" {
+                self.primary_reply.unwrap_or(self.reply)
+            } else {
+                self.reply
+            };
+            Box::pin(async move {
+                if stalls {
+                    std::future::pending::<()>().await;
+                }
+                let (client, mut server) = tokio::io::duplex(8192);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut byte = [0; 1];
+                    while server.read_exact(&mut byte).await.is_ok() {
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((host, String::from_utf8(request).unwrap()));
+                    if reply.is_empty() {
+                        // Accept writes but never return a response, like a
+                        // tunnel whose peer no longer carries application data.
+                        let mut discarded = [0; 1];
+                        let _ = server.read(&mut discarded).await;
+                    } else {
+                        tokio::time::sleep(reply_delay).await;
+                        // Fragment the headers to exercise incremental reads.
+                        for byte in reply {
+                            if server.write_all(&[*byte]).await.is_err() {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                });
+                Ok(Box::new(client) as BoxProxyStream)
+            })
+        }
+
+        fn name(&self) -> &str {
+            "mock HTTP probe"
+        }
+    }
+
+    fn http_probe_outbound(reply: &'static [u8]) -> SharedOutbound {
+        SharedOutbound(Arc::new(HttpProbeOutbound {
+            reply,
+            primary_reply: None,
+            primary_connect_stalls: false,
+            reply_delay: std::time::Duration::ZERO,
+            requests: Default::default(),
+        }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_rejects_a_tunnel_that_only_accepts_writes() {
+        let outbound = http_probe_outbound(b"");
+        let started = tokio::time::Instant::now();
+        let error = http_latency_test(&outbound, 5).await.unwrap_err();
+        assert_eq!(classify_probe_error(&error), ProbeFailureKind::Timeout);
+        assert!(started.elapsed() <= std::time::Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_rejects_eof_invalid_and_error_responses() {
+        for reply in [
+            &b"HTTP/1.1 204 No Content\r\n"[..],
+            &b"not HTTP\r\n\r\n"[..],
+            &b"HTTP/1.1 20x Invalid Status\r\n\r\n"[..],
+            &b"HTTP/1.1 503 Service Unavailable\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 302 Found\r\nLocation: https://login.invalid/\r\n\r\n"[..],
+            &[b'x'; 4096][..],
+        ] {
+            let outbound = http_probe_outbound(reply);
+            assert!(
+                http_latency_test(&outbound, 5).await.is_err(),
+                "accepted a failed HTTP exchange: {reply:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_accepts_complete_fragmented_headers() {
+        for reply in [
+            &b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"[..],
+            &b"HTTP/1.0 204 No Content\r\n\r\n"[..],
+        ] {
+            assert!(
+                http_latency_test(&http_probe_outbound(reply), 5)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_tries_fallback_after_http_failure_with_matching_host() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = SharedOutbound(Arc::new(HttpProbeOutbound {
+            reply: b"HTTP/1.1 204 No Content\r\n\r\n",
+            primary_reply: Some(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+            primary_connect_stalls: false,
+            reply_delay: std::time::Duration::ZERO,
+            requests: requests.clone(),
+        }));
+        assert!(http_latency_test(&outbound, 5).await.is_ok());
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().any(|(host, _)| host == "cp.cloudflare.com"));
+        for (host, request) in requests.iter() {
+            assert!(request.contains(&format!("\r\nHost: {host}\r\n")));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_uses_fallback_when_primary_connect_never_finishes() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = SharedOutbound(Arc::new(HttpProbeOutbound {
+            reply: b"HTTP/1.1 204 No Content\r\n\r\n",
+            primary_reply: None,
+            primary_connect_stalls: true,
+            reply_delay: std::time::Duration::ZERO,
+            requests: requests.clone(),
+        }));
+        let start = tokio::time::Instant::now();
+        http_latency_test(&outbound, 5)
+            .await
+            .expect("a blackholed primary must leave time for fallback targets");
+        assert!(start.elapsed() <= std::time::Duration::from_secs(7));
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(host, _)| host == "cp.cloudflare.com")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_does_not_shorten_a_working_targets_deadline() {
+        let outbound = SharedOutbound(Arc::new(HttpProbeOutbound {
+            reply: b"HTTP/1.1 204 No Content\r\n\r\n",
+            primary_reply: None,
+            primary_connect_stalls: false,
+            reply_delay: std::time::Duration::from_secs(2),
+            requests: Default::default(),
+        }));
+        http_latency_test(&outbound, 5)
+            .await
+            .expect("a two-second HTTP response must fit the five-second measurement deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_does_not_launch_fallbacks_after_success() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = SharedOutbound(Arc::new(HttpProbeOutbound {
+            reply: b"HTTP/1.1 204 No Content\r\n\r\n",
+            primary_reply: None,
+            primary_connect_stalls: false,
+            reply_delay: std::time::Duration::ZERO,
+            requests: requests.clone(),
+        }));
+        http_latency_test(&outbound, 5).await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "only warmup and the primary should connect"
+        );
+        assert!(requests.iter().all(|(host, _)| host == "www.gstatic.com"));
+    }
 
     #[test]
     fn classify_timeout_message() {

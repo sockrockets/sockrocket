@@ -65,11 +65,13 @@ pub(super) async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
             packet = client.read(&mut outbound) => {
                 let size = packet?;
                 if size == 0 { return Ok(()); }
-                remote.send(&outbound[..size]).await?;
+                tokio::time::timeout(Duration::from_secs(30), remote.send(&outbound[..size]))
+                    .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP upstream write stalled"))??;
             }
             packet = remote.recv(&mut inbound) => {
                 let size = packet?;
-                client.write_all(&inbound[..size]).await?;
+                tokio::time::timeout(Duration::from_secs(30), client.write_all(&inbound[..size]))
+                    .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP client write stalled"))??;
             }
             _ = tokio::time::sleep(Duration::from_secs(30)) => return Ok(()),
         }
@@ -79,6 +81,48 @@ pub(super) async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct StalledDatagram {
+        receive: bool,
+    }
+    impl Datagram for StalledDatagram {
+        fn send<'a>(&'a self, _: &'a [u8]) -> DatagramFuture<'a, ()> {
+            Box::pin(std::future::pending())
+        }
+        fn recv<'a>(&'a self, packet: &'a mut [u8]) -> DatagramFuture<'a, usize> {
+            Box::pin(async move {
+                if self.receive {
+                    packet[0] = 42;
+                    Ok(1)
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_upstream_send_cannot_retain_a_udp_relay_forever() {
+        let (mut local, mut peer) = tokio::io::duplex(16);
+        peer.write_all(b"packet").await.unwrap();
+        let remote = StalledDatagram { receive: false };
+        let error = tokio::time::timeout(Duration::from_secs(31), relay(&mut local, &remote))
+            .await
+            .expect("UDP send bypassed the relay deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("UDP upstream write stalled"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_client_write_cannot_retain_a_udp_relay_forever() {
+        let (mut local, _peer) = tokio::io::duplex(1);
+        let remote = StalledDatagram { receive: true };
+        let error = tokio::time::timeout(Duration::from_secs(31), relay(&mut local, &remote))
+            .await
+            .expect("UDP client write bypassed the relay deadline")
+            .unwrap_err();
+        assert!(error.to_string().contains("UDP client write stalled"));
+    }
+
     struct TcpOnly;
     impl super::super::connector::Outbound for TcpOnly {
         fn connect(

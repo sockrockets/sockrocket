@@ -20,6 +20,9 @@ TCP lifecycle changes in src/stream/tcp.rs:
 - Move ownership of the receive sender into the worker, publish terminal errors before channel closure, and wake pending readers and writers on worker completion or peer reset.
 - Deliver peer FIN as ordered, persistent read EOF while preserving the response direction. Defer out-of-order FIN until preceding data arrives, and acknowledge duplicate FIN without duplicating EOF.
 - Keep local FIN shutdown separate from peer FIN, validate final ACKs, support simultaneous close, and retry FIN with its original sequence number while a stream remains alive.
+- Drive payload retransmission from an independent Tokio deadline, including after a local write when no inbound packets arrive. Retain unacknowledged bytes through the final retry's full timeout; exhaustion fails the flow, clears buffered payload, wakes pending I/O, and releases the relay/session instead of silently dropping bytes.
+- Count a retransmission only after successful queueing, wait for device queue capacity without spending the retry budget, and bound each retry turn. Apply capped exponential backoff, pause data retries for a zero receive window, and send only one fast retransmission per duplicate-ACK run.
+- Bound initial handshakes with an independent configurable deadline (10 seconds by default), even without application I/O polling. Duplicate SYNs do not renew it; only an ACK of the SYN byte can establish the connection. Expiry uses the same terminal error, wakeup and cleanup path as failed payload retries.
 
 Resource and observability changes:
 
@@ -27,4 +30,5 @@ Resource and observability changes:
 - Include application-queued TCP bytes in the advertised receive window; bound queued chunks and packet-map entries to control tiny-segment metadata; reopen windows on consumption.
 - Keep producer waiters weakly owned and scoped to the exhausted budget; wake in round-robin order rather than waking all flows on every packet.
 - Publish anonymous TCP-state counts, receive-buffer occupancy and oldest closing age; terminate the stack on device EOF/error or a bounded write stall.
+- Count peer TCP resets separately from task errors, scoped to each stack. Established/closing peer resets are DEBUG events; handshake resets and unexpected task errors retain WARN. Publish cumulative anonymous counts in TUN health samples and diagnostics.
 - Reset UDP idle deadlines only on activity, reject undersized reads without panicking, and reject oversize writes rather than silently splitting or truncating datagrams.

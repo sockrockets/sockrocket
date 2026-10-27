@@ -712,11 +712,15 @@ impl TunProxy {
                     _ = health_tick.tick() => {
                         let (queued_packet_bytes, packet_queue_limit) = ip_stack.packet_queue_usage();
                         let (tcp_states, oldest_close_secs, tcp_receive_bytes) = ip_stack.tcp_health();
+                        let tcp_events = ip_stack.tcp_event_counts();
                         stats.update_tun(super::TunDiagnostics {
                             sampled_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                             running:true, active:active_streams.load(Ordering::Relaxed), rejected:rejected_sessions,
                             packet_bytes:queued_packet_bytes, packet_limit:packet_queue_limit,
                             receive_bytes:tcp_receive_bytes,tcp_states,oldest_close_secs,
+                            tcp_peer_resets: tcp_events.peer_resets,
+                            tcp_handshake_resets: tcp_events.handshake_resets,
+                            tcp_task_errors: tcp_events.task_errors,
                         });
                         tracing::info!(
                             queued_packet_bytes,
@@ -724,6 +728,9 @@ impl TunProxy {
                             tcp_states = ?tcp_states,
                             oldest_close_secs,
                             tcp_receive_bytes,
+                            tcp_peer_resets = tcp_events.peer_resets,
+                            tcp_handshake_resets = tcp_events.handshake_resets,
+                            tcp_task_errors = tcp_events.task_errors,
                             active_sessions = active_streams.load(Ordering::Relaxed),
                             active_tcp = active_tcp.load(Ordering::Relaxed),
                             active_dns = active_dns.load(Ordering::Relaxed),

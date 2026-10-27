@@ -20,6 +20,7 @@ fixture() {
     SOCKROCKET_PID="$SOCKROCKET_DIR/sockrocket.pid"
     DEGRADED_FILE="$SOCKROCKET_DIR/.lan_degraded"
     WOUT_FAILS_FILE="$SOCKROCKET_DIR/.wout_fails"
+    RECOVER_AFTER_FILE="$SOCKROCKET_DIR/.recover_after"
     LOCK_DIR="$SOCKROCKET_DIR/.lockdir"
     SOCKROCKET_DNSMASQ_DIR="$SANDBOX/dnsmasq.d"
     SOCKROCKET_RESOLV_FILE="$SANDBOX/resolv.dnsmasq"
@@ -588,6 +589,58 @@ test_dns_answer_failure_blocks_activation() {
     if update_dnsmasq start; then echo 'unresponsive DNS was activated' >&2; exit 1; fi
     check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'listening but failing DNS is not installed'
 }
+
+test_firmware_dns_failure_blocks_hijack_even_when_restart_returns_success() {
+    printf '#!/bin/sh\n[ "$2" != 53 ]\n' > "$SOCKROCKET_BIN"
+    printf '#!/bin/sh\necho "$1" >> "%s/dns-firewall.calls"\n' "$SANDBOX" > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    if update_dnsmasq start; then echo 'dead firmware DNS was reported ready' >&2; exit 1; fi
+    check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'dead firmware DNS rolls back snippet'
+    check 0 "$(grep -c '^dns-start$' "$SANDBOX/dns-firewall.calls" || true)" 'dead firmware DNS never captures LAN queries'
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'firmware DNS failure restores direct upstream'
+}
+
+test_outbound_probe_fallback_and_failure_details() {
+    # Restore the actual probe (the fixture normally stubs it).
+    sed -n '/^outbound_probe_ok() {/,/^}/p' "$SOURCE" > "$SANDBOX/probe.sh"
+    . "$SANDBOX/probe.sh"
+    nc() {
+        req=$(cat)
+        echo call >> "$SANDBOX/nc.calls"
+        case "$req" in
+            *www.gstatic.com*) printf 'HTTP/1.1 000 timeout\n' ;;
+            *) printf 'HTTP/1.1 204 No Content\n' ;;
+        esac
+    }
+    outbound_probe_ok
+    check 2 "$(wc -l < "$SANDBOX/nc.calls" | tr -d ' ')" 'blackholed primary reaches a fallback'
+    check 0 "${#OUTBOUND_PROBE_FAILURE}" 'successful fallback clears failures'
+    nc() { cat >/dev/null; printf 'HTTP/1.1 502 Bad Gateway\n'; }
+    if outbound_probe_ok; then echo 'HTTP error treated as healthy' >&2; exit 1; fi
+    case "$OUTBOUND_PROBE_FAILURE" in *'raw-http=HTTP/1.1 502'*) ;; *) echo 'missing HTTP failure diagnostics' >&2; exit 1 ;; esac
+    nc() { cat >/dev/null; return 1; }
+    if outbound_probe_ok; then echo 'all failed targets treated as healthy' >&2; exit 1; fi
+    case "$OUTBOUND_PROBE_FAILURE" in *'raw-http=none'*) ;; *) echo 'missing timeout diagnostics' >&2; exit 1 ;; esac
+    echo 'outbound failed' > "$DEGRADED_FILE"
+    wait_for_tun() { return 0; }
+    try_recover_lan_proxy
+    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'failed probes cannot re-capture LAN'
+    nc() {
+        req=$(cat)
+        case "$req" in
+            *www.gstatic.com*) printf 'HTTP/1.1 000 timeout\n' ;;
+            *) printf 'HTTP/1.1 204 No Content\n' ;;
+        esac
+    }
+    try_recover_lan_proxy
+    check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'working fallback recovers LAN even with primary still blocked'
+}
+
+test_main_dns_waits_for_async_firmware_restart() {
+    printf '#!/bin/sh\nif [ "$2" = 53 ]; then\n echo probe >> "%s/main-dns.calls"\n [ "$(wc -l < "%s/main-dns.calls")" -ge 2 ]\nfi\n' "$SANDBOX" "$SANDBOX" > "$SOCKROCKET_BIN"
+    update_dnsmasq start
+    check 2 "$(wc -l < "$SANDBOX/main-dns.calls" | tr -d ' ')" 'asynchronous firmware DNS readiness is retried'
+    check present "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'successful readiness retains hijack configuration'
+}
 test_subscription_refresh_preserves_stop() {
     : > "$SOCKROCKET_DIR/stopped"
     do_start() { echo 'unexpected start' >&2; return 1; }
@@ -720,6 +773,83 @@ test_softcenter_state_tracks_proxy_not_api_or_saved_intent() {
     check 0 "$(dbus get softcenter_module_sockrocket_enable)" 'crashed daemon is not enabled'
 }
 
+test_merlin_3006_dns_drift_leaves_proxy_rules() {
+    nvram() { case "$2" in firmver) echo 3.0.0.6 ;; *) echo 192.168.1.1 ;; esac; }
+    SOCKROCKET_DNS_MAIN_CONFIG="$SANDBOX/dnsmasq.conf"
+    SOCKROCKET_DNS_UPSTREAM_FILE="$SANDBOX/upstream"
+    SOCKROCKET_DNS_POSTCONF_SCRIPT="$SANDBOX/dnsmasq-postconf.sh"
+    SOCKROCKET_DNS_POSTCONF_HOOK="$SANDBOX/dnsmasq.postconf"
+    export SOCKROCKET_DNS_MAIN_CONFIG SOCKROCKET_DNS_UPSTREAM_FILE SOCKROCKET_DNS_POSTCONF_SCRIPT
+    cp "$ROOT/merlin/scripts/dnsmasq-postconf.sh" "$SOCKROCKET_DNS_POSTCONF_SCRIPT"
+    chmod +x "$SOCKROCKET_DNS_POSTCONF_SCRIPT"
+    printf 'dnsmasq-postconf.sh\n' > "$SOCKROCKET_DNS_POSTCONF_HOOK"
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNS_UPSTREAM_FILE"
+    printf '%s\n' 'servers-file=/tmp/resolv.dnsmasq' 'server=1.1.1.1' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    printf '#!/bin/sh\necho "$1" >> "%s/iptables.calls"\nexit 0\n' "$SANDBOX" > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    chmod +x "$SOCKROCKET_DIR/scripts/iptables.sh"
+    service() {
+        echo "$*" >> "$SANDBOX/service.calls"
+        printf 'servers-file=/tmp/resolv.dnsmasq\n' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+        "$SOCKROCKET_DNS_POSTCONF_SCRIPT" "$SOCKROCKET_DNS_MAIN_CONFIG"
+    }
+    heal_main_dns_isolation 5300
+    check 'no-resolv
+server=127.0.0.1#5300' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'firmware restart loads isolated config'
+    check 0 "$(grep -c '^stop$' "$SANDBOX/iptables.calls" || true)" 'successful DNS repair retains proxy rules'
+    check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'DNS drift does not fail-open'
+    check 1 "$(wc -l < "$SANDBOX/service.calls" | tr -d ' ')" 'DNS drift restarts to load main config'
+    heal_main_dns_isolation 5300
+    check 1 "$(wc -l < "$SANDBOX/service.calls" | tr -d ' ')" 'healthy DNS is not restarted again'
+    rm -f "$SOCKROCKET_DNS_MAIN_CONFIG"
+    heal_main_dns_isolation 5300
+    check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'missing config does not fail-open'
+    check 1 "$(wc -l < "$SANDBOX/service.calls" | tr -d ' ')" 'transiently missing config with healthy DNS does not restart'
+}
+
+test_dns_drift_failed_reload_backs_off() {
+    nvram() { echo 3.0.0.6; }
+    SOCKROCKET_DNS_MAIN_CONFIG="$SANDBOX/dnsmasq.conf"
+    printf 'servers-file=/tmp/resolv.dnsmasq\n' > "$SOCKROCKET_DNS_MAIN_CONFIG"
+    update_dnsmasq() { echo "$1" >> "$SANDBOX/dns.calls"; return 1; }
+    if heal_main_dns_isolation 5300; then echo 'failed DNS repair hidden' >&2; exit 1; fi
+    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'failed DNS reload returns LAN to direct mode'
+    check present "$([ -f "$RECOVER_AFTER_FILE" ] && echo present || echo absent)" 'failed DNS reload sets recovery cooldown'
+    before=$(wc -l < "$SANDBOX/dns.calls" | tr -d ' ')
+    heal_main_dns_isolation 5300
+    check "$before" "$(wc -l < "$SANDBOX/dns.calls" | tr -d ' ')" 'cooldown prevents immediate repeated reload'
+}
+
+test_missing_main_dns_config_and_listener_fail_open() {
+    nvram() { echo 3.0.0.6; }
+    SOCKROCKET_DNS_MAIN_CONFIG="$SANDBOX/missing.conf"
+    wait_for_main_dns() { return 1; }
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    if heal_main_dns_isolation 5300; then echo 'missing firmware DNS hidden' >&2; exit 1; fi
+    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'missing config and dead DNS fail open'
+    check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'dead DNS removes hijack config'
+}
+
+test_firewall_restore_missing_tun_removes_hijack() {
+    wait_for_tun() { return 1; }
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    if do_firewall_restore; then echo 'missing TUN reported restored' >&2; exit 1; fi
+    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'missing TUN enters fail-open'
+    check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'missing TUN removes fake-IP DNS'
+}
+
+test_firewall_rebuild_failure_restores_direct_dns() {
+    wait_for_tun() { return 0; }
+    printf 'server=127.0.0.1#5300\n' > "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf"
+    printf '#!/bin/sh\necho "$1" >> "%s/iptables.calls"\n[ "$1" != start ]\n' "$SANDBOX" > "$SOCKROCKET_DIR/scripts/iptables.sh"
+    chmod +x "$SOCKROCKET_DIR/scripts/iptables.sh"
+    if do_firewall_restore; then echo 'failed rebuild reported success' >&2; exit 1; fi
+    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'failed rebuild retains fail-open state'
+    check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'failed rebuild removes fake-IP DNS'
+    check 'server=192.0.2.53' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'failed rebuild leaves direct DNS'
+    check 1 "$(grep -c '^stop$' "$SANDBOX/iptables.calls")" 'failed rebuild clears partial proxy rules'
+    check present "$([ -f "$RECOVER_AFTER_FILE" ] && echo present || echo absent)" 'failed rebuild backs off recovery retries'
+}
+
 run_test test_boot_keeps_fresh_install_and_manual_stop_disabled
 run_test test_primary_lan_scope_validation
 run_test test_softcenter_state_tracks_proxy_not_api_or_saved_intent
@@ -732,12 +862,20 @@ run_test test_dns_restore_failure_keeps_backup
 run_test test_dns_backup_failure_does_not_pin
 run_test test_subscription_refresh_preserves_stop
 run_test test_dns_answer_failure_blocks_activation
+run_test test_firmware_dns_failure_blocks_hijack_even_when_restart_returns_success
+run_test test_outbound_probe_fallback_and_failure_details
+run_test test_main_dns_waits_for_async_firmware_restart
 run_test test_dns_nat_rule_failure_is_reported
 run_test test_startup_failure_never_enables_dns
 run_test test_dns_nat_failure_rolls_back
 run_test test_dns_failure_rolls_back
 run_test test_repeated_cleanup_does_not_restart_dns
 run_test test_merlin_3006_main_dns_isolated_from_sdn
+run_test test_merlin_3006_dns_drift_leaves_proxy_rules
+run_test test_dns_drift_failed_reload_backs_off
+run_test test_missing_main_dns_config_and_listener_fail_open
+run_test test_firewall_restore_missing_tun_removes_hijack
+run_test test_firewall_rebuild_failure_restores_direct_dns
 run_test test_lost_listener_unpins_dns
 run_test test_missing_tun_never_recovers
 run_test test_firewall_failure_never_recovers

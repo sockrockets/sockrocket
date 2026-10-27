@@ -460,6 +460,54 @@ async fn half_closed_relay_with_a_silent_upstream_has_an_idle_bound() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn silent_fin_wait_2_releases_the_actual_tcp_flow_before_established_idle_timeout() {
+    let mut tcp = ipstack::TcpConfig::default();
+    tcp.timeout = Duration::from_secs(1800);
+    let mut config = IpStackConfig::default();
+    config.with_tcp_config(tcp);
+    let (stack, mut client, mut stream, server_seq) = connected_with_config(config).await;
+    let (mut remote, mut upstream) = tokio::io::duplex(1024);
+    let task = tokio::spawn(async move {
+        sockrocket_core::proxy::relay::relay_bidirectional_with_idle_timeout(
+            &mut stream,
+            &mut remote,
+            Duration::from_secs(1800),
+        )
+        .await
+    });
+    upstream.shutdown().await.unwrap();
+    let fin = read_packet(&mut client).await;
+    let Some(TransportSlice::Tcp(header)) = SlicedPacket::from_ip(&fin).unwrap().transport else {
+        panic!("TCP FIN")
+    };
+    assert!(header.fin());
+    client
+        .write_all(&packet(
+            1002,
+            Some(server_seq.wrapping_add(2)),
+            false,
+            false,
+            &[],
+        ))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0[4], 1, "expected FIN_WAIT_2");
+    let error = timeout(Duration::from_secs(95), task)
+        .await
+        .expect("silent FIN_WAIT_2 retained the relay")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("half-closed relay idle timeout"));
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(stack.tcp_health().0.iter().sum::<usize>(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn payload_progress_keeps_the_idle_watchdog_alive() {
     let (mut client, mut local) = tokio::io::duplex(1024);
     let (mut remote, mut upstream) = tokio::io::duplex(1024);

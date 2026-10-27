@@ -14,6 +14,9 @@ pub(crate) struct Budget {
     limit: usize,
     waiters: Mutex<std::collections::VecDeque<std::sync::Weak<Mutex<Option<Waker>>>>>,
     flows: Mutex<Vec<std::sync::Weak<std::sync::Mutex<crate::stream::tcb::Tcb>>>>,
+    tcp_peer_resets: AtomicUsize,
+    tcp_handshake_resets: AtomicUsize,
+    tcp_task_errors: AtomicUsize,
 }
 impl Budget {
     pub fn new(limit: usize) -> Arc<Self> {
@@ -22,7 +25,27 @@ impl Budget {
             limit,
             waiters: Mutex::new(std::collections::VecDeque::new()),
             flows: Mutex::new(Vec::new()),
+            tcp_peer_resets: AtomicUsize::new(0),
+            tcp_handshake_resets: AtomicUsize::new(0),
+            tcp_task_errors: AtomicUsize::new(0),
         })
+    }
+    pub fn record_tcp_reset(&self, during_handshake: bool) {
+        self.tcp_peer_resets.fetch_add(1, Ordering::Relaxed);
+        if during_handshake {
+            self.tcp_handshake_resets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn record_tcp_task_error(&self) {
+        self.tcp_task_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn tcp_event_counts(&self) -> crate::TcpEventCounts {
+        let handshake_resets = self.tcp_handshake_resets.load(Ordering::Relaxed);
+        crate::TcpEventCounts {
+            peer_resets: self.tcp_peer_resets.load(Ordering::Relaxed),
+            handshake_resets,
+            task_errors: self.tcp_task_errors.load(Ordering::Relaxed),
+        }
     }
     pub fn register_flow(&self, flow: &Arc<Mutex<crate::stream::tcb::Tcb>>) {
         let mut flows = self.flows.lock().unwrap();

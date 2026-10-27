@@ -1000,7 +1000,7 @@ fn act_add_sub(post: &J) -> J {
                 String::new()
             };
             let compatibility_notes = report.compatibility_notes;
-            subscription_jobs::progress(1, 1, "applying");
+            subscription_jobs::progress(1, 1, "saving");
             let nodes = report.nodes;
             let fetched = nodes.len();
             let saved = sockrocket_core::config::storage::commit_subscription_refresh(
@@ -1017,6 +1017,7 @@ fn act_add_sub(post: &J) -> J {
             match saved {
                 Ok(commit) if commit.applied_urls.iter().any(|source| source == url) => {
                     let total = commit.config.nodes.len();
+                    subscription_jobs::progress(1, 1, "applying");
                     if let Err(error) = run_sh("restart") {
                         return err_msg(&error.to_string());
                     }
@@ -1190,7 +1191,7 @@ fn act_update_subs() -> J {
         });
     }
 
-    subscription_jobs::progress(subs.len(), subs.len(), "applying");
+    subscription_jobs::progress(subs.len(), subs.len(), "saving");
     let fetched_by_url: std::collections::HashMap<_, _> = refreshed
         .iter()
         .map(|(source, nodes)| (source.url.clone(), nodes.len()))
@@ -1218,6 +1219,7 @@ fn act_update_subs() -> J {
         ));
     }
     let total = commit.config.nodes.len();
+    subscription_jobs::progress(subs.len(), subs.len(), "applying");
     if let Err(error) = run_sh("restart") {
         return err_msg(&error.to_string());
     }

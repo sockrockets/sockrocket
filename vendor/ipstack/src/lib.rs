@@ -25,6 +25,14 @@ pub use self::stream::{
 pub use self::stream::{TcpConfig, TcpOptions};
 pub use etherparse::IpNumber;
 
+/// Cumulative TCP termination counts for this stack, without flow addresses.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TcpEventCounts {
+    pub peer_resets: usize,
+    pub handshake_resets: usize,
+    pub task_errors: usize,
+}
+
 #[cfg(unix)]
 const TTL: u8 = 64;
 
@@ -323,6 +331,9 @@ impl IpStack {
     /// age, and receive payload bytes retained by live flows.
     pub fn tcp_health(&self) -> ([usize; 10], u64, usize) {
         self.packet_budget.flow_health()
+    }
+    pub fn tcp_event_counts(&self) -> TcpEventCounts {
+        self.packet_budget.tcp_event_counts()
     }
     pub fn packet_queue_usage(&self) -> (usize, usize) {
         (self.packet_budget.used(), self.packet_budget.limit())

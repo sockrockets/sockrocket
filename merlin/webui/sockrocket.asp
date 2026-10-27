@@ -1637,6 +1637,8 @@ var subscriptionPending = false, subscriptionJobId = null, subscriptionJobTimer 
 var subscriptionJobChecked = false, subscriptionJobSnapshot = null;
 var subscriptionAwaitingLaunch = false, subscriptionLaunchError = null, subscriptionMissingPolls = 0;
 var subscriptionDiagnostic = '';
+var subscriptionNodesLoadedJobId = null;
+var subscriptionJobStartedAt = 0;
 function subscriptionBusy(on) { subscriptionPending = on; srElement('sub-add').disabled = on; srElement('sub-update').disabled = on; }
 function renderSubscriptionNotes(result) {
   var notes = result && result.compatibility_notes;
@@ -1652,9 +1654,10 @@ function renderSubscriptionNotes(result) {
   srElement('sub-notes-text').textContent = text.join(' ');
   srElement('sub-notes').hidden = !text.length;
 }
-function scheduleSubscriptionPoll() {
+function scheduleSubscriptionPoll(delay) {
   clearTimeout(subscriptionJobTimer);
-  subscriptionJobTimer = setTimeout(function () { pollSubscriptionJob(subscriptionJobId); }, 2000);
+  if (typeof delay !== 'number') delay = Date.now() - subscriptionJobStartedAt < 5000 ? 500 : 2000;
+  subscriptionJobTimer = setTimeout(function () { pollSubscriptionJob(subscriptionJobId); }, delay);
 }
 function normalizeSubscriptionError(d) {
   // Jobs saved by older packages only contain msg. Recognize exact safe
@@ -1720,7 +1723,7 @@ function failSubscriptionJob(d, fallback) {
 function subscriptionJobMissing() {
   if (subscriptionAwaitingLaunch && ++subscriptionMissingPolls < 4) {
     srShowMsg('启动结果尚未确认，正在核对同一任务；输入内容已保留。', 'info');
-    scheduleSubscriptionPoll(); return;
+    scheduleSubscriptionPoll(2000); return;
   }
   failSubscriptionJob(subscriptionLaunchError, '未能确认订阅任务，请刷新列表后重试；输入内容已保留。');
 }
@@ -1735,11 +1738,19 @@ function acceptSubscriptionJob(d) {
     subscriptionJobMissing(); return;
   }
   subscriptionAwaitingLaunch = false; subscriptionLaunchError = null; subscriptionMissingPolls = 0;
+  subscriptionJobChecked = true;
   subscriptionJobId = job.id;
   if (job.state === 'running') {
+    if (!subscriptionJobStartedAt) subscriptionJobStartedAt = Date.now();
     subscriptionBusy(true);
     var counts = job.total ? '（' + Number(job.completed || 0) + '/' + Number(job.total) + '）' : '';
-    srShowMsg((job.stage === 'applying' ? '正在保存并应用订阅' : '正在后台下载订阅') + counts + '，关闭页面后仍会继续。', 'info');
+    var saved = job.nodes_saved === true;
+    var message = job.stage === 'applying' ? (saved ? '节点已保存，正在应用设置' : '正在保存并应用订阅') : job.stage === 'saving' ? '正在保存订阅' : '正在后台下载订阅';
+    if (job.stage === 'applying' && saved && subscriptionNodesLoadedJobId !== job.id) {
+      subscriptionNodesLoadedJobId = job.id;
+      srLoadSubs(); srLoadNodes();
+    }
+    srShowMsg(message + counts + '，关闭页面后仍会继续。', 'info');
     scheduleSubscriptionPoll(); return;
   }
   subscriptionBusy(false); subscriptionJobId = null;
@@ -1761,7 +1772,7 @@ function pollSubscriptionJob(id) {
   srApi('subscription_job', id ? {id:id} : {}, acceptSubscriptionJob, function (error) {
     if (error && error.error_code === 'subscription_job_not_found') { subscriptionJobMissing(); return; }
     srShowMsg('暂时无法读取订阅进度，正在重试；刷新页面也可继续查看。', 'info');
-    scheduleSubscriptionPoll();
+    scheduleSubscriptionPoll(2000);
   }, 12000);
 }
 function restoreSubscriptionJob() {
@@ -1776,6 +1787,8 @@ function restoreSubscriptionJob() {
   }, function () { subscriptionJobChecked = false; }, 12000);
 }
 function startSubscriptionJob(action, body) {
+  subscriptionNodesLoadedJobId = null;
+  subscriptionJobStartedAt = Date.now();
   var random = new Uint8Array(16);
   try { window.crypto.getRandomValues(random); }
   catch (error) { failSubscriptionJob(null, '浏览器无法生成安全任务 ID，请使用现代浏览器。'); return; }

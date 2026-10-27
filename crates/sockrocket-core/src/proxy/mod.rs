@@ -78,6 +78,9 @@ pub struct TunDiagnostics {
     pub receive_bytes: usize,
     pub tcp_states: [usize; 10],
     pub oldest_close_secs: u64,
+    pub tcp_peer_resets: usize,
+    pub tcp_handshake_resets: usize,
+    pub tcp_task_errors: usize,
 }
 
 /// Connection and traffic statistics, shared across server tasks.

@@ -418,6 +418,64 @@ mod tests {
         monitor.stop().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn silent_tunnel_triggers_failover_instead_of_reporting_healthy() {
+        use crate::proxy::connector::{BoxProxyStream, Outbound};
+
+        struct SilentTunnel;
+        impl Outbound for SilentTunnel {
+            fn connect(
+                &self,
+                _host: &str,
+                _port: u16,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<BoxProxyStream>> + Send + '_>,
+            > {
+                Box::pin(async {
+                    let (client, mut peer) = tokio::io::duplex(1024);
+                    tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut peer, &mut tokio::io::sink()).await;
+                    });
+                    Ok(Box::new(client) as BoxProxyStream)
+                })
+            }
+
+            fn name(&self) -> &str {
+                "silent tunnel"
+            }
+        }
+
+        let setup = HealthCheckSetup {
+            config: HealthCheckConfig {
+                enabled: true,
+                interval_secs: 60,
+                failure_threshold: 1,
+                auto_switch: true,
+            },
+            nodes: vec![],
+            active_node: None,
+            swappable: Arc::new(SwappableOutbound::new(SharedOutbound(Arc::new(
+                SilentTunnel,
+            )))),
+            outbound_factory: Arc::new(|_| None),
+        };
+        let (events_tx, mut events_rx) = watch::channel(None);
+        let mut monitor = HealthMonitor::spawn(setup, events_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            loop {
+                events_rx.changed().await.unwrap();
+                let event = events_rx.borrow().clone();
+                assert!(!matches!(event, Some(HealthEvent::ProbeOk { .. })));
+                if matches!(event, Some(HealthEvent::SwitchFailed { .. })) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a silent tunnel must reach failover within the probe deadline");
+        monitor.stop().await;
+    }
+
     /// Regression: restarting the monitor (config reload) must NOT strand
     /// existing subscribers. Events emitted by the replacement monitor have
     /// to arrive on the same channel the pre-restart subscriber holds —
