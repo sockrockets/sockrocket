@@ -317,6 +317,7 @@ pub(super) fn progress(completed: usize, total: usize, stage: &str) {
             state["completed"] = json!(completed);
             state["total"] = json!(total);
             state["stage"] = json!(stage);
+            state["nodes_saved"] = json!(stage == "applying");
             let _ = write(&path(id), &state);
         }
     });

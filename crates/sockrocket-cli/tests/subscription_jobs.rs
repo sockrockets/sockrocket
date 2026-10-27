@@ -99,6 +99,80 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+#[cfg(unix)]
+#[test]
+fn saved_nodes_are_available_while_apply_is_still_running() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.0.join("stopped")).unwrap();
+    fs::write(fixture.0.join("scripts/sockrocket.sh"),
+        "#!/bin/sh\necho applying > \"$SOCKROCKET_DIR/apply-started\"\ni=0\nwhile [ ! -f \"$SOCKROCKET_DIR/release-apply\" ] && [ \"$i\" -lt 250 ]; do sleep 0.02; i=$((i+1)); done\n[ -f \"$SOCKROCKET_DIR/release-apply\" ]\n").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/fixture", listener.local_addr().unwrap());
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        let _ = client.read(&mut request).unwrap();
+        arrived_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@192.0.2.1:8388#fixture";
+        write!(
+            client,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let launch = fixture.call(
+        "subscription_start",
+        json!({"action":"add_sub","body":{"url":url}}),
+    );
+    assert_eq!(launch["ok"], true);
+    let id = &launch["job"]["id"];
+    arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let guard =
+        sockrocket_core::config::storage::MutationGuard::acquire(&fixture.0.join("config.yaml"))
+            .unwrap();
+    release_tx.send(()).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = fixture.call("subscription_job", json!({"id":id}));
+        if status["job"]["stage"] != "fetching" {
+            assert_eq!(
+                status["job"]["stage"], "saving",
+                "uncommitted nodes must not be marked ready"
+            );
+            assert_eq!(status["job"]["nodes_saved"], false);
+            break;
+        }
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let before = sockrocket_core::AppConfig::from_yaml_str(
+        &fs::read_to_string(fixture.0.join("config.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert!(before.nodes.is_empty());
+    drop(guard);
+    let until = Instant::now() + Duration::from_secs(3);
+    while !fixture.0.join("apply-started").exists() {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = fixture.call("subscription_job", json!({"id":id}));
+    assert_eq!(status["job"]["state"], "running");
+    assert_eq!(status["job"]["stage"], "applying");
+    assert_eq!(status["job"]["nodes_saved"], true);
+    assert_eq!(
+        fixture.call("subscriptions", json!({}))["subs"][0]["node_count"],
+        1
+    );
+    fs::write(fixture.0.join("release-apply"), "done").unwrap();
+    assert_eq!(fixture.finish(id)["result"]["ok"], true);
+    server.join().unwrap();
+}
+
 fn private_file(path: &Path) {
     #[cfg(unix)]
     {
