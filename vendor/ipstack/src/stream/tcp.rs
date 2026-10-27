@@ -164,6 +164,7 @@ pub struct IpStackTcpStream {
     tcb: TcbPtr,
     shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    retransmit_notify: Arc<tokio::sync::Notify>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     shutdown_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -242,6 +243,7 @@ impl IpStackTcpStream {
             tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
             shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
             write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            retransmit_notify: Arc::new(tokio::sync::Notify::new()),
             destroy_messenger,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             shutdown_timeout: None,
@@ -492,6 +494,7 @@ impl AsyncWrite for IpStackTcpStream {
         drop(tcb);
         if payload_len != 0 {
             self.reset_timeout();
+            self.retransmit_notify.notify_one();
         }
         Poll::Ready(Ok(payload_len))
     }
@@ -714,6 +717,8 @@ impl IpStackTcpStream {
         let exit_notifier = exit_task_notifier.clone();
         let config = self.config.clone();
         let diagnostics = self.up_packet_sender.global();
+        let retransmit_notify = self.retransmit_notify.clone();
+        let terminal_sender = self.up_packet_sender.clone();
         self.exit_notifier = Some(exit_task_notifier);
 
         let task_handle = tokio::spawn(async move {
@@ -730,6 +735,7 @@ impl IpStackTcpStream {
                 read_notify.clone(),
                 data_tx,
                 exit_monitor,
+                retransmit_notify,
             )
             .await;
             if let Err(e) = &v {
@@ -751,12 +757,28 @@ impl IpStackTcpStream {
                 } else {
                     diagnostics.record_tcp_task_error();
                     log::warn!("{network_tuple} {state:?} task error: {e}");
+                    let tcb = tcb.lock().unwrap();
+                    let _ = write_packet_to_device(
+                        &terminal_sender,
+                        network_tuple,
+                        &tcb,
+                        None,
+                        ACK | RST,
+                        None,
+                        None,
+                    );
                 }
             }
             if v.is_err() {
                 reset.store(true, std::sync::atomic::Ordering::Release);
             }
-            tcb.lock().unwrap().change_state(TcpState::Closed);
+            {
+                let mut tcb = tcb.lock().unwrap();
+                tcb.change_state(TcpState::Closed);
+                if v.is_err() {
+                    tcb.discard_failed_payload();
+                }
+            }
             drop(data_lifetime);
             if let Some(waker) = read_notify.lock().unwrap().take() {
                 waker.wake();
@@ -775,6 +797,58 @@ impl IpStackTcpStream {
     }
 }
 
+async fn retransmit_when_due(
+    tcb: &TcbPtr,
+    sender: &PacketSender,
+    tuple: NetworkTuple,
+    deadline: Option<tokio::time::Instant>,
+) -> std::io::Result<()> {
+    let Some(deadline) = deadline else {
+        return std::future::pending().await;
+    };
+    tokio::time::sleep_until(deadline).await;
+    std::future::poll_fn(|cx| {
+        let mut tcb = tcb.lock().unwrap();
+        // Keep each turn bounded. ACKs, cancellation and other flows must
+        // get scheduled even if a wide window contains hundreds of packets.
+        for _ in 0..16 {
+            let packet = match tcb.due_retransmission() {
+                Ok(Some(packet)) => packet,
+                Ok(None) => return Poll::Ready(Ok(())),
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let send = || {
+                write_packet_to_device(
+                    sender,
+                    tuple,
+                    &tcb,
+                    None,
+                    ACK | PSH,
+                    Some(packet.seq),
+                    Some(packet.payload.clone()),
+                )
+            };
+            let mut result = send();
+            if result
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                sender.register(cx);
+                result = send();
+            }
+            match result {
+                Ok(_) => tcb.mark_retransmitted(packet.seq),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Poll::Pending;
+                }
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+        Poll::Ready(Ok(()))
+    })
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tcp_main_logic_loop(
     tcb: TcbPtr,
@@ -787,6 +861,7 @@ async fn tcp_main_logic_loop(
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
+    retransmit_notify: Arc<tokio::sync::Notify>,
 ) -> std::io::Result<()> {
     let syn_options = {
         let tcb = tcb.lock().unwrap();
@@ -844,12 +919,19 @@ async fn tcp_main_logic_loop(
     loop {
         let exit_notifier = exit_notifier.clone();
 
+        let deadline = tcb.lock().unwrap().next_retransmit_deadline();
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
                 break;
             }
             network_packet = stream_receiver.recv() => network_packet,
+            _ = retransmit_notify.notified() => continue,
+            result = retransmit_when_due(&tcb, &up_packet_sender, network_tuple, deadline) => {
+                result?;
+                tokio::task::yield_now().await;
+                continue;
+            }
         };
 
         let Some(mut network_packet) = network_packet else {
@@ -910,22 +992,6 @@ async fn tcp_main_logic_loop(
         tcb.update_duplicate_ack_count(incoming_ack);
 
         tcb.update_inflight_packet_queue(incoming_ack);
-
-        for packet in tcb.collect_timed_out_inflight_packets() {
-            let (seq, count) = (packet.seq, packet.retransmit_count);
-            log::debug!(
-                "{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",
-            );
-            write_packet_to_device(
-                &up_packet_sender,
-                network_tuple,
-                &tcb,
-                None,
-                ACK | PSH,
-                Some(seq),
-                Some(packet.payload),
-            )?;
-        }
 
         if incoming_seq < tcb.get_ack() && !payload.is_empty() {
             let _ = write_packet_to_device(
@@ -1028,13 +1094,17 @@ async fn tcp_main_logic_loop(
                                 )?;
                             }
                             PacketType::RetransmissionRequest => {
-                                if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
+                                if let Some(packet) =
+                                    tcb.find_inflight_packet(incoming_ack).filter(|packet| {
+                                        packet.retransmit_count < config.max_retransmit_count
+                                    })
+                                {
                                     let (s, p) = (packet.seq, packet.payload.clone());
                                     log::debug!(
                                         "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
                                         p.len()
                                     );
-                                    write_packet_to_device(
+                                    match write_packet_to_device(
                                         &up_packet_sender,
                                         network_tuple,
                                         &tcb,
@@ -1042,7 +1112,15 @@ async fn tcp_main_logic_loop(
                                         ACK | PSH,
                                         Some(s),
                                         Some(p),
-                                    )?;
+                                    ) {
+                                        Ok(_) => tcb.mark_retransmitted(s),
+                                        // Let the scheduled RTO retry once the
+                                        // device queue has room; don't spend a
+                                        // retry on local queue backpressure.
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                                        Err(error) => return Err(error),
+                                    }
                                 }
                             }
                             PacketType::NewPacket => {

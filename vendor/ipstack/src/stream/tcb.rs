@@ -11,7 +11,7 @@ pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicat
 /// Retransmission timeout
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Maximum count of retransmissions before dropping the packet
+/// Maximum count of retransmissions before failing the connection.
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -147,7 +147,7 @@ impl Tcb {
     }
 
     pub fn is_duplicate_ack_count_exceeded(&self) -> bool {
-        self.duplicate_ack_count >= self.max_count_for_dup_ack
+        self.duplicate_ack_count == self.max_count_for_dup_ack
     }
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
@@ -410,27 +410,52 @@ impl Tcb {
         self.inflight_packets.get(&seq)
     }
 
-    #[must_use]
-    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Vec<InflightPacket> {
-        let mut retransmit_list = Vec::new();
+    pub(crate) fn next_retransmit_deadline(&self) -> Option<tokio::time::Instant> {
+        // A closed receive window is flow control, not packet loss. Resume
+        // data retries when a window update arrives instead of burning the
+        // retry budget while the peer cannot accept data.
+        if self.send_window == 0 || self.state == TcpState::Closed {
+            return None;
+        }
+        self.inflight_packets
+            .values()
+            .map(|p| p.send_time + p.retransmit_timeout)
+            .min()
+    }
 
-        self.inflight_packets.retain(|_, packet| {
-            if packet.retransmit_count >= self.max_retransmit_count {
-                log::warn!(
-                    "Packet with seq {:?} reached max retransmit count, dropping packet",
-                    packet.seq
-                );
-                return false; // remove this packet
-            }
-            if packet.is_timed_out() {
-                packet.retransmit_count += 1;
-                packet.retransmit_timeout *= 2; // increase timeout exponentially
-                packet.send_time = std::time::Instant::now();
-                retransmit_list.push(packet.clone());
-            }
-            true // keep the packet in the inflight_packets
-        });
-        retransmit_list
+    pub(crate) fn due_retransmission(&self) -> std::io::Result<Option<InflightPacket>> {
+        if self.send_window == 0 || self.state == TcpState::Closed {
+            return Ok(None);
+        }
+        let Some(packet) = self.inflight_packets.values().find(|p| p.is_timed_out()) else {
+            return Ok(None);
+        };
+        // Keep the payload until its final retry has had a full RTO to be
+        // acknowledged. Exhaustion fails the flow; it never creates a hole
+        // in an otherwise live byte stream.
+        if packet.retransmit_count >= self.max_retransmit_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP retransmission limit reached",
+            ));
+        }
+        Ok(Some(packet.clone()))
+    }
+
+    pub(crate) fn mark_retransmitted(&mut self, seq: SeqNum) {
+        if let Some(packet) = self.inflight_packets.get_mut(&seq) {
+            packet.retransmit_count += 1;
+            packet.retransmit_timeout = packet
+                .retransmit_timeout
+                .saturating_mul(2)
+                .min(Duration::from_secs(60).max(self.rto));
+            packet.send_time = tokio::time::Instant::now();
+        }
+    }
+
+    pub(crate) fn discard_failed_payload(&mut self) {
+        self.inflight_packets.clear();
+        self.unordered_packets.clear();
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -522,7 +547,7 @@ mod tests {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
-    pub send_time: std::time::Instant,
+    pub send_time: tokio::time::Instant,
     pub retransmit_count: usize,
     pub retransmit_timeout: std::time::Duration, // current retransmission timeout
 }
@@ -532,7 +557,7 @@ impl InflightPacket {
         Self {
             seq,
             payload,
-            send_time: std::time::Instant::now(),
+            send_time: tokio::time::Instant::now(),
             retransmit_count: 0,
             retransmit_timeout: rto,
         }

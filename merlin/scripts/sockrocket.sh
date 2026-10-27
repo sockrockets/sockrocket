@@ -2000,6 +2000,18 @@ do_watchdog() {
     mem_pct=$(memory_used_pct)
     mem_pct=${mem_pct:-0}
     if [ "$mem_pct" -ge 85 ]; then
+        # Capture attribution before fail-open or a later manual restart
+        # erases it. Never include configuration, endpoints or client data.
+        local mem_pid mem_rss mem_hwm
+        mem_pid=$(cat "$SOCKROCKET_PID" 2>/dev/null || true)
+        case "$mem_pid" in
+            ''|*[!0-9]*) mem_pid=unknown; mem_rss=unknown; mem_hwm=unknown ;;
+            *)
+                mem_rss=$(awk '/^VmRSS:/{print $2}' "$PROC_BASE/$mem_pid/status" 2>/dev/null || true)
+                mem_hwm=$(awk '/^VmHWM:/{print $2}' "$PROC_BASE/$mem_pid/status" 2>/dev/null || true)
+                ;;
+        esac
+        log_warn "Memory pressure snapshot: used_pct=${mem_pct} pid=${mem_pid} rss_kib=${mem_rss:-unknown} highwater_kib=${mem_hwm:-unknown}"
         enter_lan_degraded "memory pressure ${mem_pct}%"
         issues=$((issues + 1))
     fi

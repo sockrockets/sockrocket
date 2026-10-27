@@ -20,6 +20,8 @@ TCP lifecycle changes in src/stream/tcp.rs:
 - Move ownership of the receive sender into the worker, publish terminal errors before channel closure, and wake pending readers and writers on worker completion or peer reset.
 - Deliver peer FIN as ordered, persistent read EOF while preserving the response direction. Defer out-of-order FIN until preceding data arrives, and acknowledge duplicate FIN without duplicating EOF.
 - Keep local FIN shutdown separate from peer FIN, validate final ACKs, support simultaneous close, and retry FIN with its original sequence number while a stream remains alive.
+- Drive payload retransmission from an independent Tokio deadline, including after a local write when no inbound packets arrive. Retain unacknowledged bytes through the final retry's full timeout; exhaustion fails the flow, clears buffered payload, wakes pending I/O, and releases the relay/session instead of silently dropping bytes.
+- Count a retransmission only after successful queueing, wait for device queue capacity without spending the retry budget, and bound each retry turn. Apply capped exponential backoff, pause data retries for a zero receive window, and send only one fast retransmission per duplicate-ACK run.
 
 Resource and observability changes:
 
