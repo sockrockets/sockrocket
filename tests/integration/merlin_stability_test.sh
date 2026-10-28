@@ -2,7 +2,7 @@
 # Focused fault-injection tests; no router, real firewall, DNS, or network.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
-SOURCE="$ROOT/merlin/scripts/sockrocket.sh"
+SOURCE="${SOCKROCKET_TEST_SOURCE:-$ROOT/merlin/scripts/sockrocket.sh}"
 PASS=0
 
 check() { [ "$1" = "$2" ] || { echo "FAIL: $3 (expected '$1', got '$2')" >&2; exit 1; }; }
@@ -242,6 +242,59 @@ test_memory_pressure_delays_recovery() {
     try_recover_lan_proxy
     check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'recovery below threshold'
     check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'recovery pins DNS before clearing degraded marker'
+}
+
+memory_recovery_fixture() {
+    PROC_BASE="$SANDBOX/proc"
+    mkdir -p "$PROC_BASE/123"
+    echo 123 > "$SOCKROCKET_PID"
+    printf 'VmRSS: 30000 kB\n' > "$PROC_BASE/123/status"
+    printf 'MemTotal: 100000 kB\nMemAvailable: 18000 kB\n' > "$SOCKROCKET_MEMINFO_FILE"
+    echo 'memory pressure 86%' > "$DEGRADED_FILE"
+    echo "$(($(date +%s) - 120))" > "$SOCKROCKET_DIR/.memory-pressure-since"
+    do_stop() { echo stop >> "$SANDBOX/recycle.calls"; : > "$SOCKROCKET_DIR/stopped"; rm -f "$DEGRADED_FILE"; }
+    wait_for_tun() { return 0; }
+}
+
+test_memory_recovery_recycles_large_proxy_and_probes_before_rearming() {
+    memory_recovery_fixture
+    cp "$SOCKROCKET_CONF" "$SANDBOX/original-config"
+    do_start() {
+        echo start >> "$SANDBOX/recycle.calls"
+        check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'recycle keeps network direct until probe'
+        rm -f "$SOCKROCKET_DIR/stopped"
+        printf 'MemTotal: 100000 kB\nMemAvailable: 25000 kB\n' > "$SOCKROCKET_MEMINFO_FILE"
+        try_recover_lan_proxy
+    }
+    try_recover_lan_proxy || { echo 'FAIL: memory-degraded proxy never reclaimed memory/recovered' >&2; exit 1; }
+    check 'stop
+start' "$(cat "$SANDBOX/recycle.calls")" 'one incident recycle'
+    check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'healthy recovery clears marker'
+    cmp "$SOCKROCKET_CONF" "$SANDBOX/original-config"
+}
+
+test_memory_recovery_has_grace_cooldown_and_respects_manual_stop() {
+    memory_recovery_fixture
+    do_start() { echo start >> "$SANDBOX/recycle.calls"; rm -f "$SOCKROCKET_DIR/stopped"; return 1; }
+    echo "$(date +%s)" > "$SOCKROCKET_DIR/.memory-pressure-since"
+    if try_recover_lan_proxy; then exit 1; fi
+    check absent "$([ -f "$SANDBOX/recycle.calls" ] && echo present || echo absent)" 'live flows get drain grace'
+    echo "$(($(date +%s) - 120))" > "$SOCKROCKET_DIR/.memory-pressure-since"
+    if try_recover_lan_proxy; then exit 1; fi
+    echo "$(($(date +%s) - 120))" > "$SOCKROCKET_DIR/.memory-pressure-since"
+    if try_recover_lan_proxy; then exit 1; fi
+    check 2 "$(wc -l < "$SANDBOX/recycle.calls" | tr -d ' ')" 'failed recovery cannot restart-loop during cooldown'
+    : > "$SOCKROCKET_DIR/stopped"
+    try_recover_lan_proxy
+    check 2 "$(wc -l < "$SANDBOX/recycle.calls" | tr -d ' ')" 'manual stop is never resumed'
+}
+
+test_memory_recovery_leaves_small_proxy_when_other_memory_is_high() {
+    memory_recovery_fixture
+    printf 'VmRSS: 5000 kB\n' > "$PROC_BASE/123/status"
+    if try_recover_lan_proxy; then exit 1; fi
+    check absent "$([ -f "$SANDBOX/recycle.calls" ] && echo present || echo absent)" 'external pressure does not recycle small proxy'
+    check present "$([ -f "$SOCKROCKET_DIR/.recovery-blocked" ] && echo present || echo absent)" 'blocked recovery records attribution'
 }
 
 test_old_kernel_memory_fallback() {
@@ -880,6 +933,9 @@ run_test test_lost_listener_unpins_dns
 run_test test_missing_tun_never_recovers
 run_test test_firewall_failure_never_recovers
 run_test test_memory_pressure_delays_recovery
+run_test test_memory_recovery_recycles_large_proxy_and_probes_before_rearming
+run_test test_memory_recovery_has_grace_cooldown_and_respects_manual_stop
+run_test test_memory_recovery_leaves_small_proxy_when_other_memory_is_high
 run_test test_old_kernel_memory_fallback
 run_test test_log_rotation_preserves_writer
 run_test test_degraded_start_still_creates_tun

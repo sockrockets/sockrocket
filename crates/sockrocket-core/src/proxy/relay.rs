@@ -98,7 +98,14 @@ where
         bytes: bytes.clone(),
         half_closed_at: half_closed_at.clone(),
     };
-    let relay = relay_bidirectional(&mut observed_a, &mut observed_b);
+    // TUN keeps many mostly idle flows alive. Reserve 16 KiB per direction
+    // instead of the desktop relay's 64 KiB (16 vs 64 MiB at 512 flows).
+    let relay = tokio::io::copy_bidirectional_with_sizes(
+        &mut observed_a,
+        &mut observed_b,
+        16 * 1024,
+        16 * 1024,
+    );
     tokio::pin!(relay);
     let mut tick = tokio::time::interval(idle.min(std::time::Duration::from_secs(30)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -101,6 +101,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for RecordIo<T> {
     }
 }
 
+/// Drop the consumed prefix, allocation included, and keep the tail.
+fn release_prefix(mut buf: Vec<u8>, consumed: usize) -> Vec<u8> {
+    let tail = buf.split_off(consumed.min(buf.len()));
+    drop(buf);
+    tail
+}
+
 #[derive(Default)]
 struct Records {
     bytes: Vec<u8>,
@@ -116,37 +123,42 @@ impl Records {
         }
         if self.bytes.len() + bytes.len() > 131072 {
             self.failed = true;
-            self.bytes.clear();
+            self.bytes = Vec::new();
             return false;
         }
         self.bytes.extend_from_slice(bytes);
         let mut last_application = false;
-        while self.bytes.len() >= 5 {
-            if !matches!(self.bytes[0], 20..=23) || self.bytes[1] != 3 {
+        let mut consumed = 0;
+        while self.bytes.len() - consumed >= 5 {
+            let view = &self.bytes[consumed..];
+            if !matches!(view[0], 20..=23) || view[1] != 3 {
                 self.failed = true;
-                self.bytes.clear();
                 break;
             }
-            let size = u16::from_be_bytes([self.bytes[3], self.bytes[4]]) as usize;
+            let size = u16::from_be_bytes([view[3], view[4]]) as usize;
             if size > 18432 {
                 self.failed = true;
-                self.bytes.clear();
                 break;
             }
-            if self.bytes.len() < size + 5 {
-                return false;
+            if view.len() < size + 5 {
+                break;
             }
             self.seen_tls = true;
-            let kind = self.bytes[0];
+            let kind = view[0];
             last_application = kind == 23;
             if server && kind == 22 && !self.enabled && self.handshake.len() + size <= 65536 {
-                self.handshake.extend_from_slice(&self.bytes[5..5 + size]);
+                self.handshake.extend_from_slice(&view[5..5 + size]);
                 if let Some(enabled) = server_hello(&self.handshake) {
                     self.enabled = enabled;
-                    self.handshake.clear();
+                    self.handshake = Vec::new();
                 }
             }
-            self.bytes.drain(..size + 5);
+            consumed += size + 5;
+        }
+        if self.failed {
+            self.bytes = Vec::new();
+        } else if consumed > 0 {
+            self.bytes = release_prefix(std::mem::take(&mut self.bytes), consumed);
         }
         last_application && self.bytes.is_empty()
     }
@@ -254,7 +266,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> VisionStream<T> {
             std::task::ready!(Pin::new(&mut self.tls).poll_flush(cx))?;
             self.raw_write = true;
         }
-        self.wire.clear();
+        self.wire = Vec::new();
         self.wire_at = 0;
         Poll::Ready(Ok(()))
     }
@@ -290,12 +302,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> VisionStream<T> {
         }
         self.ready = self.encoded[prefix + 5..prefix + 5 + content].to_vec();
         self.inbound.feed(&self.ready, true);
-        self.encoded.drain(..size);
+        self.encoded = release_prefix(std::mem::take(&mut self.encoded), size);
         self.first_read = false;
         if command != 0 {
             self.reading_padding = false;
-            self.ready.extend_from_slice(&self.encoded);
-            self.encoded.clear();
+            let rest = std::mem::take(&mut self.encoded);
+            self.ready.extend_from_slice(&rest);
+            drop(rest);
             if command == 2 {
                 if !self.tls.get_ref().0.at_boundary() {
                     return Err(io::Error::new(
@@ -327,10 +340,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<T> {
                 if this.ready_at < this.ready.len() {
                     let n = buf.remaining().min(this.ready.len() - this.ready_at);
                     buf.put_slice(&this.ready[this.ready_at..this.ready_at + n]);
-                    this.ready_at += n;
+                    this.ready = release_prefix(std::mem::take(&mut this.ready), this.ready_at + n);
+                    this.ready_at = 0;
                     return Poll::Ready(Ok(()));
                 }
-                this.ready.clear();
+                this.ready = Vec::new();
                 this.ready_at = 0;
                 if !this.response_done {
                     let mut bytes = [0; 255];
@@ -492,6 +506,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_record_drops_the_buffer() {
+        let mut records = Records::default();
+        let frame = [23, 3, 3, 0, 4, 1, 2, 3, 4];
+        assert!(records.feed(&frame, false));
+        assert!(records.bytes.is_empty());
+        assert_eq!(records.bytes.capacity(), 0);
+
+        let partial = [23, 3, 3, 0, 8, 1, 2, 3, 4];
+        assert!(!records.feed(&partial, false));
+        let held = records.bytes.len();
+        assert!(held > 0);
+        records.feed(&[5, 6, 7, 8], false);
+        assert!(records.bytes.is_empty());
+        assert_eq!(records.bytes.capacity(), 0);
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const ID: [u8; 16] = [7; 16];
     async fn pair() -> (

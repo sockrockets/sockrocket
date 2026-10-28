@@ -625,6 +625,8 @@ impl TunProxy {
         tcp_config.max_unacked_bytes = 512 * 1024;
         tcp_config.read_buffer_size = 512 * 1024;
         tcp_config.window_limit = window_limit.clone();
+        tcp_config.payload_budget =
+            ipstack::TcpPayloadBudget::new(crate::resources::tun_tcp_payload_budget_bytes());
         ipstack_config.with_tcp_config(tcp_config);
         ipstack_config.udp_timeout(std::time::Duration::from_secs(30));
 
@@ -713,10 +715,13 @@ impl TunProxy {
                         let (queued_packet_bytes, packet_queue_limit) = ip_stack.packet_queue_usage();
                         let (tcp_states, oldest_close_secs, tcp_receive_bytes) = ip_stack.tcp_health();
                         let tcp_events = ip_stack.tcp_event_counts();
+                        let (tcp_payload_bytes, tcp_payload_limit) = ip_stack.tcp_payload_usage();
+                        let process_memory = crate::resources::process_memory_kib();
                         stats.update_tun(super::TunDiagnostics {
                             sampled_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                             running:true, active:active_streams.load(Ordering::Relaxed), rejected:rejected_sessions,
                             packet_bytes:queued_packet_bytes, packet_limit:packet_queue_limit,
+                            tcp_payload_bytes, tcp_payload_limit,
                             receive_bytes:tcp_receive_bytes,tcp_states,oldest_close_secs,
                             tcp_peer_resets: tcp_events.peer_resets,
                             tcp_handshake_resets: tcp_events.handshake_resets,
@@ -725,6 +730,10 @@ impl TunProxy {
                         tracing::info!(
                             queued_packet_bytes,
                             packet_queue_limit,
+                            tcp_payload_bytes,
+                            tcp_payload_limit,
+                            process_rss_kib = process_memory.map(|memory| memory.0),
+                            process_highwater_kib = process_memory.map(|memory| memory.1),
                             tcp_states = ?tcp_states,
                             oldest_close_secs,
                             tcp_receive_bytes,

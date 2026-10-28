@@ -423,6 +423,68 @@ fn decode(protocol: Protocol, frame: &[u8]) -> Result<Fragment<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_receive_queue_drains_during_stalled_upload_and_releases_on_cancel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct StalledUpload {
+            rx: tokio::sync::Mutex<mpsc::Receiver<QueuedDatagram>>,
+            started: Arc<tokio::sync::Notify>,
+        }
+        impl Datagram for StalledUpload {
+            fn send<'a>(&'a self, _: &'a [u8]) -> DatagramFuture<'a, ()> {
+                Box::pin(async move {
+                    self.started.notify_one();
+                    std::future::pending().await
+                })
+            }
+            fn recv<'a>(&'a self, buffer: &'a mut [u8]) -> DatagramFuture<'a, usize> {
+                Box::pin(async move {
+                    let packet = self.rx.lock().await.recv().await.unwrap();
+                    buffer[..packet.data.len()].copy_from_slice(&packet.data);
+                    Ok(packet.data.len())
+                })
+            }
+        }
+        let (mut channel, rx) = Channel::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let remote = StalledUpload {
+            rx: tokio::sync::Mutex::new(rx),
+            started: started.clone(),
+        };
+        let (mut local, mut peer) = tokio::io::duplex(512 * 1024);
+        let task =
+            tokio::spawn(async move { super::super::datagram::relay(&mut local, &remote).await });
+        peer.write_all(b"upload").await.unwrap();
+        started.notified().await;
+        // Match the router's 1294-byte datagrams and the hub's yield every
+        // 16 packets. The burst exceeds the unchanged 128 KiB queue budget.
+        for index in 0..192u8 {
+            channel.deliver(vec![index; 1294]);
+            if index % 16 == 15 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let mut received = vec![0; 192 * 1294];
+        let result =
+            tokio::time::timeout(Duration::from_millis(10), peer.read_exact(&mut received)).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            channel.dropped, 0,
+            "relay stopped consuming the receive queue"
+        );
+        result.expect("downstream burst stalled").unwrap();
+        for (index, packet) in received.chunks_exact(1294).enumerate() {
+            assert!(packet.iter().all(|byte| *byte == index as u8));
+        }
+        assert_eq!(channel.bytes.available_permits(), RECEIVE_QUEUE_BYTES);
+        assert!(
+            channel.tx.is_closed(),
+            "cancelled relay retained its receiver"
+        );
+    }
+
     #[tokio::test]
     async fn receive_queue_absorbs_video_bursts_and_preserves_packet_order() {
         let (mut channel, mut rx) = Channel::new();

@@ -75,6 +75,8 @@ pub struct TunDiagnostics {
     pub rejected: u64,
     pub packet_bytes: usize,
     pub packet_limit: usize,
+    pub tcp_payload_bytes: usize,
+    pub tcp_payload_limit: usize,
     pub receive_bytes: usize,
     pub tcp_states: [usize; 10],
     pub oldest_close_secs: u64,

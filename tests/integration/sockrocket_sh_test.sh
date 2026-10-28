@@ -168,6 +168,14 @@ SH
 printf '204/0.01'
 exit 0
 SH
+    # The production probe now speaks HTTP over nc. Keep this suite local
+    # and return an actual status line, matching its healthy curl fixture.
+    cat > "$SANDBOX/stub/nc" <<'SH'
+#!/bin/sh
+cat >/dev/null
+printf 'HTTP/1.1 204 No Content\r\n\r\n'
+exit 0
+SH
     cat > "$SANDBOX/stub/ip" <<'SH'
 #!/bin/sh
 # `ip link show sockrocket-tun` succeeds only while the TUN marker exists.
