@@ -58,29 +58,248 @@ pub(super) async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
     remote: &dyn Datagram,
 ) -> Result<()> {
-    let mut outbound = vec![0; 65535];
-    let mut inbound = vec![0; 65535];
-    loop {
-        tokio::select! {
-            packet = client.read(&mut outbound) => {
-                let size = packet?;
-                if size == 0 { return Ok(()); }
-                tokio::time::timeout(Duration::from_secs(30), remote.send(&outbound[..size]))
-                    .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP upstream write stalled"))??;
+    const IDLE: Duration = Duration::from_secs(30);
+    let (mut reader, mut writer) = tokio::io::split(client);
+    // A blocked/rate-limited upload must not stop draining the bounded QUIC
+    // receive queue. Keep each receive future alive until its direction exits.
+    #[derive(Clone, Copy)]
+    struct Progress {
+        last: tokio::time::Instant,
+        writing: usize,
+    }
+    let (progress, mut changed) = tokio::sync::watch::channel(Progress {
+        last: tokio::time::Instant::now(),
+        writing: 0,
+    });
+    let upload = async {
+        let mut outbound = vec![0; 65535];
+        loop {
+            let size = reader.read(&mut outbound).await?;
+            if size == 0 {
+                return Ok::<_, anyhow::Error>(());
             }
-            packet = remote.recv(&mut inbound) => {
-                let size = packet?;
-                tokio::time::timeout(Duration::from_secs(30), client.write_all(&inbound[..size]))
-                    .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP client write stalled"))??;
-            }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => return Ok(()),
+            progress.send_modify(|state| {
+                state.last = tokio::time::Instant::now();
+                state.writing += 1;
+            });
+            tokio::time::timeout(IDLE, remote.send(&outbound[..size]))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP upstream write stalled")
+                })??;
+            progress.send_modify(|state| {
+                state.last = tokio::time::Instant::now();
+                state.writing -= 1;
+            });
+            tokio::task::consume_budget().await;
         }
+    };
+    let download = async {
+        let mut inbound = vec![0; 65535];
+        loop {
+            let size = match remote.recv(&mut inbound).await {
+                Ok(size) => size,
+                Err(error) => return Err::<(), _>(error),
+            };
+            progress.send_modify(|state| {
+                state.last = tokio::time::Instant::now();
+                state.writing += 1;
+            });
+            tokio::time::timeout(IDLE, writer.write_all(&inbound[..size]))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP client write stalled")
+                })??;
+            progress.send_modify(|state| {
+                state.last = tokio::time::Instant::now();
+                state.writing -= 1;
+            });
+            tokio::task::consume_budget().await;
+        }
+    };
+    let idle = async {
+        loop {
+            let Progress { last, writing } = *changed.borrow_and_update();
+            if writing == 0 {
+                let deadline = last + IDLE;
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {},
+                    _ = changed.changed() => {},
+                }
+            } else {
+                // In-flight writes have their own hard deadline. Let that
+                // error win instead of misreporting a stalled write as idle.
+                let _ = changed.changed().await;
+            }
+        }
+    };
+    tokio::select! {
+        result = upload => result,
+        result = download => result,
+        result = idle => result,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ControlledDatagram {
+        send_started: tokio::sync::Notify,
+        release_send: tokio::sync::Notify,
+        received: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+        sent: tokio::sync::mpsc::Sender<Vec<u8>>,
+        stall_send: bool,
+        receive_started: tokio::sync::Notify,
+    }
+    impl Datagram for ControlledDatagram {
+        fn send<'a>(&'a self, packet: &'a [u8]) -> DatagramFuture<'a, ()> {
+            Box::pin(async move {
+                self.send_started.notify_one();
+                if self.stall_send {
+                    self.release_send.notified().await;
+                }
+                self.sent.send(packet.to_vec()).await?;
+                Ok(())
+            })
+        }
+        fn recv<'a>(&'a self, packet: &'a mut [u8]) -> DatagramFuture<'a, usize> {
+            Box::pin(async move {
+                let data = self.received.lock().await.recv().await.unwrap();
+                packet[..data.len()].copy_from_slice(&data);
+                self.receive_started.notify_one();
+                Ok(data.len())
+            })
+        }
+    }
+    fn controlled_datagram(
+        stall_send: bool,
+    ) -> (
+        std::sync::Arc<ControlledDatagram>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (incoming, received) = tokio::sync::mpsc::channel(128);
+        let (sent, outgoing) = tokio::sync::mpsc::channel(128);
+        (
+            std::sync::Arc::new(ControlledDatagram {
+                send_started: tokio::sync::Notify::new(),
+                release_send: tokio::sync::Notify::new(),
+                received: tokio::sync::Mutex::new(received),
+                sent,
+                stall_send,
+                receive_started: tokio::sync::Notify::new(),
+            }),
+            incoming,
+            outgoing,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_udp_upload_does_not_block_download() {
+        let (mut local, mut peer) = tokio::io::duplex(4096);
+        let (remote, incoming, _outgoing) = controlled_datagram(true);
+        let task = tokio::spawn({
+            let remote = remote.clone();
+            async move { relay(&mut local, remote.as_ref()).await }
+        });
+        peer.write_all(b"upload").await.unwrap();
+        remote.send_started.notified().await;
+        // A receive burst must drain even while the upload is rate-limited.
+        for _ in 0..96 {
+            incoming.send(vec![42; 32]).await.unwrap();
+        }
+        let mut received = [0; 96 * 32];
+        let result =
+            tokio::time::timeout(Duration::from_millis(10), peer.read_exact(&mut received)).await;
+        task.abort();
+        let _ = task.await;
+        result
+            .expect("blocked upload stopped UDP receive queue draining")
+            .unwrap();
+        assert_eq!(received, [42; 96 * 32]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_udp_download_does_not_block_upload() {
+        let (mut local, mut peer) = tokio::io::duplex(1);
+        let (remote, incoming, mut outgoing) = controlled_datagram(false);
+        let task = tokio::spawn({
+            let remote = remote.clone();
+            async move { relay(&mut local, remote.as_ref()).await }
+        });
+        incoming.send(b"download".to_vec()).await.unwrap();
+        remote.receive_started.notified().await;
+        tokio::task::yield_now().await;
+        // Do not consume the download; the client write remains blocked.
+        peer.write_all(b"x").await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(10), outgoing.recv()).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            result.expect("blocked download stopped UDP upload"),
+            Some(b"x".to_vec())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_activity_in_either_direction_preserves_relay_until_shared_idle_deadline() {
+        for download_only in [true, false] {
+            let (mut local, mut peer) = tokio::io::duplex(64);
+            let (remote, incoming, mut outgoing) = controlled_datagram(false);
+            let task = tokio::spawn(async move { relay(&mut local, remote.as_ref()).await });
+            for _ in 0..5 {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                if download_only {
+                    incoming.send(b"x".to_vec()).await.unwrap();
+                    let mut packet = [0];
+                    peer.read_exact(&mut packet).await.unwrap();
+                    assert_eq!(packet, *b"x");
+                } else {
+                    peer.write_all(b"x").await.unwrap();
+                    assert_eq!(outgoing.recv().await, Some(b"x".to_vec()));
+                }
+                assert!(!task.is_finished(), "one-way traffic is not idle");
+            }
+            // Both directions are now quiet; retaining the channel senders
+            // ensures EOF cannot masquerade as idle expiration.
+            tokio::time::advance(Duration::from_secs(29)).await;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("idle relay retained its session")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_download_progress_does_not_extend_stalled_upload_deadline() {
+        let (mut local, mut peer) = tokio::io::duplex(64);
+        let (remote, incoming, _outgoing) = controlled_datagram(true);
+        let task = tokio::spawn({
+            let remote = remote.clone();
+            async move { relay(&mut local, remote.as_ref()).await }
+        });
+        peer.write_all(b"upload").await.unwrap();
+        remote.send_started.notified().await;
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            incoming.send(b"x".to_vec()).await.unwrap();
+            let mut packet = [0];
+            peer.read_exact(&mut packet).await.unwrap();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .expect("download traffic renewed a stalled upload")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("UDP upstream write stalled"));
+    }
     struct StalledDatagram {
         receive: bool,
     }

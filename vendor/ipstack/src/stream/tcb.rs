@@ -46,8 +46,11 @@ pub(super) enum PacketType {
 /// - `unordered_packets` is the bytes stream received from the lower device,
 ///   which can be acknowledged and extracted by `consume_unordered_packets` method
 ///   then can be read by upstream application via `Tcp::poll_read` method.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Tcb {
+    pub(crate) payload_budget: Arc<crate::TcpPayloadBudget>,
+    read_reserved: usize,
+    send_reserved: usize,
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
@@ -90,12 +93,16 @@ impl Tcb {
         rto: std::time::Duration,
         max_retransmit_count: usize,
         window_limit: Arc<AtomicU32>,
+        payload_budget: Arc<crate::TcpPayloadBudget>,
     ) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::Rng::random::<u32>(&mut rand::rng());
         Tcb {
+            payload_budget,
+            read_reserved: 0,
+            send_reserved: 0,
             seq: seq.into(),
             ack,
             mtu,
@@ -166,6 +173,17 @@ impl Tcb {
         if buf.len() > self.get_available_read_buffer_size().saturating_add(old) {
             return;
         }
+        if buf.len() > old {
+            let increase = buf.len() - old;
+            let Some(credit) = self.payload_budget.reserve(increase) else {
+                return;
+            };
+            credit.commit(increase);
+            self.read_reserved += increase;
+        } else {
+            self.payload_budget.release(old - buf.len());
+            self.read_reserved -= old - buf.len();
+        }
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
@@ -232,6 +250,9 @@ impl Tcb {
         self.queued_read_chunks += 1;
     }
     pub(super) fn consume_read(&mut self, n: usize, completed_chunk: bool) {
+        let consumed = n.min(self.queued_read_bytes);
+        self.payload_budget.release(consumed);
+        self.read_reserved -= consumed;
         self.queued_read_bytes = self.queued_read_bytes.saturating_sub(n);
         if completed_chunk {
             self.queued_read_chunks = self.queued_read_chunks.saturating_sub(1);
@@ -364,7 +385,19 @@ impl Tcb {
         res
     }
 
+    #[cfg(test)]
     pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) -> std::io::Result<()> {
+        let credit = self
+            .payload_budget
+            .reserve(buf.len())
+            .ok_or(std::io::ErrorKind::WouldBlock)?;
+        self.add_reserved_inflight_packet(buf, credit)
+    }
+    pub(crate) fn add_reserved_inflight_packet(
+        &mut self,
+        buf: Vec<u8>,
+        credit: crate::tcp_budget::Reservation,
+    ) -> std::io::Result<()> {
         if buf.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -372,8 +405,15 @@ impl Tcb {
             ));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets
-            .insert(self.seq, InflightPacket::new(self.seq, buf, self.rto));
+        if let Some(old) = self
+            .inflight_packets
+            .insert(self.seq, InflightPacket::new(self.seq, buf, self.rto))
+        {
+            self.send_reserved -= old.payload.len();
+            self.payload_budget.release(old.payload.len());
+        }
+        credit.commit(buf_len as usize);
+        self.send_reserved += buf_len as usize;
         self.seq += buf_len;
         Ok(())
     }
@@ -383,6 +423,7 @@ impl Tcb {
     }
 
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
+        let before = self.get_inflight_packets_total_len();
         match self.inflight_packets.first_key_value() {
             None => return,
             Some((&seq, _)) if ack < seq => return,
@@ -397,13 +438,19 @@ impl Tcb {
             let mut inflight_packet = self.inflight_packets.remove(&seq).unwrap();
             let distance = ack.distance(inflight_packet.seq) as usize;
             if distance < inflight_packet.payload.len() {
-                inflight_packet.payload.drain(0..distance);
+                // `drain` would keep the already-acknowledged prefix's
+                // allocation until the rest of the segment is ACKed.
+                let payload = std::mem::take(&mut inflight_packet.payload);
+                inflight_packet.payload = into_tail(payload, distance);
                 inflight_packet.seq = ack;
                 self.inflight_packets.insert(ack, inflight_packet);
             }
         }
         self.inflight_packets
             .retain(|_, p| ack < p.seq + p.payload.len() as u32);
+        let released = before - self.get_inflight_packets_total_len();
+        self.send_reserved -= released;
+        self.payload_budget.release(released);
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
@@ -454,6 +501,10 @@ impl Tcb {
     }
 
     pub(crate) fn discard_failed_payload(&mut self) {
+        self.payload_budget
+            .release(self.send_reserved + self.get_unordered_packets_total_len());
+        self.send_reserved = 0;
+        self.read_reserved -= self.get_unordered_packets_total_len();
         self.inflight_packets.clear();
         self.unordered_packets.clear();
     }
@@ -483,6 +534,24 @@ impl Tcb {
     }
 }
 
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        self.payload_budget
+            .release(self.read_reserved + self.send_reserved);
+    }
+}
+
+/// Drop `buf` and return the unconsumed tail in a fresh allocation.
+///
+/// `split_off` leaves the consumed prefix in the original `Vec`, capacity
+/// included. Dropping that `Vec` is what returns the pages; `drain` and
+/// `clear` do not.
+pub(crate) fn into_tail(mut buf: Vec<u8>, consumed: usize) -> Vec<u8> {
+    let tail = buf.split_off(consumed.min(buf.len()));
+    drop(buf);
+    tail
+}
+
 /// Shift that lets a 16-bit header represent `buffer` bytes.
 pub(super) fn window_scale_shift(buffer: usize) -> u8 {
     let mut shift = 0u8;
@@ -495,6 +564,130 @@ pub(super) fn window_scale_shift(buffer: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flow(pool: Arc<crate::TcpPayloadBudget>) -> Tcb {
+        Tcb::new(
+            SeqNum(1),
+            1500,
+            8192,
+            8192,
+            3,
+            Duration::from_secs(1),
+            3,
+            Arc::new(AtomicU32::new(8192)),
+            pool,
+        )
+    }
+
+    #[test]
+    fn consumed_prefix_drops_the_original_allocation() {
+        let mut buf = Vec::with_capacity(64 * 1024);
+        buf.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let tail = into_tail(buf, 2);
+        assert_eq!(tail, [3, 4, 5]);
+        assert_eq!(tail.capacity(), tail.len());
+        assert!(into_tail(vec![9, 9], 2).is_empty());
+    }
+
+    #[test]
+    fn receive_credit_survives_queueing_and_returns_on_read_or_drop() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut first = flow(pool.clone());
+        let mut second = flow(pool.clone());
+        for i in 0..5 {
+            first.add_unordered_packet(SeqNum(1 + i * 1200), vec![1; 1200]);
+        }
+        let data = first.consume_unordered_packets(8192).unwrap();
+        first.queue_read(data.len());
+        assert_eq!(
+            pool.usage().0,
+            6000,
+            "moving data to the application queue released credit early"
+        );
+        second.add_unordered_packet(SeqNum(1), vec![2; 3600]);
+        assert_eq!(
+            second.get_unordered_packets_total_len(),
+            0,
+            "full shared pool must reject before ACK advances"
+        );
+        assert_eq!(second.get_ack(), SeqNum(1));
+        first.consume_read(3000, false);
+        second.add_unordered_packet(SeqNum(1), vec![2; 3600]);
+        assert_eq!(pool.usage().0, 6600);
+        drop(first);
+        assert_eq!(pool.usage().0, 3600);
+        drop(second);
+        assert_eq!(pool.usage().0, 0);
+    }
+
+    #[test]
+    fn partial_ack_failure_and_cancellation_return_shared_send_credits() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut first = flow(pool.clone());
+        let mut second = flow(pool.clone());
+        let seq = first.get_seq();
+        first.add_inflight_packet(vec![1; 6000]).unwrap();
+        assert_eq!(
+            second
+                .add_inflight_packet(vec![2; 4000])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        first.update_inflight_packet_queue(seq + 3000);
+        assert_eq!(pool.usage().0, 3000);
+        second.add_inflight_packet(vec![2; 4000]).unwrap();
+        assert_eq!(pool.usage().0, 7000);
+        first.discard_failed_payload();
+        assert_eq!(pool.usage().0, 4000);
+        drop(first);
+        drop(second);
+        assert_eq!(pool.usage().0, 0);
+    }
+
+    #[test]
+    fn read_and_write_share_one_budget_and_duplicate_replacement_refunds() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut tcb = flow(pool.clone());
+        tcb.add_unordered_packet(SeqNum(1), vec![1; 4000]);
+        tcb.add_unordered_packet(SeqNum(1), vec![1; 2000]);
+        assert_eq!(pool.usage().0, 2000);
+        tcb.add_inflight_packet(vec![2; 6000]).unwrap();
+        tcb.add_unordered_packet(SeqNum(1), vec![1; 4000]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 2000);
+        assert_eq!(pool.usage().0, 8000);
+        tcb.discard_failed_payload();
+        assert_eq!(pool.usage().0, 0);
+    }
+
+    #[test]
+    fn changing_per_flow_windows_does_not_oversubscribe_the_shared_payload_budget() {
+        let limit = Arc::new(AtomicU32::new(512 * 1024));
+        let pool = crate::TcpPayloadBudget::new(512 * 1024);
+        let make_flow = || {
+            Tcb::new(
+                SeqNum(1),
+                1500,
+                512 * 1024,
+                512 * 1024,
+                3,
+                Duration::from_secs(1),
+                3,
+                limit.clone(),
+                pool.clone(),
+            )
+        };
+        let mut first = make_flow();
+        let mut second = make_flow();
+        first.add_unordered_packet(SeqNum(1), vec![1; 400 * 1024]);
+        limit.store(256 * 1024, Ordering::Relaxed);
+        second.add_unordered_packet(SeqNum(1), vec![2; 200 * 1024]);
+        assert!(
+            first.get_unordered_packets_total_len() + second.get_unordered_packets_total_len()
+                <= 512 * 1024,
+            "shrinking a per-flow window did not reclaim already buffered bytes"
+        );
+    }
 
     #[test]
     fn scale_shift_covers_the_buffer_without_wasting_bits() {
@@ -515,6 +708,7 @@ mod tests {
             Duration::from_secs(1),
             3,
             limit,
+            crate::TcpPayloadBudget::new(16 * 1024 * 1024),
         );
         tcb.enable_window_scale(7, window_scale_shift(512 * 1024));
         tcb.update_send_window(1000);
@@ -535,6 +729,7 @@ mod tests {
             Duration::from_secs(1),
             3,
             limit,
+            crate::TcpPayloadBudget::new(16 * 1024 * 1024),
         );
         tcb.update_send_window(1000);
         assert_eq!(tcb.get_send_window(), 1000);

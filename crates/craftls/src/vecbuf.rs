@@ -16,6 +16,12 @@ pub(crate) struct ChunkVecBuffer {
     len: usize,
 }
 
+fn release_prefix(mut buf: Vec<u8>, consumed: usize) -> Vec<u8> {
+    let tail = buf.split_off(consumed.min(buf.len()));
+    drop(buf);
+    tail
+}
+
 impl ChunkVecBuffer {
     pub(crate) fn new(limit: Option<usize>) -> Self {
         Self {
@@ -124,10 +130,16 @@ impl ChunkVecBuffer {
 
     fn consume(&mut self, mut used: usize) {
         self.len -= used;
-        while let Some(mut buf) = self.chunks.pop_front() {
-            if used < buf.len() {
-                buf.drain(..used);
+        while let Some(buf) = self.chunks.pop_front() {
+            if used == 0 {
                 self.chunks.push_front(buf);
+                break;
+            }
+            if used < buf.len() {
+                // Drop the consumed prefix's allocation. `drain` would keep
+                // it for as long as this connection holds the remainder.
+                let tail = release_prefix(buf, used);
+                self.chunks.push_front(tail);
                 break;
             } else {
                 used -= buf.len();
@@ -155,6 +167,19 @@ impl ChunkVecBuffer {
 #[cfg(test)]
 mod tests {
     use super::ChunkVecBuffer;
+
+    #[test]
+    fn partial_read_drops_the_consumed_allocation() {
+        let mut cvb = ChunkVecBuffer::new(None);
+        let mut chunk = Vec::with_capacity(64 * 1024);
+        chunk.extend_from_slice(b"abcdef");
+        cvb.append(chunk);
+        let mut buf = [0u8; 2];
+        assert_eq!(cvb.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"ab");
+        assert_eq!(cvb.chunks[0], b"cdef");
+        assert_eq!(cvb.chunks[0].capacity(), cvb.chunks[0].len());
+    }
 
     #[test]
     fn short_append_copy_with_limit() {

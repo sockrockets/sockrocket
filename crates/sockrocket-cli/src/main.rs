@@ -411,11 +411,7 @@ async fn async_main() -> Result<()> {
                     match rx.borrow().clone() {
                         Some(HealthEvent::ProbeOk { latency_ms }) => {
                             tracing::debug!("health probe ok ({} ms)", latency_ms);
-                            update_health_state(|s| {
-                                s.last_probe_ms = Some(latency_ms);
-                                s.last_probe_at = Some(unix_now());
-                                s.consecutive_failures = 0;
-                            });
+                            update_health_state(|s| s.record_probe_ok(latency_ms, unix_now()));
                         }
                         Some(HealthEvent::ProbeFailed {
                             consecutive_failures,
@@ -487,11 +483,10 @@ async fn async_main() -> Result<()> {
             });
         }
         // Seed the state file so the UI can show the active node before any
-        // probe event fires. A stale current_node from a previous run is
-        // discarded — it referred to that run's node list.
+        // probe event fires. The file survives a daemon restart, and its
+        // node index, failure, and switch history belong to the previous run.
         update_health_state(|s| {
-            s.current_node = active_index;
-            s.current_node_name = selected.map(|n| n.name.clone());
+            s.begin_run(active_index, selected.map(|n| n.name.clone()));
         });
     }
 
@@ -896,6 +891,26 @@ struct HealthState {
     last_error: Option<String>,
     #[serde(default)]
     runtime: Option<serde_json::Value>,
+}
+
+impl HealthState {
+    /// Replace a previous process's health file with this run's node.
+    fn begin_run(&mut self, node: Option<usize>, name: Option<String>) {
+        *self = Self {
+            current_node: node,
+            current_node_name: name,
+            ..Self::default()
+        };
+    }
+
+    /// A successful probe ends the failure streak. The previous error would
+    /// otherwise stay visible for the whole time the node is healthy.
+    fn record_probe_ok(&mut self, latency_ms: u32, at: u64) {
+        self.last_probe_ms = Some(latency_ms);
+        self.last_probe_at = Some(at);
+        self.consecutive_failures = 0;
+        self.last_error = None;
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1462,6 +1477,41 @@ mod tests {
             tags: vec![],
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn new_run_drops_previous_health_and_success_clears_error() {
+        let mut state = HealthState {
+            current_node: Some(13),
+            current_node_name: Some("previous".into()),
+            last_probe_ms: Some(313),
+            last_probe_at: Some(1),
+            consecutive_failures: 0,
+            switch_count: 2,
+            last_switch: Some(SwitchRecord {
+                at: 1,
+                node_index: 13,
+                node_name: "previous".into(),
+                latency_ms: 313,
+            }),
+            last_error: Some("Connection reset by peer (os error 104)".into()),
+            runtime: None,
+        };
+        state.begin_run(Some(32), Some("current".into()));
+        assert_eq!(state.current_node, Some(32));
+        assert_eq!(state.current_node_name.as_deref(), Some("current"));
+        assert_eq!(state.switch_count, 0);
+        assert!(state.last_switch.is_none());
+        assert!(state.last_error.is_none());
+        assert!(state.last_probe_ms.is_none());
+
+        state.last_error = Some("HTTP probe timed out".into());
+        state.consecutive_failures = 1;
+        state.record_probe_ok(286, 20);
+        assert!(state.last_error.is_none());
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.last_probe_ms, Some(286));
+        assert_eq!(state.last_probe_at, Some(20));
     }
 
     #[test]

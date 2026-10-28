@@ -427,6 +427,10 @@ impl TuicOutbound {
 
         // Set transport config with congestion control
         let mut transport = quinn::TransportConfig::default();
+        // Quinn's default aggregate receive window is VarInt::MAX. A slow
+        // reader must backpressure the peer before per-stream buffers add up
+        // beyond the TUN payload budget (which cannot account for QUIC RAM).
+        transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
         match self.congestion {
             CongestionControl::Bbr => {
                 transport.congestion_controller_factory(Arc::new(
@@ -637,6 +641,100 @@ fn export_auth_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_readers_share_a_connection_receive_budget() {
+        use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+        use std::time::Duration;
+        super::super::quic_conn::ensure_quic_crypto_provider();
+        let cert = CertificateDer::from(include_bytes!("testdata/localhost-cert.der").to_vec());
+        let key = PrivatePkcs8KeyDer::from(include_bytes!("testdata/localhost-key.der").to_vec());
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key.into())
+            .unwrap();
+        tls.alpn_protocols = vec![b"tuic".to_vec()];
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .send_window(64 * 1024 * 1024);
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let tls = TlsConfig {
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            alpn: None,
+            fingerprint: None,
+        };
+        let outbound = TuicOutbound::new(
+            "localhost",
+            443,
+            "00000000-0000-0000-0000-000000000001",
+            "test",
+            "bbr",
+            Some(&tls),
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(outbound.build_client_config("tuic").unwrap());
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let (client_conn, server_conn) = tokio::join!(connecting, async {
+            server.accept().await.unwrap().await.unwrap()
+        });
+        let client_conn = client_conn.unwrap();
+        let sender = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..24 {
+                let mut stream = server_conn.open_uni().await.unwrap();
+                tasks.spawn(async move {
+                    stream.write_all(&vec![0x5a; 1024 * 1024]).await.unwrap();
+                    stream.finish().unwrap();
+                    assert_eq!(stream.stopped().await.unwrap(), None);
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+            server_conn
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), client_conn.accept_uni())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sender = sender;
+        // Every stream is smaller than Quinn's individual stream window.
+        // Only an aggregate window prevents all 24 MiB being ACKed into RAM.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), &mut sender)
+                .await
+                .is_err(),
+            "all payload was buffered despite stalled application readers"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut readers = tokio::task::JoinSet::new();
+            let mut first = Some(first);
+            for _ in 0..24 {
+                let mut receiver = match first.take() {
+                    Some(stream) => stream,
+                    None => client_conn.accept_uni().await.unwrap(),
+                };
+                readers.spawn(async move {
+                    let bytes = receiver.read_to_end(1024 * 1024).await.unwrap();
+                    assert_eq!(bytes.len(), 1024 * 1024);
+                    assert!(bytes.iter().all(|b| *b == 0x5a));
+                });
+            }
+            while let Some(result) = readers.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let connection = sender.await.unwrap();
+        connection.close(0u32.into(), b"done");
+    }
 
     #[test]
     fn test_parse_uuid() {

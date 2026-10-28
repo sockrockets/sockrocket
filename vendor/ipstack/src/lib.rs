@@ -11,7 +11,9 @@ use tokio::{
 };
 
 mod queue;
+mod tcp_budget;
 pub(crate) use queue::{PacketReceiver, PacketSender};
+pub use tcp_budget::TcpPayloadBudget;
 pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
 
 mod error;
@@ -243,6 +245,7 @@ pub struct IpStack {
     accept_receiver: mpsc::Receiver<IpStackStream>,
     dns_accept_receiver: mpsc::Receiver<IpStackStream>,
     packet_budget: Arc<queue::Budget>,
+    tcp_payload_budget: Arc<TcpPayloadBudget>,
     handle: JoinHandle<Result<()>>,
 }
 
@@ -282,6 +285,7 @@ impl IpStack {
             accept_receiver,
             dns_accept_receiver,
             packet_budget: packet_budget.clone(),
+            tcp_payload_budget: config.tcp_config.payload_budget.clone(),
             handle: run(
                 config,
                 device,
@@ -331,6 +335,9 @@ impl IpStack {
     /// age, and receive payload bytes retained by live flows.
     pub fn tcp_health(&self) -> ([usize; 10], u64, usize) {
         self.packet_budget.flow_health()
+    }
+    pub fn tcp_payload_usage(&self) -> (usize, usize) {
+        self.tcp_payload_budget.usage()
     }
     pub fn tcp_event_counts(&self) -> TcpEventCounts {
         self.packet_budget.tcp_event_counts()

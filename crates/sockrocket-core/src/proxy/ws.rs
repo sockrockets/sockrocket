@@ -339,13 +339,10 @@ fn encode_client_frame_into(out: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
 /// copy per direction (frame buffer ↔ caller buffer) instead of two copies
 /// plus a cross-task wakeup per chunk.
 ///
-/// Read side state machine, per frame: assemble the header (`hdr`/`hdr_pos`;
-/// `hdr_len` grows from 2 once the fixed part reveals the extended-length
-/// and mask-key sizes) → assemble the payload into `payload` through spare
-/// capacity → dispatch on opcode (data: deliver through `payload_pos`,
-/// retaining leftovers larger than the caller's buffer across polls; ping:
-/// queue a pong; close: queue an echo, then EOF). Write side: every frame —
-/// caller data or a queued control frame — is appended to `out` and drained
+/// Read side: assemble the header, then stream data directly into the caller's
+/// buffer. Only control frames (at most 125 bytes) are assembled internally.
+/// Mask position survives partial reads and cancellation. Write side: every
+/// frame — caller data or a queued control frame — is appended to `out` and drained
 /// in order, so wire ordering across data/pong/close survives a poll that
 /// pends mid-frame.
 pub struct WsStream {
@@ -360,13 +357,10 @@ pub struct WsStream {
     hdr: [u8; 14],
     hdr_pos: usize,
     hdr_len: usize,
-    /// Payload of the frame being assembled / delivered. Assembly progress
-    /// is `payload.len() < frame_len`; delivery progress is `payload_pos`.
+    /// Control-frame payload only; data frames never allocate a frame buffer.
     payload: Vec<u8>,
-    payload_pos: usize,
-    /// Payload length of the frame currently being assembled/delivered
-    /// (0 between frames).
-    frame_len: usize,
+    /// Bytes of this data frame already delivered (also the mask-key offset).
+    frame_read: usize,
     /// The peer sent a close frame: once the echo is flushed, reads are EOF.
     closing: bool,
     /// Reads are done (close handshake finished or inner EOF).
@@ -399,9 +393,8 @@ impl WsStream {
             hdr: [0u8; 14],
             hdr_pos: 0,
             hdr_len: 2,
-            payload: Vec::with_capacity(16384),
-            payload_pos: 0,
-            frame_len: 0,
+            payload: Vec::new(),
+            frame_read: 0,
             closing: false,
             read_eof: false,
             out: Vec::with_capacity(WRITE_BUF_SIZE + 14),
@@ -414,11 +407,11 @@ impl WsStream {
     }
 
     /// Reset the per-frame read state after a frame was fully delivered or
-    /// handled; the `payload` allocation is kept for reuse.
+    /// handled. The payload allocation is dropped so a large frame does not
+    /// stay reserved for the rest of the connection.
     fn reset_frame(&mut self) {
-        self.payload.clear();
-        self.payload_pos = 0;
-        self.frame_len = 0;
+        self.payload = Vec::new();
+        self.frame_read = 0;
         self.hdr_pos = 0;
         self.hdr_len = 2;
     }
@@ -426,6 +419,15 @@ impl WsStream {
     /// Parse the assembled header into (opcode, payload length, mask key).
     fn parse_header(&self) -> io::Result<(u8, usize, Option<[u8; 4]>)> {
         let opcode = self.hdr[0] & 0x0f;
+        if !matches!(
+            opcode,
+            OPCODE_CONT | OPCODE_TEXT | OPCODE_BINARY | OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported WS opcode",
+            ));
+        }
         let masked = self.hdr[1] & 0x80 != 0;
         let mut len = (self.hdr[1] & 0x7f) as u64;
         let mut off = 2;
@@ -440,6 +442,12 @@ impl WsStream {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("WS frame payload too large: {len} bytes"),
+            ));
+        }
+        if opcode >= 8 && (len > 125 || self.hdr[0] & 0x80 == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid WS control frame",
             ));
         }
         let mask = if masked {
@@ -489,17 +497,6 @@ impl AsyncRead for WsStream {
         loop {
             let this = &mut *self;
 
-            // Deliver the assembled data-frame payload; a leftover larger
-            // than the caller's buffer stays for the next poll.
-            if this.payload_pos < this.payload.len() && this.payload.len() == this.frame_len {
-                let n = buf.remaining().min(this.payload.len() - this.payload_pos);
-                buf.put_slice(&this.payload[this.payload_pos..this.payload_pos + n]);
-                this.payload_pos += n;
-                if this.payload_pos == this.payload.len() {
-                    this.reset_frame();
-                }
-                return Poll::Ready(Ok(()));
-            }
             if buf.remaining() == 0 || this.read_eof {
                 return Poll::Ready(Ok(()));
             }
@@ -538,7 +535,7 @@ impl AsyncRead for WsStream {
                     this.hdr_pos += n;
                     this.read_pending_pos += n;
                     if this.read_pending_pos == this.read_pending.len() {
-                        this.read_pending.clear();
+                        this.read_pending = Vec::new();
                         this.read_pending_pos = 0;
                     }
                     continue;
@@ -585,6 +582,58 @@ impl AsyncRead for WsStream {
                 Err(e) => return Poll::Ready(Err(e)),
             };
 
+            if matches!(opcode, OPCODE_BINARY | OPCODE_CONT | OPCODE_TEXT) {
+                if len == 0 {
+                    this.reset_frame();
+                    continue;
+                }
+                let remaining = len - this.frame_read;
+                let count = buf.remaining().min(remaining);
+                let start = buf.filled().len();
+                let n = if this.read_pending_pos < this.read_pending.len() {
+                    let n = count.min(this.read_pending.len() - this.read_pending_pos);
+                    buf.put_slice(
+                        &this.read_pending[this.read_pending_pos..this.read_pending_pos + n],
+                    );
+                    this.read_pending_pos += n;
+                    if this.read_pending_pos == this.read_pending.len() {
+                        this.read_pending = Vec::new();
+                        this.read_pending_pos = 0;
+                    }
+                    n
+                } else {
+                    let mut chunk = buf.take(count);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut chunk) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    let n = chunk.filled().len();
+                    // The inner ReadBuf initialized these bytes in the same storage.
+                    unsafe {
+                        buf.assume_init(n);
+                    }
+                    buf.advance(n);
+                    n
+                };
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed inside a WS frame payload",
+                    )));
+                }
+                if let Some(key) = mask_key {
+                    for (i, byte) in buf.filled_mut()[start..start + n].iter_mut().enumerate() {
+                        *byte ^= key[(this.frame_read + i) % 4];
+                    }
+                }
+                this.frame_read += n;
+                if this.frame_read == len {
+                    this.reset_frame();
+                }
+                return Poll::Ready(Ok(()));
+            }
+
             // Assemble the payload through uninitialized spare capacity
             // (same pattern as the old read task): zero-filling the frame
             // first would be a wasted memset.
@@ -598,7 +647,7 @@ impl AsyncRead for WsStream {
                     );
                     this.read_pending_pos += n;
                     if this.read_pending_pos == this.read_pending.len() {
-                        this.read_pending.clear();
+                        this.read_pending = Vec::new();
                         this.read_pending_pos = 0;
                     }
                     continue;
@@ -623,7 +672,6 @@ impl AsyncRead for WsStream {
                 // of spare capacity.
                 unsafe { this.payload.set_len(this.payload.len() + n) };
             }
-            this.frame_len = len;
 
             // Unmask in place (RFC forbids server→client masking, but
             // tolerating it is harmless).
@@ -634,15 +682,6 @@ impl AsyncRead for WsStream {
             }
 
             match opcode {
-                OPCODE_BINARY | OPCODE_CONT | OPCODE_TEXT => {
-                    if this.payload.is_empty() {
-                        // Nothing to deliver, and a 0-byte read would signal
-                        // EOF; skip to the next frame. `fin` is not surfaced:
-                        // forwarding each fragment's payload in arrival order
-                        // reassembles fragmented messages transparently.
-                        this.reset_frame();
-                    }
-                }
                 OPCODE_PING => {
                     encode_client_frame_into(&mut this.out, OPCODE_PONG, &this.payload);
                     this.ctrl_flush = true;
@@ -799,6 +838,90 @@ pub async fn connect_ws_timeout(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn streamed_mask_offset_survives_pending_reads_and_frame_boundaries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, mut peer) = tokio::io::duplex(128);
+        let data: Vec<u8> = (0..70001).map(|n| n as u8).collect();
+        let encoded = super::encode_frame_with_key(super::OPCODE_BINARY, &data, Some([1, 2, 3, 4]));
+        let mut stream = super::WsStream::new(Box::new(client), encoded[..21].to_vec());
+        let mut first = [0; 3];
+        stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, &data[..3]);
+        let mut next = [0; 1];
+        // Four bytes of handshake leftover remain after the first read.
+        let mut leftover = [0; 4];
+        stream.read_exact(&mut leftover).await.unwrap();
+        assert_eq!(&leftover, &data[3..7]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), stream.read(&mut next))
+                .await
+                .is_err()
+        );
+        let writer = tokio::spawn(async move {
+            peer.write_all(&encoded[21..]).await.unwrap();
+            peer.write_all(&super::encode_frame_with_key(
+                super::OPCODE_BINARY,
+                b"next",
+                None,
+            ))
+            .await
+            .unwrap();
+        });
+        let mut received = first.to_vec();
+        received.extend_from_slice(&leftover);
+        while received.len() < data.len() {
+            let mut chunk = [0; 113];
+            let count = (data.len() - received.len()).min(chunk.len());
+            let n = stream.read(&mut chunk[..count]).await.unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(received, data);
+        let mut following = [0; 4];
+        stream.read_exact(&mut following).await.unwrap();
+        assert_eq!(&following, b"next");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_control_frames_are_rejected_before_payload_allocation() {
+        use tokio::io::AsyncReadExt;
+        for header in [
+            vec![0x89, 126, 1, 0],
+            vec![0x09, 0],
+            vec![0x83, 127, 0, 0, 0, 0, 4, 0, 0, 0],
+        ] {
+            let (client, _peer) = tokio::io::duplex(64);
+            let mut stream = super::WsStream::new(Box::new(client), header);
+            let error = stream.read(&mut [0; 1]).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(stream.payload.capacity(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn large_incomplete_data_frame_streams_without_reserving_its_announced_size() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut stream = super::WsStream::new(Box::new(client), Vec::new());
+        let mut header = vec![0x82, 127];
+        header.extend_from_slice(&super::MAX_FRAME_PAYLOAD.to_be_bytes());
+        header.extend_from_slice(b"first bytes");
+        peer.write_all(&header).await.unwrap();
+        let mut prefix = [0; 11];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.read_exact(&mut prefix),
+        )
+        .await
+        .expect("data frames must stream before the full payload arrives")
+        .unwrap();
+        assert_eq!(&prefix, b"first bytes");
+        assert!(
+            stream.payload.capacity() <= 125,
+            "announced frame size reserved heap memory"
+        );
+    }
     use super::*;
     use crate::config::model::WsConfig;
 

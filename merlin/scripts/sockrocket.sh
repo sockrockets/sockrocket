@@ -1272,6 +1272,7 @@ do_stop() {
     restore_core_pattern
     prune_core_dumps
     rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
+    rm -f "$SOCKROCKET_DIR/.memory-pressure-since" "$SOCKROCKET_DIR/.recovery-blocked"
 
     if [ "$cleanup_rc" != 0 ]; then
         log_error "Sockrocket stopped, but network cleanup failed; recovery state retained"
@@ -1836,7 +1837,10 @@ try_recover_lan_proxy() {
     # Both cron and the fast guard call this function.
     local mem_pct
     mem_pct=$(memory_used_pct)
-    [ -z "$mem_pct" ] || [ "$mem_pct" -lt 80 ] || return 1
+    if [ -n "$mem_pct" ] && [ "$mem_pct" -ge 80 ]; then
+        reclaim_degraded_memory "$mem_pct"
+        return $?
+    fi
 
     local dns_port
     dns_port=$(get_config_value dns_port)
@@ -1872,7 +1876,50 @@ try_recover_lan_proxy() {
         fi
     fi
     rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE" "$RECOVER_AFTER_FILE"
+    rm -f "$SOCKROCKET_DIR/.memory-pressure-since" "$SOCKROCKET_DIR/.recovery-blocked"
     ok "LAN proxy path restored after fail-open"
+}
+
+# A memory fail-open must have a path out even when idle allocator/transport
+# caches keep this process resident. Give live flows 60s to drain first; only
+# recycle a large proxy while LAN is already degraded. This is incident-driven,
+# with a 10-minute cooldown, and never changes user intent or resumes a stop.
+reclaim_degraded_memory() {
+    local mem_pct="$1" now since after pid rss total reason note
+    [ ! -f "$SOCKROCKET_DIR/stopped" ] || return 1
+    reason=$(cat "$DEGRADED_FILE" 2>/dev/null)
+    case "$reason" in 'memory pressure '*) ;; *) return 1 ;; esac
+    now=$(date +%s)
+    since=$(cat "$SOCKROCKET_DIR/.memory-pressure-since" 2>/dev/null)
+    case "$since" in ''|*[!0-9]*) echo "$now" > "$SOCKROCKET_DIR/.memory-pressure-since"; return 1 ;; esac
+    [ "$((now - since))" -ge 60 ] || return 1
+    after=$(cat "$SOCKROCKET_DIR/.memory-restart-after" 2>/dev/null)
+    case "$after" in ''|*[!0-9]*) after=0 ;; esac
+    [ "$now" -ge "$after" ] || return 1
+    pid=$(cat "$SOCKROCKET_PID" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    rss=$(awk '/^VmRSS:/{print $2}' "$PROC_BASE/$pid/status" 2>/dev/null)
+    total=$(awk '/^MemTotal:/{print $2}' "${SOCKROCKET_MEMINFO_FILE:-/proc/meminfo}")
+    case "$rss:$total" in *[!0-9:]*|:*|*:) return 1 ;; esac
+    [ "$total" -gt 0 ] || return 1
+    # Do not recycle a small healthy proxy because another process uses RAM.
+    if [ "$rss" -lt "$((total / 8))" ]; then
+        note="Memory recovery blocked: used_pct=$mem_pct proxy_rss_kib=$rss; waiting for system memory"
+        if [ "$(cat "$SOCKROCKET_DIR/.recovery-blocked" 2>/dev/null)" != "$note" ]; then
+            echo "$note" > "$SOCKROCKET_DIR/.recovery-blocked"
+            log_warn "$note"
+        fi
+        return 1
+    fi
+    log_warn "Memory recovery: recycling proxy after $((now - since))s (used_pct=$mem_pct rss_kib=$rss)"
+    echo $((now + 600)) > "$SOCKROCKET_DIR/.memory-restart-after"
+    # do_stop clears runtime degradation; restore it BEFORE do_start so DNS
+    # and steering stay direct until the existing recovery probes succeed.
+    do_stop >> "$SOCKROCKET_LOG" 2>&1 || true
+    echo "$reason" > "$DEGRADED_FILE"
+    echo "$now" > "$SOCKROCKET_DIR/.memory-pressure-since"
+    do_start >> "$SOCKROCKET_LOG" 2>&1 || return 1
+    [ ! -f "$DEGRADED_FILE" ]
 }
 
 # ── Watchdog ──────────────────────────────────────────────────────────────────

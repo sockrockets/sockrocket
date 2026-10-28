@@ -10,8 +10,8 @@ impl ResourceBudget {
     pub fn for_memory_kib(total: u64) -> Self {
         // Leave room for ordinary multi-device LAN concurrency. The previous
         // 32/64/128 caps could reject new flows while ample memory remained.
-        // At the 1 GiB tier, 512 TCP flows budget 96 MiB for two relay buffers
-        // and the 64 KiB unacknowledged-data window; DNS has its own quota.
+        // TUN relay copies reserve 32 KiB per TCP flow; retained receive/send
+        // payload has a separate shared cap. DNS has its own admission quota.
         if total <= 300 * 1024 {
             Self {
                 tun_streams: 128,
@@ -55,11 +55,35 @@ fn detected_memory_kib() -> u64 {
         .unwrap_or(1024 * 1024)
 }
 
+/// Hard aggregate payload cap: includes both TCP receive queues and sends.
+pub fn tun_tcp_payload_budget_bytes() -> usize {
+    tun_tcp_payload_budget_for(detected_memory_kib())
+}
+
+fn tun_tcp_payload_budget_for(memory_kib: u64) -> usize {
+    (memory_kib.saturating_mul(1024) / 16).clamp(4 * 1024 * 1024, 64 * 1024 * 1024) as usize
+}
+
+/// Linux process residency is distinct from the live TCP payload counters.
+pub(crate) fn process_memory_kib() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |key: &str| {
+        text.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    Some((field("VmRSS:")?, field("VmHWM:")?))
+}
+
 /// Bytes of TUN TCP data one flow may keep in flight.
 ///
 /// The userspace stack's window is this value divided by the LAN round trip,
 /// so a fixed 64 KiB cap is what makes Wi-Fi feel slow. A single flow may use
-/// up to 512 KiB. All flows together stay inside 1/16 of RAM, and a crowded
+/// up to 512 KiB. A separate shared payload budget bounds aggregate use; a crowded
 /// router falls back to 64 KiB per flow.
 pub fn tun_tcp_window_bytes(active_tcp: usize) -> u32 {
     tun_tcp_window_for(detected_memory_kib(), active_tcp)
@@ -78,8 +102,8 @@ mod tests {
         for (memory, streams) in [(256, 128), (512, 256), (1024, 512)] {
             let budget = ResourceBudget::for_memory_kib(memory * 1024);
             assert_eq!(budget.tun_streams, streams);
-            // Include two relay buffers plus the TCP unacked-data budget.
-            assert!(budget.tun_streams as u64 * 192 < memory * 1024 / 8);
+            let shared_payload_kib = tun_tcp_payload_budget_for(memory * 1024) as u64 / 1024;
+            assert!(budget.tun_streams as u64 * 32 + shared_payload_kib < memory * 1024 / 8);
             assert!(budget.dns_queries <= budget.tun_streams);
             assert!(budget.api_requests <= 6);
         }

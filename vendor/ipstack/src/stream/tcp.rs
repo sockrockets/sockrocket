@@ -8,8 +8,8 @@ use crate::{
         tcp_header_flags, tcp_header_fmt,
     },
     stream::tcb::{
-        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO,
-        Tcb, TcpState, window_scale_shift,
+        into_tail, MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType,
+        READ_BUFFER_SIZE, RTO, Tcb, TcpState, window_scale_shift,
     },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
@@ -65,6 +65,8 @@ pub struct TcpConfig {
     /// shares this value, so the owner can shrink it as concurrency rises.
     /// The ceiling is still [`Self::max_unacked_bytes`] and [`Self::read_buffer_size`].
     pub window_limit: Arc<AtomicU32>,
+    /// Hard aggregate payload cap shared by all flows, in both directions.
+    pub payload_budget: Arc<crate::TcpPayloadBudget>,
 }
 
 #[non_exhaustive]
@@ -92,6 +94,7 @@ impl Default for TcpConfig {
             max_retransmit_count: MAX_RETRANSMIT_COUNT,
             options: Default::default(),
             window_limit: Arc::new(AtomicU32::new(MAX_UNACK)),
+            payload_budget: crate::TcpPayloadBudget::new(16 * 1024 * 1024),
         }
     }
 }
@@ -202,6 +205,7 @@ impl IpStackTcpStream {
             config.rto,
             config.max_retransmit_count,
             config.window_limit.clone(),
+            config.payload_budget.clone(),
         );
         // Reply with a scale only when the client offered one. Otherwise the
         // header window stays a raw 16-bit byte count, maxing out at 64 KiB.
@@ -238,13 +242,14 @@ impl IpStackTcpStream {
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let deadline = tokio::time::Instant::now() + config.timeout;
 
+        let (seq, ack, state) = (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state());
         let mut stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
             stream_receiver: Some(stream_receiver),
             up_packet_sender,
-            tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
+            tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb)),
             shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
             write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             retransmit_notify: Arc::new(tokio::sync::Notify::new()),
@@ -266,7 +271,6 @@ impl IpStackTcpStream {
         let sessions = SESSION_COUNTER
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .saturating_add(1);
-        let (seq, ack, state) = { (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state()) };
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::debug!("{tuple} {state:?}: {l_info} session begins, total TCP sessions: {sessions}");
 
@@ -347,10 +351,13 @@ impl AsyncRead for IpStackTcpStream {
         }
         // if there is data in the temp buffer, read it first
         if !self.temp_read_buffer.is_empty() {
-            let len = std::cmp::min(buf.remaining(), self.temp_read_buffer.len());
-            buf.put_slice(&self.temp_read_buffer[..len]);
-            self.temp_read_buffer.drain(..len); // remove the read data from the temp buffer
-            self.read_consumed(len, self.temp_read_buffer.is_empty());
+            let owned = std::mem::take(&mut self.temp_read_buffer);
+            let len = std::cmp::min(buf.remaining(), owned.len());
+            buf.put_slice(&owned[..len]);
+            let rest = into_tail(owned, len);
+            let done = rest.is_empty();
+            self.temp_read_buffer = rest;
+            self.read_consumed(len, done);
             self.reset_timeout();
             return Poll::Ready(Ok(()));
         }
@@ -372,8 +379,12 @@ impl AsyncRead for IpStackTcpStream {
                     self.reset_timeout();
                     let n = buf.remaining().min(data.len());
                     buf.put_slice(&data[..n]);
-                    self.read_consumed(n, n == data.len());
-                    self.temp_read_buffer.extend_from_slice(&data[n..]);
+                    let rest = into_tail(data, n);
+                    let done = rest.is_empty();
+                    self.read_consumed(n, done);
+                    if !done {
+                        self.temp_read_buffer = rest;
+                    }
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -457,15 +468,32 @@ impl AsyncWrite for IpStackTcpStream {
                 .lock()
                 .unwrap()
                 .replace(cx.waker().clone());
-            let info = format!("current send window: {send_window}, send buffer full: {is_full}");
-            log::trace!(
-                "{nt} {state:?}: [poll_write] {info}, waiting for the other side to send ACK..."
-            );
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!(
+                    "{nt} {state:?}: [poll_write] current send window: {send_window}, send buffer full: {is_full}, waiting for the other side to send ACK..."
+                );
+            }
             return Poll::Pending;
         }
 
         let sender = &self.up_packet_sender;
-        let data = &buf[..buf.len().min(tcb.get_mtu() as usize)];
+        let ip_header_len = if nt.src.is_ipv4() { 20 } else { 40 };
+        let size = buf
+            .len()
+            .min(tcb.calculate_payload_max_len(ip_header_len, 20));
+        let credit = match tcb.payload_budget.reserve(size) {
+            Some(credit) => credit,
+            None => {
+                *self.write_notify.lock().unwrap() = Some(cx.waker().clone());
+                tcb.payload_budget.register(&self.write_notify);
+                // Close the release/register race before returning Pending.
+                let Some(credit) = tcb.payload_budget.reserve(size) else {
+                    return Poll::Pending;
+                };
+                credit
+            }
+        };
+        let data = &buf[..size];
         let mut result =
             write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(data.to_vec()));
         if result
@@ -488,13 +516,14 @@ impl AsyncWrite for IpStackTcpStream {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Poll::Pending,
             Err(error) => return Poll::Ready(Err(error)),
         };
-        tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
+        tcb.add_reserved_inflight_packet(buf[..payload_len].to_vec(), credit)?;
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::trace!(
-            "{nt} {state:?}: [poll_write] {l_info} upstream data written to device, len = {payload_len}"
-        );
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "{nt} {state:?}: [poll_write] local {{ seq: {seq}, ack: {ack} }} upstream data written to device, len = {payload_len}"
+            );
+        }
         drop(tcb);
         if payload_len != 0 {
             self.reset_timeout();
@@ -1026,8 +1055,17 @@ async fn tcp_main_logic_loop(
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
         let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
-        let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+        let len = payload.len();
+        // These strings exist only for logs. Building them on every packet
+        // allocated a heap buffer that the router never printed.
+        let (info, l_info) = if log::log_enabled!(log::Level::Debug) {
+            (
+                tcp_header_fmt(tcp_header),
+                format!("local {{ seq: {seq}, ack: {ack} }}"),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
         if pkt_type == PacketType::Invalid {
             continue;
@@ -1302,7 +1340,11 @@ fn extract_data_n_write_upstream(
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<()> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-    let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+    let l_info = if log::log_enabled!(log::Level::Debug) {
+        format!("local {{ seq: {seq}, ack: {ack} }}")
+    } else {
+        String::new()
+    };
     if state == TcpState::Closed {
         log::debug!(
             "{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"..."

@@ -34,7 +34,15 @@ if [ -z "$upstream" ]; then
     postconf_log "Merlin 3006 DNS postconf skipped ${config}: upstream line missing"
     exit 1
 fi
-tmp="${config}.sockrocket-tmp"
+# Firmware postconf and the controller's repair may run concurrently. A
+# shared temp name lets one delete the other's output; `cat > config` then
+# truncates the live config before it discovers the missing input. Keep each
+# output private and publish by rename so readers never see an empty file.
+tmpdir="${config}.sockrocket-tmp.$$"
+(umask 077; mkdir "$tmpdir") || exit 1
+tmp="$tmpdir/config"
+trap 'rm -f "$tmp"; rmdir "$tmpdir" 2>/dev/null || true' EXIT
+trap 'exit 1' HUP INT TERM
 # Drop every shared or ISP upstream. Keep domain overrides
 # (server=/example.com/...). One no-resolv stops /etc/resolv.conf from
 # racing Sockrocket. SDN configs are not edited.
@@ -66,7 +74,9 @@ if grep -q 'servers-file' "$tmp" || grep -q 'resolv-file' "$tmp" ||
     postconf_log "Merlin 3006 DNS postconf failed ${config}"
     exit 1
 fi
-cat "$tmp" > "$config" || { rm -f "$tmp"; postconf_log "Merlin 3006 DNS postconf failed ${config}"; exit 1; }
-rm -f "$tmp"
+chmod 644 "$tmp" && mv -f "$tmp" "$config" || {
+    postconf_log "Merlin 3006 DNS postconf failed ${config}"
+    exit 1
+}
 postconf_log "Merlin 3006 DNS postconf isolated ${config}"
 exit 0
