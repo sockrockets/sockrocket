@@ -26,6 +26,7 @@ sockrocket/
 | Internals | [internals/](./internals/) |
 | Merlin | [merlin.md](./merlin.md), [merlin-reference.md](./merlin-reference.md) |
 | Merlin local build | [merlin-local-build.md](./merlin-local-build.md): ARM64 build command, allocator checks and provenance |
+| Router branch layout | [router-branch-layout-2026-10-29.md](./architecture/router-branch-layout-2026-10-29.md): local merge-ready fixes and diagnostics reference |
 
 ## Local Merlin ARM64 builds
 
