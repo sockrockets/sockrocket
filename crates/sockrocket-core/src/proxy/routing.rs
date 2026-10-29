@@ -15,33 +15,35 @@ tokio::task_local! { static TUN_IPV6: bool; }
 pub(crate) fn tun_ipv6() -> bool {
     TUN_IPV6.try_with(|value| *value).unwrap_or(false)
 }
-pub(crate) async fn with_tun_family<F: Future>(ipv6: bool, future: F) -> F::Output {
-    TUN_IPV6.scope(ipv6, future).await
+// Return the Tokio scope directly: an async wrapper retains both its input
+// future and scoped await state, multiplying large TUN frames at each layer.
+pub(crate) fn with_tun_family<F: Future>(ipv6: bool, future: F) -> impl Future<Output = F::Output> {
+    TUN_IPV6.scope(ipv6, future)
 }
 pub(crate) fn tun_destination() -> (Option<std::net::IpAddr>, bool) {
     TUN_DESTINATION
         .try_with(|context| *context)
         .unwrap_or((None, false))
 }
-pub(crate) async fn with_tun_destination<F: Future>(
+pub(crate) fn with_tun_destination<F: Future>(
     ip: Option<std::net::IpAddr>,
     domestic: bool,
     future: F,
-) -> F::Output {
-    TUN_DESTINATION.scope((ip, domestic), future).await
+) -> impl Future<Output = F::Output> {
+    TUN_DESTINATION.scope((ip, domestic), future)
 }
 pub(crate) fn client_source() -> Option<std::net::IpAddr> {
     CLIENT_SOURCE.try_with(|ip| *ip).ok().flatten()
 }
-pub(crate) async fn with_client_source<F: Future>(
+pub(crate) fn with_client_source<F: Future>(
     ip: Option<std::net::IpAddr>,
     future: F,
-) -> F::Output {
+) -> impl Future<Output = F::Output> {
     let ip = ip.map(|ip| match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
         _ => ip,
     });
-    CLIENT_SOURCE.scope(ip, future).await
+    CLIENT_SOURCE.scope(ip, future)
 }
 
 /// Shared immutable rule snapshots for long-lived listeners. Never hold the
@@ -481,5 +483,43 @@ mod device_ingress_tests {
         stop.send(true).unwrap();
         http_task.await.unwrap().unwrap();
         socks_task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod async_context_memory_review {
+    use super::*;
+    #[tokio::test]
+    async fn nested_context_scopes_do_not_multiply_the_inner_future_frame() {
+        let future = async move {
+            let payload = [0x5au8; 8192];
+            tokio::task::yield_now().await;
+            std::hint::black_box(payload);
+            assert_eq!(client_source(), Some("192.0.2.4".parse().unwrap()));
+            assert_eq!(
+                tun_destination(),
+                (Some("198.51.100.7".parse().unwrap()), true)
+            );
+            assert!(tun_ipv6());
+        };
+        let inner = std::mem::size_of_val(&future);
+        let scoped = crate::traffic::with_traffic_scope(with_client_source(
+            Some("::ffff:192.0.2.4".parse().unwrap()),
+            with_tun_destination(
+                Some("198.51.100.7".parse().unwrap()),
+                true,
+                with_tun_family(true, future),
+            ),
+        ));
+        let actual = std::mem::size_of_val(&scoped);
+        println!("context_future_bytes inner={inner} wrapped={actual}");
+        assert!(
+            actual <= inner + 512,
+            "nested context frame grew from {inner} to {actual} bytes"
+        );
+        scoped.await;
+        assert_eq!(client_source(), None);
+        assert_eq!(tun_destination(), (None, false));
+        assert!(!tun_ipv6());
     }
 }
