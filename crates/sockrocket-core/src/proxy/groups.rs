@@ -33,6 +33,13 @@ enum GroupKind {
     Fallback,
     UrlTest,
 }
+const GROUP_PROBE_CONCURRENCY: usize = 4;
+const GLOBAL_PROBE_CONCURRENCY: usize = 16;
+fn probe_budget() -> &'static Arc<tokio::sync::Semaphore> {
+    static BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)))
+}
+
 struct GroupOutbound {
     members: Vec<Arc<Member>>,
     kind: GroupKind,
@@ -42,6 +49,10 @@ struct GroupOutbound {
     /// A saved `current` is used once, then the runtime pick takes over.
     use_saved: std::sync::atomic::AtomicBool,
     sticky_until: std::sync::Mutex<Option<tokio::time::Instant>>,
+    selection: tokio::sync::Mutex<()>,
+    generation: std::sync::atomic::AtomicUsize,
+    next_probe: std::sync::atomic::AtomicUsize,
+    probe_slots: Arc<tokio::sync::Semaphore>,
 }
 impl GroupOutbound {
     fn remember(&self, index: usize) {
@@ -50,6 +61,8 @@ impl GroupOutbound {
         if let Ok(mut until) = self.sticky_until.lock() {
             *until = Some(tokio::time::Instant::now() + Duration::from_secs(300));
         }
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     fn sticky_index(&self) -> Option<usize> {
         let len = self.members.len();
@@ -92,22 +105,37 @@ impl GroupOutbound {
     }
     async fn connect_fastest(&self, host: &str, port: u16) -> Result<BoxProxyStream> {
         let mut tasks = tokio::task::JoinSet::new();
-        for (index, member) in self.members.iter().cloned().enumerate() {
-            let host = host.to_owned();
-            tasks.spawn(async move {
-                let stream = tokio::time::timeout(Duration::from_secs(3), async {
-                    member.get()?.0.connect(&host, port).await
-                })
-                .await
-                .map_err(|_| anyhow::anyhow!("Proxy group member timed out"))??;
-                Ok::<_, anyhow::Error>((index, stream))
-            });
-        }
+        let mut launched = 0;
         let mut winner = None;
-        while let Some(joined) = tasks.join_next().await {
-            if let Ok(Ok(found)) = joined {
-                winner = Some(found);
-                break;
+        loop {
+            while tasks.len() < GROUP_PROBE_CONCURRENCY && launched < self.members.len() {
+                // Continue after prior cancelled/failed scans instead of always
+                // spending the entire deadline on the same unreachable prefix.
+                let index = self
+                    .next_probe
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % self.members.len();
+                let member = self.members[index].clone();
+                let host = host.to_owned();
+                launched += 1;
+                let slots = self.probe_slots.clone();
+                tasks.spawn(async move {
+                    let _permit = slots.acquire_owned().await?;
+                    let stream = tokio::time::timeout(Duration::from_secs(3), async {
+                        member.get()?.0.connect(&host, port).await
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Proxy group member timed out"))??;
+                    Ok::<_, anyhow::Error>((index, stream))
+                });
+            }
+            match tasks.join_next().await {
+                Some(Ok(Ok(found))) => {
+                    winner = Some(found);
+                    break;
+                }
+                Some(_) => {}
+                None => break,
             }
         }
         drop(tasks);
@@ -132,12 +160,24 @@ impl Outbound for GroupOutbound {
             }
             tokio::time::timeout(Duration::from_secs(10), async {
                 if self.kind == GroupKind::UrlTest {
+                    let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
                     if let Some(index) = self.sticky_index()
                         && let Ok(stream) = self
-                            .connect_at(index, &host, port, Duration::from_secs(10))
+                            .connect_at(index, &host, port, Duration::from_secs(3))
                             .await
                     {
                         return Ok(stream);
+                    }
+                    let selection = self.selection.lock().await;
+                    // Other requests reuse the chosen node, but each opens its
+                    // own stream for its own destination outside the selection lock.
+                    if self.generation.load(std::sync::atomic::Ordering::Acquire) != generation
+                        && let Some(index) = self.sticky_index()
+                    {
+                        drop(selection);
+                        return self
+                            .connect_at(index, &host, port, Duration::from_secs(3))
+                            .await;
                     }
                     return self.connect_fastest(&host, port).await;
                 }
@@ -306,6 +346,10 @@ pub fn build_groups(
                             && matches!(kind, GroupKind::Fallback | GroupKind::UrlTest),
                     ),
                     sticky_until: std::sync::Mutex::new(None),
+                    selection: tokio::sync::Mutex::new(()),
+                    generation: std::sync::atomic::AtomicUsize::new(0),
+                    next_probe: std::sync::atomic::AtomicUsize::new(0),
+                    probe_slots: probe_budget().clone(),
                 })),
             )
         })
@@ -371,6 +415,123 @@ mod tests {
             calls,
         )
     }
+    struct CountingProbe {
+        calls: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        complete: bool,
+    }
+    struct Attempt(Arc<AtomicUsize>);
+    impl Drop for Attempt {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl Outbound for CountingProbe {
+        fn connect(
+            &self,
+            _: &str,
+            _: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                let _attempt = Attempt(self.active.clone());
+                if !self.complete {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(Box::new(tokio::io::duplex(64).0) as BoxProxyStream)
+            })
+        }
+        fn name(&self) -> &str {
+            "counting-fixture"
+        }
+    }
+    fn counting_group(probe: Arc<CountingProbe>) -> Arc<GroupOutbound> {
+        let members = (0..64)
+            .map(|_| {
+                let cell = OnceLock::new();
+                cell.set(Ok(SharedOutbound(probe.clone()))).ok().unwrap();
+                Arc::new(Member {
+                    node: node(),
+                    outbound: cell,
+                })
+            })
+            .collect();
+        Arc::new(GroupOutbound {
+            members,
+            kind: GroupKind::UrlTest,
+            preferred: AtomicUsize::new(0),
+            use_saved: std::sync::atomic::AtomicBool::new(false),
+            sticky_until: std::sync::Mutex::new(None),
+            selection: tokio::sync::Mutex::new(()),
+            generation: AtomicUsize::new(0),
+            next_probe: AtomicUsize::new(0),
+            probe_slots: probe_budget().clone(),
+        })
+    }
+    fn counting_probe(complete: bool) -> Arc<CountingProbe> {
+        Arc::new(CountingProbe {
+            calls: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            complete,
+        })
+    }
+    #[tokio::test]
+    async fn concurrent_url_test_requests_share_selection_and_keep_individual_streams() {
+        let probe = counting_probe(true);
+        let group = counting_group(probe.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let group = group.clone();
+            tasks.spawn(async move { group.connect(&format!("target-{i}.invalid"), 443).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        let calls = probe.calls.load(Ordering::SeqCst);
+        assert!(calls >= 8, "every request needs its own outbound stream");
+        assert!(
+            calls <= GROUP_PROBE_CONCURRENCY + 7,
+            "selection was duplicated: {calls}"
+        );
+    }
+    #[tokio::test]
+    async fn group_probes_obey_global_and_per_group_limits_and_refund_on_cancel() {
+        let probe = counting_probe(false);
+        let groups: Vec<_> = (0..8).map(|_| counting_group(probe.clone())).collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for group in &groups {
+            for _ in 0..8 {
+                let group = group.clone();
+                tasks.spawn(async move { group.connect("target.invalid", 443).await });
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while probe.active.load(Ordering::SeqCst) < GLOBAL_PROBE_CONCURRENCY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for group in &groups {
+            assert!(group.next_probe.load(Ordering::Relaxed) <= GROUP_PROBE_CONCURRENCY);
+        }
+        assert!(probe.peak.load(Ordering::SeqCst) <= GLOBAL_PROBE_CONCURRENCY);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probe.active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn fallback_is_bounded_and_udp_does_not_change_member() {
         let (first, a) = member(true, true);
@@ -381,6 +542,12 @@ mod tests {
             preferred: std::sync::atomic::AtomicUsize::new(0),
             use_saved: std::sync::atomic::AtomicBool::new(false),
             sticky_until: std::sync::Mutex::new(None),
+            selection: tokio::sync::Mutex::new(()),
+            generation: std::sync::atomic::AtomicUsize::new(0),
+            next_probe: std::sync::atomic::AtomicUsize::new(0),
+            // Virtual-time fixtures must not wait on permits held by another
+            // test runtime: their clock can advance while that runtime sleeps.
+            probe_slots: Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)),
         };
         let start = tokio::time::Instant::now();
         assert!(group.connect("example.invalid", 443).await.is_ok());
@@ -413,6 +580,12 @@ mod tests {
             preferred: std::sync::atomic::AtomicUsize::new(0),
             use_saved: std::sync::atomic::AtomicBool::new(false),
             sticky_until: std::sync::Mutex::new(None),
+            selection: tokio::sync::Mutex::new(()),
+            generation: std::sync::atomic::AtomicUsize::new(0),
+            next_probe: std::sync::atomic::AtomicUsize::new(0),
+            // Virtual-time fixtures must not wait on permits held by another
+            // test runtime: their clock can advance while that runtime sleeps.
+            probe_slots: Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)),
         };
         assert!(group.connect("example.invalid", 443).await.is_ok());
         assert_eq!(a.load(Ordering::SeqCst), 1);
@@ -439,6 +612,12 @@ mod tests {
             preferred: std::sync::atomic::AtomicUsize::new(0),
             use_saved: std::sync::atomic::AtomicBool::new(false),
             sticky_until: std::sync::Mutex::new(None),
+            selection: tokio::sync::Mutex::new(()),
+            generation: std::sync::atomic::AtomicUsize::new(0),
+            next_probe: std::sync::atomic::AtomicUsize::new(0),
+            // Virtual-time fixtures must not wait on permits held by another
+            // test runtime: their clock can advance while that runtime sleeps.
+            probe_slots: Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)),
         };
         assert!(group.connect("example.invalid", 443).await.is_err());
         assert_eq!(a.load(Ordering::SeqCst), 1);
