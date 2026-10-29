@@ -51,6 +51,10 @@ The [Merlin compatibility notes](../docs/architecture/merlin-compatibility.md) d
 
 Requires Merlin **384+**, JFFS custom scripts, SSH.
 
+For contributors building ARM64 packages locally, use the
+[Merlin local build guide](../docs/merlin-local-build.md). It documents the
+compiler/linker separation and allocator checks required before packaging.
+
 ## Install
 
 ```sh

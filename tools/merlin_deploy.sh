@@ -4,6 +4,7 @@
 # binary. After restart, poll until SSH returns and verify the service.
 #
 # Usage (from repo root):
+#   bash tools/build-merlin-musl.sh  # verified ARM64 build; docs/merlin-local-build.md
 #   . .local/router.env   # ROUTER_HOST/PORT/USER/PASS
 #   ./tools/merlin_deploy.sh
 #

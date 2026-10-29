@@ -157,6 +157,11 @@ Prefer a package from [GitHub Releases](https://github.com/sockrockets/sockrocke
 (`sockrocket-merlin-<platform>.tar.gz`). To replace only the binary on an
 already-installed router:
 
+For a locally built ARM64 binary, first follow the
+[local build and allocator verification guide](./merlin-local-build.md).
+`bash tools/build-merlin-musl.sh` produces the binary and matching symbols;
+packaging or uploading an existing binary does not validate its allocator.
+
 Preferred path (uploads binary + WebUI, including Softcenter
 `Module_sockrocket.asp`, then restarts safely):
 
