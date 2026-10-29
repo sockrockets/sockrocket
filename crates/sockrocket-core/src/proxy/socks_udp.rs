@@ -14,7 +14,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     net::{TcpStream, UdpSocket},
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::Instant,
 };
@@ -22,6 +22,9 @@ struct Flow {
     remote: Arc<dyn Datagram>,
     activity: Arc<Mutex<Instant>>,
     task: JoinHandle<()>,
+    // The worker may outlive an aborted/dropped Flow until cancellation is
+    // polled. Both owners keep the quota charged until all resources drop.
+    _permit: Arc<OwnedSemaphorePermit>,
 }
 impl Drop for Flow {
     fn drop(&mut self) {
@@ -98,10 +101,19 @@ pub(super) async fn serve(
         let mut client = (requested_port != 0).then(|| SocketAddr::new(peer.ip(), requested_port));
         let mut flows: HashMap<(String, u16), Flow> = HashMap::new();
         let mut packet = vec![0; 65535];
+        let mut cleanup = tokio::time::interval(Duration::from_secs(1));
+        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let idle = tokio::time::sleep(Duration::from_secs(120));
+        tokio::pin!(idle);
         loop {
-            let (n, source) =
-                tokio::time::timeout(Duration::from_secs(120), socket.recv_from(&mut packet))
-                    .await??;
+            let (n, source) = tokio::select! {
+                _ = &mut idle => return Ok(()),
+                _ = cleanup.tick() => {
+                    flows.retain(|_, flow| !flow.task.is_finished());
+                    continue;
+                }
+                result = socket.recv_from(&mut packet) => result?,
+            };
             if source.ip() != peer.ip() || client.is_some_and(|client| client != source) {
                 continue;
             }
@@ -109,6 +121,8 @@ pub(super) async fn serve(
                 continue;
             };
             client = Some(source);
+            idle.as_mut()
+                .reset(Instant::now() + Duration::from_secs(120));
             let key = (host.clone(), port);
             flows.retain(|_, flow| !flow.task.is_finished());
             if !flows.contains_key(&key) {
@@ -135,6 +149,8 @@ pub(super) async fn serve(
                 else {
                     continue;
                 };
+                let permit = Arc::new(permit);
+                let worker_permit = permit.clone();
                 let remote: Arc<dyn Datagram> = Arc::from(remote);
                 let activity = Arc::new(Mutex::new(Instant::now()));
                 let (read, active, socket, stats) = (
@@ -146,7 +162,7 @@ pub(super) async fn serve(
                 let traffic = crate::traffic::current_traffic_target();
                 let header = packet[..offset].to_vec();
                 let task = tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = worker_permit;
                     let mut body = vec![0; 65535];
                     loop {
                         tokio::select! {
@@ -169,6 +185,7 @@ pub(super) async fn serve(
                         remote,
                         activity,
                         task,
+                        _permit: permit,
                     },
                 );
             }

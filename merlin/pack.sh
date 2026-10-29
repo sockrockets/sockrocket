@@ -11,6 +11,9 @@
 #   ipq64    -> Qualcomm IPQ53xx 64-bit;               binary: aarch64 musl
 #
 # Usage:
+#   For local ARM64 builds, first run bash tools/build-merlin-musl.sh.
+#   See docs/merlin-local-build.md for allocator checks. This script copies
+#   binaries as supplied; it does not verify or change their allocator.
 #   ./merlin/pack.sh
 #     Expects release binaries already built at:
 #       target/aarch64-unknown-linux-musl/release/sockrocket-cli

@@ -47,7 +47,7 @@
 - `sh tests/integration/merlin_stability_test.sh`：**15 个场景通过**。覆盖 启动 TUN/路由失败阻止 DNS 接管、DNS NAT 规则失败清理及上游回滚、DNS 重启失败回滚、重复清理、监听消失恢复上游、缺 TUN/路由失败保持直连、内存恢复阈值、旧内核内存计算、日志写入描述符、降级启动、命令返回码、防火墙事件和策略规则幂等。
 - DNS 负载测试使用本地不回应的上游，验证超额请求及时失败、关闭取消在途任务和端口释放；API 使用六个未完成请求验证第七个连接不排队，释放配额后可以继续服务。
 - Shell 语法与 `git diff --check` 通过。故障注入检查已加入 Linux CI。
-- ARM64 musl release 构建完成，产物为静态链接 ELF。构建使用仓库 Zig 包装，并为顶层二进制设置 `-C link-self-contained=no`，避免 Rust/Zig 重复提供 CRT。
+- ARM64 release 构建当时使用仓库 Zig 包装，并为顶层二进制设置 `-C link-self-contained=no`。**此方式是历史记录，不再作为构建建议**：2026-10-29 已核实 Zig 0.16 最终链接会引入 SmpAllocator 小块 slab 保留机制；静态 ELF 和 musl 目标名称不足以证明分配器归属。后续统一按[本地构建指南](./merlin-local-build.md)使用 Rust 自带 musl，并核验产物符号。
 - **未做**真机启用/重启、故障注入、长时间高负载、WAN 切换、IPv6 或各机型固件矩阵验证。
 
 ## 尚未修复的独立问题（不计入已完成项）

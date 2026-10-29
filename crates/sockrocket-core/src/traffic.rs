@@ -963,10 +963,11 @@ pub fn current_traffic_target() -> Option<TrafficTarget> {
         .flatten()
 }
 
-pub async fn with_traffic_scope<F: std::future::Future>(future: F) -> F::Output {
-    TRAFFIC_SLOT
-        .scope(std::sync::Arc::new(std::sync::Mutex::new(None)), future)
-        .await
+// Avoid another async frame around the already scoped future.
+pub fn with_traffic_scope<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    TRAFFIC_SLOT.scope(std::sync::Arc::new(std::sync::Mutex::new(None)), future)
 }
 
 #[cfg(test)]

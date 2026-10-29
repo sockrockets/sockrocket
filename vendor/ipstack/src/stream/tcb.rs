@@ -135,7 +135,14 @@ impl Tcb {
         ip_header_size: usize,
         tcp_header_size: usize,
     ) -> usize {
-        let send_window = self.get_send_window() as usize;
+        // The advertised window includes data already in flight. Only its
+        // remaining suffix is available to a new write, also bounded by the
+        // live per-flow allowance when concurrency reduces that allowance.
+        let outstanding = self.seq.distance(self.get_last_received_ack()) as usize;
+        let send_window = self
+            .buffer_limit()
+            .min(self.get_send_window() as usize)
+            .saturating_sub(outstanding);
         let mtu = self.get_mtu() as usize;
         std::cmp::min(
             send_window,
@@ -423,6 +430,11 @@ impl Tcb {
     }
 
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
+        // Defend the queue independently of packet classification: an ACK
+        // cannot release credit for bytes that have never been transmitted.
+        if ack > self.seq || ack < self.last_received_ack {
+            return;
+        }
         let before = self.get_inflight_packets_total_len();
         match self.inflight_packets.first_key_value() {
             None => return,
@@ -577,6 +589,28 @@ mod tests {
             Arc::new(AtomicU32::new(8192)),
             pool,
         )
+    }
+
+    #[test]
+    fn send_credit_and_ack_validation_survive_sequence_wrap() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut tcb = flow(pool.clone());
+        let first = SeqNum(u32::MAX - 2);
+        tcb.seq = first;
+        tcb.last_received_ack = first;
+        tcb.update_send_window(6);
+        tcb.add_inflight_packet(vec![1; 4]).unwrap();
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), 2);
+        tcb.update_inflight_packet_queue(tcb.seq + 500);
+        assert_eq!(pool.usage().0, 4);
+        tcb.update_inflight_packet_queue(first + 2);
+        tcb.update_last_received_ack(first + 2);
+        assert_eq!(pool.usage().0, 2);
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), 4);
+        tcb.update_inflight_packet_queue(first + 1);
+        assert_eq!(pool.usage().0, 2);
+        drop(tcb);
+        assert_eq!(pool.usage().0, 0);
     }
 
     #[test]

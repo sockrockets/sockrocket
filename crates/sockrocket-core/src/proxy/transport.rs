@@ -349,11 +349,74 @@ fn mark_server_needs_classic_reality(server: &str, port: u16) {
 /// hybrid handshake itself or wait for another connection's probe.
 enum RealityProbe {
     /// No probe is running for this server: proceed with the hybrid handshake.
-    /// The returned `Arc<Notify>` must be passed to [`finish_reality_probe`]
-    /// once the outcome (classic needed or not) is known.
-    Leader(Arc<tokio::sync::Notify>),
+    /// Owns the table entry until completion or future cancellation.
+    Leader(RealityProbeGuard),
     /// Another connection is already probing this server.
     Follower(Arc<tokio::sync::Notify>),
+}
+
+struct RealityProbeGuard {
+    server: String,
+    port: u16,
+    notify: Option<Arc<tokio::sync::Notify>>,
+}
+impl RealityProbeGuard {
+    fn new(server: &str, port: u16, notify: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            server: server.to_owned(),
+            port,
+            notify: Some(notify),
+        }
+    }
+    fn finish(mut self, classic: bool) {
+        if let Some(notify) = self.notify.take() {
+            finish_reality_probe(&self.server, self.port, notify, classic);
+        }
+    }
+}
+impl Drop for RealityProbeGuard {
+    fn drop(&mut self) {
+        if let Some(notify) = self.notify.take() {
+            finish_reality_probe(&self.server, self.port, notify, false);
+        }
+    }
+}
+
+// Register the notification before checking the map: completion between
+// becoming a follower and polling notified() must not cause a two-second wait.
+async fn wait_for_reality_probe(server: &str, port: u16, notify: &Arc<tokio::sync::Notify>) {
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let key = format!("{server}:{port}");
+    let running = reality_probe_inflight().lock().is_ok_and(|map| {
+        map.get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, notify))
+    });
+    if running {
+        let _ = tokio::time::timeout(Duration::from_secs(2), notified).await;
+    }
+}
+
+async fn prepare_reality_probe(server: &str, port: u16) -> Option<RealityProbeGuard> {
+    if server_needs_classic_reality(server, port) {
+        return None;
+    }
+    match begin_reality_probe(server, port) {
+        RealityProbe::Leader(guard) => Some(guard),
+        RealityProbe::Follower(notify) => {
+            wait_for_reality_probe(server, port, &notify).await;
+            if server_needs_classic_reality(server, port) {
+                return None;
+            }
+            // A timed-out follower can proceed, but cannot remove another
+            // leader's entry. If the prior leader finished, own the new entry.
+            match begin_reality_probe(server, port) {
+                RealityProbe::Leader(guard) => Some(guard),
+                RealityProbe::Follower(_) => None,
+            }
+        }
+    }
 }
 
 /// Register interest in probing `server:port`. The first caller becomes the
@@ -365,7 +428,11 @@ fn begin_reality_probe(server: &str, port: u16) -> RealityProbe {
         Err(_) => {
             // Lock poisoned: fall back to every-connection-probes behaviour
             // rather than panicking in the hot path.
-            return RealityProbe::Leader(Arc::new(tokio::sync::Notify::new()));
+            return RealityProbe::Leader(RealityProbeGuard::new(
+                server,
+                port,
+                Arc::new(tokio::sync::Notify::new()),
+            ));
         }
     };
     match map.entry(key) {
@@ -373,7 +440,7 @@ fn begin_reality_probe(server: &str, port: u16) -> RealityProbe {
         std::collections::hash_map::Entry::Vacant(e) => {
             let notify = Arc::new(tokio::sync::Notify::new());
             e.insert(notify.clone());
-            RealityProbe::Leader(notify)
+            RealityProbe::Leader(RealityProbeGuard::new(server, port, notify))
         }
     }
 }
@@ -1159,17 +1226,13 @@ impl ConnFactory for TlsConnFactory {
             }
             let can_retry_classic = self.reality_classic_connector.is_some();
 
-            // Wait briefly for an in-flight probe on this server so a burst of
-            // concurrent latency checks share one hybrid→classic discovery.
-            // Cap the wait low: callers (GUI/Merlin http_latency_test) often wrap
-            // connect() in a 5–10s timeout — a 20s wait here made every follower
-            // look like a hard timeout ("most nodes unreachable") during Test-all.
-            if can_retry_classic
-                && !server_needs_classic_reality(&self.server, self.port)
-                && let RealityProbe::Follower(notify) = begin_reality_probe(&self.server, self.port)
-            {
-                let _ = tokio::time::timeout(Duration::from_secs(2), notify.notified()).await;
-            }
+            // Own the first registration, and clean it even if an outer
+            // connect deadline or a winning group race cancels this future.
+            let mut probe_guard = if can_retry_classic {
+                prepare_reality_probe(&self.server, self.port).await
+            } else {
+                None
+            };
 
             // If this server already proved it needs the classic key share, skip
             // the handshake that is known to fail and go straight to it.
@@ -1181,21 +1244,6 @@ impl ConnFactory for TlsConnFactory {
                     .expect("checked above")
             } else {
                 self.reality_connector.as_ref().unwrap_or(&self.connector)
-            };
-            // Register as the leader when we are about to run the probe
-            // ourselves (hybrid, server not yet classified). `probe_notify`
-            // stays `Some` until the outcome is recorded, so every exit path
-            // out of this scope wakes the followers exactly once.
-            let mut probe_notify = if can_retry_classic && !prefer_classic {
-                match begin_reality_probe(&self.server, self.port) {
-                    RealityProbe::Leader(n) => Some(n),
-                    // Lost the race with a just-finished probe's wake-up:
-                    // proceed without registering; the cache check above has
-                    // already seen the latest outcome.
-                    RealityProbe::Follower(_) => None,
-                }
-            } else {
-                None
             };
             let stream = connect_with_connector(
                 &self.server,
@@ -1217,8 +1265,8 @@ impl ConnFactory for TlsConnFactory {
                     // remember it so the next connection to this server skips
                     // the doomed first attempt entirely.
                     tracing::info!("REALITY fallback detected, retrying with classic X25519 share");
-                    if let Some(n) = probe_notify.take() {
-                        finish_reality_probe(&self.server, self.port, n, true);
+                    if let Some(guard) = probe_guard.take() {
+                        guard.finish(true);
                     } else {
                         mark_server_needs_classic_reality(&self.server, self.port);
                     }
@@ -1244,16 +1292,16 @@ impl ConnFactory for TlsConnFactory {
                     // The hybrid attempt failed for a non-fallback reason
                     // (timeout, refused, …). Wake followers with no cache
                     // entry so they run their own probe instead of hanging.
-                    if let Some(n) = probe_notify.take() {
-                        finish_reality_probe(&self.server, self.port, n, false);
+                    if let Some(guard) = probe_guard.take() {
+                        guard.finish(false);
                     }
                     return Err(e);
                 }
             };
             // The hybrid handshake got past the REALITY check: this server is
             // fine with the default share, so no classic entry is recorded.
-            if let Some(n) = probe_notify.take() {
-                finish_reality_probe(&self.server, self.port, n, false);
+            if let Some(guard) = probe_guard.take() {
+                guard.finish(false);
             }
             if let Some(ws) = &self.ws {
                 super::ws::connect_ws_timeout(stream, &self.server, ws, Duration::from_secs(15))
@@ -1268,6 +1316,63 @@ impl ConnFactory for TlsConnFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reality_probe_entries_are_reclaimed_after_completion() {
+        for i in 0..256 {
+            let host = format!("probe-complete-{i}.invalid");
+            let guard = prepare_reality_probe(&host, 443)
+                .await
+                .expect("first caller must own cleanup");
+            guard.finish(false);
+            assert!(
+                !reality_probe_inflight()
+                    .lock()
+                    .unwrap()
+                    .contains_key(&format!("{host}:443"))
+            );
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reality_probe_cancellation_removes_entry_and_wakes_followers() {
+        let host = "probe-cancel.invalid";
+        let guard = prepare_reality_probe(host, 443).await.unwrap();
+        let RealityProbe::Follower(notify) = begin_reality_probe(host, 443) else {
+            panic!("follower");
+        };
+        let leader = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let follower = tokio::spawn(async move {
+            wait_for_reality_probe(host, 443, &notify).await;
+        });
+        tokio::task::yield_now().await;
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(1), follower)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !reality_probe_inflight()
+                .lock()
+                .unwrap()
+                .contains_key("probe-cancel.invalid:443")
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reality_probe_completion_before_wait_does_not_lose_notification() {
+        let host = "probe-finished-before-wait.invalid";
+        let guard = prepare_reality_probe(host, 443).await.unwrap();
+        let RealityProbe::Follower(notify) = begin_reality_probe(host, 443) else {
+            panic!("follower");
+        };
+        guard.finish(false);
+        let start = tokio::time::Instant::now();
+        wait_for_reality_probe(host, 443, &notify).await;
+        assert!(start.elapsed().is_zero());
+    }
 
     #[tokio::test]
     async fn tune_socket_does_not_shrink_the_receive_window() {

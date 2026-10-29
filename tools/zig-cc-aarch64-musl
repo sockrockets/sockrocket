@@ -1,5 +1,15 @@
 #!/bin/bash
-# Thin linker wrapper for aarch64-linux-musl: strip rustc flags zig rejects.
+# C dependency compiler wrapper; not a final linker for Rust executables.
+# Zig 0.16 final linking can select its SmpAllocator-backed malloc/free.
+# Use bash tools/build-merlin-musl.sh; see docs/merlin-local-build.md.
+for arg in "$@"; do
+  case "$arg" in
+    *.rlib)
+      echo 'Refusing Zig final linking of Rust libraries. Use bash tools/build-merlin-musl.sh (docs/merlin-local-build.md).' >&2
+      exit 2
+      ;;
+  esac
+done
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
