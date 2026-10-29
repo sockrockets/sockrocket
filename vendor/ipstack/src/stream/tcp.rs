@@ -8,8 +8,8 @@ use crate::{
         tcp_header_flags, tcp_header_fmt,
     },
     stream::tcb::{
-        into_tail, MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType,
-        READ_BUFFER_SIZE, RTO, Tcb, TcpState, window_scale_shift,
+        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO,
+        Tcb, TcpState, into_tail, window_scale_shift,
     },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
@@ -1033,6 +1033,25 @@ async fn tcp_main_logic_loop(
         if state == TcpState::SynReceived && (flags & ACK == 0 || incoming_ack != tcb.get_seq()) {
             // Only an ACK of our SYN can complete the handshake. A stale
             // ACK must not turn an abandoned SYN into a long-lived flow.
+            continue;
+        }
+
+        // Validate before touching retransmission data, duplicate-ACK state
+        // or the peer window. A synchronized TCP segment needs an ACK; one
+        // beyond SND.NXT must receive our current ACK and otherwise be ignored.
+        if flags & ACK == 0 {
+            continue;
+        }
+        if incoming_ack > tcb.get_seq() {
+            let _ = write_packet_to_device(
+                &up_packet_sender,
+                network_tuple,
+                &tcb,
+                None,
+                ACK,
+                None,
+                None,
+            );
             continue;
         }
 
