@@ -63,45 +63,54 @@ async fn socks_responses(
     let requests = Arc::new(AtomicUsize::new(0));
     let count = requests.clone();
     let task = tokio::spawn(async move {
+        let mut handlers = tokio::task::JoinSet::new();
         loop {
-            let (mut client, _) = server.accept().await.unwrap();
-            let mut hello = [0; 2];
-            if client.read_exact(&mut hello).await.is_err() {
-                continue;
-            } // Availability probe.
-            assert_eq!(hello[0], 5);
-            let mut methods = vec![0; hello[1] as usize];
-            client.read_exact(&mut methods).await.unwrap();
-            client.write_all(&[5, 0]).await.unwrap();
-            let mut header = [0; 4];
-            client.read_exact(&mut header).await.unwrap();
-            let len = match header[3] {
-                1 => 4,
-                3 => client.read_u8().await.unwrap() as usize,
-                4 => 16,
-                _ => panic!("SOCKS address"),
-            };
-            client.read_exact(&mut vec![0; len + 2]).await.unwrap();
-            client
-                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
-                .await
-                .unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                request.push(client.read_u8().await.unwrap());
-                assert!(request.len() < 8192);
-            }
-            let index = count.fetch_add(1, Ordering::SeqCst);
-            let (status, body) = responses[index.min(responses.len() - 1)];
-            tokio::time::sleep(delay).await;
-            let response = format!(
-                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = client.write_all(response.as_bytes()).await;
+            let (client, _) = server.accept().await.unwrap();
+            let count = count.clone();
+            let responses = responses.clone();
+            handlers.spawn(async move {
+                let _ = serve_socks_response(client, count, responses, delay).await;
+            });
         }
     });
     (addr, requests, task)
+}
+
+async fn serve_socks_response(
+    mut client: tokio::net::TcpStream,
+    count: Arc<AtomicUsize>,
+    responses: Vec<(u16, &'static str)>,
+    delay: Duration,
+) -> std::io::Result<()> {
+    let mut hello = [0; 2];
+    client.read_exact(&mut hello).await?;
+    assert_eq!(hello[0], 5);
+    let mut methods = vec![0; hello[1] as usize];
+    client.read_exact(&mut methods).await?;
+    client.write_all(&[5, 0]).await?;
+    let mut header = [0; 4];
+    client.read_exact(&mut header).await?;
+    let len = match header[3] {
+        1 => 4,
+        3 => client.read_u8().await? as usize,
+        4 => 16,
+        _ => panic!("SOCKS address"),
+    };
+    client.read_exact(&mut vec![0; len + 2]).await?;
+    client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).await?;
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(client.read_u8().await?);
+        assert!(request.len() < 8192);
+    }
+    let index = count.fetch_add(1, Ordering::SeqCst);
+    let (status, body) = responses[index.min(responses.len() - 1)];
+    tokio::time::sleep(delay).await;
+    let response = format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client.write_all(response.as_bytes()).await
 }
 
 #[tokio::test]
@@ -136,7 +145,7 @@ async fn slow_direct_path_does_not_delay_a_healthy_local_proxy() {
     .expect("a working proxy waited for the slow direct path")
     .unwrap();
     assert_eq!(nodes.len(), 1);
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!((1..=3).contains(&requests.load(Ordering::SeqCst)));
     eprintln!(
         "slow-direct healthy-proxy elapsed_ms={}",
         started.elapsed().as_millis()
@@ -156,7 +165,7 @@ async fn a_fast_valid_route_wins_without_waiting_for_the_other_route() {
             .len(),
         1
     );
-    assert!(requests.load(Ordering::SeqCst) <= 1);
+    assert!(requests.load(Ordering::SeqCst) <= 3);
     direct.abort();
     proxy_task.abort();
 }
@@ -169,7 +178,7 @@ async fn direct_http_errors_allow_a_successful_proxy_download() {
         .await
         .unwrap();
     assert_eq!(nodes.len(), 1);
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!((1..=3).contains(&requests.load(Ordering::SeqCst)));
     direct.await.unwrap();
     proxy_task.abort();
 }
@@ -185,7 +194,7 @@ async fn proxy_failure_does_not_abort_a_direct_download_that_can_finish() {
             .len(),
         1
     );
-    assert!((1..=4).contains(&requests.load(Ordering::SeqCst)));
+    assert!((1..=12).contains(&requests.load(Ordering::SeqCst)));
     direct.await.unwrap();
     proxy_task.abort();
 }
@@ -233,8 +242,8 @@ async fn a_direct_http_200_block_page_does_not_beat_a_valid_proxy_subscription()
         .await
         .unwrap();
     assert_eq!(nodes.len(), 1);
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!((1..=3).contains(&count.load(Ordering::SeqCst)));
+    assert!((1..=3).contains(&requests.load(Ordering::SeqCst)));
     direct.abort();
     proxy_task.abort();
 }
@@ -242,10 +251,10 @@ async fn a_direct_http_200_block_page_does_not_beat_a_valid_proxy_subscription()
 #[tokio::test]
 async fn a_direct_subscription_can_succeed_on_the_third_retry() {
     let (url, requests, direct) =
-        http_responses(vec![(503, ""), (503, ""), (503, ""), (200, BODY)]).await;
+        http_responses([vec![(503, ""); 9], vec![(200, BODY)]].concat()).await;
     let nodes = fetch_subscription_with(&sub(url), None).await.unwrap();
     assert_eq!(nodes.len(), 1);
-    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    assert!((10..=12).contains(&requests.load(Ordering::SeqCst)));
     direct.abort();
 }
 
@@ -253,7 +262,7 @@ async fn a_direct_subscription_can_succeed_on_the_third_retry() {
 async fn a_proxy_subscription_can_succeed_on_the_third_retry_while_direct_fails() {
     let (url, direct_requests, direct) = http_responses(vec![(403, "")]).await;
     let (proxy, requests, proxy_task) = socks_responses(
-        vec![(503, ""), (503, ""), (503, ""), (200, BODY)],
+        [vec![(503, ""); 9], vec![(200, BODY)]].concat(),
         Duration::from_millis(20),
     )
     .await;
@@ -261,8 +270,8 @@ async fn a_proxy_subscription_can_succeed_on_the_third_retry_while_direct_fails(
         .await
         .unwrap();
     assert_eq!(nodes.len(), 1);
-    assert_eq!(requests.load(Ordering::SeqCst), 4);
-    assert!((1..=4).contains(&direct_requests.load(Ordering::SeqCst)));
+    assert!((10..=12).contains(&requests.load(Ordering::SeqCst)));
+    assert!((1..=12).contains(&direct_requests.load(Ordering::SeqCst)));
     direct.abort();
     proxy_task.abort();
 }
@@ -276,8 +285,99 @@ async fn both_http_routes_stop_after_three_retries_and_keep_errors_private() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("403"));
     assert!(!format!("{error:#}").contains("private-fixture-token"));
-    assert_eq!(direct_requests.load(Ordering::SeqCst), 4);
-    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    assert_eq!(direct_requests.load(Ordering::SeqCst), 12);
+    assert_eq!(requests.load(Ordering::SeqCst), 12);
     direct.abort();
     proxy_task.abort();
+}
+
+#[tokio::test]
+async fn three_direct_and_three_proxy_requests_are_live_and_losers_are_cancelled() {
+    async fn route(
+        is_proxy: bool,
+        ready: Arc<tokio::sync::Barrier>,
+        closed: Arc<AtomicUsize>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let task = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            for _ in 0..3 {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let ready = ready.clone();
+                let count = count.clone();
+                let closed = closed.clone();
+                handlers.spawn(async move {
+                    if is_proxy {
+                        let mut hello = [0; 2];
+                        client.read_exact(&mut hello).await?;
+                        let mut methods = vec![0; hello[1] as usize];
+                        client.read_exact(&mut methods).await?;
+                        client.write_all(&[5, 0]).await?;
+                        let mut header = [0; 4];
+                        client.read_exact(&mut header).await?;
+                        let len = match header[3] {
+                            1 => 4,
+                            3 => client.read_u8().await? as usize,
+                            4 => 16,
+                            _ => panic!("SOCKS address"),
+                        };
+                        client.read_exact(&mut vec![0; len + 2]).await?;
+                        client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).await?;
+                    }
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(client.read_u8().await?);
+                        assert!(request.len() < 8192);
+                    }
+                    let index = count.fetch_add(1, Ordering::SeqCst);
+                    // No response can succeed until all six requests exist.
+                    ready.wait().await;
+                    if is_proxy && index == 0 {
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}", BODY.len());
+                        client.write_all(response.as_bytes()).await?;
+                    } else {
+                        let result = tokio::time::timeout(Duration::from_secs(2), client.read(&mut [0])).await.expect("losing HTTP request did not close");
+                        assert!(matches!(result, Ok(0) | Err(_)));
+                        closed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok::<(), std::io::Error>(())
+                });
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.unwrap().unwrap();
+            }
+        });
+        (addr, requests, task)
+    }
+    let ready = Arc::new(tokio::sync::Barrier::new(6));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let (origin, direct_count, direct) = route(false, ready.clone(), closed.clone()).await;
+    let (proxy, proxy_count, proxy_task) = route(true, ready, closed.clone()).await;
+    let nodes = tokio::time::timeout(
+        Duration::from_secs(5),
+        fetch_subscription_with(
+            &sub(format!("http://{origin}/private-fixture-token")),
+            Some(proxy),
+        ),
+    )
+    .await
+    .expect("six requests were not launched concurrently")
+    .unwrap();
+    assert_eq!(nodes.len(), 1);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        direct.await.unwrap();
+        proxy_task.await.unwrap();
+    })
+    .await
+    .expect("losing request handlers remained alive");
+    assert_eq!(direct_count.load(Ordering::SeqCst), 3);
+    assert_eq!(proxy_count.load(Ordering::SeqCst), 3);
+    assert_eq!(closed.load(Ordering::SeqCst), 5);
 }

@@ -123,7 +123,8 @@ pub async fn fetch_subscription_report_with(
 const DIRECT_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const PROXY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// Four attempts per route: the initial request and up to three retries.
+const SUB_FETCH_CONCURRENCY_PER_ROUTE: usize = 3;
+// Four attempts per worker: the initial request and up to three retries.
 const SUB_FETCH_RETRIES: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -140,7 +141,7 @@ struct BodyError {
     error: anyhow::Error,
 }
 
-/// Run at most two routes concurrently, each with bounded retries.
+/// Run three workers per route (at most six), each with bounded retries.
 ///
 /// A route succeeds only after parsing usable nodes, so a fast HTTP 200
 /// block page cannot beat a valid subscription from the other route.
@@ -154,7 +155,7 @@ async fn download_subscription(
             kind: BodyErrorKind::Permanent,
             error,
         })?;
-        let direct = retry_subscription_route(|| fetch_valid_subscription(&direct, sub));
+        let direct = fetch_subscription_route(&direct, sub);
         let Some(socks) = socks else {
             return direct.await;
         };
@@ -163,12 +164,58 @@ async fn download_subscription(
                 kind: BodyErrorKind::Permanent,
                 error,
             })?;
-            retry_subscription_route(|| fetch_valid_subscription(&proxy, sub)).await
+            fetch_subscription_route(&proxy, sub).await
         };
         first_successful_route(direct, proxy).await
     })
     .await
     .map_err(|error| error.error)
+}
+
+async fn fetch_subscription_route(
+    client: &reqwest::Client,
+    sub: &Subscription,
+) -> Result<(String, Vec<Node>), BodyError> {
+    let workers =
+        std::array::from_fn(|_| retry_subscription_route(|| fetch_valid_subscription(client, sub)));
+    first_successful_workers(workers).await
+}
+
+async fn first_successful_workers<T, F>(
+    workers: [F; SUB_FETCH_CONCURRENCY_PER_ROUTE],
+) -> Result<T, BodyError>
+where
+    F: Future<Output = Result<T, BodyError>>,
+{
+    // Own the futures rather than spawning detached tasks: success or the
+    // shared deadline immediately drops every losing request/retry timer.
+    let mut workers = workers.map(|worker| Some(Box::pin(worker)));
+    let mut failure = None;
+    std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        for worker in &mut workers {
+            let Some(pending) = worker.as_mut() else {
+                continue;
+            };
+            match pending.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => return Poll::Ready(Ok(value)),
+                Poll::Ready(Err(error)) => {
+                    *worker = None;
+                    failure = Some(match failure.take() {
+                        Some(previous) => preferred_route_error(previous, error),
+                        None => error,
+                    });
+                }
+                Poll::Pending => {}
+            }
+        }
+        if workers.iter().all(Option::is_none) {
+            Poll::Ready(Err(failure.take().expect("three workers returned errors")))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 async fn fetch_before_deadline<T>(
@@ -836,17 +883,65 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn three_workers_start_together_and_any_one_can_cancel_the_others() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for winner in 0..3 {
+            let started = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let workers = std::array::from_fn(|index| {
+                let started = started.clone();
+                let guard = Dropped(dropped.clone());
+                async move {
+                    let _guard = guard;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if index == winner {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        Ok(index)
+                    } else {
+                        std::future::pending::<Result<usize, BodyError>>().await
+                    }
+                }
+            });
+            assert_eq!(first_successful_workers(workers).await.unwrap(), winner);
+            assert_eq!(started.load(Ordering::SeqCst), 3);
+            assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_failed_workers_have_a_total_budget_of_twelve_attempts() {
+        let attempts = std::cell::Cell::new(0);
+        let workers = std::array::from_fn(|_| {
+            retry_subscription_route(|| {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err::<(), _>(route_error(BodyErrorKind::Http, "HTTP 503")))
+            })
+        });
+        let error = first_successful_workers(workers).await.unwrap_err();
+        assert_eq!(error.kind, BodyErrorKind::Http);
+        assert_eq!(attempts.get(), 12);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn concurrent_retries_share_one_total_deadline() {
         let started = tokio::time::Instant::now();
         let attempts = std::cell::Cell::new(0);
         let route = || {
-            retry_subscription_route(|| {
-                attempts.set(attempts.get() + 1);
-                async {
-                    tokio::time::sleep(Duration::from_secs(12)).await;
-                    Err::<(), _>(route_error(BodyErrorKind::Transport, "timeout"))
-                }
-            })
+            first_successful_workers(std::array::from_fn(|_| {
+                retry_subscription_route(|| {
+                    attempts.set(attempts.get() + 1);
+                    async {
+                        tokio::time::sleep(Duration::from_secs(12)).await;
+                        Err::<(), _>(route_error(BodyErrorKind::Transport, "timeout"))
+                    }
+                })
+            }))
         };
         let error = fetch_before_deadline(first_successful_route(route(), route()))
             .await
