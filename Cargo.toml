@@ -8,7 +8,7 @@ exclude = ["vendor/ipstack", "vendor/tokio-wireguard"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.12"
+version = "0.0.13"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Sockrocket"]
