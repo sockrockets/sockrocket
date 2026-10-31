@@ -142,6 +142,10 @@ The format hint `v2ray` (Merlin / config) means this URI/base64 list. Use `v2ray
 3. Base64 with `://` → line URIs  
 4. Otherwise try plain URI lines  
 
+### Download retries
+
+Subscription downloads try the direct route and, when available, the application's local SOCKS proxy concurrently. The first response that parses into usable nodes wins; remaining requests and retry timers are cancelled. Each route allows one initial request plus up to three retries for HTTP or transport failures, with 200/400/800 ms backoff. All attempts share a 30-second deadline, so a slow request may exhaust the deadline before all retries run. Each decoded response remains limited to 8 MiB. Invalid content is not repeatedly downloaded, but it does not prevent the other route from succeeding. Desktop import and refresh use the running application's SOCKS listener; without a running proxy, only the direct route is tried.
+
 ---
 
 ## Default config paths
