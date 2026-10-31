@@ -49,8 +49,8 @@ pub async fn fetch_subscription(sub: &Subscription) -> Result<Vec<Node>> {
     fetch_subscription_with(sub, None).await
 }
 
-/// Same as [`fetch_subscription`], with a local SOCKS fallback when direct
-/// download fails. `socks` is `127.0.0.1:<socks_port>` while the daemon is up.
+/// Race direct and local SOCKS downloads when a proxy is available.
+/// `socks` is `127.0.0.1:<socks_port>` while the daemon is up.
 pub async fn fetch_subscription_with(
     sub: &Subscription,
     socks: Option<SocketAddr>,
@@ -76,19 +76,14 @@ pub async fn fetch_subscription_report_with(
 ) -> Result<SubscriptionFetchReport> {
     validate_subscription_url(&sub.url)?;
     let download_started = tokio::time::Instant::now();
-    let content = download_subscription(&sub.url, socks).await?;
+    let (content, mut nodes) = download_subscription(sub, socks).await?;
     tracing::info!(
         elapsed_ms = download_started.elapsed().as_millis() as u64,
         decoded_bytes = content.len(),
-        "Subscription download completed"
+        "Subscription download and validation completed"
     );
 
-    let parse_started = tokio::time::Instant::now();
-    let mut nodes = parse_subscription_content(&content, &sub.format)?;
-    anyhow::ensure!(
-        !nodes.is_empty(),
-        "Subscription contains no usable nodes; existing nodes were kept"
-    );
+    let report_started = tokio::time::Instant::now();
     // The URL has to travel with the nodes: a later refresh replaces this
     // source, and a restart has to know which subscription they belong to.
     super::dedup::tag_subscription_nodes(&mut nodes, &sub.url);
@@ -113,10 +108,10 @@ pub async fn fetch_subscription_report_with(
     compatibility_notes.sort_unstable();
     compatibility_notes.dedup();
     tracing::info!(
-        elapsed_ms = parse_started.elapsed().as_millis() as u64,
+        elapsed_ms = report_started.elapsed().as_millis() as u64,
         node_count = nodes.len(),
         skipped_entries,
-        "Subscription parsing completed"
+        "Subscription import diagnostics completed"
     );
     Ok(SubscriptionFetchReport {
         nodes,
@@ -128,76 +123,184 @@ pub async fn fetch_subscription_report_with(
 const DIRECT_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const PROXY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const PROXY_HEDGE_DELAY: Duration = Duration::from_millis(500);
+const SUB_FETCH_CONCURRENCY_PER_ROUTE: usize = 3;
+// Four attempts per worker: the initial request and up to three retries.
+const SUB_FETCH_RETRIES: usize = 3;
+const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyErrorKind {
+    Transport,
+    Http,
+    Permanent,
+}
 
 #[derive(Debug)]
 struct BodyError {
-    transport: bool,
+    kind: BodyErrorKind,
     error: anyhow::Error,
 }
 
-/// Give direct downloads a head start, then try the local SOCKS port if slow.
+/// Run three workers per route (at most six), each with bounded retries.
 ///
-/// fancyss resolves the subscription host at 223.5.5.5 and fetches that
-/// address from the WAN. On Merlin the system resolver is this process, so
-/// a normal lookup returns a fake-IP and the download is sent through the
-/// current node. Domestic A records stay on the WAN. A connect failure
-/// retries through local SOCKS, which resolves the name on the far side.
-async fn download_subscription(url: &str, socks: Option<SocketAddr>) -> Result<String> {
-    let direct = subscription_client(None, socks.is_some())?;
-    let Some(socks) = socks else {
-        return fetch_body(&direct, url).await.map_err(|error| error.error);
-    };
-    hedged_subscription_fetch(fetch_body(&direct, url), || async {
-        if !socks_accepts(socks).await {
-            return None;
-        }
-        tracing::debug!("Trying local proxy for subscription download");
-        Some(match subscription_client(Some(socks), true) {
-            Ok(proxy) => fetch_body(&proxy, url).await,
-            Err(error) => Err(BodyError {
-                transport: false,
+/// A route succeeds only after parsing usable nodes, so a fast HTTP 200
+/// block page cannot beat a valid subscription from the other route.
+/// The losing future is dropped, cancelling its request and retry timer.
+async fn download_subscription(
+    sub: &Subscription,
+    socks: Option<SocketAddr>,
+) -> Result<(String, Vec<Node>)> {
+    fetch_before_deadline(async {
+        let direct = subscription_client(None, socks.is_some()).map_err(|error| BodyError {
+            kind: BodyErrorKind::Permanent,
+            error,
+        })?;
+        let direct = fetch_subscription_route(&direct, sub);
+        let Some(socks) = socks else {
+            return direct.await;
+        };
+        let proxy = async {
+            let proxy = subscription_client(Some(socks), true).map_err(|error| BodyError {
+                kind: BodyErrorKind::Permanent,
                 error,
-            }),
-        })
+            })?;
+            fetch_subscription_route(&proxy, sub).await
+        };
+        first_successful_route(direct, proxy).await
     })
     .await
     .map_err(|error| error.error)
 }
 
-async fn hedged_subscription_fetch<D, F, P>(direct: D, fallback: F) -> Result<String, BodyError>
+async fn fetch_subscription_route(
+    client: &reqwest::Client,
+    sub: &Subscription,
+) -> Result<(String, Vec<Node>), BodyError> {
+    let workers =
+        std::array::from_fn(|_| retry_subscription_route(|| fetch_valid_subscription(client, sub)));
+    first_successful_workers(workers).await
+}
+
+async fn first_successful_workers<T, F>(
+    workers: [F; SUB_FETCH_CONCURRENCY_PER_ROUTE],
+) -> Result<T, BodyError>
 where
-    D: Future<Output = Result<String, BodyError>>,
-    F: FnOnce() -> P,
-    P: Future<Output = Option<Result<String, BodyError>>>,
+    F: Future<Output = Result<T, BodyError>>,
 {
-    tokio::pin!(direct);
-    tokio::select! {
-        biased;
-        result = &mut direct => return match result {
-            Err(error) if error.transport => fallback().await.unwrap_or(Err(error)),
-            result => result,
-        },
-        _ = tokio::time::sleep(PROXY_HEDGE_DELAY) => {}
+    // Own the futures rather than spawning detached tasks: success or the
+    // shared deadline immediately drops every losing request/retry timer.
+    let mut workers = workers.map(|worker| Some(Box::pin(worker)));
+    let mut failure = None;
+    std::future::poll_fn(|cx| {
+        use std::task::Poll;
+        for worker in &mut workers {
+            let Some(pending) = worker.as_mut() else {
+                continue;
+            };
+            match pending.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => return Poll::Ready(Ok(value)),
+                Poll::Ready(Err(error)) => {
+                    *worker = None;
+                    failure = Some(match failure.take() {
+                        Some(previous) => preferred_route_error(previous, error),
+                        None => error,
+                    });
+                }
+                Poll::Pending => {}
+            }
+        }
+        if workers.iter().all(Option::is_none) {
+            Poll::Ready(Err(failure.take().expect("three workers returned errors")))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+async fn fetch_before_deadline<T>(
+    fetch: impl Future<Output = Result<T, BodyError>>,
+) -> Result<T, BodyError> {
+    tokio::time::timeout(Duration::from_secs(SUB_FETCH_TIMEOUT_SECS), fetch)
+        .await
+        .unwrap_or_else(|_| {
+            Err(BodyError {
+                kind: BodyErrorKind::Transport,
+                error: anyhow::anyhow!(
+                    "Subscription download timed out after {SUB_FETCH_TIMEOUT_SECS}s"
+                ),
+            })
+        })
+}
+
+async fn retry_subscription_route<T, F, A>(mut attempt: F) -> Result<T, BodyError>
+where
+    F: FnMut() -> A,
+    A: Future<Output = Result<T, BodyError>>,
+{
+    for retry in 0..=SUB_FETCH_RETRIES {
+        match attempt().await {
+            Err(error) if error.kind != BodyErrorKind::Permanent && retry < SUB_FETCH_RETRIES => {
+                tokio::time::sleep(RETRY_BACKOFF * (1 << retry)).await;
+            }
+            result => return result,
+        }
     }
-    let proxy = fallback();
-    tokio::pin!(proxy);
-    // Failures on one route must not cancel a usable download on the other.
-    // Dropping the losing future cancels its request and response buffering.
+    unreachable!("the final attempt always returns")
+}
+
+async fn first_successful_route<T, D, P>(direct: D, proxy: P) -> Result<T, BodyError>
+where
+    D: Future<Output = Result<T, BodyError>>,
+    P: Future<Output = Result<T, BodyError>>,
+{
+    tokio::pin!(direct, proxy);
     tokio::select! {
-        biased;
         result = &mut direct => match result {
-            Err(error) if error.transport => proxy.await.unwrap_or(Err(error)),
-            result => result,
+            Ok(value) => Ok(value),
+            Err(direct_error) => match proxy.await {
+                Ok(value) => Ok(value),
+                Err(proxy_error) => Err(preferred_route_error(direct_error, proxy_error)),
+            },
         },
         result = &mut proxy => match result {
-            Some(Ok(body)) => Ok(body),
-            proxy_error => match direct.await {
-                Err(error) if error.transport => proxy_error.unwrap_or(Err(error)),
-                result => result,
+            Ok(value) => Ok(value),
+            Err(proxy_error) => match direct.await {
+                Ok(value) => Ok(value),
+                Err(direct_error) => Err(preferred_route_error(direct_error, proxy_error)),
             },
         }
     }
+}
+
+fn preferred_route_error(direct: BodyError, proxy: BodyError) -> BodyError {
+    // Preserve the direct HTTP/format error when the proxy also fails,
+    // rather than hiding it behind an unavailable local SOCKS listener.
+    if direct.kind == BodyErrorKind::Transport {
+        proxy
+    } else {
+        direct
+    }
+}
+
+async fn fetch_valid_subscription(
+    client: &reqwest::Client,
+    sub: &Subscription,
+) -> Result<(String, Vec<Node>), BodyError> {
+    let content = fetch_body(client, &sub.url).await?;
+    let nodes = parse_subscription_content(&content, &sub.format).map_err(|error| BodyError {
+        kind: BodyErrorKind::Permanent,
+        error,
+    })?;
+    if nodes.is_empty() {
+        return Err(BodyError {
+            kind: BodyErrorKind::Permanent,
+            error: anyhow::anyhow!(
+                "Subscription contains no usable nodes; existing nodes were kept"
+            ),
+        });
+    }
+    Ok((content, nodes))
 }
 
 fn subscription_client(
@@ -235,9 +338,8 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
     let mut response = match client.get(url).send().await {
         Ok(response) => response,
         Err(error) => {
-            let transport = error.status().is_none();
             return Err(BodyError {
-                transport,
+                kind: BodyErrorKind::Transport,
                 error: anyhow::Error::from(error.without_url())
                     .context("Failed to fetch subscription"),
             });
@@ -246,7 +348,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
     let status = response.status();
     if !status.is_success() {
         return Err(BodyError {
-            transport: false,
+            kind: BodyErrorKind::Http,
             error: anyhow::anyhow!("Subscription returned HTTP {status}"),
         });
     }
@@ -255,7 +357,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
         .is_some_and(|length| length > MAX_SUBSCRIPTION_BYTES as u64)
     {
         return Err(BodyError {
-            transport: false,
+            kind: BodyErrorKind::Permanent,
             error: anyhow::anyhow!("Subscription exceeds the 8 MiB size limit"),
         });
     }
@@ -265,7 +367,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
             Ok(Some(chunk)) => {
                 if chunk.len() > MAX_SUBSCRIPTION_BYTES.saturating_sub(body.len()) {
                     return Err(BodyError {
-                        transport: false,
+                        kind: BodyErrorKind::Permanent,
                         error: anyhow::anyhow!("Subscription exceeds the 8 MiB size limit"),
                     });
                 }
@@ -274,7 +376,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
             Ok(None) => break,
             Err(error) => {
                 return Err(BodyError {
-                    transport: true,
+                    kind: BodyErrorKind::Transport,
                     error: anyhow::Error::from(error.without_url())
                         .context("Failed to read subscription body"),
                 });
@@ -282,18 +384,9 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
         }
     }
     String::from_utf8(body).map_err(|error| BodyError {
-        transport: false,
+        kind: BodyErrorKind::Permanent,
         error: anyhow::Error::from(error).context("Subscription is not valid UTF-8"),
     })
-}
-
-async fn socks_accepts(addr: SocketAddr) -> bool {
-    tokio::time::timeout(
-        Duration::from_millis(200),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
-    .is_ok_and(|result| result.is_ok())
 }
 
 struct SubscriptionResolver {
@@ -627,60 +720,240 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn an_immediate_transport_failure_starts_fallback_without_the_head_start_delay() {
-        let started = tokio::time::Instant::now();
-        let result = hedged_subscription_fetch(
-            async {
-                Err(BodyError {
-                    transport: true,
-                    error: anyhow::anyhow!("connection refused"),
-                })
-            },
-            || async { Some(Ok("proxy".into())) },
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, "proxy");
-        assert!(started.elapsed() < PROXY_HEDGE_DELAY);
+    fn route_error(kind: BodyErrorKind, message: &str) -> BodyError {
+        BodyError {
+            kind,
+            error: anyhow::anyhow!("{message}"),
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_missing_proxy_preserves_the_direct_download_and_its_deadline() {
-        let started = tokio::time::Instant::now();
-        let result = hedged_subscription_fetch(
+    async fn a_direct_http_error_cannot_cancel_a_healthy_proxy() {
+        for delay in [Duration::ZERO, Duration::from_millis(600)] {
+            let result = first_successful_route(
+                async {
+                    tokio::time::sleep(delay).await;
+                    Err(route_error(BodyErrorKind::Http, "HTTP 403"))
+                },
+                async {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    Ok("proxy")
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, "proxy");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_proxy_error_cannot_cancel_a_healthy_direct_route() {
+        let result = first_successful_route(
             async {
                 tokio::time::sleep(Duration::from_millis(800)).await;
-                Ok("direct".into())
+                Ok("direct")
             },
-            || async { None },
+            async { Err(route_error(BodyErrorKind::Transport, "proxy unavailable")) },
         )
         .await
         .unwrap();
         assert_eq!(result, "direct");
-        assert_eq!(started.elapsed(), Duration::from_millis(800));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_proxy_error_does_not_hide_a_later_direct_http_error() {
-        let error = hedged_subscription_fetch(
+    async fn both_failed_routes_preserve_the_direct_http_error_in_either_order() {
+        for direct_first in [false, true] {
+            let error = first_successful_route::<(), _, _>(
+                async {
+                    if !direct_first {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(route_error(BodyErrorKind::Http, "HTTP 403"))
+                },
+                async {
+                    if direct_first {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(route_error(BodyErrorKind::Transport, "proxy unavailable"))
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.error.to_string(), "HTTP 403");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_can_succeed_after_exactly_three_retries() {
+        let attempts = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let result = retry_subscription_route(|| {
+            let count = attempts.get() + 1;
+            attempts.set(count);
+            std::future::ready(if count == 4 {
+                Ok("fourth attempt")
+            } else {
+                Err(route_error(BodyErrorKind::Http, "HTTP 503"))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "fourth attempt");
+        assert_eq!(attempts.get(), 4);
+        assert_eq!(started.elapsed(), Duration::from_millis(1400));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_routes_stop_after_the_initial_attempt_and_three_retries() {
+        for kind in [BodyErrorKind::Transport, BodyErrorKind::Http] {
+            let attempts = std::cell::Cell::new(0);
+            let error = retry_subscription_route::<(), _, _>(|| {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err(route_error(kind, "fixture failure")))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts.get(), 4);
+            assert_eq!(error.kind, kind);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_content_is_not_downloaded_repeatedly() {
+        let attempts = std::cell::Cell::new(0);
+        let error = retry_subscription_route::<(), _, _>(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err(route_error(BodyErrorKind::Permanent, "size limit")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.error.to_string(), "size limit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_cancels_the_other_routes_pending_retries() {
+        let attempts = std::cell::Cell::new(0);
+        let result = first_successful_route(
+            retry_subscription_route(|| {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err(route_error(BodyErrorKind::Http, "HTTP 403")))
+            }),
             async {
-                tokio::time::sleep(Duration::from_millis(800)).await;
-                Err(BodyError {
-                    transport: false,
-                    error: anyhow::anyhow!("HTTP 403"),
-                })
-            },
-            || async {
-                Some(Err(BodyError {
-                    transport: true,
-                    error: anyhow::anyhow!("proxy unreachable"),
-                }))
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                Ok("proxy")
             },
         )
         .await
-        .unwrap_err();
-        assert_eq!(error.error.to_string(), "HTTP 403");
+        .unwrap();
+        assert_eq!(result, "proxy");
+        assert_eq!(attempts.get(), 2);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_success_cancels_the_other_route_in_either_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Cancelled(Arc<AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for direct_wins in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let guard = Cancelled(cancelled.clone());
+            let winner = async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok("winner")
+            };
+            let loser = async move {
+                let _guard = guard;
+                std::future::pending::<Result<&str, BodyError>>().await
+            };
+            let result = if direct_wins {
+                first_successful_route(winner, loser).await
+            } else {
+                first_successful_route(loser, winner).await
+            };
+            assert_eq!(result.unwrap(), "winner");
+            assert!(cancelled.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_workers_start_together_and_any_one_can_cancel_the_others() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for winner in 0..3 {
+            let started = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let workers = std::array::from_fn(|index| {
+                let started = started.clone();
+                let guard = Dropped(dropped.clone());
+                async move {
+                    let _guard = guard;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if index == winner {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        Ok(index)
+                    } else {
+                        std::future::pending::<Result<usize, BodyError>>().await
+                    }
+                }
+            });
+            assert_eq!(first_successful_workers(workers).await.unwrap(), winner);
+            assert_eq!(started.load(Ordering::SeqCst), 3);
+            assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_failed_workers_have_a_total_budget_of_twelve_attempts() {
+        let attempts = std::cell::Cell::new(0);
+        let workers = std::array::from_fn(|_| {
+            retry_subscription_route(|| {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Err::<(), _>(route_error(BodyErrorKind::Http, "HTTP 503")))
+            })
+        });
+        let error = first_successful_workers(workers).await.unwrap_err();
+        assert_eq!(error.kind, BodyErrorKind::Http);
+        assert_eq!(attempts.get(), 12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_retries_share_one_total_deadline() {
+        let started = tokio::time::Instant::now();
+        let attempts = std::cell::Cell::new(0);
+        let route = || {
+            first_successful_workers(std::array::from_fn(|_| {
+                retry_subscription_route(|| {
+                    attempts.set(attempts.get() + 1);
+                    async {
+                        tokio::time::sleep(Duration::from_secs(12)).await;
+                        Err::<(), _>(route_error(BodyErrorKind::Transport, "timeout"))
+                    }
+                })
+            }))
+        };
+        let error = fetch_before_deadline(first_successful_route(route(), route()))
+            .await
+            .unwrap_err();
+        assert!(error.error.to_string().contains("timed out after 30s"));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(SUB_FETCH_TIMEOUT_SECS)
+        );
+        let count = attempts.get();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(attempts.get(), count);
     }
 
     #[test]

@@ -41,12 +41,13 @@ use sockrocket_core::{
     HealthCheckSetup, HealthEvent, Outbound, OutboundFactory, ProbeResult, ProxyMode, ProxyService,
     Router, RoutingOutbound, ShareServer, SharedOutbound, SharedShareState, SubscriptionFormat,
     SwappableOutbound, TunProxy, assign_group_outlet, config_content_hash, create_outbound,
-    dedup_nodes, fallback_pick, fetch_subscription, format_rule_clash_line, format_rules_export,
-    generate_token, get_system_proxy as get_os_proxy, group_member_indices, local_lan_ip,
-    make_typed_rule, merge_batch_rules, new_shared_state, node_fingerprint, normalize_node_names,
-    parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group, resolve_members,
-    resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group, setup_tun_routes,
-    start_share_server, system_proxy_supported, uniquify_node_names, url_test_pick,
+    dedup_nodes, fallback_pick, fetch_subscription_with, format_rule_clash_line,
+    format_rules_export, generate_token, get_system_proxy as get_os_proxy, group_member_indices,
+    local_lan_ip, make_typed_rule, merge_batch_rules, new_shared_state, node_fingerprint,
+    normalize_node_names, parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group,
+    resolve_members, resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group,
+    setup_tun_routes, start_share_server, system_proxy_supported, uniquify_node_names,
+    url_test_pick,
 };
 
 /// Main application state
@@ -1987,6 +1988,22 @@ impl AppState {
 
     // === Import ===
 
+    fn subscription_proxy_addr(&self) -> Option<std::net::SocketAddr> {
+        self.proxy_running.then(|| {
+            use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+            let ip = self
+                .listen_addr
+                .parse()
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let ip = match ip {
+                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ip => ip,
+            };
+            SocketAddr::new(ip, self.socks_port)
+        })
+    }
+
     pub(crate) fn import_subscription(&mut self, cx: &mut Context<Self>) {
         let url = self.import_url_input.read(cx).value().trim().to_string();
         if url.trim().is_empty() {
@@ -2012,6 +2029,7 @@ impl AppState {
         self.import_status = "⏳ Importing...".to_string();
         cx.notify();
 
+        let socks = self.subscription_proxy_addr();
         let handle = self.tokio_handle.clone();
         let sub = Subscription {
             name: "Imported".to_string(),
@@ -2024,7 +2042,7 @@ impl AppState {
 
         cx.spawn(async move |weak, cx| {
             let result = handle
-                .spawn(async move { fetch_subscription(&sub).await })
+                .spawn(async move { fetch_subscription_with(&sub, socks).await })
                 .await;
 
             weak.update(cx, |this: &mut AppState, cx| {
@@ -3604,103 +3622,92 @@ impl AppState {
 
         let handle = self.tokio_handle.clone();
         let url = sub.url.clone();
+        let socks = self.subscription_proxy_addr();
 
         tracing::info!("Auto-refreshing a subscription");
         cx.spawn(async move |weak, cx| {
-            // Retry up to 3 times with exponential backoff
-            let mut last_err = String::new();
-            for attempt in 0..3u32 {
-                if attempt > 0 {
-                    handle
-                        .spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt)))
-                                .await;
-                        })
-                        .await
-                        .ok();
-                }
-                let sub_clone = sub.clone();
-                match handle
-                    .spawn(async move { fetch_subscription(&sub_clone).await })
-                    .await
-                {
-                    Ok(Ok(mut new_nodes)) => {
-                        weak.update(cx, |this: &mut AppState, cx| {
-                            let Some(current_index) =
-                                this.subscriptions.iter().position(|s| s.url == url)
-                            else {
-                                this.refreshing_subscriptions.remove(&url);
-                                cx.notify();
-                                return;
-                            };
-                            normalize_node_names(&mut new_nodes);
-                            // Tag new nodes with subscription URL
-                            for n in &mut new_nodes {
-                                n.extra.insert("sub_url".to_string(), url.clone());
-                            }
-                            // Preserve selection by stable server identity across renames.
-                            let selected_fingerprint = this
-                                .selected_node
-                                .and_then(|i| this.nodes.get(i))
-                                .map(node_fingerprint);
-                            let active_fingerprint = this
-                                .active_proxy_node
-                                .and_then(|i| this.nodes.get(i))
-                                .map(node_fingerprint);
-
-                            let count = new_nodes.len();
-                            let mut config = this.snapshot_config();
-                            sockrocket_core::config::dedup::apply_subscription_refresh(
-                                &mut config,
-                                vec![(url.clone(), new_nodes)],
-                            );
-                            this.nodes = config.nodes;
-                            this.subscriptions = config.subscriptions;
-
-                            // Restore selection/active by fingerprint
-                            if let Some(fingerprint) = selected_fingerprint {
-                                this.selected_node = this
-                                    .nodes
-                                    .iter()
-                                    .position(|n| node_fingerprint(n) == fingerprint);
-                            }
-                            if let Some(fingerprint) = active_fingerprint {
-                                this.active_proxy_node = this
-                                    .nodes
-                                    .iter()
-                                    .position(|n| node_fingerprint(n) == fingerprint);
-                            }
-
-                            // Update last_updated timestamp
-                            if let Some(s) = this.subscriptions.get_mut(current_index) {
-                                s.last_updated = Some(
-                                    SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                );
-                            }
+            // The core owns retries and the shared deadline; do not multiply
+            // its attempt budget with another UI-level retry loop.
+            let last_err = match handle
+                .spawn(async move { fetch_subscription_with(&sub, socks).await })
+                .await
+            {
+                Ok(Ok(mut new_nodes)) => {
+                    weak.update(cx, |this: &mut AppState, cx| {
+                        let Some(current_index) =
+                            this.subscriptions.iter().position(|s| s.url == url)
+                        else {
                             this.refreshing_subscriptions.remove(&url);
-                            this.import_status = format!(
-                                "✓ Refreshed '{}': {} nodes",
-                                this.subscriptions
-                                    .get(current_index)
-                                    .map(|s| s.name.as_str())
-                                    .unwrap_or("subscription"),
-                                count
-                            );
-                            this.schedule_persist(cx);
                             cx.notify();
-                        })
-                        .ok();
-                        return;
-                    }
-                    Ok(Err(e)) => last_err = format!("{:#}", e),
-                    Err(e) => last_err = format!("task: {:#}", e),
+                            return;
+                        };
+                        normalize_node_names(&mut new_nodes);
+                        // Tag new nodes with subscription URL
+                        for n in &mut new_nodes {
+                            n.extra.insert("sub_url".to_string(), url.clone());
+                        }
+                        // Preserve selection by stable server identity across renames.
+                        let selected_fingerprint = this
+                            .selected_node
+                            .and_then(|i| this.nodes.get(i))
+                            .map(node_fingerprint);
+                        let active_fingerprint = this
+                            .active_proxy_node
+                            .and_then(|i| this.nodes.get(i))
+                            .map(node_fingerprint);
+
+                        let count = new_nodes.len();
+                        let mut config = this.snapshot_config();
+                        sockrocket_core::config::dedup::apply_subscription_refresh(
+                            &mut config,
+                            vec![(url.clone(), new_nodes)],
+                        );
+                        this.nodes = config.nodes;
+                        this.subscriptions = config.subscriptions;
+
+                        // Restore selection/active by fingerprint
+                        if let Some(fingerprint) = selected_fingerprint {
+                            this.selected_node = this
+                                .nodes
+                                .iter()
+                                .position(|n| node_fingerprint(n) == fingerprint);
+                        }
+                        if let Some(fingerprint) = active_fingerprint {
+                            this.active_proxy_node = this
+                                .nodes
+                                .iter()
+                                .position(|n| node_fingerprint(n) == fingerprint);
+                        }
+
+                        // Update last_updated timestamp
+                        if let Some(s) = this.subscriptions.get_mut(current_index) {
+                            s.last_updated = Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            );
+                        }
+                        this.refreshing_subscriptions.remove(&url);
+                        this.import_status = format!(
+                            "✓ Refreshed '{}': {} nodes",
+                            this.subscriptions
+                                .get(current_index)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("subscription"),
+                            count
+                        );
+                        this.schedule_persist(cx);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
                 }
-            }
+                Ok(Err(e)) => format!("{:#}", e),
+                Err(e) => format!("task: {:#}", e),
+            };
             tracing::warn!(
-                "Auto-refresh of subscription {} failed after 3 attempts: {}",
+                "Auto-refresh of subscription {} failed: {}",
                 sub_index,
                 last_err
             );

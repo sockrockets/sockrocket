@@ -279,30 +279,43 @@ fn partial_delete_during_refresh_counts_only_saved_nodes() {
     let (arrived_tx, arrived_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let server = thread::spawn(move || {
-        let (mut connection, _) = listener.accept().unwrap();
-        let mut request = [0; 4096];
-        connection.read(&mut request).unwrap();
-        arrived_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
-        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@removed.invalid:8388#removed";
-        write!(
-            connection,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
-        let (mut connection, _) = listener.accept().unwrap();
-        let mut request = [0; 4096];
-        connection.read(&mut request).unwrap();
-        let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@kept.invalid:8388#kept";
-        write!(
-            connection,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
+        let mut released = false;
+        loop {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let Ok(n) = connection.read(&mut request) else {
+                continue;
+            };
+            if n == 0 {
+                continue;
+            } // Cancelled concurrent request.
+            let request = String::from_utf8_lossy(&request[..n]);
+            let kept_request = request.starts_with("GET /kept ");
+            assert!(kept_request || request.starts_with("GET /slow "));
+            if !kept_request && !released {
+                arrived_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+                released = true;
+            }
+            let body = if kept_request {
+                "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@kept.invalid:8388#kept"
+            } else {
+                "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@removed.invalid:8388#removed"
+            };
+            // More workers can have sent /slow before the first response;
+            // never serve /kept content based on connection arrival order.
+            let _ = write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if kept_request {
+                break;
+            }
+        }
     });
     let launch = fixture.call("subscription_start", json!({"action":"update_subs"}));
     assert_eq!(launch["ok"], true);
@@ -490,18 +503,37 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
         serde_yaml::to_string(&config).unwrap(),
     )
     .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let stopped = server_stop.clone();
     let server = thread::spawn(move || {
-        for _ in 0..4 {
-            let (mut connection, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let (mut connection, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            };
             connection
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut request = [0; 4096];
-            let n = connection.read(&mut request).unwrap();
+            let Ok(n) = connection.read(&mut request) else {
+                continue;
+            };
+            if n == 0 {
+                continue;
+            }
             let request = String::from_utf8_lossy(&request[..n]);
             thread::sleep(Duration::from_millis(100));
             if request.starts_with("GET /3 ") {
-                write!(connection,"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
             } else {
                 let index = request
                     .split_whitespace()
@@ -509,13 +541,12 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
                     .unwrap()
                     .trim_start_matches('/');
                 let body = format!("hy2://synthetic@new-{index}.invalid:443?fp=chrome#new-{index}");
-                write!(
+                let _ = write!(
                     connection,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
-                )
-                .unwrap();
+                );
             }
         }
     });
@@ -552,6 +583,7 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(25));
     }
+    server_stop.store(true, Ordering::SeqCst);
     let saved = sockrocket_core::AppConfig::from_yaml_str(
         &fs::read_to_string(fixture.0.join("config.yaml")).unwrap(),
     )
