@@ -964,6 +964,9 @@ async fn handle_tun_stream_inner(
                     return Ok(());
                 }
             };
+            let (host, prefix) =
+                tun_tls_target(&mut tcp, &host, port, force_direct, router.as_ref()).await?;
+            let mut tcp = super::tls_sniff::Replay::new(tcp, prefix);
             tracing::debug!(
                 "TUN TCP: -> {}:{}{}",
                 host,
@@ -1197,6 +1200,32 @@ fn tun_dial_target(
         }
     }
     Ok((addr.ip().to_string(), addr.port(), false))
+}
+
+/// Recover only an explicit domain policy for an otherwise anonymous TLS flow.
+/// Keep the original destination context so higher-priority IP/source rules
+/// still participate in the normal ordered route evaluation.
+pub(super) async fn tun_tls_target<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+    force_direct: bool,
+    router: Option<&Arc<Router>>,
+) -> Result<(String, Vec<u8>)> {
+    if !force_direct
+        && port == 443
+        && host.parse::<IpAddr>().is_ok()
+        && let Some(router) = router
+    {
+        let (name, prefix) = super::tls_sniff::read_name(stream).await?;
+        if let Some(name) = name
+            && router.route_domain_only(&name).is_some()
+        {
+            return Ok((name, prefix));
+        }
+        return Ok((host.to_owned(), prefix));
+    }
+    Ok((host.to_owned(), Vec::new()))
 }
 
 /// Dial an upstream for a TUN stream. `force_direct` bypasses the routing

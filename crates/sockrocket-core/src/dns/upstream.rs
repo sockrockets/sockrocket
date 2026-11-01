@@ -9,6 +9,7 @@ impl DnsResolver {
         // ID is interchangeable. Bound wire residency to 1 MiB per generation.
         let mut key = query.to_vec();
         key[..2].fill(0);
+        key.push(u8::from(self.direct_resolution));
         if self.config.cache_enabled {
             let mut cache = self.wire_cache.lock().await;
             if let Some((reply, expiry)) = cache.entries.get(&key)
@@ -24,12 +25,16 @@ impl DnsResolver {
             }
         }
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        let servers = match self.match_domain_group(&domain) {
-            DnsGroup::Primary => self
-                .primary_override
-                .as_deref()
-                .unwrap_or(&self.config.servers),
-            DnsGroup::Fallback => &self.config.fallback,
+        let servers = if self.direct_resolution && !self.config.fallback.is_empty() {
+            &self.config.fallback
+        } else {
+            match self.match_domain_group(&domain) {
+                DnsGroup::Primary => self
+                    .primary_override
+                    .as_deref()
+                    .unwrap_or(&self.config.servers),
+                DnsGroup::Fallback => &self.config.fallback,
+            }
         };
         let mut pending = tokio::task::JoinSet::new();
         for server in servers {

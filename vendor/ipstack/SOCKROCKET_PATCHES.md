@@ -32,3 +32,10 @@ Resource and observability changes:
 - Publish anonymous TCP-state counts, receive-buffer occupancy and oldest closing age; terminate the stack on device EOF/error or a bounded write stall.
 - Count peer TCP resets separately from task errors, scoped to each stack. Established/closing peer resets are DEBUG events; handshake resets and unexpected task errors retain WARN. Publish cumulative anonymous counts in TUN health samples and diagnostics.
 - Reset UDP idle deadlines only on activity, reject undersized reads without panicking, and reject oversize writes rather than silently splitting or truncating datagrams.
+
+TCP receive reassembly correction (2026-11-01):
+
+- Preserve the new tail of retransmissions that overlap acknowledged bytes.
+- Buffer out-of-order PSH payload just like other TCP payload and send a cumulative ACK for gaps or exhausted receive capacity.
+- Trim duplicate ranges when extracting overlapping queued segments, retaining shorter-resend tails and releasing duplicate payload reservations. When partial extraction ends at another queued segment, preserve the longer tail and release duplicate reservations.
+- Regressions cover partial retransmissions, reordered PSH, overlapping queue entries, sequence wrap, payload accounting, and a lossless 3 MiB upload with repeated reordering/overlap.

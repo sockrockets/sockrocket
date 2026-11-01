@@ -28,6 +28,46 @@ pub(crate) async fn scoped_resolve(host: &str) -> Option<Result<Vec<IpAddr>>> {
     Some(resolver.resolve_addresses(host).await)
 }
 
+// Only the direct connection's target inherits this intent; nested DNS server
+// and proxy bootstrap lookups must retain their own resolution policy.
+tokio::task_local! { static DIRECT_DESTINATION: String; }
+pub(crate) async fn with_direct_destination<F: Future>(host: &str, future: F) -> F::Output {
+    DIRECT_DESTINATION
+        .scope(
+            host.trim_matches(['[', ']'])
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            future,
+        )
+        .await
+}
+
+pub(crate) async fn scoped_direct_resolve(host: &str) -> Option<Result<Vec<IpAddr>>> {
+    let canonical = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if canonical.parse::<IpAddr>().is_ok()
+        || !DIRECT_DESTINATION
+            .try_with(|target| target == &canonical)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut resolver = REQUEST_DNS.try_with(Clone::clone).ok()?.query_snapshot();
+    if resolver.config.node_hosts.contains(&canonical)
+        && let Some(bootstrap) = &resolver.bootstrap
+    {
+        return Some(bootstrap.resolve_addresses(&canonical).await);
+    }
+    resolver.direct_resolution = true;
+    resolver.fakeip = None;
+    if crate::proxy::routing::tun_ipv6() {
+        return Some(resolver.resolve_with_qtype(&canonical, 28).await);
+    }
+    Some(resolver.resolve_addresses(&canonical).await)
+}
+
 struct Bootstrap {
     servers: Vec<SocketAddr>,
     hosts: HashSet<String>,

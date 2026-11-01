@@ -1059,7 +1059,10 @@ async fn tcp_main_logic_loop(
 
         tcb.update_inflight_packet_queue(incoming_ack);
 
-        if incoming_seq < tcb.get_ack() && !payload.is_empty() {
+        if incoming_seq < tcb.get_ack()
+            && !payload.is_empty()
+            && tcb.get_ack().distance(incoming_seq) as usize >= payload.len()
+        {
             let _ = write_packet_to_device(
                 &up_packet_sender,
                 network_tuple,
@@ -1226,7 +1229,7 @@ async fn tcp_main_logic_loop(
                             PacketType::Invalid => {}
                         }
                     } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                        if !payload.is_empty() && tcb.get_ack() == incoming_seq {
+                        if !payload.is_empty() {
                             tcb.add_unordered_packet(incoming_seq, payload);
                             extract_data_n_write_upstream(
                                 &up_packet_sender,
@@ -1394,6 +1397,11 @@ fn extract_data_n_write_upstream(
             .take()
             .map(|w| w.wake_by_ref())
             .unwrap_or(());
+        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+    }
+    if tcb.get_ack() == ack {
+        // A gap, exhausted receive window or rejected segment still needs a
+        // cumulative ACK, so the peer can retransmit instead of timing out.
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
     Ok(())

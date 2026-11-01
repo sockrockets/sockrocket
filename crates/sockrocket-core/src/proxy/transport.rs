@@ -88,9 +88,9 @@ pub(crate) fn format_host_port(host: &str, port: u16) -> String {
 /// Resolve address string and connect TCP with a timeout, applying socket tuning.
 ///
 /// When the host part is a domain (the common case for proxy server addresses),
-/// resolution goes through a process-wide cache ([`resolve_server_ips`]) to
-/// avoid a fresh DNS lookup on every connection. Any cache/lookup failure
-/// falls back to the original direct `TcpStream::connect` behaviour.
+/// direct destinations first use their request-scoped direct DNS policy. Other
+/// domains use the process-wide server cache ([`resolve_server_ips`]); only
+/// that generic path may fall back to system resolution on lookup failure.
 pub(crate) async fn connect_tcp(addr: &str, timeout: Duration) -> Result<TcpStream> {
     let tcp = tokio::time::timeout(timeout, connect_tcp_inner(addr))
         .await
@@ -120,7 +120,12 @@ async fn connect_tcp_inner(addr: &str) -> Result<TcpStream> {
                 .await
                 .with_context(|| format!("TCP connection to {} failed", addr));
         }
-        if let Some(ips) = resolve_server_ips(host).await {
+        let ips = if let Some(result) = crate::dns::scoped_direct_resolve(bare).await {
+            Some(result?) // An explicit direct DNS failure must not use proxy/system DNS.
+        } else {
+            resolve_server_ips(host).await
+        };
+        if let Some(ips) = ips {
             let sockaddrs: Vec<SocketAddr> =
                 ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
             return connect_staggered(&sockaddrs)

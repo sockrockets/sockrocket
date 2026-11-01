@@ -164,10 +164,17 @@ impl Tcb {
         self.duplicate_ack_count == self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            // A retransmission may cover both acknowledged and new bytes.
+            let consumed = self.ack.distance(seq) as usize;
+            if consumed >= buf.len() {
+                return;
+            }
+            buf = into_tail(buf, consumed);
+            seq = self.ack;
+        }
+        if buf.is_empty() {
             return;
         }
         if self.unordered_packets.len() >= 64
@@ -177,6 +184,10 @@ impl Tcb {
             return;
         }
         let old = self.unordered_packets.get(&seq).map_or(0, Vec::len);
+        // A shorter retransmission must not erase an already buffered tail.
+        if old >= buf.len() {
+            return;
+        }
         if buf.len() > self.get_available_read_buffer_size().saturating_add(old) {
             return;
         }
@@ -220,12 +231,20 @@ impl Tcb {
 
         while remaining_bytes > 0 {
             if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq != self.ack {
+                if seq > self.ack {
                     break; // sequence number is not continuous, stop extracting
                 }
 
                 // remove and get the first packet
                 let mut payload = self.unordered_packets.remove(&seq).unwrap();
+                // Overlapping out-of-order segments can become partly or fully
+                // acknowledged when a preceding segment fills the gap.
+                let duplicate = (self.ack.distance(seq) as usize).min(payload.len());
+                if duplicate > 0 {
+                    self.payload_budget.release(duplicate);
+                    self.read_reserved -= duplicate;
+                    payload = into_tail(payload, duplicate);
+                }
                 let payload_len = payload.len();
 
                 if payload_len <= remaining_bytes {
@@ -235,9 +254,19 @@ impl Tcb {
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
-                    let remaining_payload = payload.split_off(remaining_bytes);
+                    let mut remaining_payload = payload.split_off(remaining_bytes);
                     data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
+                    // Splitting may land on another segment's starting sequence.
+                    // Keep the longer tail and release only duplicate bytes.
+                    if let Some(overlap) = self.unordered_packets.remove(&self.ack) {
+                        let duplicate = overlap.len().min(remaining_payload.len());
+                        if overlap.len() > remaining_payload.len() {
+                            remaining_payload = overlap;
+                        }
+                        self.payload_budget.release(duplicate);
+                        self.read_reserved -= duplicate;
+                    }
                     self.unordered_packets.insert(self.ack, remaining_payload);
                     break;
                 }
@@ -592,6 +621,64 @@ mod tests {
     }
 
     #[test]
+    fn receive_overlap_preserves_bytes_and_returns_duplicate_credit_across_wrap() {
+        for base in [1u32, u32::MAX - 4] {
+            let pool = crate::TcpPayloadBudget::new(8192);
+            let mut tcb = flow(pool.clone());
+            tcb.ack = SeqNum(base);
+            tcb.add_unordered_packet(SeqNum(base) + 4, b"efgh".to_vec());
+            tcb.add_unordered_packet(SeqNum(base) + 2, b"cdef".to_vec());
+            // A shorter resend must not erase the buffered segment's tail.
+            tcb.add_unordered_packet(SeqNum(base) + 2, b"cd".to_vec());
+            tcb.add_unordered_packet(SeqNum(base), b"ab".to_vec());
+            let data = tcb.consume_unordered_packets(8192).unwrap();
+            assert_eq!(data, b"abcdefgh");
+            assert_eq!(tcb.get_ack(), SeqNum(base) + 8);
+            assert_eq!(pool.usage().0, 8);
+            tcb.queue_read(data.len());
+            tcb.consume_read(data.len(), true);
+            assert_eq!(pool.usage().0, 0);
+            tcb.add_unordered_packet(SeqNum(base) + 6, b"ghij".to_vec());
+            let tail = tcb.consume_unordered_packets(8192).unwrap();
+            assert_eq!(tail, b"ij");
+            assert_eq!(pool.usage().0, 2);
+            drop(tcb);
+            assert_eq!(pool.usage().0, 0);
+        }
+    }
+
+    #[test]
+    fn partial_extraction_keeps_longer_overlapping_tail_and_refunds_duplicates() {
+        for later_len in [1000, 128] {
+            let pool = crate::TcpPayloadBudget::new(32768);
+            let mut tcb = flow(pool.clone());
+            tcb.read_buffer_size = 16384;
+            tcb.max_unacked_bytes = 16384;
+            tcb.window_limit.store(16384, Ordering::Relaxed);
+            for i in 0..7 {
+                tcb.add_unordered_packet(SeqNum(1 + i * 1000), vec![1; 1000]);
+            }
+            tcb.add_unordered_packet(SeqNum(7001), vec![1; 1440]);
+            tcb.add_unordered_packet(SeqNum(8193), vec![1; later_len]);
+            let first = tcb.consume_unordered_packets(8192).unwrap();
+            assert_eq!(first.len(), 8192);
+            tcb.queue_read(first.len());
+            let tail = tcb.consume_unordered_packets(8192).unwrap();
+            let expected = (8440 - 8192).max(later_len);
+            assert_eq!(tail.len(), expected);
+            assert!(tail.iter().all(|byte| *byte == 1));
+            tcb.queue_read(tail.len());
+            assert_eq!(tcb.get_ack(), SeqNum(8193 + expected as u32));
+            assert_eq!(pool.usage().0, 8192 + expected);
+            tcb.consume_read(first.len(), true);
+            tcb.consume_read(tail.len(), true);
+            assert_eq!(pool.usage().0, 0);
+            drop(tcb);
+            assert_eq!(pool.usage().0, 0);
+        }
+    }
+
+    #[test]
     fn send_credit_and_ack_validation_survive_sequence_wrap() {
         let pool = crate::TcpPayloadBudget::new(8192);
         let mut tcb = flow(pool.clone());
@@ -680,15 +767,16 @@ mod tests {
     }
 
     #[test]
-    fn read_and_write_share_one_budget_and_duplicate_replacement_refunds() {
+    fn read_and_write_share_one_budget_without_short_resends_erasing_data() {
         let pool = crate::TcpPayloadBudget::new(8192);
         let mut tcb = flow(pool.clone());
         tcb.add_unordered_packet(SeqNum(1), vec![1; 4000]);
         tcb.add_unordered_packet(SeqNum(1), vec![1; 2000]);
-        assert_eq!(pool.usage().0, 2000);
-        tcb.add_inflight_packet(vec![2; 6000]).unwrap();
-        tcb.add_unordered_packet(SeqNum(1), vec![1; 4000]);
-        assert_eq!(tcb.get_unordered_packets_total_len(), 2000);
+        assert_eq!(pool.usage().0, 4000);
+        assert!(tcb.add_inflight_packet(vec![2; 6000]).is_err());
+        tcb.add_inflight_packet(vec![2; 4000]).unwrap();
+        tcb.add_unordered_packet(SeqNum(1), vec![1; 6000]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 4000);
         assert_eq!(pool.usage().0, 8000);
         tcb.discard_failed_payload();
         assert_eq!(pool.usage().0, 0);

@@ -16,7 +16,10 @@ pub use listener::check_listener as check_dns_listener;
 mod runtime;
 mod upstream;
 pub use runtime::configure_bootstrap;
-pub(crate) use runtime::{bootstrap_is_default, bootstrap_resolver, scoped_resolve, with_resolver};
+pub(crate) use runtime::{
+    bootstrap_is_default, bootstrap_resolver, scoped_direct_resolve, scoped_resolve,
+    with_direct_destination, with_resolver,
+};
 pub(crate) mod wire;
 pub use wire::{
     build_dns_error_response, build_dns_response, build_dns_response_with_ttl, parse_dns_query,
@@ -39,9 +42,6 @@ use crate::proxy::connector::{BoxProxyStream, SharedOutbound, connect_upstream};
 use crate::router::GeoIpDb;
 
 use self::fakeip::FakeIpPool;
-
-/// Cap for the resolve-then-geoip CN-direct decision cache.
-const CN_DIRECT_CACHE_MAX: usize = 4096;
 
 /// DNS resolver configuration.
 #[derive(Debug, Clone)]
@@ -152,9 +152,9 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-/// Cache key: answers are per (domain, qtype) so a negative AAAA entry can
-/// never poison A lookups for the same name (and vice versa).
-type CacheKey = (String, u16);
+/// Cache by name, query type and direct-exit purpose. An overseas lookup
+/// must not satisfy a subsequent lookup through the direct DNS group.
+type CacheKey = (String, u16, bool);
 type EndpointKey = (String, Vec<SocketAddr>, bool);
 type EndpointCache = LruCache<EndpointKey, (Instant, Vec<IpAddr>)>;
 
@@ -244,7 +244,6 @@ struct RuntimeDnsCache {
     config: Arc<DnsConfig>,
     cache: Arc<RwLock<LruCache<CacheKey, CacheEntry>>>,
     inflight: InflightMap,
-    cn_direct: Arc<RwLock<LruCache<String, bool>>>,
     wire: Arc<Mutex<WireCache>>,
     bootstrap: Option<Arc<DnsResolver>>,
 }
@@ -308,6 +307,8 @@ pub struct DnsResolver {
     /// clear error in that state.
     outbound: Option<SharedOutbound>,
     follow_runtime: bool,
+    /// Resolve the final direct destination using its own DNS group.
+    direct_resolution: bool,
     primary_override: Option<Arc<Vec<DnsServer>>>,
     runtime_cache: Arc<std::sync::Mutex<Option<RuntimeDnsCache>>>,
     endpoint_cache: Arc<Mutex<EndpointCache>>,
@@ -338,9 +339,6 @@ pub struct DnsResolver {
     /// the real addresses are returned (domestic direct) instead of a
     /// fake-IP. Avoids relying on an incomplete domain suffix list.
     geoip: Option<Arc<GeoIpDb>>,
-    /// Cached per-domain CN-direct decisions from resolve-then-geoip
-    /// (`true` = return real IPs / direct; `false` = fake-IP / proxy).
-    cn_direct: Arc<RwLock<LruCache<String, bool>>>,
     /// Proxy-server hostnames (the tunnel endpoints). These must NEVER be
     /// answered with fake IPs and must resolve via the direct (fallback)
     /// group: the router's own tooling (Web UI speedtest uses system DNS)
@@ -384,6 +382,7 @@ impl DnsResolver {
             refresh_slots: Arc::new(tokio::sync::Semaphore::new(16)),
             outbound: None,
             follow_runtime: false,
+            direct_resolution: false,
             primary_override: None,
             runtime_cache: Arc::new(std::sync::Mutex::new(None)),
             endpoint_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap()))),
@@ -395,9 +394,6 @@ impl DnsResolver {
             tls_connector: build_dot_tls_connector(),
             fakeip: None,
             geoip: None,
-            cn_direct: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(CN_DIRECT_CACHE_MAX).expect("capacity is non-zero"),
-            ))),
             server_domains: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
@@ -529,15 +525,11 @@ impl DnsResolver {
                         NonZeroUsize::new(snapshot.config.cache_capacity.clamp(16, 16384)).unwrap(),
                     ))),
                     inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
-                    cn_direct: Arc::new(RwLock::new(LruCache::new(
-                        NonZeroUsize::new(CN_DIRECT_CACHE_MAX).unwrap(),
-                    ))),
                 });
             }
             let generation = generation.as_ref().unwrap();
             snapshot.cache = generation.cache.clone();
             snapshot.inflight = generation.inflight.clone();
-            snapshot.cn_direct = generation.cn_direct.clone();
             snapshot.wire_cache = generation.wire.clone();
             snapshot.bootstrap = generation.bootstrap.clone();
             snapshot.outbound = Some(current);
@@ -686,7 +678,7 @@ impl DnsResolver {
         // Check cache — fresh hits (positive and negative) need only a read lock.
         if self.config.cache_enabled {
             let now = Instant::now();
-            let key: CacheKey = (domain.to_string(), qtype);
+            let key: CacheKey = (domain.to_string(), qtype, self.direct_resolution);
             let cached = {
                 let cache = self.cache.read().await;
                 cache.peek(&key).and_then(|entry| {
@@ -733,26 +725,11 @@ impl DnsResolver {
         qtype: u16,
         pool: &FakeIpPool,
     ) -> Result<Vec<IpAddr>> {
-        let key = domain.to_lowercase();
-        if let Some(cn) = {
-            let cache = self.cn_direct.read().await;
-            cache.peek(&key).copied()
-        } {
-            return if cn {
-                self.answer_cn_direct(domain, qtype, pool).await
-            } else {
-                Ok(Self::answer_fakeip(pool, domain, qtype))
-            };
-        }
-
-        // Probe A on the clean primary upstream (ProxyTls / 8.8.8.8) — same
-        // path international clients need, without re-entering this hook.
+        // Classify the current DNS answer, not a separate timeless boolean.
+        // exchange_raw retains the upstream TTL, deduplicates via resolve_dedup,
+        // and refreshes expired answers before we choose real versus fake IPs.
         let probe = self.resolve_dedup(domain, QTYPE_A).await?;
         let cn = self.ips_are_cn(&probe);
-        {
-            let mut cache = self.cn_direct.write().await;
-            cache.put(key, cn);
-        }
 
         if cn {
             self.record_probe_domestic(domain, pool, &probe);
@@ -801,7 +778,7 @@ impl DnsResolver {
     /// (domain, qtype) share one upstream query. Writes the outcome
     /// (positive or negative) to the cache.
     async fn resolve_dedup(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        let key: CacheKey = (domain.to_string(), qtype);
+        let key: CacheKey = (domain.to_string(), qtype, self.direct_resolution);
         let cell = {
             let mut inflight = self.inflight.lock().unwrap();
             inflight
@@ -945,8 +922,10 @@ impl DnsResolver {
     /// Clear the DNS cache.
     pub async fn clear_cache(&self) {
         let snapshot = self.query_snapshot();
-        let mut cache = snapshot.cache.write().await;
-        cache.clear();
+        snapshot.cache.write().await.clear();
+        // Address lookups and the UDP/TCP listener share the wire cache.
+        // Clearing only parsed addresses would immediately restore old answers.
+        *snapshot.wire_cache.lock().await = WireCache::new(snapshot.config.cache_capacity);
     }
 
     /// Get cache statistics: (total_entries, expired_entries).
@@ -1846,7 +1825,7 @@ mod tests {
         let resolver = DnsResolver::with_config(china_split_dns_config());
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         resolver.cache.write().await.put(
-            ("stale.example.com".into(), QTYPE_A),
+            ("stale.example.com".into(), QTYPE_A, false),
             CacheEntry {
                 addresses: vec![ip],
                 expires_at: Instant::now() - Duration::from_secs(1),

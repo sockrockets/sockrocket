@@ -28,9 +28,14 @@ impl Datagram for UdpSocket {
 
 pub(super) async fn connect_direct(host: &str, port: u16) -> Result<BoxDatagram> {
     // A device direct rule may restore a Fake-IP to its domain. On Merlin
-    // the OS resolver can return that token again; use the same bootstrap
-    // path as direct TCP and never send UDP back into the fake-address pool.
-    let resolved = if let Some(ips) = super::transport::resolve_server_ips(host).await {
+    // the OS resolver can return that token again; use the same direct DNS
+    // policy as TCP and never send UDP back into the fake-address pool.
+    let ips = if let Some(result) = crate::dns::scoped_direct_resolve(host).await {
+        Some(result?)
+    } else {
+        super::transport::resolve_server_ips(host).await
+    };
+    let resolved = if let Some(ips) = ips {
         ips.into_iter()
             .map(|ip| std::net::SocketAddr::new(ip, port))
             .collect::<Vec<_>>()
