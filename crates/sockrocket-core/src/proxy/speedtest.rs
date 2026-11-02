@@ -511,9 +511,11 @@ mod tests {
             &b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"[..],
             &b"HTTP/1.0 204 No Content\r\n\r\n"[..],
         ] {
-            assert!(http_latency_test(&http_probe_outbound(reply), 5)
-                .await
-                .is_ok());
+            assert!(
+                http_latency_test(&http_probe_outbound(reply), 5)
+                    .await
+                    .is_ok()
+            );
         }
     }
 
@@ -550,11 +552,13 @@ mod tests {
             .await
             .expect("a blackholed primary must leave time for fallback targets");
         assert!(start.elapsed() <= std::time::Duration::from_secs(7));
-        assert!(requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(host, _)| host == "cp.cloudflare.com"));
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(host, _)| host == "cp.cloudflare.com")
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -21,9 +21,9 @@ mod network_settings;
 mod proxy_groups;
 mod route_trace;
 mod rule_presets;
+mod speedtest_jobs;
 mod storage;
 mod subscription_jobs;
-mod speedtest_jobs;
 pub use speedtest_jobs::worker as speedtest_worker;
 pub use subscription_jobs::worker as subscription_worker;
 
@@ -1365,9 +1365,12 @@ fn act_speedtest_node(post: &J) -> J {
         }
     };
     let quick = post.get("mode").and_then(|v| v.as_str()) != Some("http")
-        && !matches!(&node.protocol, sockrocket_core::ProxyProtocol::Tuic { .. }
-            | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
-            | sockrocket_core::ProxyProtocol::Wireguard { .. });
+        && !matches!(
+            &node.protocol,
+            sockrocket_core::ProxyProtocol::Tuic { .. }
+                | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
+                | sockrocket_core::ProxyProtocol::Wireguard { .. }
+        );
     let server = node.server.clone();
     let port = node.port;
     let result = std::thread::spawn(move || {
@@ -1382,8 +1385,11 @@ fn act_speedtest_node(post: &J) -> J {
             // TCP handshakes are cheap; keep a separate budget from protocol probes.
             if quick {
                 static TCP_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-                let _permit = TCP_SEM.get_or_init(|| tokio::sync::Semaphore::new(16))
-                    .acquire().await.map_err(|_| anyhow::anyhow!("speedtest cancelled"))?;
+                let _permit = TCP_SEM
+                    .get_or_init(|| tokio::sync::Semaphore::new(16))
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("speedtest cancelled"))?;
                 return sockrocket_core::tcp_latency_test(&node.server, node.port, 3).await;
             }
             // Bound concurrent probes so Test-all cannot saturate the router.
@@ -3277,23 +3283,41 @@ fn act_check_update() -> J {
 /// Download the matching musl CLI binary from GitHub Releases and replace the
 /// installed binary (config preserved). Restarts the service when it was running.
 fn merlin_update_asset() -> Option<String> {
-    let platform = fs::read_to_string(sockrocket_dir().join("platform")).ok()
-        .or_else(|| Command::new("dbus").args(["get", "softcenter_arch"]).output().ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()))?;
+    let platform = fs::read_to_string(sockrocket_dir().join("platform"))
+        .ok()
+        .or_else(|| {
+            Command::new("dbus")
+                .args(["get", "softcenter_arch"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        })?;
     sockrocket_core::merlin_package_asset(platform.trim())
 }
 
 // POSIX df -P keeps the available-block column stable on Merlin BusyBox.
 fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<()> {
     let output = Command::new("df").arg("-Pk").arg(path).output()?;
-    anyhow::ensure!(output.status.success(), "Cannot determine free space for {}", path.display());
+    anyhow::ensure!(
+        output.status.success(),
+        "Cannot determine free space for {}",
+        path.display()
+    );
     let text = String::from_utf8_lossy(&output.stdout);
-    let available = text.lines().last().and_then(|line| line.split_whitespace().nth(3))
-        .and_then(|v| v.parse::<u64>().ok()).and_then(|v| v.checked_mul(1024))
+    let available = text
+        .lines()
+        .last()
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.checked_mul(1024))
         .ok_or_else(|| anyhow::anyhow!("Cannot parse free space for {}", path.display()))?;
-    anyhow::ensure!(available >= required,
+    anyhow::ensure!(
+        available >= required,
         "更新空间不足：{} 需要 {} KiB，可用 {} KiB；现有安装未修改",
-        path.display(), required.div_ceil(1024), available / 1024);
+        path.display(),
+        required.div_ceil(1024),
+        available / 1024
+    );
     Ok(())
 }
 
@@ -3302,14 +3326,22 @@ fn act_apply_update() -> J {
         return err_msg("Unknown Merlin platform; reinstall the matching offline package first");
     };
     let result = (|| -> anyhow::Result<J> {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let check = rt.block_on(sockrocket_core::check_for_update(env!("CARGO_PKG_VERSION"), Some(&asset)))?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let check = rt.block_on(sockrocket_core::check_for_update(
+            env!("CARGO_PKG_VERSION"),
+            Some(&asset),
+        ))?;
         if check.availability != sockrocket_core::UpdateAvailability::Available {
             return Ok(json!({"ok":true,"msg":"Already up to date"}));
         }
-        let url = check.asset_url.ok_or_else(|| anyhow::anyhow!("Release has no matching full plugin package"))?;
-        let size = check.asset_size.filter(|s| *s > 0)
-            .ok_or_else(|| anyhow::anyhow!("Release asset size unavailable; cannot preflight update space"))?;
+        let url = check
+            .asset_url
+            .ok_or_else(|| anyhow::anyhow!("Release has no matching full plugin package"))?;
+        let size = check.asset_size.filter(|s| *s > 0).ok_or_else(|| {
+            anyhow::anyhow!("Release asset size unavailable; cannot preflight update space")
+        })?;
         let temporary = std::env::temp_dir();
         ensure_update_space(&temporary, size.saturating_add(8 * 1024 * 1024))?;
         let work = temporary.join(format!("sockrocket-update-{}", rand::random::<u64>()));
@@ -3320,39 +3352,95 @@ fn act_apply_update() -> J {
             let listing = Command::new("tar").arg("-tzvf").arg(&archive).output()?;
             anyhow::ensure!(listing.status.success(), "Invalid package archive");
             for line in String::from_utf8_lossy(&listing.stdout).lines() {
-                anyhow::ensure!(line.starts_with('-') || line.starts_with('d'), "Package contains links or special files");
+                anyhow::ensure!(
+                    line.starts_with('-') || line.starts_with('d'),
+                    "Package contains links or special files"
+                );
             }
             let names = Command::new("tar").arg("-tzf").arg(&archive).output()?;
             anyhow::ensure!(names.status.success(), "Cannot inspect archive");
             for name in String::from_utf8_lossy(&names.stdout).lines() {
-                anyhow::ensure!(name.starts_with("sockrocket/") && !name.split('/').any(|p| p == ".."), "Unsafe archive path");
+                anyhow::ensure!(
+                    name.starts_with("sockrocket/") && !name.split('/').any(|p| p == ".."),
+                    "Unsafe archive path"
+                );
             }
             // Count expanded tar bytes without materializing them in /tmp.
-            let expanded = Command::new("sh").arg("-c")
-                .arg(r#"gzip -dc "$1" | wc -c"#).arg("update-size").arg(&archive).output()?;
+            let expanded = Command::new("sh")
+                .arg("-c")
+                .arg(r#"gzip -dc "$1" | wc -c"#)
+                .arg("update-size")
+                .arg(&archive)
+                .output()?;
             anyhow::ensure!(expanded.status.success(), "Cannot measure expanded package");
-            let bytes = String::from_utf8_lossy(&expanded.stdout).trim().parse::<u64>()?;
+            let bytes = String::from_utf8_lossy(&expanded.stdout)
+                .trim()
+                .parse::<u64>()?;
             ensure_update_space(&work, bytes.saturating_add(8 * 1024 * 1024))?;
-            anyhow::ensure!(Command::new("tar").arg("-xzf").arg(&archive).arg("-C").arg(&work).status()?.success(), "Extraction failed");
+            anyhow::ensure!(
+                Command::new("tar")
+                    .arg("-xzf")
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(&work)
+                    .status()?
+                    .success(),
+                "Extraction failed"
+            );
             let pkg = work.join("sockrocket");
             let platform = fs::read_to_string(pkg.join(".valid"))?;
-            anyhow::ensure!(sockrocket_core::merlin_package_asset(platform.trim()).as_ref() == Some(&asset), "Platform mismatch");
-            let output = Command::new(pkg.join("bin/sockrocket-cli")).arg("--version").output()?;
-            anyhow::ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).split_whitespace().any(|v| v.trim_start_matches('v') == check.latest.trim_start_matches('v')), "Executable version validation failed");
+            anyhow::ensure!(
+                sockrocket_core::merlin_package_asset(platform.trim()).as_ref() == Some(&asset),
+                "Platform mismatch"
+            );
+            let output = Command::new(pkg.join("bin/sockrocket-cli"))
+                .arg("--version")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .split_whitespace()
+                        .any(|v| v.trim_start_matches('v') == check.latest.trim_start_matches('v')),
+                "Executable version validation failed"
+            );
             // Copy worker outside the plugin tree so its own replacement is safe.
-            fs::write(work.join("worker.sh"), include_str!("../../../merlin/scripts/update.sh"))?;
-            let space = Command::new("sh").arg(work.join("worker.sh"))
-                .arg(&pkg).arg(&work).arg("--check-space")
-                .env("SOCKROCKET_DIR", sockrocket_dir()).output()?;
-            anyhow::ensure!(space.status.success(), "{}", String::from_utf8_lossy(&space.stderr).trim());
-            Command::new("sh").arg("-c").arg(r#"sleep 2; exec sh "$1" "$2" "$3""#)
-                .arg("sockrocket-update").arg(work.join("worker.sh")).arg(&pkg).arg(&work)
+            fs::write(
+                work.join("worker.sh"),
+                include_str!("../../../merlin/scripts/update.sh"),
+            )?;
+            let space = Command::new("sh")
+                .arg(work.join("worker.sh"))
+                .arg(&pkg)
+                .arg(&work)
+                .arg("--check-space")
                 .env("SOCKROCKET_DIR", sockrocket_dir())
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+                .output()?;
+            anyhow::ensure!(
+                space.status.success(),
+                "{}",
+                String::from_utf8_lossy(&space.stderr).trim()
+            );
+            Command::new("sh")
+                .arg("-c")
+                .arg(r#"sleep 2; exec sh "$1" "$2" "$3""#)
+                .arg("sockrocket-update")
+                .arg(work.join("worker.sh"))
+                .arg(&pkg)
+                .arg(&work)
+                .env("SOCKROCKET_DIR", sockrocket_dir())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
             Ok(())
         })();
-        if let Err(e) = prepare { let _ = fs::remove_dir_all(&work); return Err(e); }
-        Ok(json!({"ok":true,"msg":"完整插件更新已启动；稍后刷新页面查看版本。失败时自动恢复旧版。"}))
+        if let Err(e) = prepare {
+            let _ = fs::remove_dir_all(&work);
+            return Err(e);
+        }
+        Ok(
+            json!({"ok":true,"msg":"完整插件更新已启动；稍后刷新页面查看版本。失败时自动恢复旧版。"}),
+        )
     })();
     result.unwrap_or_else(|e| err_msg(&format!("Plugin update failed: {e}")))
 }

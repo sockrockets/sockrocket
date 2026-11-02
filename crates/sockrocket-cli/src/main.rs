@@ -33,7 +33,11 @@ fn main() -> Result<()> {
         );
     }
     if env::args().nth(1).as_deref() == Some("--speedtest-worker") {
-        return cgi::speedtest_worker(&env::args().nth(2).ok_or_else(|| anyhow::anyhow!("Speed test job ID required"))?);
+        return cgi::speedtest_worker(
+            &env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("Speed test job ID required"))?,
+        );
     }
     if cgi::is_cgi() {
         return cgi::run();

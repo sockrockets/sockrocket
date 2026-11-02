@@ -2511,7 +2511,9 @@ impl AppState {
     }
 
     pub(crate) fn test_all_real_latency(&mut self, cx: &mut Context<Self>) {
-        if self.pending_latency_batch > 0 { return; }
+        if self.pending_latency_batch > 0 {
+            return;
+        }
         self.pending_latency_batch = self.nodes.len();
         self.auto_select_best = false;
         self.auto_select_scope = None;
