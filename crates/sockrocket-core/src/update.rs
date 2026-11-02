@@ -27,6 +27,7 @@ pub struct UpdateCheck {
     /// Direct download URL for a preferred asset name, if found.
     pub asset_url: Option<String>,
     pub asset_name: Option<String>,
+    pub asset_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +42,8 @@ struct GhRelease {
 struct GhAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 /// Guess the desktop GUI asset name for the current host (best-effort).
@@ -62,7 +65,11 @@ pub fn preferred_merlin_cli_asset() -> Option<&'static str> {
     let arch = std::env::consts::ARCH;
     match arch {
         "aarch64" => Some("sockrocket-cli-linux-aarch64"),
-        "arm" | "armv7" => Some("sockrocket-cli-linux-armv7"),
+        "arm" | "armv7" => Some(if cfg!(target_abi = "eabihf") {
+            "sockrocket-cli-linux-armv7"
+        } else {
+            "sockrocket-cli-linux-armv7sf"
+        }),
         _ => None,
     }
 }
@@ -154,11 +161,13 @@ pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Resu
 
     let mut asset_url = None;
     let mut asset_name = None;
+    let mut asset_size = None;
     if let Some(want) = prefer_asset
         && let Some(a) = release.assets.iter().find(|a| a.name == want)
     {
         asset_url = Some(a.browser_download_url.clone());
         asset_name = Some(a.name.clone());
+        asset_size = a.size;
     }
 
     let html_url = if release.html_url.is_empty() {
@@ -174,6 +183,7 @@ pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Resu
         html_url,
         asset_url,
         asset_name,
+        asset_size,
     })
 }
 

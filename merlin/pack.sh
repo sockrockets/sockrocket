@@ -64,7 +64,7 @@ pack_one() {
      "$ROOT/merlin/config.yaml.template" "$ROOT/merlin/version" "$pkg/"
   printf '%s\n' "$platform" > "$pkg/.valid"
 
-  cp "$ROOT/merlin/scripts/sockrocket.sh" "$ROOT/merlin/scripts/iptables.sh" \
+  cp "$ROOT/merlin/scripts/update.sh" "$ROOT/merlin/scripts/sockrocket.sh" "$ROOT/merlin/scripts/iptables.sh" \
      "$ROOT/merlin/scripts/dnsmasq-postconf.sh" \
      "$ROOT/merlin/scripts/dnsmasq.conf" "$ROOT/merlin/scripts/sockrocket_api.sh" \
      "$ROOT/merlin/scripts/sockrocket_status.sh" \

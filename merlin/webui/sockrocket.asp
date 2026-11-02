@@ -621,7 +621,7 @@ body.bg {min-width:0!important}
             <button class="btn btn-success btn-sm" id="sr-btn-apply-update" style="display:none" onclick="srApplyUpdate()">下载并安装</button>
             <a class="btn btn-sm" id="sr-btn-update-link" href="https://github.com/sockrockets/sockrocket/releases" target="_blank" rel="noopener">发布记录</a>
           </div>
-          <div class="hint" id="sr-update-status">检查 GitHub 发布版本，仅替换程序文件； <strong>config.yaml</strong>、订阅、节点和规则会保留。</div>
+          <div class="hint" id="sr-update-status">检查 GitHub 发布版本，更新完整插件（程序、页面及脚本）； <strong>config.yaml</strong>、订阅、节点和规则会保留。</div>
         </div>
       </div>
 
@@ -2730,7 +2730,7 @@ function srCheckUpdate() {
 }
 function srApplyUpdate() {
   var st = srElement('update-status');
-  if (!confirm('下载并安装最新程序？\n\n订阅、节点和规则会保留。服务将重启，网络连接可能短暂中断。')) return;
+  if (!confirm('下载并安装最新完整插件？\n\n订阅、节点和规则会保留。服务将重启，网络连接可能短暂中断。')) return;
   st.textContent = '正在下载并安装，可能需要一分钟…';
   srElement('btn-apply-update').style.display = 'none';
   srApi('apply_update', null, function (d) {
