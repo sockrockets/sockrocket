@@ -3,6 +3,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import tarfile
 import unittest
 
 WORKER = pathlib.Path(__file__).resolve().parents[2] / 'merlin/scripts/update.sh'
@@ -27,6 +28,37 @@ class RecoveryTest(unittest.TestCase):
             self.assertEqual((root / 'sockrocket-cli').read_text(), 'old')
             self.assertFalse(tx.exists())
             self.assertEqual(self.run_recovery(root).returncode, 0)
+
+    def test_compressed_backup_recovers_and_can_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            tx = root / '.update-transaction'
+            (root / 'scripts').mkdir()
+            (root / 'scripts/sockrocket.sh').write_text('#!/bin/sh\nexit 0\n')
+            (root / 'sockrocket-cli').write_text('old')
+            tx.mkdir()
+            with tarfile.open(tx / 'backup.tar.gz', 'w:gz') as archive:
+                archive.add(root / 'sockrocket-cli', arcname='sockrocket-cli')
+                archive.add(root / 'scripts', arcname='scripts')
+            (root / 'sockrocket-cli').write_text('new')
+            (tx / 'prepared').touch()
+            (tx / 'running').write_text('0')
+            result = self.run_recovery(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / 'sockrocket-cli').read_text(), 'old')
+            self.assertFalse(tx.exists())
+
+    def test_corrupt_backup_does_not_delete_installed_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            tx = root / '.update-transaction'
+            tx.mkdir()
+            (tx / 'backup.tar.gz').write_bytes(b'broken')
+            (tx / 'prepared').touch()
+            (root / 'sockrocket-cli').write_text('new')
+            self.assertNotEqual(self.run_recovery(root).returncode, 0)
+            self.assertEqual((root / 'sockrocket-cli').read_text(), 'new')
+            self.assertTrue(tx.exists())
 
     def test_insufficient_space_leaves_install_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
