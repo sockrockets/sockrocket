@@ -772,7 +772,7 @@ impl AppState {
             latency_failed: std::collections::HashSet::new(),
             latency_fail_reason: std::collections::HashMap::new(),
             nodes_generation: 0,
-            latency_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(5)),
+            latency_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
             pending_persist: false,
             persistence_waiting: false,
             pending_latency_batch: 0,
@@ -1381,7 +1381,7 @@ impl AppState {
         self.auto_select_scope = None;
         self.group_test_pending = Some(group_idx);
         for i in member_indices {
-            self.test_node_latency(i, cx);
+            self.test_node_latency_mode(i, true, cx);
         }
     }
 
@@ -2348,6 +2348,13 @@ impl AppState {
     // === Latency Test ===
 
     pub(crate) fn test_node_latency(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.test_node_latency_mode(index, false, cx);
+    }
+
+    fn test_node_latency_mode(&mut self, index: usize, real: bool, cx: &mut Context<Self>) {
+        if self.latency_testing.contains(&index) {
+            return;
+        }
         let node = match self.nodes.get(index) {
             Some(n) => n.clone(),
             None => return,
@@ -2371,6 +2378,13 @@ impl AppState {
                     // the local network when testing many nodes simultaneously).
                     let _permit = semaphore.acquire_owned().await.ok();
 
+                    if !real && !matches!(&node.protocol,
+                        sockrocket_core::ProxyProtocol::Tuic { .. }
+                        | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
+                        | sockrocket_core::ProxyProtocol::Wireguard { .. }) {
+                        return sockrocket_core::tcp_latency_test(&node.server, node.port, 3)
+                            .await.map_err(|e| (format!("{e:#}"), sockrocket_core::classify_probe_error(&e)));
+                    }
                     // Unwarmed: this outbound lives only for the latency
                     // probe; a warming pool would fire a full round of
                     // pre-connect handshakes per tested node.
@@ -2378,29 +2392,18 @@ impl AppState {
                         // Outbound construction failures are local config
                         // problems, not network reachability.
                         .map_err(|e| (format!("{:#}", e), sockrocket_core::ProbeFailureKind::Other))?;
-                    // Run TCP ping and full HTTP probe concurrently.
-                    // HTTP gives protocol-realistic latency; TCP is the fallback
-                    // if the proxy probe target is temporarily unreachable.
-                    // Timeout reduced to 5s (was 10s) to keep batch tests responsive.
-                    let server = node.server.clone();
-                    let port = node.port;
-                    let (tcp_result, http_result) = tokio::join!(
-                        sockrocket_core::tcp_latency_test(&server, port, 5),
-                        sockrocket_core::http_latency_test(&outbound, 5),
-                    );
-                    // The HTTP probe runs *through* the proxy, so it is the only
-                    // result that proves the node actually works. A TCP ping that
-                    // succeeds while the proxy probe fails means the port is
-                    // reachable but the node cannot carry traffic — reporting the
-                    // TCP latency there would show a latency number (and imply
-                    // "available") for a node that is really unusable. So the
-                    // proxy probe result is authoritative; TCP is diagnostic only.
+                    // Publish successful proxy probes immediately. TCP is only
+                    // useful as a diagnostic after the authoritative probe fails.
+                    let http_result = sockrocket_core::quick_http_latency_test(&outbound, 5).await;
                     match http_result {
                         Ok(ms) => Ok(ms),
                         Err(http_err) => {
                             // Classify the authoritative proxy-probe failure so
                             // the UI can show why the node is unreachable.
                             let kind = sockrocket_core::classify_probe_error(&http_err);
+                            let tcp_result = sockrocket_core::tcp_latency_test(
+                                &node.server, node.port, 2,
+                            ).await;
                             let msg = match tcp_result {
                                 Ok(_) => format!(
                                     "proxy probe failed: {:#} (tcp port reachable but node unusable)",
@@ -2494,8 +2497,11 @@ impl AppState {
     }
 
     pub(crate) fn test_all_latency(&mut self, cx: &mut Context<Self>) {
+        if self.pending_latency_batch > 0 {
+            return;
+        }
         let count = self.nodes.len();
-        self.pending_latency_batch = 0; // plain test-all doesn't trigger auto-select
+        self.pending_latency_batch = count; // include probes already running
         self.auto_select_best = false;
         self.auto_select_scope = None;
         self.group_test_pending = None;
@@ -2504,8 +2510,24 @@ impl AppState {
         }
     }
 
+    pub(crate) fn test_all_real_latency(&mut self, cx: &mut Context<Self>) {
+        if self.pending_latency_batch > 0 {
+            return;
+        }
+        self.pending_latency_batch = self.nodes.len();
+        self.auto_select_best = false;
+        self.auto_select_scope = None;
+        self.group_test_pending = None;
+        for i in 0..self.nodes.len() {
+            self.test_node_latency_mode(i, true, cx);
+        }
+    }
+
     /// Test all nodes and automatically switch to the fastest one when done.
     pub(crate) fn test_all_and_select_best(&mut self, cx: &mut Context<Self>) {
+        if !self.latency_testing.is_empty() {
+            return;
+        }
         let count = self.nodes.len();
         if count == 0 {
             return;
@@ -2515,7 +2537,7 @@ impl AppState {
         self.auto_select_scope = None;
         self.group_test_pending = None;
         for i in 0..count {
-            self.test_node_latency(i, cx);
+            self.test_node_latency_mode(i, true, cx);
         }
     }
 

@@ -596,7 +596,7 @@ impl AppState {
                                 tint_button(
                                     "test-all-btn",
                                     if self.latency_testing.is_empty() {
-                                        if compact { "Test" } else { "Test All" }
+                                        if compact { "TCP" } else { "Quick Test" }
                                     } else {
                                         "Testing…"
                                     },
@@ -607,6 +607,16 @@ impl AppState {
                                         this.test_all_latency(cx);
                                     },
                                 )),
+                            )
+                            .child(
+                                Button::new("real-latency-btn")
+                                    .xsmall()
+                                    .label("HTTP Test")
+                                    .tooltip("Verify proxy connectivity and measure HTTP latency")
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.test_all_real_latency(cx);
+                                    })),
                             )
                             .child(
                                 Button::new("sort-latency-btn")
