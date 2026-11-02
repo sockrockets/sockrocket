@@ -15,7 +15,10 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -36,6 +39,8 @@ struct Client {
     idle: Mutex<Vec<Session>>,
     slots: Arc<Semaphore>,
     keep_idle: bool,
+    sequence: AtomicU64,
+    idle_changed: Arc<tokio::sync::Notify>,
     reaper: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl Drop for Client {
@@ -87,6 +92,8 @@ impl AnyTlsOutbound {
                 idle: Mutex::new(Vec::new()),
                 slots: Arc::new(Semaphore::new(64)),
                 keep_idle,
+                sequence: AtomicU64::new(0),
+                idle_changed: Arc::new(tokio::sync::Notify::new()),
                 reaper: Mutex::new(None),
             }),
         })
@@ -135,7 +142,9 @@ impl AnyTlsOutbound {
                 session.queue(request);
                 let ready = async {
                     std::future::poll_fn(|cx| session.poll_flush_wire(cx)).await?;
-                    std::future::poll_fn(|cx| session.poll_ready(cx)).await
+                    // Unknown peers default to v1: they may never send settings or
+                    // SYNACK. Only a previously negotiated v2 session can require ACK.
+                    std::future::poll_fn(|cx| session.poll_open_ready(cx)).await
                 }
                 .await;
                 match ready {
@@ -165,9 +174,41 @@ impl Client {
             return;
         }
         let weak = Arc::downgrade(self);
+        let changed = self.idle_changed.clone();
         *reaper = Some(tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = changed.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    _ = std::future::poll_fn(|cx| {
+                        let Some(client) = weak.upgrade() else {
+                            return Poll::Ready(());
+                        };
+                        let mut idle = client.idle.lock().unwrap();
+                        idle.retain_mut(|session| {
+                            for _ in 0..16 {
+                                if let Poll::Ready(Err(_)) = session.poll_flush_wire(cx) {
+                                    return false;
+                                }
+                                match session.poll_frame(cx) {
+                                    Poll::Ready(Ok((cmd, id, data))) => {
+                                        if session.apply(cmd, id, data).is_err() {
+                                            return false;
+                                        }
+                                        // No application stream owns an idle session.
+                                        session.content.clear();
+                                        session.content_pos = 0;
+                                    }
+                                    Poll::Ready(Err(_)) => return false,
+                                    Poll::Pending => return true,
+                                }
+                            }
+                            cx.waker().wake_by_ref();
+                            true
+                        });
+                        Poll::Pending
+                    }) => {},
+                }
                 let Some(client) = weak.upgrade() else {
                     break;
                 };
@@ -233,6 +274,7 @@ impl Client {
             padding: self.padding.clone(),
             id: 0,
             next_id: 1,
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
             packet: 1,
             idle_since: Instant::now(),
             wire: VecDeque::new(),
@@ -256,10 +298,13 @@ impl Client {
         }
         session.idle_since = Instant::now();
         let mut idle = self.idle.lock().unwrap();
-        if idle.len() >= IDLE_LIMIT {
+        idle.push(session);
+        idle.sort_by_key(|session| session.sequence);
+        if idle.len() > IDLE_LIMIT {
             idle.remove(0);
         }
-        idle.push(session);
+        // Wake the receiver when a newly idle socket has not registered a waker.
+        self.idle_changed.notify_one();
     }
 }
 fn frame(out: &mut Vec<u8>, command: u8, id: u32, data: &[u8]) {
@@ -299,6 +344,7 @@ struct Session {
     padding: Arc<Mutex<Padding>>,
     id: u32,
     next_id: u32,
+    sequence: u64,
     packet: u32,
     idle_since: Instant,
     wire: VecDeque<Vec<u8>>,
@@ -314,6 +360,13 @@ struct Session {
     peer_finished: bool,
     local_finished: bool,
     healthy: bool,
+}
+fn remote_message(data: &[u8]) -> String {
+    String::from_utf8_lossy(data)
+        .chars()
+        .take(512)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -436,7 +489,7 @@ impl Session {
                 if !data.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
-                        "AnyTLS destination rejected",
+                        format!("AnyTLS destination rejected: {}", remote_message(&data)),
                     ));
                 }
                 self.acked = true;
@@ -445,7 +498,10 @@ impl Session {
             5 => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "AnyTLS server rejected the session",
+                    format!(
+                        "AnyTLS server rejected the session: {}",
+                        remote_message(&data)
+                    ),
                 ));
             }
             6 if id == 0 => {
@@ -465,14 +521,22 @@ impl Session {
             10 if id == 0 => {
                 let text = std::str::from_utf8(&data)
                     .map_err(|_| invalid("Invalid AnyTLS server settings"))?;
-                if !text.lines().any(|line| line == "v=2") {
-                    return Err(invalid("Unsupported AnyTLS server version"));
-                }
-                self.server_settings = true;
+                let version = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("v="))
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .ok_or_else(|| invalid("Invalid AnyTLS server version"))?;
+                self.server_settings = version >= 2;
             }
             _ => return Err(invalid("Unexpected AnyTLS session frame")),
         }
         Ok(())
+    }
+    fn poll_open_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.server_settings {
+            return Poll::Ready(Ok(()));
+        }
+        self.poll_ready(cx)
     }
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         for _ in 0..16 {
@@ -664,6 +728,7 @@ mod tests {
             padding: Arc::new(Mutex::new(Padding::default())),
             id: 1,
             next_id: 2,
+            sequence: 0,
             packet: 1,
             idle_since: Instant::now(),
             wire: VecDeque::new(),
@@ -711,7 +776,7 @@ mod tests {
         assert_eq!(s.content, b"current");
         assert!(s.apply(2, 3, vec![]).is_err());
         assert!(
-            !s.apply(7, 2, b"private server response".to_vec())
+            s.apply(7, 2, b"private server response".to_vec())
                 .unwrap_err()
                 .to_string()
                 .contains("private")
@@ -750,6 +815,70 @@ mod tests {
         b.read_exact(&mut body).await.unwrap();
         assert_eq!(body, b"reply");
     }
+    #[tokio::test]
+    async fn unknown_peer_opens_without_v2_ack_and_negotiates_future_versions() {
+        let (a, _peer) = tokio::io::duplex(128);
+        let mut s = session(Box::new(a));
+        std::future::poll_fn(|cx| s.poll_open_ready(cx))
+            .await
+            .unwrap();
+        s.apply(10, 0, b"v=3\n".to_vec()).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                std::future::poll_fn(|cx| s.poll_open_ready(cx))
+            )
+            .await
+            .is_err()
+        );
+        s.apply(7, 1, vec![]).unwrap();
+        std::future::poll_fn(|cx| s.poll_open_ready(cx))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_receiver_answers_heartbeats_and_removes_closed_sessions() {
+        let c = AnyTlsOutbound::new("localhost", 443, "synthetic", None, true).unwrap();
+        c.client.ensure_reaper();
+        let (a, mut peer) = tokio::io::duplex(2048);
+        let mut s = session(Box::new(a));
+        s.packet = 8; // Disable padding for the control-frame assertion.
+        c.client.recycle(s);
+        let mut request = vec![];
+        frame(&mut request, 8, 42, &[]);
+        peer.write_all(&request).await.unwrap();
+        let mut reply = [0; 7];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, [9, 0, 0, 0, 42, 0, 0]);
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !c.client.idle.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn reuse_prefers_creation_sequence_over_return_order() {
+        let c = AnyTlsOutbound::new("localhost", 443, "synthetic", None, true).unwrap();
+        for sequence in [5, 2, 4, 1, 3] {
+            let (a, _peer) = tokio::io::duplex(128);
+            let mut s = session(Box::new(a));
+            s.sequence = sequence;
+            c.client.recycle(s);
+        }
+        assert_eq!(c.client.idle.lock().unwrap().len(), IDLE_LIMIT);
+        for expected in [5, 4, 3, 2] {
+            assert_eq!(c.client.take_idle().unwrap().sequence, expected);
+        }
+    }
+
     #[test]
     fn server_padding_is_per_client_and_idle_pool_has_a_hard_cap() {
         let a = AnyTlsOutbound::new("localhost", 443, "synthetic", None, true).unwrap();
