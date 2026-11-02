@@ -57,7 +57,8 @@ pub struct TcpConfig {
     pub max_count_for_dup_ack: usize,
     /// Retransmission timeout duration.
     pub rto: std::time::Duration,
-    /// Maximum number of retransmissions before giving up.
+    /// Maximum timeout retransmissions or unanswered window probes before
+    /// giving up. Fast retransmission does not consume this timeout budget.
     pub max_retransmit_count: usize,
     /// TCP options
     pub options: Option<Vec<TcpOptions>>,
@@ -464,6 +465,9 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         if send_window == 0 || is_full {
+            if send_window == 0 && tcb.ensure_persist_timer() {
+                self.retransmit_notify.notify_one();
+            }
             self.write_notify
                 .lock()
                 .unwrap()
@@ -842,13 +846,21 @@ async fn retransmit_when_due(
     tokio::time::sleep_until(deadline).await;
     std::future::poll_fn(|cx| {
         let mut tcb = tcb.lock().unwrap();
-        // Keep each turn bounded. ACKs, cancellation and other flows must
-        // get scheduled even if a wide window contains hundreds of packets.
+        // Bound work even if a caller configures an immediate retry timer.
+        // ACKs, cancellation and other flows must still get scheduled.
         for _ in 0..16 {
-            let packet = match tcb.due_retransmission() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => return Poll::Ready(Ok(())),
+            let probe = match tcb.window_probe_due() {
+                Ok(probe) => probe,
                 Err(error) => return Poll::Ready(Err(error)),
+            };
+            let packet = if probe {
+                tcb.window_probe_packet()
+            } else {
+                match tcb.due_retransmission() {
+                    Ok(Some(packet)) => Some(packet),
+                    Ok(None) => return Poll::Ready(Ok(())),
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
             };
             let send = || {
                 write_packet_to_device(
@@ -856,9 +868,13 @@ async fn retransmit_when_due(
                     tuple,
                     &tcb,
                     None,
-                    ACK | PSH,
-                    Some(packet.seq),
-                    Some(packet.payload.clone()),
+                    if probe { ACK } else { ACK | PSH },
+                    Some(
+                        packet
+                            .as_ref()
+                            .map_or(tcb.get_last_received_ack() - 1, |packet| packet.seq),
+                    ),
+                    packet.as_ref().map(|packet| packet.payload.clone()),
                 )
             };
             let mut result = send();
@@ -870,7 +886,13 @@ async fn retransmit_when_due(
                 result = send();
             }
             match result {
-                Ok(_) => tcb.mark_retransmitted(packet.seq),
+                Ok(_) => {
+                    if probe {
+                        tcb.mark_window_probe_sent();
+                    } else if let Some(packet) = packet {
+                        tcb.mark_retransmitted(packet.seq, true);
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     return Poll::Pending;
                 }
@@ -1055,14 +1077,28 @@ async fn tcp_main_logic_loop(
             continue;
         }
 
-        tcb.update_duplicate_ack_count(incoming_ack);
+        let unchanged_pure_ack = flags == ACK
+            && payload.is_empty()
+            && tcb.get_send_window() > 0
+            && tcb.get_send_window() == tcb.scaled_peer_window(incoming_win);
+        tcb.update_duplicate_ack_count(incoming_ack, unchanged_pure_ack);
 
         tcb.update_inflight_packet_queue(incoming_ack);
 
         if incoming_seq < tcb.get_ack()
             && !payload.is_empty()
             && tcb.get_ack().distance(incoming_seq) as usize >= payload.len()
+            && flags & FIN == 0
         {
+            if incoming_ack >= tcb.get_last_received_ack() {
+                // Duplicate upstream bytes may carry a fresh downstream ACK
+                // and receive window. Do not leave phantom bytes in flight.
+                tcb.update_last_received_ack(incoming_ack);
+                tcb.update_send_window(incoming_win);
+                if let Some(waker) = write_notify.lock().unwrap().take() {
+                    waker.wake();
+                }
+            }
             let _ = write_packet_to_device(
                 &up_packet_sender,
                 network_tuple,
@@ -1172,11 +1208,7 @@ async fn tcp_main_logic_loop(
                                 )?;
                             }
                             PacketType::RetransmissionRequest => {
-                                if let Some(packet) =
-                                    tcb.find_inflight_packet(incoming_ack).filter(|packet| {
-                                        packet.retransmit_count < config.max_retransmit_count
-                                    })
-                                {
+                                if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
                                     let (s, p) = (packet.seq, packet.payload.clone());
                                     log::debug!(
                                         "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
@@ -1191,7 +1223,7 @@ async fn tcp_main_logic_loop(
                                         Some(s),
                                         Some(p),
                                     ) {
-                                        Ok(_) => tcb.mark_retransmitted(s),
+                                        Ok(_) => tcb.mark_retransmitted(s, false),
                                         // Let the scheduled RTO retry once the
                                         // device queue has room; don't spend a
                                         // retry on local queue backpressure.
@@ -1437,11 +1469,22 @@ pub(crate) fn write_packet_to_device(
     payload: Option<Vec<u8>>,
 ) -> std::io::Result<usize> {
     use std::io::Error;
+    let owned_payload = seq.is_some() && payload.as_ref().is_some_and(|bytes| !bytes.is_empty());
+    let retry_segment = seq.is_some() && flags & (SYN | FIN | RST) == 0;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
     let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window());
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| {
-        tcb.calculate_payload_max_len(ip_header_len, tcp_header_len)
+        if owned_payload {
+            // Retries reuse existing sequence/credit. New-write allowance can
+            // be zero precisely because these bytes are already in flight.
+            // A closed-window probe is limited to one owned byte.
+            (tcb.get_mtu() as usize)
+                .saturating_sub(ip_header_len + tcp_header_len)
+                .min((tcb.get_send_window() as usize).max(1))
+        } else {
+            tcb.calculate_payload_max_len(ip_header_len, tcp_header_len)
+        }
     };
     let packet = create_raw_packet(
         src,
@@ -1458,8 +1501,9 @@ pub(crate) fn write_packet_to_device(
     let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     match up_packet_sender.send(packet) {
         Ok(()) => {}
-        // A control packet can be retried by TCP; payload writes must wait.
-        Err(error) if error.1 && len == 0 => {}
+        // Ordinary ACKs may be retried by the peer. Explicit retry/probe
+        // sequences must report backpressure before spending retry budget.
+        Err(error) if error.1 && len == 0 && !retry_segment => {}
         Err(error) => {
             return Err(Error::new(
                 if error.1 {
@@ -1565,4 +1609,44 @@ pub(crate) fn create_raw_packet(
         transport: TransportHeader::Tcp(tcp_header),
         payload: Some(payload),
     })
+}
+
+#[cfg(test)]
+mod retry_queue_tests {
+    use super::*;
+
+    #[test]
+    fn a_header_only_window_probe_reports_queue_backpressure() {
+        let (sender, _receiver) = crate::queue::channel(1024, crate::queue::Budget::new(0));
+        let config = TcpConfig::default();
+        let tcb = Tcb::new(
+            1.into(),
+            1500,
+            config.max_unacked_bytes,
+            config.read_buffer_size,
+            config.max_count_for_dup_ack,
+            config.rto,
+            config.max_retransmit_count,
+            config.window_limit.clone(),
+            config.payload_budget.clone(),
+        );
+        let tuple = NetworkTuple::new(
+            "192.0.2.2:12345".parse().unwrap(),
+            "198.51.100.2:443".parse().unwrap(),
+            true,
+        );
+        let error = write_packet_to_device(
+            &sender,
+            tuple,
+            &tcb,
+            None,
+            ACK,
+            Some(tcb.get_seq() - 1),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        // Do not turn an ordinary receive ACK into a fatal flow error.
+        assert!(write_packet_to_device(&sender, tuple, &tcb, None, ACK, None, None).is_ok());
+    }
 }

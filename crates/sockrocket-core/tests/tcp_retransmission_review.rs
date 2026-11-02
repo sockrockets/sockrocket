@@ -35,6 +35,10 @@ async fn connected(retries: usize) -> (IpStack, DuplexStream, IpStackTcpStream, 
     let mut tcp = TcpConfig::default();
     tcp.rto = Duration::from_millis(100);
     tcp.max_retransmit_count = retries;
+    connected_with_tcp(tcp).await
+}
+
+async fn connected_with_tcp(tcp: TcpConfig) -> (IpStack, DuplexStream, IpStackTcpStream, u32) {
     let mut config = IpStackConfig::default();
     config.with_tcp_config(tcp);
     let (device, mut client) = tokio::io::duplex(65536);
@@ -235,7 +239,7 @@ async fn exhaustion_releases_the_real_bidirectional_relay_task() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn closed_receive_window_does_not_consume_retry_budget() {
+async fn window_probes_recover_a_lost_reopening_update_without_spending_data_retries() {
     let (stack, mut client, mut stream, seq) = connected(1).await;
     stream.write_all(b"held").await.unwrap();
     read_packet(&mut client).await;
@@ -247,11 +251,19 @@ async fn closed_receive_window_does_not_consume_retry_budget() {
     client.write_all(&zero_window).await.unwrap();
     stream.read_exact(&mut [0]).await.unwrap();
     read_packet(&mut client).await;
-    assert!(
-        timeout(Duration::from_secs(1), read_packet(&mut client))
-            .await
-            .is_err()
+    let probe = timeout(Duration::from_millis(150), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(
+        payload(&probe),
+        b"h",
+        "window probes must be limited to one byte"
     );
+    let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&probe).unwrap().transport else {
+        panic!("TCP")
+    };
+    assert!(h.ack() && !h.rst());
+    assert_eq!(h.sequence_number(), seq);
     assert_eq!(stack.tcp_event_counts().task_errors, 0);
     client
         .write_all(&packet(1003, Some(seq), false, b"z"))
@@ -403,4 +415,491 @@ async fn completed_handshake_disarms_its_deadline() {
     stream.write_all(b"alive").await.unwrap();
     let data = read_packet(&mut client).await;
     assert_eq!(payload(&data), b"alive");
+}
+
+#[tokio::test(start_paused = true)]
+async fn progress_ack_restarts_the_remaining_payload_timeout() {
+    let (stack, mut client, mut stream, seq) = connected(1).await;
+    stream.write_all(b"abcdef").await.unwrap();
+    read_packet(&mut client).await;
+    assert_eq!(payload(&read_packet(&mut client).await), b"abcdef");
+    tokio::time::advance(Duration::from_millis(190)).await;
+    client
+        .write_all(&packet(1002, Some(seq.wrapping_add(3)), false, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    assert!(
+        timeout(Duration::from_millis(50), read_packet(&mut client))
+            .await
+            .is_err(),
+        "ACK progress must restart the timer instead of using the old retry deadline"
+    );
+    client
+        .write_all(&packet(1003, Some(seq.wrapping_add(6)), false, b"z"))
+        .await
+        .unwrap();
+    let mut marker = [0];
+    stream.read_exact(&mut marker).await.unwrap();
+    assert_eq!(&marker, b"z");
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_retries_allow_a_twenty_second_blackout_then_recover() {
+    let mut tcp = TcpConfig::default();
+    tcp.timeout = Duration::from_secs(1800); // Match the TUN's idle policy.
+    let (stack, mut client, mut stream, seq) = connected_with_tcp(tcp).await;
+    stream.write_all(b"delayed").await.unwrap();
+    read_packet(&mut client).await;
+    for _ in 0..4 {
+        let retry = read_packet(&mut client).await;
+        assert_eq!(
+            payload(&retry),
+            b"delayed",
+            "connection aborted after a brief blackout"
+        );
+    }
+    // Retries occur at 1, 3, 7 and 15 seconds. Resume at 20 seconds.
+    assert!(
+        timeout(Duration::from_secs(5), read_packet(&mut client))
+            .await
+            .is_err()
+    );
+    client
+        .write_all(&packet(1002, Some(seq.wrapping_add(7)), false, b"y"))
+        .await
+        .unwrap();
+    let mut marker = [0];
+    stream.read_exact(&mut marker).await.unwrap();
+    assert_eq!(&marker, b"y");
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_retries_bound_a_permanently_unresponsive_peer_and_release_payload() {
+    let mut tcp = TcpConfig::default();
+    tcp.timeout = Duration::from_secs(1800);
+    let (stack, mut client, mut stream, _) = connected_with_tcp(tcp).await;
+    stream.write_all(b"lost").await.unwrap();
+    read_packet(&mut client).await;
+    let start = tokio::time::Instant::now();
+    timeout(Duration::from_secs(130), async {
+        loop {
+            let bytes = read_packet(&mut client).await;
+            let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&bytes).unwrap().transport
+            else {
+                panic!("TCP")
+            };
+            if h.rst() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("retry policy retained an unresponsive flow indefinitely");
+    assert!(
+        start.elapsed() >= Duration::from_secs(100),
+        "default policy aborted before the recommended failure threshold"
+    );
+    assert_eq!(stack.tcp_event_counts().task_errors, 1);
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+    assert_eq!(stack.tcp_health().0[2], 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn acknowledging_the_oldest_segment_preserves_connection_backoff() {
+    let (stack, mut client, mut stream, seq) = connected(3).await;
+    stream.write_all(b"a").await.unwrap();
+    read_packet(&mut client).await;
+    stream.write_all(b"b").await.unwrap();
+    read_packet(&mut client).await;
+    assert_eq!(payload(&read_packet(&mut client).await), b"a");
+    client
+        .write_all(&packet(1002, Some(seq.wrapping_add(1)), false, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    assert!(
+        timeout(Duration::from_millis(150), read_packet(&mut client))
+            .await
+            .is_err(),
+        "advancing to the next segment collapsed the connection's 200 ms backoff"
+    );
+    let retry = timeout(Duration::from_millis(60), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(payload(&retry), b"b");
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_retransmission_does_not_spend_timeout_retries_or_double_rto() {
+    let (stack, mut client, mut stream, seq) = connected(1).await;
+    stream.write_all(b"lost").await.unwrap();
+    read_packet(&mut client).await;
+    for _ in 0..3 {
+        client
+            .write_all(&packet(1002, Some(seq), false, &[]))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let fast = timeout(Duration::from_millis(50), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(payload(&fast), b"lost");
+    let retry = timeout(Duration::from_millis(110), read_packet(&mut client))
+        .await
+        .expect("fast retransmission incorrectly doubled the RTO");
+    assert_eq!(
+        payload(&retry),
+        b"lost",
+        "fast retransmission spent the timeout retry budget"
+    );
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn window_updates_do_not_poison_the_duplicate_ack_run() {
+    let (stack, mut client, mut stream, seq) = connected(3).await;
+    stream.write_all(b"lost").await.unwrap();
+    read_packet(&mut client).await;
+    for window in [60000, 59000, 58000, 58000, 58000, 58000] {
+        let b = PacketBuilder::ipv4([192, 0, 2, 2], [198, 51, 100, 2], 64)
+            .tcp(12345, 443, 1002, window)
+            .ack(seq);
+        let mut bytes = Vec::new();
+        b.write(&mut bytes, &[]).unwrap();
+        client.write_all(&bytes).await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let retry = timeout(Duration::from_millis(50), read_packet(&mut client))
+        .await
+        .expect("window updates prevented fast retransmission after three actual duplicate ACKs");
+    assert_eq!(payload(&retry), b"lost");
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clean_rtt_sample_reduces_backoff_for_later_data() {
+    let (stack, mut client, mut stream, seq) = connected(3).await;
+    stream.write_all(b"a").await.unwrap();
+    read_packet(&mut client).await;
+    read_packet(&mut client).await; // RTO: connection backoff is now 200 ms.
+    client
+        .write_all(&packet(1002, Some(seq.wrapping_add(1)), false, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    stream.write_all(b"fresh").await.unwrap();
+    read_packet(&mut client).await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    client
+        .write_all(&packet(1003, Some(seq.wrapping_add(6)), false, b"z"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    stream.write_all(b"last").await.unwrap();
+    read_packet(&mut client).await;
+    let retry = timeout(Duration::from_millis(110), read_packet(&mut client))
+        .await
+        .expect("a clean RTT sample did not reduce the backed-off timer");
+    assert_eq!(payload(&retry), b"last");
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_ack_after_retransmission_is_not_a_clean_rtt_sample() {
+    let (_stack, mut client, mut stream, seq) = connected(3).await;
+    stream.write_all(b"a").await.unwrap();
+    read_packet(&mut client).await;
+    read_packet(&mut client).await;
+    tokio::time::advance(Duration::from_millis(90)).await;
+    client
+        .write_all(&packet(1002, Some(seq.wrapping_add(1)), false, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    stream.write_all(b"b").await.unwrap();
+    read_packet(&mut client).await;
+    assert!(
+        timeout(Duration::from_millis(150), read_packet(&mut client))
+            .await
+            .is_err()
+    );
+    let retry = timeout(Duration::from_millis(60), read_packet(&mut client))
+        .await
+        .expect("an ambiguous ACK changed the RTO measurement");
+    assert_eq!(payload(&retry), b"b");
+}
+
+fn window_packet(seq: u32, ack: u32, window: u16, data: &[u8]) -> Vec<u8> {
+    let b = PacketBuilder::ipv4([192, 0, 2, 2], [198, 51, 100, 2], 64)
+        .tcp(12345, 443, seq, window)
+        .ack(ack);
+    let mut bytes = Vec::new();
+    b.write(&mut bytes, data).unwrap();
+    bytes
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_window_blocked_writer_probes_even_with_no_inflight_data() {
+    let (stack, mut client, mut stream, seq) = connected(1).await;
+    client
+        .write_all(&window_packet(1002, seq, 0, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    let writer = tokio::spawn(async move {
+        let result = stream.write_all(b"next").await;
+        (stream, result)
+    });
+    let probe = timeout(Duration::from_millis(150), read_packet(&mut client))
+        .await
+        .expect("blocked writer never armed a window probe");
+    let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&probe).unwrap().transport else {
+        panic!("TCP")
+    };
+    assert!(h.payload().is_empty() && h.ack() && !h.rst());
+    assert_eq!(h.sequence_number(), seq.wrapping_sub(1));
+    client
+        .write_all(&window_packet(1003, seq, 65535, &[]))
+        .await
+        .unwrap();
+    let data = timeout(Duration::from_millis(20), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(payload(&data), b"next");
+    let (mut stream, result) = writer.await.unwrap();
+    result.unwrap();
+    client
+        .write_all(&packet(1003, Some(seq.wrapping_add(4)), false, b"z"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unanswered_window_probes_fail_the_flow_and_release_held_payload() {
+    let (stack, mut client, mut stream, seq) = connected(1).await;
+    stream.write_all(b"held").await.unwrap();
+    read_packet(&mut client).await;
+    client
+        .write_all(&window_packet(1002, seq, 0, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    let probe = timeout(Duration::from_millis(150), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(payload(&probe), b"h");
+    let reset = timeout(Duration::from_millis(250), read_packet(&mut client))
+        .await
+        .expect("unanswered window probes retained a dead flow");
+    let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&reset).unwrap().transport else {
+        panic!("TCP")
+    };
+    assert!(h.rst());
+    assert_eq!(stack.tcp_event_counts().task_errors, 1);
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn responsive_closed_window_does_not_exhaust_data_or_probe_retries() {
+    let (stack, mut client, mut stream, seq) = connected(1).await;
+    stream.write_all(b"held").await.unwrap();
+    read_packet(&mut client).await;
+    client
+        .write_all(&window_packet(1002, seq, 0, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    for _ in 0..4 {
+        let probe = timeout(Duration::from_secs(2), read_packet(&mut client))
+            .await
+            .unwrap();
+        let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&probe).unwrap().transport else {
+            panic!("TCP")
+        };
+        assert!(
+            h.payload() == b"h" && h.ack() && !h.rst(),
+            "closed-window ACKs triggered full data retries or an abort"
+        );
+        client
+            .write_all(&window_packet(1003, seq, 0, &[]))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    client
+        .write_all(&window_packet(1003, seq, 65535, &[]))
+        .await
+        .unwrap();
+    let data = timeout(Duration::from_millis(150), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(payload(&data), b"held");
+    client
+        .write_all(&packet(1003, Some(seq.wrapping_add(4)), false, b"z"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_retransmission_reuses_full_send_window_credit() {
+    let (stack, mut client, mut stream, _) = connected(3).await;
+    stream.write_all(&vec![7; 16 * 1024]).await.unwrap();
+    let original = read_packet(&mut client).await;
+    let first = payload(&original).to_vec();
+    let mut received = first.len();
+    while received < 16 * 1024 {
+        received += payload(&read_packet(&mut client).await).len();
+    }
+    let retry = timeout(Duration::from_millis(150), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(
+        payload(&retry),
+        first,
+        "full send credit turned an RTO retry into an empty segment"
+    );
+    assert_eq!(stack.tcp_payload_usage().0, 16 * 1024);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_retransmission_reuses_full_send_window_credit() {
+    let (stack, mut client, mut stream, seq) = connected(3).await;
+    stream.write_all(&vec![7; 16 * 1024]).await.unwrap();
+    let original = read_packet(&mut client).await;
+    let first = payload(&original).to_vec();
+    let mut received = first.len();
+    while received < 16 * 1024 {
+        received += payload(&read_packet(&mut client).await).len();
+    }
+    for _ in 0..3 {
+        client
+            .write_all(&packet(1002, Some(seq), false, &[]))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let retry = timeout(Duration::from_millis(50), read_packet(&mut client))
+        .await
+        .unwrap();
+    assert_eq!(
+        payload(&retry),
+        first,
+        "full send credit turned a fast retry into an empty segment"
+    );
+    assert_eq!(stack.tcp_payload_usage().0, 16 * 1024);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_retry_progress_survives_a_shrunken_receive_window() {
+    let (stack, mut client, mut stream, seq) = connected(1).await;
+    stream.write_all(b"abcdefgh").await.unwrap();
+    read_packet(&mut client).await;
+    client
+        .write_all(&window_packet(1002, seq, 2, &[]))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    for i in 0..4u32 {
+        let retry = timeout(Duration::from_secs(2), read_packet(&mut client))
+            .await
+            .unwrap();
+        assert_eq!(
+            payload(&retry),
+            &b"abcdefgh"[i as usize * 2..i as usize * 2 + 2]
+        );
+        client
+            .write_all(&window_packet(
+                1002 + i,
+                seq.wrapping_add((i + 1) * 2),
+                2,
+                b"y",
+            ))
+            .await
+            .unwrap();
+        stream.read_exact(&mut [0]).await.unwrap();
+        read_packet(&mut client).await;
+    }
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_received_payload_still_advances_the_peer_ack_state() {
+    let (stack, mut client, mut stream, seq) = connected(3).await;
+    client
+        .write_all(&window_packet(1002, seq, 4, b"y"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    read_packet(&mut client).await;
+    stream.write_all(b"data").await.unwrap();
+    read_packet(&mut client).await;
+    // The upstream byte is a duplicate, but the downstream ACK is new.
+    client
+        .write_all(&window_packet(1002, seq.wrapping_add(4), 4, b"y"))
+        .await
+        .unwrap();
+    read_packet(&mut client).await;
+    timeout(Duration::from_millis(20), stream.write_all(b"next"))
+        .await
+        .expect("duplicate payload discarded the ACK and left phantom bytes in flight")
+        .unwrap();
+    let next = read_packet(&mut client).await;
+    assert_eq!(payload(&next), b"next");
+    client
+        .write_all(&window_packet(1003, seq.wrapping_add(8), 4, b"z"))
+        .await
+        .unwrap();
+    stream.read_exact(&mut [0]).await.unwrap();
+    assert_eq!(stack.tcp_payload_usage().0, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fin_after_already_delivered_payload_is_not_discarded_as_a_duplicate() {
+    let (stack, mut client, mut stream, seq) = connected(3).await;
+    let b = PacketBuilder::ipv4([192, 0, 2, 2], [198, 51, 100, 2], 64)
+        .tcp(12345, 443, 1001, 65535)
+        .ack(seq)
+        .fin();
+    let mut bytes = Vec::new();
+    b.write(&mut bytes, b"x").unwrap();
+    client.write_all(&bytes).await.unwrap();
+    let read = timeout(Duration::from_millis(100), stream.read(&mut [0]))
+        .await
+        .expect("the new FIN was discarded with already-delivered data")
+        .unwrap();
+    assert_eq!(read, 0);
+    assert_eq!(stack.tcp_event_counts().task_errors, 0);
+    stream.write_all(b"reply").await.unwrap();
 }
