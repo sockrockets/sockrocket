@@ -130,6 +130,11 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
     let config: ClashConfig =
         serde_yaml::from_str(yaml_str).context("Failed to parse Clash YAML")?;
 
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml_str)
+        .map_err(|_| anyhow::anyhow!("Invalid Clash configuration"))?;
+    let server_dns = super::server_dns::import(&root)?
+        .map(|p| serde_json::to_string(&p))
+        .transpose()?;
     let mut nodes = Vec::new();
     for value in config.proxies {
         if value.get("type").and_then(serde_yaml::Value::as_str) == Some("wireguard") {
@@ -156,6 +161,11 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
         }
     }
 
+    if let Some(policy) = server_dns {
+        for node in &mut nodes {
+            node.extra.insert(super::server_dns::KEY.into(), policy.clone());
+        }
+    }
     Ok(nodes)
 }
 
