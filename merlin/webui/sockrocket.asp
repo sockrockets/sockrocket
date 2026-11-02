@@ -389,7 +389,8 @@ body.bg {min-width:0!important}
         <section class="card"><h3>节点分组</h3><p class="hint">为不同规则选择独立出口。分组内选择节点不会改变全局节点；节点更名后仍保留成员关系。失效成员不会自动改走其他线路。</p><div class="toolbar"><button class="btn btn-sm" onclick="editProxyGroup(-1)">新建分组</button><button class="btn btn-sm" onclick="loadProxyGroups()">刷新分组</button></div><div id="sr-proxy-group-list" style="margin-top:12px"></div>
         <div id="sr-proxy-group-editor" hidden><h4>编辑节点分组</h4><div class="form-grid proxy-group-grid"><div class="fg"><label for="sr-pg-name">名称（必填）</label><input id="sr-pg-name" type="text" maxlength="96" placeholder="例如：视频线路"></div><div class="fg"><label for="sr-pg-type">选择方式</label><select id="sr-pg-type" onchange="updateProxyGroupMode()"><option value="select">手动选择</option><option value="fallback">TCP 建连失败时按成员顺序尝试</option><option value="url-test">按连接延迟自动选择</option></select></div><div class="fg"><label id="sr-pg-members-label">使用的节点</label><div id="sr-pg-members" class="pg-member-list" role="group" aria-labelledby="sr-pg-members-label"></div><span class="hint" id="sr-pg-member-hint">只会使用这一个节点。点另一个即切换，不会自动改走其他节点。</span><div class="toolbar" id="sr-pg-member-tools" hidden><button type="button" class="btn btn-sm" onclick="setProxyGroupMembers(true)">全选</button><button type="button" class="btn btn-sm" onclick="setProxyGroupMembers(false)">清空</button></div></div></div><div class="toolbar"><button class="btn btn-accent" id="sr-pg-save" onclick="saveProxyGroup()">保存分组</button><button class="btn" onclick="srElement('proxy-group-editor').hidden=true">取消</button></div></div></section>
         <div class="toolbar">
-          <button class="btn btn-accent btn-sm" id="sr-test-all-btn" onclick="testAllNodes()">全部测速</button>
+          <button class="btn btn-accent btn-sm" id="sr-test-all-btn" onclick="testAllNodes()">快速测速</button>
+          <button class="btn btn-sm" onclick="testAllNodes('http')">真实延迟</button>
           <button class="btn btn-sm" onclick="srLoadNodes()">刷新</button><button class="btn btn-sm" onclick="toggleAddNodeForm()">添加节点</button>
           <div class="spacer"></div>
           <input type="search" id="sr-node-search" aria-label="搜索节点" placeholder="搜索名称或协议" oninput="renderNodes()"><span class="hint" id="sr-nodes-count"></span>
@@ -743,8 +744,21 @@ function probeGet(url, timeout, cb) {
 }
 
 function srApi(action, data, cb, errCb, timeoutMs) {
-  if (TRANSPORT === 'ksc') return apiKsc(action, data, cb, errCb, timeoutMs);
-  return apiXhr(TRANSPORT === 'http' ? apiBase() : '/cgi-bin/sockrocket.cgi', action, data, cb, errCb, timeoutMs);
+  var deadline = Date.now() + (timeoutMs || 15000);
+  function attempt() {
+    var remaining = deadline - Date.now();
+    if (remaining <= 0) { if (errCb) errCb({error_code: 'timeout'}); return; }
+    function failed(error) {
+      // A busy response means the backend has not run this request.
+      // Keep its queue slot and retry rather than recording a failed node.
+      if (error && error.error_code === 'busy') {
+        setTimeout(attempt, 300 + Math.floor(Math.random() * 300));
+      } else if (errCb) errCb(error);
+    }
+    if (TRANSPORT === 'ksc') return apiKsc(action, data, cb, failed, remaining);
+    return apiXhr(TRANSPORT === 'http' ? apiBase() : '/cgi-bin/sockrocket.cgi', action, data, cb, failed, remaining);
+  }
+  return attempt();
 }
 
 function apiXhr(base, action, data, cb, errCb, timeoutMs) {
@@ -766,7 +780,7 @@ function apiXhr(base, action, data, cb, errCb, timeoutMs) {
     try {
       var d = JSON.parse(xhr.responseText);
       if (d.error_code || d.error) {
-        srShowMsg('错误：' + (d.error_message || d.error || d.error_code), 'err');
+        if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.error || d.error_code), 'err');
         if (errCb) errCb(d);
       } else { cb(d); }
     } catch (e) {
@@ -789,7 +803,7 @@ var kscQueue = [];
 var kscBusy = false;
 function apiKsc(action, data, cb, errCb, timeoutMs) {
   // Stop must remain usable while a subscription fetch is queued/running.
-  if (action === 'stop') return apiKscRequest(action, data, cb, errCb, timeoutMs);
+  if (action === 'stop' || action === 'speedtest_node') return apiKscRequest(action, data, cb, errCb, timeoutMs);
   if (kscQueue.length >= 16) {
     if (errCb) errCb({ error_code: 'busy' });
     return;
@@ -882,7 +896,7 @@ function pollKscResult(seq, tries, cb, errCb, deadline) {
         var d = JSON.parse(t);
         acknowledgeKscResult(seq);
         if (d.error_code || d.error) {
-          srShowMsg('错误：' + (d.error_message || d.error || d.error_code), 'err');
+          if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.error || d.error_code), 'err');
           if (errCb) errCb(d);
         } else { cb(d); }
         return;
@@ -1394,13 +1408,32 @@ function restoreDirect() {
 }
 
 /* ══ Nodes ═════════════════════════════════════════════════════════ */
+// Keep measurements and unfinished batch work across reloads in this tab.
+var savedSpeedTests = (function () {
+  try { return JSON.parse(sessionStorage.getItem('sr-speedtests-v1')) || {}; }
+  catch (e) { return {}; }
+})();
+var speedTestsRestored = false;
+function saveSpeedTests() {
+  savedSpeedTests.results = SR_STATE.nodes.map(function (n, i) {
+    return {key: nodeViewKey(n), latency: SR_STATE.lat[i]};
+  }).filter(function (entry) { return typeof entry.latency === 'number'; });
+  try { sessionStorage.setItem('sr-speedtests-v1', JSON.stringify(savedSpeedTests)); }
+  catch (e) { /* Measurement still works if browser storage is unavailable. */ }
+}
 function srLoadNodes() {
   srApi('node_details', null, function (d) {
     if (d.ok === false || !Array.isArray(d.nodes)) { srShowMsg(d.msg || '节点加载失败，请重试。','err'); return; }
     var previous = Object.create(null);
+    (savedSpeedTests.results || []).forEach(function (entry) { previous[entry.key] = entry.latency; });
     SR_STATE.nodes.forEach(function (n,i) { if (SR_STATE.lat[i] != null) previous[nodeViewKey(n)] = SR_STATE.lat[i]; });
     SR_STATE.nodes = d.nodes; SR_STATE.lat = {};
     SR_STATE.nodes.forEach(function(n,i) { var key = nodeViewKey(n); if (previous[key] != null) SR_STATE.lat[i] = previous[key]; });
+    if (!speedTestsRestored) {
+      speedTestsRestored = true;
+      // The backend owns running work and cached results, including after reload.
+      pollSpeedTestJob();
+    }
     SR_STATE.activeNode = d.active || 0;
     renderNodes();
     renderChrome();
@@ -1430,7 +1463,7 @@ function renderNodes() {
   el.innerHTML = html || '<div class="hint">没有匹配的节点，请更换搜索条件。</div>';
 }
 var nodeSwitchPending = false, inspectedNodeKey = null;
-function nodeViewKey(n) { return JSON.stringify([n.name, n.protocol, n.server, n.port]); }
+function nodeViewKey(n) { return n.test_id || JSON.stringify([n.name, n.protocol, n.server, n.port]); }
 function inspectNode(i) {
   var n = SR_STATE.nodes[i]; if (!n) return;
   inspectedNodeKey = nodeViewKey(n);
@@ -1472,54 +1505,69 @@ function testNode(i) {
   srApi('speedtest_node', { index: i }, function (d) {
     if (!SR_STATE.nodes[i] || nodeViewKey(SR_STATE.nodes[i]) !== key) return;
     SR_STATE.lat[i] = d.ok && d.latency >= 0 ? d.latency : -1;
+    saveSpeedTests();
     renderNodes();
     renderChrome();
   }, function () {
     if (!SR_STATE.nodes[i] || nodeViewKey(SR_STATE.nodes[i]) !== key) return;
     SR_STATE.lat[i] = -1;
+    saveSpeedTests();
     renderNodes();
     renderChrome();
   }, 60000);
 }
-function testAllNodes() {
+var speedTestPollPending = false;
+var speedTestPollTimer = null;
+function applySpeedTestJob(job) {
+  var indices = Object.create(null);
+  SR_STATE.nodes.forEach(function (node, i) { indices[nodeViewKey(node)] = i; });
+  (job.results || []).forEach(function (result) {
+    var index = indices[result.key];
+    if (index != null) SR_STATE.lat[index] = result.latency;
+  });
+  SR_STATE.testingAll = job.state === 'running';
+  var btn = srElement('test-all-btn');
+  btn.disabled = SR_STATE.testingAll;
+  btn.textContent = SR_STATE.testingAll ? '正在测速 ' + job.completed + '/' + job.total : '快速测速';
+  // Once per poll, rather than rebuilding and saving the list for every node.
+  saveSpeedTests();
+  renderNodes();
+  renderChrome();
+  if (job.state === 'interrupted') srShowMsg('后台测速已中断，已完成的结果已保留，请重新测速。', 'err');
+}
+function pollSpeedTestJob() {
+  if (speedTestPollPending) return;
+  if (speedTestPollTimer) { clearTimeout(speedTestPollTimer); speedTestPollTimer = null; }
+  speedTestPollPending = true;
+  srApi('speedtest_job', {}, function (data) {
+    speedTestPollPending = false;
+    if (!data.ok || !data.job) return;
+    applySpeedTestJob(data.job);
+    if (data.job.state === 'running') speedTestPollTimer = setTimeout(pollSpeedTestJob, 1000);
+  }, function () {
+    speedTestPollPending = false;
+    speedTestPollTimer = setTimeout(pollSpeedTestJob, 2000);
+  });
+}
+function testAllNodes(mode) {
   if (SR_STATE.testingAll || !SR_STATE.nodes.length) return;
   SR_STATE.testingAll = true;
   var btn = srElement('test-all-btn');
-  btn.disabled = true; btn.textContent = '正在测速…';
-  // Keep concurrency low on Merlin: each probe is a full protocol handshake
-  // and the API also caps at 2 in-process. Higher parallelism starved the
-  // router CPU and produced mass false timeouts.
-  var CONCURRENCY = 2;
-  var keys = SR_STATE.nodes.map(nodeViewKey);
-  var next = 0;
-  var inflight = 0;
-  function finishAll() {
-    SR_STATE.testingAll = false;
-    btn.disabled = false;
-    btn.textContent = '全部测速';
-  }
-  function pump() {
-    if (SR_STATE.page !== 'nodes' || document.hidden || JSON.stringify(SR_STATE.nodes.map(nodeViewKey)) !== JSON.stringify(keys)) { finishAll(); return; }
-    while (inflight < CONCURRENCY && next < SR_STATE.nodes.length) {
-      (function (idx) {
-        inflight++;
-        var el = srElement('lat-' + idx);
-        if (el) el.textContent = '…';
-        function done(ok, d) {
-          if (SR_STATE.nodes[idx] && nodeViewKey(SR_STATE.nodes[idx]) === keys[idx]) SR_STATE.lat[idx] = ok && d && d.ok && d.latency >= 0 ? d.latency : -1;
-          renderNodes();
-          inflight--;
-          if (next >= SR_STATE.nodes.length && inflight === 0) finishAll();
-          else pump();
-        }
-        srApi('speedtest_node', { index: idx },
-          function (d) { done(true, d); },
-          function () { done(false, null); },
-          60000);
-      })(next++);
+  btn.disabled = true; btn.textContent = '正在启动测速…';
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  var requestId = Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  srApi('speedtest_start', {mode: mode || 'tcp', request_id: requestId}, function (data) {
+    if (!data.ok || !data.job) {
+      SR_STATE.testingAll = false; btn.disabled = false; btn.textContent = '快速测速';
+      srShowMsg(data.msg || '无法启动测速', 'err'); return;
     }
-  }
-  pump();
+    applySpeedTestJob(data.job);
+    pollSpeedTestJob();
+  }, function () {
+    // The start response may be lost after the worker launched. Reattach first.
+    pollSpeedTestJob();
+  });
 }
 function clearAddNodeSecrets() {
   ['an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id) { srElement(id).value = ''; });

@@ -23,6 +23,8 @@ mod route_trace;
 mod rule_presets;
 mod storage;
 mod subscription_jobs;
+mod speedtest_jobs;
+pub use speedtest_jobs::worker as speedtest_worker;
 pub use subscription_jobs::worker as subscription_worker;
 
 use std::env;
@@ -444,6 +446,8 @@ fn read_only_action(action: &str) -> bool {
         "status"
             | "speedtest"
             | "speedtest_node"
+            | "speedtest_start"
+            | "speedtest_job"
             | "ip_check"
             | "check_update"
             | "diagnose"
@@ -515,6 +519,8 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "logs_clear" => act_logs_clear(),
         "ip_check" => act_ip_check(),
         "speedtest_node" => act_speedtest_node(post),
+        "speedtest_start" => speedtest_jobs::start(post),
+        "speedtest_job" => speedtest_jobs::status(),
         "node_details" => act_node_details(),
         "add_node" => act_add_node(post),
         "del_node" => act_del_node(post),
@@ -694,6 +700,7 @@ fn act_node_details() -> J {
             let info = parse_node(n);
             json!({
                 "index": i,
+                "test_id": speedtest_jobs::key(i, n),
                 "name": info.name,
                 "protocol": info.protocol,
                 "server": info.server,
@@ -1357,9 +1364,12 @@ fn act_speedtest_node(post: &J) -> J {
             return json!({"ok": false, "latency": -1, "msg": format!("Failed to parse config for node {index}: {e}")});
         }
     };
+    let quick = post.get("mode").and_then(|v| v.as_str()) != Some("http")
+        && !matches!(&node.protocol, sockrocket_core::ProxyProtocol::Tuic { .. }
+            | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
+            | sockrocket_core::ProxyProtocol::Wireguard { .. });
     let server = node.server.clone();
     let port = node.port;
-    let probe_server = server.clone();
     let result = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1369,6 +1379,13 @@ fn act_speedtest_node(post: &J) -> J {
             Err(e) => return Err(anyhow::anyhow!("runtime: {e}")),
         };
         rt.block_on(async {
+            // TCP handshakes are cheap; keep a separate budget from protocol probes.
+            if quick {
+                static TCP_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+                let _permit = TCP_SEM.get_or_init(|| tokio::sync::Semaphore::new(16))
+                    .acquire().await.map_err(|_| anyhow::anyhow!("speedtest cancelled"))?;
+                return sockrocket_core::tcp_latency_test(&node.server, node.port, 3).await;
+            }
             // Bound concurrent probes so Test-all cannot saturate the router.
             let _permit = speedtest_semaphore()
                 .acquire()
@@ -1377,29 +1394,16 @@ fn act_speedtest_node(post: &J) -> J {
             let outbound = sockrocket_core::create_outbound_unwarmed(&node)?;
             // Warm path: http_latency_test does warmup (Reality classic
             // discovery / QUIC session) then times the second connect.
-            match sockrocket_core::http_latency_test(&outbound, 10).await {
+            match sockrocket_core::quick_http_latency_test(&outbound, 5).await {
                 Ok(ms) => Ok(ms),
-                Err(http_err) => {
-                    // TCP only on failure — diagnostic, not mixed into the score.
-                    let tcp_result =
-                        sockrocket_core::tcp_latency_test(&probe_server, port, 5).await;
-                    let msg = match tcp_result {
-                        Ok(_) => format!(
-                            "proxy probe failed: {http_err:#} (tcp port reachable but node unusable)"
-                        ),
-                        Err(tcp_err) => format!(
-                            "proxy probe failed: {http_err:#}; tcp fallback failed: {tcp_err:#}"
-                        ),
-                    };
-                    Err(anyhow::anyhow!(msg))
-                }
+                Err(http_err) => Err(http_err),
             }
         })
     })
     .join();
     match result {
         Ok(Ok(ms)) => {
-            json!({"ok": true, "latency": ms, "server": server, "port": port, "path": "warm_outbound"})
+            json!({"ok": true, "latency": ms, "server": server, "port": port, "path": if quick { "tcp" } else { "http" }})
         }
         Ok(Err(e)) => {
             json!({"ok": false, "latency": -1, "msg": format!("Probe via {server}:{port} failed: {e:#}")})

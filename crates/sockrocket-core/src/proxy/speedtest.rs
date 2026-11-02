@@ -218,6 +218,28 @@ pub async fn tcp_latency_test(server: &str, port: u16, timeout_secs: u64) -> Res
 ///
 /// Typical results: 100-500ms for TUIC/Hysteria2, 50-200ms for TCP protocols.
 pub async fn http_latency_test(outbound: &SharedOutbound, timeout_secs: u64) -> Result<u32> {
+    http_latency_probe(outbound, timeout_secs, true).await
+}
+
+/// Interactive probe: measure the first usable HTTP response without a warmup.
+pub async fn quick_http_latency_test(outbound: &SharedOutbound, timeout_secs: u64) -> Result<u32> {
+    // Match URL-test semantics: one target and one total deadline, including
+    // the proxy handshake. A second target would add its launch delay to the score.
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        http_probe_exchange_method(outbound, "www.gstatic.com", 80, "HEAD"),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("HTTP probe timed out"))??;
+    Ok((start.elapsed().as_millis() as u32).max(1))
+}
+
+async fn http_latency_probe(
+    outbound: &SharedOutbound,
+    timeout_secs: u64,
+    warmup: bool,
+) -> Result<u32> {
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
     // Phase 1: Warmup — establish underlying connections (QUIC session, etc.).
@@ -228,27 +250,30 @@ pub async fn http_latency_test(outbound: &SharedOutbound, timeout_secs: u64) -> 
         std::cmp::max(timeout / 2, std::time::Duration::from_secs(2)),
         std::time::Duration::from_secs(5),
     );
-    match tokio::time::timeout(warmup_timeout, outbound.connect("www.gstatic.com", 80)).await {
-        Ok(Ok(mut s)) => {
-            // write_all needs its own timeout: on a half-dead QUIC stream
-            // (connection object alive, network path gone) a write can block
-            // on flow-control credit forever — an unguarded write here wedged
-            // the health-check loop permanently (probes just stopped).
-            let _ = tokio::time::timeout(
+    if warmup {
+        match tokio::time::timeout(warmup_timeout, outbound.connect("www.gstatic.com", 80)).await {
+            Ok(Ok(mut s)) => {
+                // write_all needs its own timeout: on a half-dead QUIC stream
+                // (connection object alive, network path gone) a write can block
+                // on flow-control credit forever — an unguarded write here wedged
+                // the health-check loop permanently (probes just stopped).
+                let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 s.write_all(
                     b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n",
                 ),
             )
             .await;
-            let mut buf = [0u8; 128];
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf)).await;
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("http_latency_test warmup failed (non-fatal): {:#}", e);
-        }
-        Err(_) => {
-            tracing::debug!("http_latency_test warmup timed out (non-fatal)",);
+                let mut buf = [0u8; 128];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf)).await;
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("http_latency_test warmup failed (non-fatal): {:#}", e);
+            }
+            Err(_) => {
+                tracing::debug!("http_latency_test warmup timed out (non-fatal)",);
+            }
         }
     }
 
@@ -313,9 +338,18 @@ pub async fn http_latency_test(outbound: &SharedOutbound, timeout_secs: u64) -> 
 }
 
 async fn http_probe_exchange(outbound: &SharedOutbound, host: &str, port: u16) -> Result<()> {
+    http_probe_exchange_method(outbound, host, port, "GET").await
+}
+
+async fn http_probe_exchange_method(
+    outbound: &SharedOutbound,
+    host: &str,
+    port: u16,
+    method: &str,
+) -> Result<()> {
     let mut stream = outbound.connect(host, port).await?;
     let request =
-        format!("GET /generate_204 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        format!("{method} /generate_204 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
     stream.flush().await?;
 
@@ -477,11 +511,9 @@ mod tests {
             &b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"[..],
             &b"HTTP/1.0 204 No Content\r\n\r\n"[..],
         ] {
-            assert!(
-                http_latency_test(&http_probe_outbound(reply), 5)
-                    .await
-                    .is_ok()
-            );
+            assert!(http_latency_test(&http_probe_outbound(reply), 5)
+                .await
+                .is_ok());
         }
     }
 
@@ -518,13 +550,11 @@ mod tests {
             .await
             .expect("a blackholed primary must leave time for fallback targets");
         assert!(start.elapsed() <= std::time::Duration::from_secs(7));
-        assert!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(host, _)| host == "cp.cloudflare.com")
-        );
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(host, _)| host == "cp.cloudflare.com"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -561,6 +591,20 @@ mod tests {
             "only warmup and the primary should connect"
         );
         assert!(requests.iter().all(|(host, _)| host == "www.gstatic.com"));
+    }
+
+    #[tokio::test]
+    async fn quick_probe_skips_warmup() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = SharedOutbound(Arc::new(HttpProbeOutbound {
+            reply: b"HTTP/1.1 204 No Content\r\n\r\n",
+            primary_reply: None,
+            primary_connect_stalls: false,
+            reply_delay: std::time::Duration::ZERO,
+            requests: requests.clone(),
+        }));
+        quick_http_latency_test(&outbound, 5).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[test]
