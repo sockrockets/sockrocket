@@ -332,15 +332,19 @@ impl Router {
     }
 
     /// Route like [`route`](Self::route), but resolves domain hosts via the
-    /// system DNS when evaluation reaches an IP-based rule (GeoIP / IP-CIDR).
+    /// request-scoped DNS (or system DNS) when reaching an IP-based rule.
     ///
     /// Rule order is preserved: domain rules are tried first, and a DNS
     /// lookup happens only if evaluation reaches an IP-based rule without a
-    /// prior match — at most once per call. The result shares the route
-    /// cache, so repeat connections to the same host never re-resolve.
+    /// prior match — at most once per call. Domain decisions are re-evaluated
+    /// against the TTL-aware DNS cache so address changes and transient DNS
+    /// failures cannot pin a host to an obsolete route.
     pub async fn route_resolving(&self, host: &str, port: u16) -> RouteAction {
-        // Fast path: same cache as `route` (same lowercased keying, same
-        // LRU promotion on hit).
+        // Only concrete destinations are safe to cache without a DNS TTL.
+        // Also avoid consuming a synchronous route() decision made without DNS.
+        if host.parse::<IpAddr>().is_err() && crate::proxy::routing::tun_destination().0.is_none() {
+            return self.route_uncached_resolving(host, port).await;
+        }
         let key = client_cache_key(host, port);
         if let Ok(mut cache) = self.cache.write()
             && let Some(action) = cache.get(&key)
@@ -612,7 +616,7 @@ mod tests {
             router.route_resolving("localhost", 80).await,
             RouteAction::Direct
         );
-        // Second call is served from the route cache.
+        // Repeated domain decisions still evaluate against current DNS.
         assert_eq!(
             router.route_resolving("localhost", 80).await,
             RouteAction::Direct
@@ -871,7 +875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_route_and_route_resolving_share_lowercased_cache() {
+    async fn test_cached_sync_route_agrees_with_resolving_domain_rule() {
         let mut rules = RuleSet::new();
         rules.add_rule(
             MatchRule::DomainSuffix(".example.com".into()),
@@ -889,7 +893,7 @@ mod tests {
             RouteAction::Direct
         );
 
-        // All case variants map to a single cache entry (same port).
+        // Resolving domain routes leave the synchronous cache unchanged.
         let cache = router.cache.read().unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(

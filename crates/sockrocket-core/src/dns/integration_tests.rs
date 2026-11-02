@@ -254,3 +254,117 @@ async fn zero_ttl_answers_are_not_served_from_stale_cache() {
     assert_eq!(resolver.cache_stats().await.0, 0);
     task.await.unwrap();
 }
+
+// A changing upstream exercises classification and routing across DNS generations.
+async fn changing_upstream(
+    ttl: u32,
+) -> (
+    DnsResolver,
+    Arc<std::sync::atomic::AtomicU32>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut resolver = DnsResolver::with_config(DnsConfig {
+        servers: vec![DnsServer::Udp(socket.local_addr().unwrap())],
+        strategy: crate::config::dns::AddressStrategy::Ipv4Only,
+        ..Default::default()
+    });
+    let mut geo = GeoIpDb::new();
+    geo.add_entry("1.2.3.0/24", "CN");
+    geo.build();
+    resolver.set_geoip(Arc::new(geo));
+    let address = Arc::new(std::sync::atomic::AtomicU32::new(u32::from(Ipv4Addr::new(
+        8, 8, 8, 8,
+    ))));
+    let current = address.clone();
+    let server = tokio::spawn(async move {
+        let mut buf = [0; 4096];
+        loop {
+            let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let ip = Ipv4Addr::from(current.load(std::sync::atomic::Ordering::SeqCst));
+            let reply = build_dns_response_with_ttl(&buf[..n], &[ip.into()], ttl).unwrap();
+            socket.send_to(&reply, peer).await.unwrap();
+        }
+    });
+    (resolver, address, server)
+}
+
+#[tokio::test]
+async fn fakeip_classification_follows_dns_expiry_and_cache_clear() {
+    for (ttl, cache_enabled) in [(0, true), (1, true), (300, true), (300, false)] {
+        let (mut resolver, address, server) = changing_upstream(ttl).await;
+        Arc::make_mut(&mut resolver.config).cache_enabled = cache_enabled;
+        resolver.set_fakeip(FakeIpPool::new());
+        let host = "mixed.example.test";
+        assert!(resolver.is_fake(&resolver.resolve(host).await.unwrap()[0]));
+        address.store(
+            u32::from(Ipv4Addr::new(1, 2, 3, 4)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if ttl > 0 && cache_enabled {
+            assert!(resolver.is_fake(&resolver.resolve(host).await.unwrap()[0]));
+        }
+        if ttl == 1 {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        } else if ttl == 300 && cache_enabled {
+            resolver.clear_cache().await;
+        }
+        assert_eq!(
+            resolver.resolve(host).await.unwrap(),
+            vec!["1.2.3.4".parse::<IpAddr>().unwrap()]
+        );
+        address.store(
+            u32::from(Ipv4Addr::new(8, 8, 8, 8)),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        resolver.clear_cache().await;
+        assert!(resolver.is_fake(&resolver.resolve(host).await.unwrap()[0]));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn clearing_dns_cache_refreshes_wire_listener_answers() {
+    let (resolver, address, server) = changing_upstream(300).await;
+    let query = build_dns_query("mixed.example.test", 1);
+    let first = answer_raw_dns_query(&resolver, &query).await;
+    address.store(
+        u32::from(Ipv4Addr::new(1, 2, 3, 4)),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    resolver.clear_cache().await;
+    let next = answer_raw_dns_query(&resolver, &query).await;
+    assert_ne!(
+        parse_dns_response(&first).unwrap(),
+        parse_dns_response(&next).unwrap()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn resolving_route_follows_changed_dns_on_same_router() {
+    use crate::router::{MatchRule, RouteAction, Router, RuleSet};
+    let (resolver, address, server) = changing_upstream(0).await;
+    let mut rules = RuleSet::new();
+    rules.add_rule(MatchRule::GeoIp("CN".into()), RouteAction::Direct);
+    let router = Router::new(rules).with_geoip(resolver.geoip.clone().unwrap());
+    resolver
+        .scope(async {
+            let host = "mixed.example.test";
+            // A previous synchronous lookup must not suppress DNS evaluation.
+            assert_eq!(router.route(host, 443), RouteAction::Proxy);
+            assert_eq!(router.route_resolving(host, 443).await, RouteAction::Proxy);
+            address.store(
+                u32::from(Ipv4Addr::new(1, 2, 3, 4)),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            assert_eq!(router.route_resolving(host, 443).await, RouteAction::Direct);
+            address.store(
+                u32::from(Ipv4Addr::new(8, 8, 8, 8)),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            assert_eq!(router.route_resolving(host, 443).await, RouteAction::Proxy);
+        })
+        .await;
+    server.abort();
+}

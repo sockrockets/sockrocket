@@ -699,3 +699,133 @@ async fn tiny_segments_are_bounded_by_chunk_count_and_reopen_after_consumption()
     };
     assert!(h.window_size() > 0);
 }
+
+// Retransmitted TCP bytes can be segmented differently from the original send.
+#[tokio::test]
+async fn retransmission_with_an_acknowledged_prefix_delivers_its_new_tail() {
+    let (_stack, mut client, mut stream, server_seq) = connected().await;
+    let ack = Some(server_seq.wrapping_add(1));
+    client
+        .write_all(&packet(1002, ack, false, false, b"abcd"))
+        .await
+        .unwrap();
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).await.unwrap();
+    client
+        .write_all(&packet(1004, ack, false, false, b"cdefgh"))
+        .await
+        .unwrap();
+    let mut tail = [0; 4];
+    timeout(Duration::from_millis(200), stream.read_exact(&mut tail))
+        .await
+        .expect("overlapping retransmission discarded its new tail")
+        .unwrap();
+    assert_eq!(&tail, b"efgh");
+}
+
+#[tokio::test]
+async fn reordered_push_segment_is_buffered_and_acknowledged() {
+    let (_stack, mut client, mut stream, server_seq) = connected().await;
+    let ack = Some(server_seq.wrapping_add(1));
+    client
+        .write_all(&packet(1006, ack, false, false, b"efgh"))
+        .await
+        .unwrap();
+    let bytes = timeout(Duration::from_millis(200), read_packet(&mut client))
+        .await
+        .expect("missing duplicate ACK for reordered PSH payload");
+    let parsed = SlicedPacket::from_ip(&bytes).unwrap();
+    let Some(TransportSlice::Tcp(h)) = parsed.transport else {
+        panic!("TCP")
+    };
+    assert_eq!(h.acknowledgment_number(), 1002);
+    client
+        .write_all(&packet(1002, ack, false, false, b"abcd"))
+        .await
+        .unwrap();
+    let mut all = [0; 8];
+    timeout(Duration::from_millis(200), stream.read_exact(&mut all))
+        .await
+        .expect("reordered PSH tail was discarded")
+        .unwrap();
+    assert_eq!(&all, b"abcdefgh");
+}
+
+#[tokio::test]
+async fn overlapping_reordered_segments_do_not_block_the_receive_queue() {
+    let (_stack, mut client, mut stream, server_seq) = connected().await;
+    let ack = Some(server_seq.wrapping_add(1));
+    // Clear PSH to exercise the existing unordered queue, independently of PSH handling.
+    for (seq, bytes) in [
+        (1006, &b"efgh"[..]),
+        (1004, &b"cdef"[..]),
+        (1002, &b"ab"[..]),
+    ] {
+        let mut p = packet(seq, ack, false, false, bytes);
+        p[33] &= !8;
+        client.write_all(&p).await.unwrap();
+        timeout(Duration::from_millis(200), read_packet(&mut client))
+            .await
+            .unwrap();
+    }
+    let mut all = [0; 8];
+    timeout(Duration::from_millis(200), stream.read_exact(&mut all))
+        .await
+        .expect("overlapping queue entry blocked contiguous bytes")
+        .unwrap();
+    assert_eq!(&all, b"abcdefgh");
+}
+
+#[tokio::test]
+async fn three_megabyte_upload_with_reordering_and_overlap_is_lossless() {
+    let mut config = IpStackConfig::default();
+    config.mtu(1500).unwrap();
+    let (stack, mut client, mut stream, server_seq) = connected_with_config(config).await;
+    let ack = Some(server_seq.wrapping_add(1));
+    for i in 0..1536u32 {
+        let seq = 1002 + i * 2048;
+        let data: Vec<u8> = (0..2048).map(|n| ((n + i as usize) % 251) as u8).collect();
+        client
+            .write_all(&packet(seq + 1024, ack, false, false, &data[1024..]))
+            .await
+            .unwrap();
+        // Keep the memory device packet-oriented by awaiting each packet's ACK.
+        loop {
+            let p = timeout(Duration::from_secs(1), read_packet(&mut client))
+                .await
+                .unwrap();
+            let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&p).unwrap().transport else {
+                panic!("TCP")
+            };
+            if h.acknowledgment_number() == seq {
+                break;
+            }
+        }
+        client
+            .write_all(&packet(seq, ack, false, false, &data[..1280]))
+            .await
+            .unwrap();
+        let mut received = vec![0; 2048];
+        timeout(Duration::from_secs(1), stream.read_exact(&mut received))
+            .await
+            .unwrap_or_else(|_| panic!("upload stalled in block {i}"))
+            .unwrap();
+        assert_eq!(received, data, "upload corruption in block {i}");
+        loop {
+            let p = timeout(Duration::from_secs(1), read_packet(&mut client))
+                .await
+                .unwrap();
+            let Some(TransportSlice::Tcp(h)) = SlicedPacket::from_ip(&p).unwrap().transport else {
+                panic!("TCP")
+            };
+            if h.acknowledgment_number() == seq + 2048 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        stack.tcp_health().2,
+        0,
+        "consumed upload retained receive credit"
+    );
+}

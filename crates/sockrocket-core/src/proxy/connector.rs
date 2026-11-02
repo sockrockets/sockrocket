@@ -117,7 +117,7 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Direct TCP connection (no proxy, used for testing and direct mode).
 ///
 /// Goes through [`super::transport::connect_tcp`], so domain hosts are
-/// resolved once per 60s via the process-wide server-address cache and
+/// resolved via the request-scoped direct DNS group when available and
 /// connected happy-eyeballs-style; IP literals skip resolution entirely.
 pub struct DirectOutbound;
 
@@ -128,15 +128,23 @@ impl Outbound for DirectOutbound {
         port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
         let addr = super::transport::format_host_port(host, port);
+        let host = host.to_owned();
         Box::pin(async move {
-            let stream = super::transport::connect_tcp(&addr, DIRECT_CONNECT_TIMEOUT).await?;
+            let stream = crate::dns::with_direct_destination(
+                &host,
+                super::transport::connect_tcp(&addr, DIRECT_CONNECT_TIMEOUT),
+            )
+            .await?;
             Ok(Box::new(stream) as BoxProxyStream)
         })
     }
 
     fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
         let host = host.to_owned();
-        Box::pin(async move { super::datagram::connect_direct(&host, port).await })
+        Box::pin(async move {
+            crate::dns::with_direct_destination(&host, super::datagram::connect_direct(&host, port))
+                .await
+        })
     }
 
     fn is_direct(&self) -> bool {

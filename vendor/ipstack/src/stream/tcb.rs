@@ -11,8 +11,16 @@ pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicat
 /// Retransmission timeout
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Maximum count of retransmissions before failing the connection.
-pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
+/// Six backed-off retries allow ~123 seconds without an ACK at the default
+/// one-second RTO, rather than treating a short blackout as a dead connection.
+pub(super) const MAX_RETRANSMIT_COUNT: usize = 6;
+
+#[derive(Debug)]
+struct PersistTimer {
+    deadline: tokio::time::Instant,
+    interval: Duration,
+    unanswered: usize,
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
@@ -80,6 +88,12 @@ pub(crate) struct Tcb {
     queued_read_chunks: usize,
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
+    current_rto: Duration,
+    retransmit_deadline: Option<tokio::time::Instant>,
+    smoothed_rtt: Option<Duration>,
+    rtt_variance: Duration,
+    rtt_probe: Option<(SeqNum, tokio::time::Instant)>,
+    persist: Option<PersistTimer>,
     max_retransmit_count: usize,
 }
 
@@ -126,6 +140,12 @@ impl Tcb {
             queued_read_chunks: 0,
             max_count_for_dup_ack,
             rto,
+            current_rto: rto,
+            retransmit_deadline: None,
+            smoothed_rtt: None,
+            rtt_variance: Duration::ZERO,
+            rtt_probe: None,
+            persist: None,
             max_retransmit_count,
         }
     }
@@ -150,9 +170,15 @@ impl Tcb {
         )
     }
 
-    pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
-        // If the received rcvd_ack is the same as duplicate_ack_count_helper and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
-        if rcvd_ack == self.duplicate_ack_count_helper && rcvd_ack < self.seq {
+    pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum, unchanged_pure_ack: bool) {
+        if rcvd_ack < self.last_received_ack {
+            return;
+        }
+        if unchanged_pure_ack
+            && rcvd_ack == self.last_received_ack
+            && rcvd_ack == self.duplicate_ack_count_helper
+            && rcvd_ack < self.seq
+        {
             self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
         } else {
             self.duplicate_ack_count_helper = rcvd_ack;
@@ -164,10 +190,17 @@ impl Tcb {
         self.duplicate_ack_count == self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            // A retransmission may cover both acknowledged and new bytes.
+            let consumed = self.ack.distance(seq) as usize;
+            if consumed >= buf.len() {
+                return;
+            }
+            buf = into_tail(buf, consumed);
+            seq = self.ack;
+        }
+        if buf.is_empty() {
             return;
         }
         if self.unordered_packets.len() >= 64
@@ -177,6 +210,10 @@ impl Tcb {
             return;
         }
         let old = self.unordered_packets.get(&seq).map_or(0, Vec::len);
+        // A shorter retransmission must not erase an already buffered tail.
+        if old >= buf.len() {
+            return;
+        }
         if buf.len() > self.get_available_read_buffer_size().saturating_add(old) {
             return;
         }
@@ -220,12 +257,20 @@ impl Tcb {
 
         while remaining_bytes > 0 {
             if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq != self.ack {
+                if seq > self.ack {
                     break; // sequence number is not continuous, stop extracting
                 }
 
                 // remove and get the first packet
                 let mut payload = self.unordered_packets.remove(&seq).unwrap();
+                // Overlapping out-of-order segments can become partly or fully
+                // acknowledged when a preceding segment fills the gap.
+                let duplicate = (self.ack.distance(seq) as usize).min(payload.len());
+                if duplicate > 0 {
+                    self.payload_budget.release(duplicate);
+                    self.read_reserved -= duplicate;
+                    payload = into_tail(payload, duplicate);
+                }
                 let payload_len = payload.len();
 
                 if payload_len <= remaining_bytes {
@@ -235,9 +280,19 @@ impl Tcb {
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
-                    let remaining_payload = payload.split_off(remaining_bytes);
+                    let mut remaining_payload = payload.split_off(remaining_bytes);
                     data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
+                    // Splitting may land on another segment's starting sequence.
+                    // Keep the longer tail and release only duplicate bytes.
+                    if let Some(overlap) = self.unordered_packets.remove(&self.ack) {
+                        let duplicate = overlap.len().min(remaining_payload.len());
+                        if overlap.len() > remaining_payload.len() {
+                            remaining_payload = overlap;
+                        }
+                        self.payload_budget.release(duplicate);
+                        self.read_reserved -= duplicate;
+                    }
                     self.unordered_packets.insert(self.ack, remaining_payload);
                     break;
                 }
@@ -326,10 +381,29 @@ impl Tcb {
     }
 
     pub(super) fn update_send_window(&mut self, window: u16) {
+        let was_closed = self.send_window == 0;
         self.send_window = Self::scale_window(window, self.snd_scale);
+        if self.send_window == 0 {
+            // Receiver flow control is not a network RTT measurement.
+            self.rtt_probe = None;
+            if let Some(persist) = self.persist.as_mut() {
+                // A valid ACK, even with a closed window, proves peer liveness.
+                persist.unanswered = 0;
+            } else if !self.inflight_packets.is_empty() {
+                self.ensure_persist_timer();
+            }
+        } else {
+            self.persist = None;
+        }
+        if was_closed && self.send_window > 0 {
+            self.restart_retransmission_timer();
+        }
     }
     pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
+    }
+    pub(super) fn scaled_peer_window(&self, window: u16) -> u32 {
+        Self::scale_window(window, self.snd_scale)
     }
     pub(super) fn get_recv_window(&self) -> u16 {
         let available = self.get_available_read_buffer_size() >> self.rcv_scale;
@@ -412,9 +486,10 @@ impl Tcb {
             ));
         }
         let buf_len = buf.len() as u32;
+        let was_empty = self.inflight_packets.is_empty();
         if let Some(old) = self
             .inflight_packets
-            .insert(self.seq, InflightPacket::new(self.seq, buf, self.rto))
+            .insert(self.seq, InflightPacket::new(self.seq, buf))
         {
             self.send_reserved -= old.payload.len();
             self.payload_budget.release(old.payload.len());
@@ -422,6 +497,12 @@ impl Tcb {
         credit.commit(buf_len as usize);
         self.send_reserved += buf_len as usize;
         self.seq += buf_len;
+        if self.rtt_probe.is_none() {
+            self.rtt_probe = Some((self.seq, tokio::time::Instant::now()));
+        }
+        if was_empty {
+            self.restart_retransmission_timer();
+        }
         Ok(())
     }
 
@@ -463,32 +544,136 @@ impl Tcb {
         let released = before - self.get_inflight_packets_total_len();
         self.send_reserved -= released;
         self.payload_budget.release(released);
+        if released > 0 {
+            if let Some(mut oldest) = self.inflight_packets.first_entry() {
+                // Failure counts consecutive timeouts without ACK progress,
+                // not the lifetime of a segment that may be partly delivered.
+                oldest.get_mut().retransmit_count = 0;
+            }
+            if let Some((end, sent)) = self.rtt_probe
+                && ack >= end
+            {
+                self.rtt_probe = None;
+                self.record_rtt(sent.elapsed());
+            }
+            // RFC 6298 section 5.3: newly acknowledged bytes restart the
+            // timer. Duplicate/stale ACKs must not keep a dead flow alive.
+            self.restart_retransmission_timer();
+            if self.inflight_packets.is_empty() {
+                // A blocked writer is woken by the ACK path and can re-arm
+                // persistence. An otherwise idle stream needs no probes.
+                self.persist = None;
+            }
+        }
+    }
+
+    fn restart_retransmission_timer(&mut self) {
+        self.retransmit_deadline = (!self.inflight_packets.is_empty())
+            .then(|| tokio::time::Instant::now() + self.current_rto);
+    }
+
+    fn record_rtt(&mut self, sample: Duration) {
+        // RFC 6298 sections 2-3. Retransmission invalidates the active RTT
+        // probe (Karn's rule); only fresh data supplies a timing sample.
+        let smoothed = match self.smoothed_rtt {
+            Some(previous) => {
+                let difference = previous.abs_diff(sample);
+                self.rtt_variance = self.rtt_variance * 3 / 4 + difference / 4;
+                previous * 7 / 8 + sample / 8
+            }
+            None => {
+                self.rtt_variance = sample / 2;
+                sample
+            }
+        };
+        self.smoothed_rtt = Some(smoothed);
+        self.current_rto = smoothed
+            .saturating_add((self.rtt_variance * 4).max(Duration::from_millis(1)))
+            .clamp(self.rto, Duration::from_secs(60).max(self.rto));
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
         self.inflight_packets.get(&seq)
     }
 
+    pub(crate) fn ensure_persist_timer(&mut self) -> bool {
+        if self.send_window != 0 || self.persist.is_some() {
+            return false;
+        }
+        self.persist = Some(PersistTimer {
+            deadline: tokio::time::Instant::now() + self.current_rto,
+            interval: self.current_rto,
+            unanswered: 0,
+        });
+        true
+    }
+
+    pub(crate) fn window_probe_due(&self) -> std::io::Result<bool> {
+        let Some(persist) = &self.persist else {
+            return Ok(false);
+        };
+        if self.state == TcpState::Closed
+            || self.send_window != 0
+            || persist.deadline > tokio::time::Instant::now()
+        {
+            return Ok(false);
+        }
+        if persist.unanswered >= self.max_retransmit_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP zero-window probes unanswered",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn window_probe_packet(&self) -> Option<InflightPacket> {
+        self.inflight_packets
+            .first_key_value()
+            .map(|(&seq, packet)| {
+                // Re-send one owned byte, without advancing sequence or credit.
+                InflightPacket::new(seq, vec![packet.payload[0]])
+            })
+    }
+
+    pub(crate) fn mark_window_probe_sent(&mut self) {
+        if let Some(persist) = self.persist.as_mut() {
+            persist.unanswered += 1;
+            persist.interval = persist
+                .interval
+                .saturating_mul(2)
+                .min(Duration::from_secs(60).max(self.rto));
+            persist.deadline = tokio::time::Instant::now() + persist.interval;
+        }
+    }
+
     pub(crate) fn next_retransmit_deadline(&self) -> Option<tokio::time::Instant> {
-        // A closed receive window is flow control, not packet loss. Resume
-        // data retries when a window update arrives instead of burning the
-        // retry budget while the peer cannot accept data.
-        if self.send_window == 0 || self.state == TcpState::Closed {
+        // Flow control pauses data retries. Separate, paced window probes
+        // recover a lost reopening update without spending data retries.
+        if self.state == TcpState::Closed {
             return None;
         }
-        self.inflight_packets
-            .values()
-            .map(|p| p.send_time + p.retransmit_timeout)
-            .min()
+        if self.send_window == 0 {
+            return self.persist.as_ref().map(|persist| persist.deadline);
+        }
+        self.retransmit_deadline
     }
 
     pub(crate) fn due_retransmission(&self) -> std::io::Result<Option<InflightPacket>> {
         if self.send_window == 0 || self.state == TcpState::Closed {
             return Ok(None);
         }
-        let Some(packet) = self.inflight_packets.values().find(|p| p.is_timed_out()) else {
+        // RFC 6298 section 5.4: timeout recovery retransmits the earliest
+        // unacknowledged segment, not every later segment's expired timer.
+        let Some((_, packet)) = self.inflight_packets.first_key_value() else {
             return Ok(None);
         };
+        if self
+            .retransmit_deadline
+            .is_none_or(|deadline| deadline > tokio::time::Instant::now())
+        {
+            return Ok(None);
+        }
         // Keep the payload until its final retry has had a full RTO to be
         // acknowledged. Exhaustion fails the flow; it never creates a hole
         // in an otherwise live byte stream.
@@ -501,14 +686,17 @@ impl Tcb {
         Ok(Some(packet.clone()))
     }
 
-    pub(crate) fn mark_retransmitted(&mut self, seq: SeqNum) {
+    pub(crate) fn mark_retransmitted(&mut self, seq: SeqNum, timeout: bool) {
         if let Some(packet) = self.inflight_packets.get_mut(&seq) {
-            packet.retransmit_count += 1;
-            packet.retransmit_timeout = packet
-                .retransmit_timeout
-                .saturating_mul(2)
-                .min(Duration::from_secs(60).max(self.rto));
-            packet.send_time = tokio::time::Instant::now();
+            if timeout {
+                packet.retransmit_count += 1;
+                self.current_rto = self
+                    .current_rto
+                    .saturating_mul(2)
+                    .min(Duration::from_secs(60).max(self.rto));
+            }
+            self.rtt_probe = None;
+            self.restart_retransmission_timer();
         }
     }
 
@@ -518,6 +706,9 @@ impl Tcb {
         self.send_reserved = 0;
         self.read_reserved -= self.get_unordered_packets_total_len();
         self.inflight_packets.clear();
+        self.retransmit_deadline = None;
+        self.rtt_probe = None;
+        self.persist = None;
         self.unordered_packets.clear();
     }
 
@@ -589,6 +780,167 @@ mod tests {
             Arc::new(AtomicU32::new(8192)),
             pool,
         )
+    }
+
+    #[test]
+    fn receive_overlap_preserves_bytes_and_returns_duplicate_credit_across_wrap() {
+        for base in [1u32, u32::MAX - 4] {
+            let pool = crate::TcpPayloadBudget::new(8192);
+            let mut tcb = flow(pool.clone());
+            tcb.ack = SeqNum(base);
+            tcb.add_unordered_packet(SeqNum(base) + 4, b"efgh".to_vec());
+            tcb.add_unordered_packet(SeqNum(base) + 2, b"cdef".to_vec());
+            // A shorter resend must not erase the buffered segment's tail.
+            tcb.add_unordered_packet(SeqNum(base) + 2, b"cd".to_vec());
+            tcb.add_unordered_packet(SeqNum(base), b"ab".to_vec());
+            let data = tcb.consume_unordered_packets(8192).unwrap();
+            assert_eq!(data, b"abcdefgh");
+            assert_eq!(tcb.get_ack(), SeqNum(base) + 8);
+            assert_eq!(pool.usage().0, 8);
+            tcb.queue_read(data.len());
+            tcb.consume_read(data.len(), true);
+            assert_eq!(pool.usage().0, 0);
+            tcb.add_unordered_packet(SeqNum(base) + 6, b"ghij".to_vec());
+            let tail = tcb.consume_unordered_packets(8192).unwrap();
+            assert_eq!(tail, b"ij");
+            assert_eq!(pool.usage().0, 2);
+            drop(tcb);
+            assert_eq!(pool.usage().0, 0);
+        }
+    }
+
+    #[test]
+    fn partial_extraction_keeps_longer_overlapping_tail_and_refunds_duplicates() {
+        for later_len in [1000, 128] {
+            let pool = crate::TcpPayloadBudget::new(32768);
+            let mut tcb = flow(pool.clone());
+            tcb.read_buffer_size = 16384;
+            tcb.max_unacked_bytes = 16384;
+            tcb.window_limit.store(16384, Ordering::Relaxed);
+            for i in 0..7 {
+                tcb.add_unordered_packet(SeqNum(1 + i * 1000), vec![1; 1000]);
+            }
+            tcb.add_unordered_packet(SeqNum(7001), vec![1; 1440]);
+            tcb.add_unordered_packet(SeqNum(8193), vec![1; later_len]);
+            let first = tcb.consume_unordered_packets(8192).unwrap();
+            assert_eq!(first.len(), 8192);
+            tcb.queue_read(first.len());
+            let tail = tcb.consume_unordered_packets(8192).unwrap();
+            let expected = (8440 - 8192).max(later_len);
+            assert_eq!(tail.len(), expected);
+            assert!(tail.iter().all(|byte| *byte == 1));
+            tcb.queue_read(tail.len());
+            assert_eq!(tcb.get_ack(), SeqNum(8193 + expected as u32));
+            assert_eq!(pool.usage().0, 8192 + expected);
+            tcb.consume_read(first.len(), true);
+            tcb.consume_read(tail.len(), true);
+            assert_eq!(pool.usage().0, 0);
+            drop(tcb);
+            assert_eq!(pool.usage().0, 0);
+        }
+    }
+
+    #[test]
+    fn rtt_estimator_preserves_variance_floor_and_backoff_cap() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        tcb.record_rtt(Duration::from_secs(2));
+        assert_eq!(tcb.current_rto, Duration::from_secs(6));
+        tcb.record_rtt(Duration::from_secs(1));
+        assert_eq!(tcb.smoothed_rtt, Some(Duration::from_millis(1875)));
+        assert_eq!(tcb.rtt_variance, Duration::from_secs(1));
+        assert_eq!(tcb.current_rto, Duration::from_millis(5875));
+        tcb.record_rtt(Duration::from_secs(100));
+        assert_eq!(tcb.current_rto, Duration::from_secs(60));
+        let mut fresh = flow(crate::TcpPayloadBudget::new(8192));
+        fresh.record_rtt(Duration::from_millis(1));
+        assert_eq!(fresh.current_rto, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn appending_data_does_not_postpone_the_running_timer() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        let seq = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 2]).unwrap();
+        let deadline = tcb.next_retransmit_deadline();
+        tcb.add_inflight_packet(vec![2; 2]).unwrap();
+        assert_eq!(tcb.next_retransmit_deadline(), deadline);
+        assert_eq!(tcb.rtt_probe.unwrap().0, seq + 2);
+    }
+
+    #[test]
+    fn busy_connections_can_measure_fresh_data_without_restarting_the_timer() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        let seq = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 2]).unwrap();
+        tcb.add_inflight_packet(vec![2; 2]).unwrap();
+        tcb.update_inflight_packet_queue(seq + 2);
+        assert!(tcb.rtt_probe.is_none());
+        let deadline = tcb.next_retransmit_deadline();
+        tcb.add_inflight_packet(vec![3; 2]).unwrap();
+        assert_eq!(tcb.rtt_probe.unwrap().0, seq + 6);
+        assert_eq!(tcb.next_retransmit_deadline(), deadline);
+    }
+
+    #[test]
+    fn a_connection_timer_only_selects_the_oldest_unacknowledged_segment() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        let first = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 2]).unwrap();
+        tcb.add_inflight_packet(vec![2; 2]).unwrap();
+        let now = tokio::time::Instant::now();
+        tcb.retransmit_deadline = Some(now + Duration::from_secs(4));
+        assert!(tcb.due_retransmission().unwrap().is_none());
+        assert_eq!(
+            tcb.next_retransmit_deadline(),
+            Some(now + Duration::from_secs(4))
+        );
+        tcb.retransmit_deadline = Some(now - Duration::from_secs(1));
+        assert_eq!(tcb.due_retransmission().unwrap().unwrap().seq, first);
+    }
+
+    #[test]
+    fn reopening_a_zero_window_does_not_expire_an_old_payload_timer_immediately() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut tcb = flow(pool.clone());
+        let seq = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 4]).unwrap();
+        let packet = tcb.inflight_packets.get_mut(&seq).unwrap();
+        packet.retransmit_count = 3;
+        tcb.retransmit_deadline = Some(tokio::time::Instant::now() - Duration::from_secs(2));
+        tcb.update_send_window(0);
+        assert!(tcb.next_retransmit_deadline().is_some());
+        assert!(!tcb.window_probe_due().unwrap());
+        tcb.update_send_window(4096);
+        assert!(tcb.due_retransmission().unwrap().is_none());
+        assert_eq!(pool.usage().0, 4);
+        tcb.update_inflight_packet_queue(seq + 4);
+        assert_eq!(pool.usage().0, 0);
+    }
+
+    #[test]
+    fn acknowledging_all_held_data_stops_idle_window_probes() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        let seq = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 1]).unwrap();
+        tcb.update_send_window(0);
+        assert!(tcb.next_retransmit_deadline().is_some());
+        tcb.update_inflight_packet_queue(seq + 1);
+        assert!(tcb.next_retransmit_deadline().is_none());
+        assert!(tcb.ensure_persist_timer());
+    }
+
+    #[test]
+    fn duplicate_ack_does_not_extend_the_retransmission_deadline() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        let seq = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 4]).unwrap();
+        let deadline = tcb.next_retransmit_deadline();
+        tcb.update_inflight_packet_queue(seq);
+        assert_eq!(tcb.next_retransmit_deadline(), deadline);
+        tcb.update_inflight_packet_queue(seq + 1);
+        let progressed = tcb.next_retransmit_deadline();
+        tcb.update_inflight_packet_queue(seq + 1);
+        assert_eq!(tcb.next_retransmit_deadline(), progressed);
     }
 
     #[test]
@@ -680,15 +1032,16 @@ mod tests {
     }
 
     #[test]
-    fn read_and_write_share_one_budget_and_duplicate_replacement_refunds() {
+    fn read_and_write_share_one_budget_without_short_resends_erasing_data() {
         let pool = crate::TcpPayloadBudget::new(8192);
         let mut tcb = flow(pool.clone());
         tcb.add_unordered_packet(SeqNum(1), vec![1; 4000]);
         tcb.add_unordered_packet(SeqNum(1), vec![1; 2000]);
-        assert_eq!(pool.usage().0, 2000);
-        tcb.add_inflight_packet(vec![2; 6000]).unwrap();
-        tcb.add_unordered_packet(SeqNum(1), vec![1; 4000]);
-        assert_eq!(tcb.get_unordered_packets_total_len(), 2000);
+        assert_eq!(pool.usage().0, 4000);
+        assert!(tcb.add_inflight_packet(vec![2; 6000]).is_err());
+        tcb.add_inflight_packet(vec![2; 4000]).unwrap();
+        tcb.add_unordered_packet(SeqNum(1), vec![1; 6000]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 4000);
         assert_eq!(pool.usage().0, 8000);
         tcb.discard_failed_payload();
         assert_eq!(pool.usage().0, 0);
@@ -776,25 +1129,18 @@ mod tests {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
-    pub send_time: tokio::time::Instant,
     pub retransmit_count: usize,
-    pub retransmit_timeout: std::time::Duration, // current retransmission timeout
 }
 
 impl InflightPacket {
-    fn new(seq: SeqNum, payload: Vec<u8>, rto: Duration) -> Self {
+    fn new(seq: SeqNum, payload: Vec<u8>) -> Self {
         Self {
             seq,
             payload,
-            send_time: tokio::time::Instant::now(),
             retransmit_count: 0,
-            retransmit_timeout: rto,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
-    }
-    pub(crate) fn is_timed_out(&self) -> bool {
-        self.send_time.elapsed() >= self.retransmit_timeout
     }
 }

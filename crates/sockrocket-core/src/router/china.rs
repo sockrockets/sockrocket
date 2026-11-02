@@ -18,10 +18,11 @@ pub fn china_domain_suffix_list() -> &'static [&'static str] {
 ///
 /// Order:
 /// 1. Private / LAN IPs → Direct
-/// 2. Common China domain suffixes → Direct
-/// 3. Common China domain keywords → Direct
-/// 4. GeoIP CN (expanded built-in CIDR DB) → Direct
-/// 5. Catch-all → Proxy
+/// 2. Destinations identified as domestic by DNS policy → Direct
+/// 3. Common China domain suffixes → Direct
+/// 4. Common China domain keywords → Direct
+/// 5. GeoIP CN (expanded built-in CIDR DB) → Direct
+/// 6. Catch-all → Proxy
 pub fn china_direct_ruleset() -> RuleSet {
     let mut rs = RuleSet::new();
 
@@ -31,6 +32,10 @@ pub fn china_direct_ruleset() -> RuleSet {
             rs.add_rule(MatchRule::IpCidr { addr, prefix_len }, RouteAction::Direct);
         }
     }
+
+    // Preserve DNS policy's domestic classification even with no custom rules.
+    // A direct-domain CDN may use an address outside the built-in CN ranges.
+    rs.add_rule(MatchRule::DomesticHint, RouteAction::Direct);
 
     // --- China domain suffixes ---
     for suffix in CHINA_DOMAIN_SUFFIXES {
@@ -113,6 +118,9 @@ const CHINA_DOMAIN_SUFFIXES: &[&str] = &[
     "xn--fiqs8s", // .xn--fiqs8s (China IDN TLD)
     "xn--55qx5d", // .xn--55qx5d (company IDN TLD)
     "xn--io0a7i", // .xn--io0a7i (network IDN TLD)
+    // Kimi web and its mainland platform use local DNS and the direct exit.
+    // Keep international API names (moonshot.ai) outside this service rule.
+    "kimi.com",
     // Major services
     "baidu.com",
     "bdstatic.com",

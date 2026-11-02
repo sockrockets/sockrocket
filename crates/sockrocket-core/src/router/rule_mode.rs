@@ -50,7 +50,6 @@ pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
     // Built-in China-direct without its catch-all. Placed after user
     // non-final rules so an explicit user `geoip:CN → proxy` (or a CN
     // ip-cidr override) still wins, but before any final.
-    set.add_rule(MatchRule::DomesticHint, RouteAction::Direct);
     for entry in china_direct_ruleset().rules() {
         if matches!(entry.rule, MatchRule::MatchAll) {
             continue;
@@ -72,6 +71,20 @@ mod tests {
     use super::*;
     use crate::router::{RouteAction, Router};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn builtin_rules_preserve_domestic_dns_hint_without_custom_rules() {
+        let router = Router::new(rule_mode_ruleset(&[]));
+        crate::proxy::routing::with_tun_destination(
+            Some("192.0.2.99".parse().unwrap()),
+            true,
+            async {
+                assert_eq!(router.route("mixed.example.test", 443), RouteAction::Direct);
+            },
+        )
+        .await;
+        assert_eq!(router.route("mixed.example.test", 443), RouteAction::Proxy);
+    }
 
     #[test]
     fn rule_mode_ruleset_uses_builtin_rules_when_empty() {
