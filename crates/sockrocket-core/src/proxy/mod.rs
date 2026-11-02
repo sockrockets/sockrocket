@@ -576,3 +576,5 @@ mod tests {
 }
 
 pub mod wireguard;
+
+pub(crate) mod xhttp;

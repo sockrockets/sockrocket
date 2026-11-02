@@ -291,6 +291,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
             .filter(|s| !s.is_empty())
             .context("REALITY public key is required")?;
         return Ok(Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Reality,
             tls: None,
             ws: None,
@@ -358,6 +359,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
     };
 
     Ok(Some(TransportConfig {
+        xhttp: None,
         transport_type,
         tls,
         ws,

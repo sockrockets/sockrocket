@@ -277,10 +277,17 @@ fn transport_summary(transport: Option<&TransportConfig>) -> String {
         TransportType::Tcp => "tcp",
         TransportType::Tls => "tls",
         TransportType::WebSocket => "ws",
+        TransportType::Xhttp => "xhttp",
         TransportType::Quic => "quic",
         TransportType::Reality => "reality",
     };
     let mut summary = ttype.to_string();
+    if let Some(xhttp) = &tc.xhttp {
+        summary.push_str(&format!(
+            "|{}",
+            serde_json::to_string(xhttp).unwrap_or_default()
+        ));
+    }
     if let Some(ws) = &tc.ws {
         summary.push_str(&format!(
             "|{}|{}",
@@ -556,6 +563,7 @@ mod tests {
         let tcp = vmess("tcp", "2.2.2.2", 443, "uuid-1");
         let mut ws = vmess("ws", "2.2.2.2", 443, "uuid-1");
         ws.transport = Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: Some(WsConfig {
@@ -578,6 +586,7 @@ mod tests {
     fn ws_path_and_reality_key_distinguish_fingerprints() {
         let mut a = vmess("a", "2.2.2.2", 443, "uuid-1");
         a.transport = Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: Some(WsConfig {
@@ -593,6 +602,7 @@ mod tests {
 
         let mut r1 = vmess("r1", "2.2.2.2", 443, "uuid-1");
         r1.transport = Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Reality,
             tls: None,
             ws: None,
