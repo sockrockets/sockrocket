@@ -257,13 +257,18 @@ pub fn node_fingerprint(node: &Node) -> String {
         ),
     };
 
-    format!(
+    let mut fingerprint = format!(
         "{}|{}|{}|{}",
         node.server.to_ascii_lowercase(),
         node.port,
         credentials,
         transport_summary(node.transport.as_ref())
-    )
+    );
+    if let Some(policy) = node.extra.get(super::server_dns::KEY) {
+        fingerprint.push_str("|server-dns:");
+        fingerprint.push_str(policy);
+    }
+    fingerprint
 }
 
 /// One-line summary of how the node is reached: transport type plus the

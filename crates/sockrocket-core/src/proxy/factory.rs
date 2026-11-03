@@ -40,7 +40,19 @@ pub fn create_outbound_unwarmed(node: &Node) -> Result<SharedOutbound> {
 }
 
 fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> {
-    let outbound = build_outbound_inner(node, warm_pool)?;
+    let policy = crate::config::server_dns::ServerDns::from_node(node)?;
+    let outbound = if let Some(policy) = policy.filter(|_| {
+        node.server
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+    }) {
+        SharedOutbound(Arc::new(super::server_dns::ServerDnsOutbound::new(
+            node, policy, warm_pool,
+        )?))
+    } else {
+        build_outbound_inner(node, warm_pool)?
+    };
     if node.protocol.supports_udp() {
         Ok(outbound)
     } else {

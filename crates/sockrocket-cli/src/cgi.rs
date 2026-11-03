@@ -21,8 +21,10 @@ mod network_settings;
 mod proxy_groups;
 mod route_trace;
 mod rule_presets;
+mod speedtest_jobs;
 mod storage;
 mod subscription_jobs;
+pub use speedtest_jobs::worker as speedtest_worker;
 pub use subscription_jobs::worker as subscription_worker;
 
 use std::env;
@@ -444,6 +446,8 @@ fn read_only_action(action: &str) -> bool {
         "status"
             | "speedtest"
             | "speedtest_node"
+            | "speedtest_start"
+            | "speedtest_job"
             | "ip_check"
             | "check_update"
             | "diagnose"
@@ -515,6 +519,8 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "logs_clear" => act_logs_clear(),
         "ip_check" => act_ip_check(),
         "speedtest_node" => act_speedtest_node(post),
+        "speedtest_start" => speedtest_jobs::start(post),
+        "speedtest_job" => speedtest_jobs::status(),
         "node_details" => act_node_details(),
         "add_node" => act_add_node(post),
         "del_node" => act_del_node(post),
@@ -694,6 +700,7 @@ fn act_node_details() -> J {
             let info = parse_node(n);
             json!({
                 "index": i,
+                "test_id": speedtest_jobs::key(i, n),
                 "name": info.name,
                 "protocol": info.protocol,
                 "server": info.server,
@@ -1357,9 +1364,15 @@ fn act_speedtest_node(post: &J) -> J {
             return json!({"ok": false, "latency": -1, "msg": format!("Failed to parse config for node {index}: {e}")});
         }
     };
+    let quick = post.get("mode").and_then(|v| v.as_str()) != Some("http")
+        && !matches!(
+            &node.protocol,
+            sockrocket_core::ProxyProtocol::Tuic { .. }
+                | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
+                | sockrocket_core::ProxyProtocol::Wireguard { .. }
+        );
     let server = node.server.clone();
     let port = node.port;
-    let probe_server = server.clone();
     let result = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1369,6 +1382,16 @@ fn act_speedtest_node(post: &J) -> J {
             Err(e) => return Err(anyhow::anyhow!("runtime: {e}")),
         };
         rt.block_on(async {
+            // TCP handshakes are cheap; keep a separate budget from protocol probes.
+            if quick {
+                static TCP_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+                let _permit = TCP_SEM
+                    .get_or_init(|| tokio::sync::Semaphore::new(16))
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("speedtest cancelled"))?;
+                return sockrocket_core::tcp_latency_test(&node.server, node.port, 3).await;
+            }
             // Bound concurrent probes so Test-all cannot saturate the router.
             let _permit = speedtest_semaphore()
                 .acquire()
@@ -1377,29 +1400,16 @@ fn act_speedtest_node(post: &J) -> J {
             let outbound = sockrocket_core::create_outbound_unwarmed(&node)?;
             // Warm path: http_latency_test does warmup (Reality classic
             // discovery / QUIC session) then times the second connect.
-            match sockrocket_core::http_latency_test(&outbound, 10).await {
+            match sockrocket_core::quick_http_latency_test(&outbound, 5).await {
                 Ok(ms) => Ok(ms),
-                Err(http_err) => {
-                    // TCP only on failure — diagnostic, not mixed into the score.
-                    let tcp_result =
-                        sockrocket_core::tcp_latency_test(&probe_server, port, 5).await;
-                    let msg = match tcp_result {
-                        Ok(_) => format!(
-                            "proxy probe failed: {http_err:#} (tcp port reachable but node unusable)"
-                        ),
-                        Err(tcp_err) => format!(
-                            "proxy probe failed: {http_err:#}; tcp fallback failed: {tcp_err:#}"
-                        ),
-                    };
-                    Err(anyhow::anyhow!(msg))
-                }
+                Err(http_err) => Err(http_err),
             }
         })
     })
     .join();
     match result {
         Ok(Ok(ms)) => {
-            json!({"ok": true, "latency": ms, "server": server, "port": port, "path": "warm_outbound"})
+            json!({"ok": true, "latency": ms, "server": server, "port": port, "path": if quick { "tcp" } else { "http" }})
         }
         Ok(Err(e)) => {
             json!({"ok": false, "latency": -1, "msg": format!("Probe via {server}:{port} failed: {e:#}")})
@@ -3239,7 +3249,7 @@ fn act_delete_rule_group(post: &J) -> J {
 
 fn act_check_update() -> J {
     let current = env!("CARGO_PKG_VERSION");
-    let prefer = sockrocket_core::preferred_merlin_cli_asset().map(|s| s.to_string());
+    let prefer = merlin_update_asset();
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3273,107 +3283,167 @@ fn act_check_update() -> J {
 
 /// Download the matching musl CLI binary from GitHub Releases and replace the
 /// installed binary (config preserved). Restarts the service when it was running.
-fn act_apply_update() -> J {
-    let current = env!("CARGO_PKG_VERSION");
-    let Some(asset) = sockrocket_core::preferred_merlin_cli_asset() else {
-        return err_msg("Unsupported architecture for auto-update");
-    };
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => return err_msg(&format!("Runtime error: {e}")),
-    };
-    let check = match rt
-        .block_on(async { sockrocket_core::check_for_update(current, Some(asset)).await })
-    {
-        Ok(c) => c,
-        Err(e) => return err_msg(&format!("Update check failed: {e}")),
-    };
-    if check.availability != sockrocket_core::UpdateAvailability::Available {
-        return json!({"ok": true, "msg": format!("Already up to date (v{})", check.current)});
-    }
-    let Some(url) = check.asset_url.clone() else {
-        return err_msg(&format!(
-            "Latest v{} has no asset `{asset}` — open {}",
-            check.latest, check.html_url
-        ));
-    };
+fn merlin_update_asset() -> Option<String> {
+    let platform = fs::read_to_string(sockrocket_dir().join("platform"))
+        .ok()
+        .or_else(|| {
+            Command::new("dbus")
+                .args(["get", "softcenter_arch"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        })?;
+    sockrocket_core::merlin_package_asset(platform.trim())
+}
 
-    let dest = std::env::temp_dir().join(format!("sockrocket-cli-update-{}", check.latest));
-    if let Err(e) = rt.block_on(async { sockrocket_core::download_file(&url, &dest).await }) {
-        return err_msg(&format!("Download failed: {e}"));
-    }
-
-    let bin = sockrocket_dir().join("sockrocket-cli");
-    // Stage on the destination filesystem before stopping anything. A full
-    // JFFS must leave the old executable intact (also avoids ETXTBSY while
-    // this API process is executing that file).
-    let staged = bin.with_file_name(format!("sockrocket-cli.update-{}", rand::random::<u64>()));
-    let prepare = (|| -> std::io::Result<()> {
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)?;
-        let mut input = fs::File::open(&dest)?;
-        std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = prepare {
-        let _ = fs::remove_file(&staged);
-        return err_msg(&format!(
-            "Cannot stage update; installed program unchanged: {error}"
-        ));
-    }
-    let was_running = is_running();
-    if was_running && let Err(error) = run_sh("stop") {
-        let _ = fs::remove_file(&staged);
-        return err_msg(&error.to_string());
-    }
-    // Only rename touches the installed executable; failed staging and failed
-    // rename both preserve it. The download in the temporary directory is
-    // removed only after installation succeeds.
-    if let Err(error) = fs::rename(&staged, &bin) {
-        let _ = fs::remove_file(&staged);
-        if was_running {
-            let _ = run_sh("start");
-        }
-        return err_msg(&format!(
-            "Failed to install update; previous binary retained: {error}"
-        ));
-    }
-    let _ = fs::remove_file(&dest);
-    // Record package version for the Web UI.
-    let _ = fs::write(
-        sockrocket_dir().join("version"),
-        format!("{}\n", check.latest),
+// POSIX df -P keeps the available-block column stable on Merlin BusyBox.
+fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<()> {
+    let output = Command::new("df").arg("-Pk").arg(path).output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Cannot determine free space for {}",
+        path.display()
     );
-    if was_running && let Err(error) = run_sh("start") {
-        return err_msg(&error.to_string());
-    }
-    // Restart API after the HTTP response is flushed — killing ourselves
-    // mid-write drops the WebUI reply.
-    let api_sh = sockrocket_sh();
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sleep 2; sh '{}' api-restart >/dev/null 2>&1",
-            api_sh.display()
-        ))
-        .spawn();
-    json!({
-        "ok": true,
-        "msg": format!("Updated to v{} — service restarted (API reloads in ~2s)", check.latest),
-        "latest": check.latest,
-        "current": check.latest
-    })
+    let text = String::from_utf8_lossy(&output.stdout);
+    let available = text
+        .lines()
+        .last()
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.checked_mul(1024))
+        .ok_or_else(|| anyhow::anyhow!("Cannot parse free space for {}", path.display()))?;
+    anyhow::ensure!(
+        available >= required,
+        "更新空间不足：{} 需要 {} KiB，可用 {} KiB；现有安装未修改",
+        path.display(),
+        required.div_ceil(1024),
+        available / 1024
+    );
+    Ok(())
+}
+
+fn act_apply_update() -> J {
+    let Some(asset) = merlin_update_asset() else {
+        return err_msg("Unknown Merlin platform; reinstall the matching offline package first");
+    };
+    let result = (|| -> anyhow::Result<J> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let check = rt.block_on(sockrocket_core::check_for_update(
+            env!("CARGO_PKG_VERSION"),
+            Some(&asset),
+        ))?;
+        if check.availability != sockrocket_core::UpdateAvailability::Available {
+            return Ok(json!({"ok":true,"msg":"Already up to date"}));
+        }
+        let url = check
+            .asset_url
+            .ok_or_else(|| anyhow::anyhow!("Release has no matching full plugin package"))?;
+        let size = check.asset_size.filter(|s| *s > 0).ok_or_else(|| {
+            anyhow::anyhow!("Release asset size unavailable; cannot preflight update space")
+        })?;
+        let temporary = std::env::temp_dir();
+        ensure_update_space(&temporary, size.saturating_add(8 * 1024 * 1024))?;
+        let work = temporary.join(format!("sockrocket-update-{}", rand::random::<u64>()));
+        fs::create_dir(&work)?;
+        let prepare = (|| -> anyhow::Result<()> {
+            let archive = work.join("package.tar.gz");
+            rt.block_on(sockrocket_core::download_file(&url, &archive))?;
+            let listing = Command::new("tar").arg("-tzvf").arg(&archive).output()?;
+            anyhow::ensure!(listing.status.success(), "Invalid package archive");
+            for line in String::from_utf8_lossy(&listing.stdout).lines() {
+                anyhow::ensure!(
+                    line.starts_with('-') || line.starts_with('d'),
+                    "Package contains links or special files"
+                );
+            }
+            let names = Command::new("tar").arg("-tzf").arg(&archive).output()?;
+            anyhow::ensure!(names.status.success(), "Cannot inspect archive");
+            for name in String::from_utf8_lossy(&names.stdout).lines() {
+                anyhow::ensure!(
+                    name.starts_with("sockrocket/") && !name.split('/').any(|p| p == ".."),
+                    "Unsafe archive path"
+                );
+            }
+            // Count expanded tar bytes without materializing them in /tmp.
+            let expanded = Command::new("sh")
+                .arg("-c")
+                .arg(r#"gzip -dc "$1" | wc -c"#)
+                .arg("update-size")
+                .arg(&archive)
+                .output()?;
+            anyhow::ensure!(expanded.status.success(), "Cannot measure expanded package");
+            let bytes = String::from_utf8_lossy(&expanded.stdout)
+                .trim()
+                .parse::<u64>()?;
+            ensure_update_space(&work, bytes.saturating_add(8 * 1024 * 1024))?;
+            anyhow::ensure!(
+                Command::new("tar")
+                    .arg("-xzf")
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(&work)
+                    .status()?
+                    .success(),
+                "Extraction failed"
+            );
+            let pkg = work.join("sockrocket");
+            let platform = fs::read_to_string(pkg.join(".valid"))?;
+            anyhow::ensure!(
+                sockrocket_core::merlin_package_asset(platform.trim()).as_ref() == Some(&asset),
+                "Platform mismatch"
+            );
+            let output = Command::new(pkg.join("bin/sockrocket-cli"))
+                .arg("--version")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .split_whitespace()
+                        .any(|v| v.trim_start_matches('v') == check.latest.trim_start_matches('v')),
+                "Executable version validation failed"
+            );
+            // Copy worker outside the plugin tree so its own replacement is safe.
+            fs::write(
+                work.join("worker.sh"),
+                include_str!("../../../merlin/scripts/update.sh"),
+            )?;
+            let space = Command::new("sh")
+                .arg(work.join("worker.sh"))
+                .arg(&pkg)
+                .arg(&work)
+                .arg("--check-space")
+                .env("SOCKROCKET_DIR", sockrocket_dir())
+                .output()?;
+            anyhow::ensure!(
+                space.status.success(),
+                "{}",
+                String::from_utf8_lossy(&space.stderr).trim()
+            );
+            Command::new("sh")
+                .arg("-c")
+                .arg(r#"sleep 2; exec sh "$1" "$2" "$3""#)
+                .arg("sockrocket-update")
+                .arg(work.join("worker.sh"))
+                .arg(&pkg)
+                .arg(&work)
+                .env("SOCKROCKET_DIR", sockrocket_dir())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            Ok(())
+        })();
+        if let Err(e) = prepare {
+            let _ = fs::remove_dir_all(&work);
+            return Err(e);
+        }
+        Ok(
+            json!({"ok":true,"msg":"完整插件更新已启动；稍后刷新页面查看版本。失败时自动恢复旧版。"}),
+        )
+    })();
+    result.unwrap_or_else(|e| err_msg(&format!("Plugin update failed: {e}")))
 }
 
 fn act_diagnose() -> J {

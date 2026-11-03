@@ -53,7 +53,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 # The firmware starts a fresh CGI process per job: cap these independently
 # of the long-lived HTTP API. Reserve Stop outside the normal work slots.
-if [ "$ACTION" = stop ]; then slots="stop"; else slots="1 2 3 4"; fi
+if [ "$ACTION" = stop ]; then
+    slots="stop"
+elif [ "$ACTION" = speedtest_node ]; then
+    # Leave two firmware worker slots available for status and controls.
+    slots="1 2"
+else
+    slots="3 4 1 2"
+fi
 for n in $slots; do
     slot="$RUNTIME_DIR/slot-$n"
     if [ -f "$slot/pid" ]; then

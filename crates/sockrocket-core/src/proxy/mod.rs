@@ -577,4 +577,5 @@ mod tests {
 
 pub mod wireguard;
 
+mod server_dns;
 pub(crate) mod xhttp;
