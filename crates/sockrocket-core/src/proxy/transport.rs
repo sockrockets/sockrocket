@@ -1052,8 +1052,13 @@ pub fn resolve_transport_tls(
     let use_tls = matches!(
         t.transport_type,
         TransportType::Tls | TransportType::Reality
-    ) || t.tls.is_some();
-    let tls = if t.transport_type == TransportType::Reality && t.tls.is_none() {
+    ) || t.tls.is_some()
+        || t.reality.is_some();
+    let tls = if matches!(
+        t.transport_type,
+        TransportType::Reality | TransportType::Xhttp
+    ) && t.tls.is_none()
+    {
         if let Some(ref r) = t.reality {
             tracing::debug!(
                 "Reality transport: SNI '{}', public_key {}...",
@@ -1079,6 +1084,7 @@ pub fn resolve_transport_tls(
 ///
 /// Replaces the per-protocol `XxxConnFactory` boilerplate. Build once in
 /// `Outbound::new()` and store inside a `ConnPool`.
+#[derive(Clone)]
 pub struct TlsConnFactory {
     server: String,
     port: u16,
@@ -1098,6 +1104,8 @@ pub struct TlsConnFactory {
     /// WebSocket layer config; set when the transport is ws. The WS
     /// handshake runs on top of TCP/TLS/Reality inside `create()`.
     ws: Option<WsConfig>,
+    xhttp: Option<Arc<super::xhttp::Factory>>,
+    xhttp_error: Option<String>,
 }
 
 impl TlsConnFactory {
@@ -1136,21 +1144,48 @@ impl TlsConnFactory {
             }
             _ => None,
         };
-        Self::build(
+        let mut tls_config = tls_config;
+        if transport.is_some_and(|t| t.transport_type == TransportType::Xhttp)
+            && let Some(tls) = tls_config.as_mut()
+        {
+            let alpn = if transport.is_some_and(|t| t.reality.is_some()) {
+                "h2"
+            } else {
+                match tls.alpn.as_deref() {
+                    Some([one]) if one == "http/1.1" => "http/1.1",
+                    Some([one]) if one == "h3" => "h3",
+                    _ => "h2",
+                }
+            };
+            tls.alpn = Some(vec![alpn.into()]);
+        }
+        let mut factory = Self::build(
             server,
             port,
             tls_config.as_ref(),
             force_tls || resolved_tls,
             transport.and_then(|t| t.reality.as_ref()),
             ws,
-        )
+        );
+        if let Some(t) = transport.filter(|t| t.transport_type == TransportType::Xhttp) {
+            match super::xhttp::Factory::new(Arc::new(factory.clone()), server, port, t) {
+                Ok(xhttp) => factory.xhttp = Some(xhttp),
+                Err(error) => factory.xhttp_error = Some(error.to_string()),
+            }
+        }
+        factory
     }
 
+    pub(crate) fn without_xhttp(mut self) -> Self {
+        self.xhttp = None;
+        self.xhttp_error = None;
+        self
+    }
     pub(super) async fn connect_vision(
         &self,
     ) -> Result<craft_tls::client::TlsStream<super::vision::RecordIo<TcpStream>>> {
         anyhow::ensure!(
-            self.use_tls && self.ws.is_none(),
+            self.use_tls && self.ws.is_none() && self.xhttp.is_none(),
             "Vision requires native TLS or REALITY over TCP"
         );
         if let Some(error) = &self.reality_error {
@@ -1245,6 +1280,8 @@ impl TlsConnFactory {
             reality_classic_connector,
             reality_error,
             ws,
+            xhttp: None,
+            xhttp_error: None,
         }
     }
 }
@@ -1252,6 +1289,12 @@ impl TlsConnFactory {
 impl ConnFactory for TlsConnFactory {
     fn create(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<BoxProxyStream>> + Send + '_>> {
         Box::pin(async {
+            if self.xhttp_error.is_some() {
+                anyhow::bail!("Invalid XHTTP transport configuration");
+            }
+            if let Some(xhttp) = &self.xhttp {
+                return xhttp.open().await;
+            }
             if let Some(err) = &self.reality_error {
                 return Err(anyhow::anyhow!("REALITY configuration error: {}", err));
             }
@@ -1560,6 +1603,7 @@ mod tests {
         // ws+tls node: type=websocket plus an explicit tls config must NOT
         // be silently downgraded to plaintext TCP.
         let t = TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: Some(TlsConfig {
                 sni: Some("cdn.example.com".to_string()),
@@ -1578,6 +1622,7 @@ mod tests {
     #[test]
     fn resolve_transport_tls_ws_without_tls_stays_plaintext() {
         let t = TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: None,
@@ -1657,6 +1702,7 @@ mod tests {
         });
 
         let transport = TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: Some(WsConfig {

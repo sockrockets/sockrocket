@@ -76,6 +76,7 @@ async fn reference_vision_plain_tls_direct_udp_and_shutdown() {
     .await
     .unwrap();
     let transport = TransportConfig {
+        xhttp: None,
         transport_type: TransportType::Tls,
         tls: Some(TlsConfig {
             sni: Some("localhost".into()),

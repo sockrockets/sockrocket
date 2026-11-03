@@ -89,7 +89,9 @@ impl VlessOutbound {
         let factory = Arc::new(TlsConnFactory::from_transport(
             server, port, transport, false,
         ));
-        let pool = if warm_pool {
+        let is_xhttp = transport
+            .is_some_and(|t| t.transport_type == crate::config::model::TransportType::Xhttp);
+        let pool = if warm_pool && !is_xhttp {
             ConnPool::new(factory)
         } else {
             ConnPool::lazy(factory)
