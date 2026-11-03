@@ -57,8 +57,10 @@ fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::Fingerpr
 }
 
 fn modern_chrome(name: Option<&str>) -> bool {
-    !matches!(name.map(str::to_ascii_lowercase).as_deref(),
-        Some("chrome108" | "chrome112" | "safari" | "firefox"))
+    !matches!(
+        name.map(str::to_ascii_lowercase).as_deref(),
+        Some("chrome108" | "chrome112" | "safari" | "firefox")
+    )
 }
 
 /// Apply TCP_NODELAY and keepalive to a connected stream.
@@ -716,10 +718,13 @@ fn build_tls_config(config: Option<&TlsConfig>, pin: Option<[u8; 32]>) -> Arc<Cl
 
     let mut provider = craft_tls::rustls::crypto::ring::default_provider();
     if modern_chrome(fp_name) {
-        provider.kx_groups.insert(0, &craft_tls::rustls::reality::X25519_MLKEM768);
+        provider
+            .kx_groups
+            .insert(0, &craft_tls::rustls::reality::X25519_MLKEM768);
     }
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions().expect("built-in TLS versions");
+        .with_safe_default_protocol_versions()
+        .expect("built-in TLS versions");
     let base_config = if let Some(pin) = pin {
         builder
             .dangerous()
@@ -805,12 +810,13 @@ pub fn build_reality_tls_connector(
 
     // The built-in fingerprints only know classic key shares; let rustls
     // emit the native key share (our hybrid group) instead.
-    let mut tls_config = base_config
-        .with_fingerprint(if force_classic && modern_chrome(fp_name) {
-            craft_tls::rustls::craft::CHROME_112.builder().dangerous_disable_override_keyshare()
-        } else {
-            fingerprint_builder(fp_name).dangerous_disable_override_keyshare()
-        });
+    let mut tls_config = base_config.with_fingerprint(if force_classic && modern_chrome(fp_name) {
+        craft_tls::rustls::craft::CHROME_112
+            .builder()
+            .dangerous_disable_override_keyshare()
+    } else {
+        fingerprint_builder(fp_name).dangerous_disable_override_keyshare()
+    });
     tls_config.reality = Some(Arc::new(CraftRealityConfig {
         public_key,
         short_id,

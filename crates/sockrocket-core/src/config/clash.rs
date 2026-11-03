@@ -163,7 +163,8 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
 
     if let Some(policy) = server_dns {
         for node in &mut nodes {
-            node.extra.insert(super::server_dns::KEY.into(), policy.clone());
+            node.extra
+                .insert(super::server_dns::KEY.into(), policy.clone());
         }
     }
     Ok(nodes)

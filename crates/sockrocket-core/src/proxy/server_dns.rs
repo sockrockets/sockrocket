@@ -43,19 +43,19 @@ impl ServerDnsOutbound {
             !ips.is_empty(),
             "Subscription proxy server DNS returned no address"
         );
-        if let Some((cached_ip, _)) = self.cached.lock().unwrap().as_ref() {
-            if let Some(index) = ips.iter().position(|ip| ip == cached_ip) {
-                ips.swap(0, index);
-            }
+        if let Some((cached_ip, _)) = self.cached.lock().unwrap().as_ref()
+            && let Some(index) = ips.iter().position(|ip| ip == cached_ip)
+        {
+            ips.swap(0, index);
         }
         Ok(ips)
     }
     fn outbound(&self, ip: IpAddr) -> Result<SharedOutbound> {
         let mut cached = self.cached.lock().unwrap();
-        if let Some((cached_ip, outbound)) = cached.as_ref() {
-            if *cached_ip == ip {
-                return Ok(outbound.clone());
-            }
+        if let Some((cached_ip, outbound)) = cached.as_ref()
+            && *cached_ip == ip
+        {
+            return Ok(outbound.clone());
         }
         let mut node = self.node.clone();
         node.server = ip.to_string();
