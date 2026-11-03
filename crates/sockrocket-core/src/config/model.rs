@@ -75,6 +75,9 @@ pub struct AppConfig {
     /// Whether TUN mode was active when the app was last closed
     #[serde(default)]
     pub tun_was_enabled: bool,
+    /// None selects MTU at TUN startup; a value overrides discovery (1280..=9000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tun_mtu: Option<u16>,
     /// Node health check + auto-switch settings
     #[serde(default)]
     pub health_check: HealthCheckConfig,
@@ -106,6 +109,7 @@ impl Default for AppConfig {
             rules: Vec::new(),
             auto_connect: false,
             tun_was_enabled: false,
+            tun_mtu: None,
             health_check: HealthCheckConfig::default(),
             groups: Vec::new(),
             locale: default_locale(),

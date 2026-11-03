@@ -96,6 +96,7 @@ pub struct AppState {
     pub(crate) http_port: u16,
     pub(crate) dns: Option<sockrocket_core::config::dns::DnsSettings>,
     pub(crate) ipv6_mode: sockrocket_core::config::dns::Ipv6Mode,
+    pub(crate) tun_mtu: Option<u16>,
     pub(crate) dns_direct_input: Entity<InputState>,
     pub(crate) dns_proxy_input: Entity<InputState>,
     pub(crate) dns_bootstrap_input: Entity<InputState>,
@@ -719,6 +720,7 @@ impl AppState {
             http_port: persisted.http_port,
             dns: persisted.dns.clone(),
             ipv6_mode: persisted.ipv6_mode,
+            tun_mtu: persisted.tun_mtu,
             dns_direct_input,
             dns_proxy_input,
             dns_bootstrap_input,
@@ -2903,6 +2905,8 @@ impl AppState {
         self.tun_swappable = Some(tun_swappable.clone());
         let tun_outbound = SharedOutbound(tun_swappable.clone() as std::sync::Arc<dyn Outbound>);
         let tun_stats = self.proxy_stats.clone().unwrap_or_default();
+        let manual_mtu = self.tun_mtu;
+        let mtu_cache = gui_state_path().map(|path| path.with_file_name("tun-mtu.json"));
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         self.tun_stop_tx = Some(stop_tx);
@@ -2986,7 +2990,22 @@ impl AppState {
                                     proxy_server_host.as_deref().unwrap_or("no node selected")
                                 ));
                             }
-                            let tun_proxy = TunProxy::start_with_stats(tun_outbound, None, None, tun_stats)?;
+                            let mtu_targets = if manual_mtu.is_none() {
+                                node.as_ref()
+                                    .map(|n| resolve_to_ips(&n.server))
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            let mtu = sockrocket_core::proxy::tun::mtu::select(
+                                node.as_ref(),
+                                &mtu_targets,
+                                manual_mtu,
+                                mtu_cache.as_deref(),
+                            )?;
+                            let tun_proxy = TunProxy::start_with_mtu_and_stats(
+                                tun_outbound, None, None, tun_stats, mtu,
+                            )?;
                             let route_info = tun_proxy.route_info();
                             let route_guard = setup_tun_routes(&route_info, &proxy_server_ips)?;
                             Ok((tun_proxy, route_guard))
@@ -3547,6 +3566,7 @@ impl AppState {
             http_port: self.http_port,
             dns: self.dns.clone(),
             ipv6_mode: self.ipv6_mode,
+            tun_mtu: self.tun_mtu,
             proxy_mode: self.proxy_mode.clone(),
             nodes: self.nodes.clone(),
             active_node: self.selected_node,
@@ -3955,6 +3975,7 @@ impl AppState {
                 self.rules = new_config.rules.clone();
                 self.dns = new_config.dns.clone();
                 self.ipv6_mode = new_config.ipv6_mode;
+                self.tun_mtu = new_config.tun_mtu;
                 self.proxy_mode = new_config.proxy_mode.clone();
                 let health_was_enabled = self.health_check.enabled;
                 self.health_check = new_config.health_check.clone();

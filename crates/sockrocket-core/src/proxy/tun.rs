@@ -18,6 +18,8 @@ use crate::dns::DnsResolver;
 use crate::dns::fakeip::FakeIpPool;
 use crate::router::Router;
 
+pub mod mtu;
+
 // ─── Global TUN exit state for emergency cleanup ───
 
 /// Saved state for emergency route restoration when the process exits.
@@ -450,7 +452,6 @@ fn run_cmd_sync(cmd: &str, args: &[&str]) -> Result<String> {
 const TUN_IPV4: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 2);
 const TUN_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 10, 0, 1);
 const TUN_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
-const TUN_MTU: u16 = 1500;
 
 /// TUN device IPv6 configuration.
 ///
@@ -476,8 +477,8 @@ const TUN_V6_IFACE_METRIC: u32 = 5;
 /// MSS announced to TCP peers on the TUN device. `ipstack` uses a single
 /// `TcpConfig` for both address families, so the value must fit the larger
 /// IPv6 header: MTU - 40 (IPv6 header) - 20 (TCP header). IPv4 peers
-/// therefore see MSS 1440 instead of 1460; slightly conservative but correct
-/// for both families.
+/// see MSS 1440 instead of 1460 at MTU 1500; slightly conservative but
+/// correct for both families.
 fn tun_tcp_mss(mtu: u16) -> u16 {
     mtu - 60
 }
@@ -558,6 +559,20 @@ impl TunProxy {
         router: Option<Arc<Router>>,
         stats: super::ProxyStats,
     ) -> Result<Self> {
+        // Callers with node information should use start_with_mtu_and_stats
+        // after mtu::select. Without an endpoint, do not claim path discovery.
+        Self::start_with_mtu_and_stats(outbound, fakeip, router, stats, mtu::FALLBACK_MTU)
+    }
+
+    /// Start with a validated selection applied to the device, stack and TCP MSS.
+    pub fn start_with_mtu_and_stats(
+        outbound: SharedOutbound,
+        fakeip: Option<Arc<FakeIpPool>>,
+        router: Option<Arc<Router>>,
+        stats: super::ProxyStats,
+        mtu: u16,
+    ) -> Result<Self> {
+        mtu::validate(mtu)?;
         validate_tun_environment()?;
 
         let mut tun_config = tun::Configuration::default();
@@ -571,7 +586,7 @@ impl TunProxy {
             .address(TUN_IPV4)
             .netmask(TUN_NETMASK)
             .destination(TUN_GATEWAY)
-            .mtu(TUN_MTU)
+            .mtu(mtu)
             .up();
 
         #[cfg(target_os = "linux")]
@@ -586,7 +601,13 @@ impl TunProxy {
             .tun_name()
             .unwrap_or_else(|_| default_tun_name().to_string());
 
-        tracing::info!("TUN device created: {} ({})", tun_name, TUN_IPV4);
+        tracing::info!(
+            "TUN device created: {} ({}, MTU {}, TCP MSS {})",
+            tun_name,
+            TUN_IPV4,
+            mtu,
+            tun_tcp_mss(mtu)
+        );
 
         // Relax reverse-path filtering on the TUN device (Linux only).
         // Strict rp_filter (common router default, inherited from
@@ -603,7 +624,7 @@ impl TunProxy {
         let ipv6_gateway = configure_tun_ipv6(&tun_name);
 
         let mut ipstack_config = IpStackConfig::default();
-        ipstack_config.mtu(TUN_MTU).expect("valid MTU");
+        ipstack_config.mtu(mtu).expect("validated MTU");
 
         let mut tcp_config = TcpConfig::default();
         // Idle-session timeout: ipstack resets this timer on every read/write
@@ -615,7 +636,7 @@ impl TunProxy {
         // typical push idle gaps while capping how long a dead session can
         // hold ipstack memory on a memory-tight Merlin router.
         tcp_config.timeout = std::time::Duration::from_secs(1800);
-        tcp_config.options = Some(vec![TcpOptions::MaximumSegmentSize(tun_tcp_mss(TUN_MTU))]);
+        tcp_config.options = Some(vec![TcpOptions::MaximumSegmentSize(tun_tcp_mss(mtu))]);
         // Ceiling for one LAN flow. The live cap sits on `window_limit` and
         // shrinks toward 64 KiB as more TCP sessions appear, so a speed test
         // gets a wide window without reserving 512 KiB for every flow. Both
@@ -1393,12 +1414,14 @@ fn relax_tun_rp_filter(tun_name: &str) {
 /// decision about the proxy; IPv6 on other interfaces and forwarding stay
 /// untouched. Missing sysctl means this kernel has no IPv6 for the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
 enum TunIpv6Enable {
     AlreadyOn,
     TurnOn,
     Missing,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn tun_ipv6_enable_action(current: Option<&str>) -> TunIpv6Enable {
     match current.map(str::trim) {
         None => TunIpv6Enable::Missing,
@@ -3580,7 +3603,8 @@ mod tests {
     fn test_tun_tcp_mss() {
         // Must leave room for the larger IPv6 header (40) + TCP header (20).
         assert_eq!(tun_tcp_mss(1500), 1440);
-        assert!(tun_tcp_mss(TUN_MTU) <= TUN_MTU - 60);
+        assert_eq!(tun_tcp_mss(1400), 1340);
+        assert_eq!(tun_tcp_mss(1280), 1220);
     }
 
     #[test]
