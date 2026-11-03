@@ -603,7 +603,10 @@ impl TunProxy {
 
         tracing::info!(
             "TUN device created: {} ({}, MTU {}, TCP MSS {})",
-            tun_name, TUN_IPV4, mtu, tun_tcp_mss(mtu)
+            tun_name,
+            TUN_IPV4,
+            mtu,
+            tun_tcp_mss(mtu)
         );
 
         // Relax reverse-path filtering on the TUN device (Linux only).
@@ -1411,12 +1414,14 @@ fn relax_tun_rp_filter(tun_name: &str) {
 /// decision about the proxy; IPv6 on other interfaces and forwarding stay
 /// untouched. Missing sysctl means this kernel has no IPv6 for the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
 enum TunIpv6Enable {
     AlreadyOn,
     TurnOn,
     Missing,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn tun_ipv6_enable_action(current: Option<&str>) -> TunIpv6Enable {
     match current.map(str::trim) {
         None => TunIpv6Enable::Missing,

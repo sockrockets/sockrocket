@@ -41,7 +41,7 @@ pub(crate) fn get_root_cert_store() -> &'static craft_tls::rustls::RootCertStore
 fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::FingerprintBuilder {
     use craft_tls::rustls::craft::*;
     match name.map(|s| s.to_lowercase()).as_deref() {
-        Some("chrome") | None => CHROME_112.builder(),
+        Some("chrome") | Some("chromeauto") | Some("chrome133") | None => CHROME_AUTO.builder(),
         Some("safari") => {
             // SAFARI_17_1 advertises TLS 1.0/1.1 in supported_versions, which
             // this rustls base cannot emit; strict mode would panic per
@@ -50,9 +50,17 @@ fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::Fingerpr
         }
         Some("firefox") => FIREFOX_105.builder(),
         Some("chrome108") => CHROME_108.builder(),
-        // Default to Chrome 112 for any unrecognized fingerprint
-        _ => CHROME_112.builder(),
+        Some("chrome112") => CHROME_112.builder(),
+        // Preserve the default-to-Chrome behavior for unknown names.
+        _ => CHROME_AUTO.builder(),
     }
+}
+
+fn modern_chrome(name: Option<&str>) -> bool {
+    !matches!(
+        name.map(str::to_ascii_lowercase).as_deref(),
+        Some("chrome108" | "chrome112" | "safari" | "firefox")
+    )
 }
 
 /// Apply TCP_NODELAY and keepalive to a connected stream.
@@ -700,22 +708,35 @@ pub(crate) fn build_tls_connector_pinned(
     config: Option<&TlsConfig>,
     pin: Option<[u8; 32]>,
 ) -> TlsConnector {
+    TlsConnector::from(build_tls_config(config, pin))
+}
+
+fn build_tls_config(config: Option<&TlsConfig>, pin: Option<[u8; 32]>) -> Arc<ClientConfig> {
     let skip_verify = config.map(|c| c.skip_cert_verify).unwrap_or(false);
     let alpn = config.and_then(|c| c.alpn.as_ref());
     let fp_name = config.and_then(|c| c.fingerprint.as_deref());
 
+    let mut provider = craft_tls::rustls::crypto::ring::default_provider();
+    if modern_chrome(fp_name) {
+        provider
+            .kx_groups
+            .insert(0, &craft_tls::rustls::reality::X25519_MLKEM768);
+    }
+    let builder = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("built-in TLS versions");
     let base_config = if let Some(pin) = pin {
-        ClientConfig::builder()
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedTlsVerifier(pin)))
             .with_no_client_auth()
     } else if skip_verify {
-        ClientConfig::builder()
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
             .with_no_client_auth()
     } else {
-        ClientConfig::builder()
+        builder
             .with_root_certificates(get_root_cert_store().clone())
             .with_no_client_auth()
     };
@@ -731,7 +752,7 @@ pub(crate) fn build_tls_connector_pinned(
         tls_config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
     }
 
-    TlsConnector::from(Arc::new(tls_config))
+    Arc::new(tls_config)
 }
 
 /// Build a TLS connector for the REALITY protocol.
@@ -789,8 +810,13 @@ pub fn build_reality_tls_connector(
 
     // The built-in fingerprints only know classic key shares; let rustls
     // emit the native key share (our hybrid group) instead.
-    let mut tls_config = base_config
-        .with_fingerprint(fingerprint_builder(fp_name).dangerous_disable_override_keyshare());
+    let mut tls_config = base_config.with_fingerprint(if force_classic && modern_chrome(fp_name) {
+        craft_tls::rustls::craft::CHROME_112
+            .builder()
+            .dangerous_disable_override_keyshare()
+    } else {
+        fingerprint_builder(fp_name).dangerous_disable_override_keyshare()
+    });
     tls_config.reality = Some(Arc::new(CraftRealityConfig {
         public_key,
         short_id,
@@ -1026,8 +1052,13 @@ pub fn resolve_transport_tls(
     let use_tls = matches!(
         t.transport_type,
         TransportType::Tls | TransportType::Reality
-    ) || t.tls.is_some();
-    let tls = if t.transport_type == TransportType::Reality && t.tls.is_none() {
+    ) || t.tls.is_some()
+        || t.reality.is_some();
+    let tls = if matches!(
+        t.transport_type,
+        TransportType::Reality | TransportType::Xhttp
+    ) && t.tls.is_none()
+    {
         if let Some(ref r) = t.reality {
             tracing::debug!(
                 "Reality transport: SNI '{}', public_key {}...",
@@ -1053,6 +1084,7 @@ pub fn resolve_transport_tls(
 ///
 /// Replaces the per-protocol `XxxConnFactory` boilerplate. Build once in
 /// `Outbound::new()` and store inside a `ConnPool`.
+#[derive(Clone)]
 pub struct TlsConnFactory {
     server: String,
     port: u16,
@@ -1072,6 +1104,8 @@ pub struct TlsConnFactory {
     /// WebSocket layer config; set when the transport is ws. The WS
     /// handshake runs on top of TCP/TLS/Reality inside `create()`.
     ws: Option<WsConfig>,
+    xhttp: Option<Arc<super::xhttp::Factory>>,
+    xhttp_error: Option<String>,
 }
 
 impl TlsConnFactory {
@@ -1110,21 +1144,48 @@ impl TlsConnFactory {
             }
             _ => None,
         };
-        Self::build(
+        let mut tls_config = tls_config;
+        if transport.is_some_and(|t| t.transport_type == TransportType::Xhttp)
+            && let Some(tls) = tls_config.as_mut()
+        {
+            let alpn = if transport.is_some_and(|t| t.reality.is_some()) {
+                "h2"
+            } else {
+                match tls.alpn.as_deref() {
+                    Some([one]) if one == "http/1.1" => "http/1.1",
+                    Some([one]) if one == "h3" => "h3",
+                    _ => "h2",
+                }
+            };
+            tls.alpn = Some(vec![alpn.into()]);
+        }
+        let mut factory = Self::build(
             server,
             port,
             tls_config.as_ref(),
             force_tls || resolved_tls,
             transport.and_then(|t| t.reality.as_ref()),
             ws,
-        )
+        );
+        if let Some(t) = transport.filter(|t| t.transport_type == TransportType::Xhttp) {
+            match super::xhttp::Factory::new(Arc::new(factory.clone()), server, port, t) {
+                Ok(xhttp) => factory.xhttp = Some(xhttp),
+                Err(error) => factory.xhttp_error = Some(error.to_string()),
+            }
+        }
+        factory
     }
 
+    pub(crate) fn without_xhttp(mut self) -> Self {
+        self.xhttp = None;
+        self.xhttp_error = None;
+        self
+    }
     pub(super) async fn connect_vision(
         &self,
     ) -> Result<craft_tls::client::TlsStream<super::vision::RecordIo<TcpStream>>> {
         anyhow::ensure!(
-            self.use_tls && self.ws.is_none(),
+            self.use_tls && self.ws.is_none() && self.xhttp.is_none(),
             "Vision requires native TLS or REALITY over TCP"
         );
         if let Some(error) = &self.reality_error {
@@ -1219,6 +1280,8 @@ impl TlsConnFactory {
             reality_classic_connector,
             reality_error,
             ws,
+            xhttp: None,
+            xhttp_error: None,
         }
     }
 }
@@ -1226,6 +1289,12 @@ impl TlsConnFactory {
 impl ConnFactory for TlsConnFactory {
     fn create(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<BoxProxyStream>> + Send + '_>> {
         Box::pin(async {
+            if self.xhttp_error.is_some() {
+                anyhow::bail!("Invalid XHTTP transport configuration");
+            }
+            if let Some(xhttp) = &self.xhttp {
+                return xhttp.open().await;
+            }
             if let Some(err) = &self.reality_error {
                 return Err(anyhow::anyhow!("REALITY configuration error: {}", err));
             }
@@ -1534,6 +1603,7 @@ mod tests {
         // ws+tls node: type=websocket plus an explicit tls config must NOT
         // be silently downgraded to plaintext TCP.
         let t = TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: Some(TlsConfig {
                 sni: Some("cdn.example.com".to_string()),
@@ -1552,6 +1622,7 @@ mod tests {
     #[test]
     fn resolve_transport_tls_ws_without_tls_stays_plaintext() {
         let t = TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: None,
@@ -1631,6 +1702,7 @@ mod tests {
         });
 
         let transport = TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: Some(WsConfig {
@@ -1702,3 +1774,7 @@ mod certificate_pin_tests {
         assert!(!correct.supported_verify_schemes().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "chrome_auto_tests.rs"]
+mod chrome_auto_tests;

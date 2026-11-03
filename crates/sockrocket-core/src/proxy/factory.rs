@@ -40,7 +40,19 @@ pub fn create_outbound_unwarmed(node: &Node) -> Result<SharedOutbound> {
 }
 
 fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> {
-    let outbound = build_outbound_inner(node, warm_pool)?;
+    let policy = crate::config::server_dns::ServerDns::from_node(node)?;
+    let outbound = if let Some(policy) = policy.filter(|_| {
+        node.server
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+    }) {
+        SharedOutbound(Arc::new(super::server_dns::ServerDnsOutbound::new(
+            node, policy, warm_pool,
+        )?))
+    } else {
+        build_outbound_inner(node, warm_pool)?
+    };
     if node.protocol.supports_udp() {
         Ok(outbound)
     } else {
@@ -51,6 +63,14 @@ fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound>
 }
 
 fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> {
+    anyhow::ensure!(
+        !node
+            .transport
+            .as_ref()
+            .is_some_and(|t| t.transport_type == crate::config::model::TransportType::Xhttp)
+            || matches!(node.protocol, ProxyProtocol::VLess { .. }),
+        "XHTTP is currently supported only for VLESS"
+    );
     match &node.protocol {
         ProxyProtocol::Wireguard { config } => {
             anyhow::ensure!(
@@ -263,6 +283,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::Tls,
                 tls: Some(TlsConfig {
                     sni: Some("server.com".to_string()),
@@ -293,6 +314,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::Tls,
                 tls: Some(TlsConfig {
                     sni: Some("trojan.server.com".to_string()),
