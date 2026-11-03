@@ -16,3 +16,5 @@ pub mod watch;
 pub mod storage;
 
 pub mod wireguard;
+
+pub mod server_dns;

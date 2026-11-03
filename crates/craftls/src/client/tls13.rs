@@ -218,10 +218,8 @@ pub(super) fn initial_key_share(
     config: &ClientConfig,
     server_name: &ServerName<'_>,
 ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
-    let group = config
-        .resumption
-        .store
-        .kx_hint(server_name)
+    let group = config.craft.preferred_key_share()
+        .or_else(|| config.resumption.store.kx_hint(server_name))
         .and_then(|group_name| config.find_kx_group(group_name))
         .unwrap_or_else(|| {
             config
