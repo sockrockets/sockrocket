@@ -450,6 +450,7 @@ fn read_only_action(action: &str) -> bool {
             | "speedtest_job"
             | "ip_check"
             | "check_update"
+            | "update_status"
             | "diagnose"
             | "nodes"
             | "log"
@@ -477,6 +478,9 @@ pub use http::{DEFAULT_API_PORT, serve_api};
 // === Actions ===
 
 fn dispatch(action: &str, post: &J) -> J {
+    if sockrocket_dir().join(".update-transaction").exists() && !read_only_action(action) {
+        return json!({"ok":false,"error_code":"update_in_progress","msg":"软件更新中，暂不能修改配置或服务，请稍后重试"});
+    }
     let _transaction = if matches!(
         action,
         "stop" | "subscription_start" | "add_sub" | "update_subs"
@@ -552,6 +556,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "replace_rule_group" => act_replace_rule_group(post),
         "check_update" => act_check_update(),
         "apply_update" => act_apply_update(),
+        "update_status" => act_update_status(),
         "diagnose" => act_diagnose(),
         _ => json!({"error": "Unknown action"}),
     }
@@ -3322,6 +3327,18 @@ fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<
     Ok(())
 }
 
+fn act_update_status() -> J {
+    let root = sockrocket_dir();
+    let mut active = root.join(".update-transaction").is_dir();
+    let status = fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
+    active |= status.trim() == "queued";
+    if status.starts_with("rollback-failed:") {
+        active = false;
+    }
+    let stage = fs::read_to_string(root.join(".update-transaction/stage")).unwrap_or_default();
+    json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim()})
+}
+
 fn act_apply_update() -> J {
     let Some(asset) = merlin_update_asset() else {
         return err_msg("Unknown Merlin platform; reinstall the matching offline package first");
@@ -3421,6 +3438,7 @@ fn act_apply_update() -> J {
                 "{}",
                 String::from_utf8_lossy(&space.stderr).trim()
             );
+            fs::write(sockrocket_dir().join("update-status"), "queued\n")?;
             Command::new("sh")
                 .arg("-c")
                 .arg(r#"sleep 2; exec sh "$1" "$2" "$3""#)
@@ -3436,6 +3454,10 @@ fn act_apply_update() -> J {
             Ok(())
         })();
         if let Err(e) = prepare {
+            let _ = fs::write(
+                sockrocket_dir().join("update-status"),
+                "failed: preparation\n",
+            );
             let _ = fs::remove_dir_all(&work);
             return Err(e);
         }
@@ -3850,6 +3872,31 @@ mod tests {
             false
         );
         assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), before);
+    }
+
+    #[test]
+    fn update_blocks_configuration_writes_and_reports_terminal_states() {
+        let _env = TestEnv::new(SAMPLE);
+        let root = sockrocket_dir();
+        fs::create_dir(root.join(".update-transaction")).unwrap();
+        fs::write(root.join("update-status"), "preparing").unwrap();
+        assert!(storage::MutationGuard::acquire().is_err());
+        let response = dispatch("save_config", &json!({}));
+        assert_eq!(response["error_code"], "update_in_progress");
+        assert_eq!(dispatch("update_status", &json!({}))["active"], true);
+        fs::write(
+            root.join("update-status"),
+            "rollback-failed: backup retained",
+        )
+        .unwrap();
+        assert_eq!(dispatch("update_status", &json!({}))["active"], false);
+        fs::remove_dir(root.join(".update-transaction")).unwrap();
+        assert!(storage::MutationGuard::acquire().is_ok());
+        fs::write(root.join("update-status"), "success: plugin updated").unwrap();
+        assert_eq!(
+            dispatch("update_status", &json!({}))["status"],
+            "success: plugin updated"
+        );
     }
 
     #[test]

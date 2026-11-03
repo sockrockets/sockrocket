@@ -2776,6 +2776,28 @@ function srCheckUpdate() {
     srShowMsg('更新检查失败', 'err');
   }, 30000);
 }
+var srUpdatePollTimer = null;
+function srPollUpdate() {
+  if (srUpdatePollTimer) clearTimeout(srUpdatePollTimer);
+  srApi('update_status', null, function (d) {
+    var st = srElement('update-status'), status = d.status || 'idle';
+    if (d.active) {
+      var labels = {queued:'等待开始',preparing:'准备备份',stopping:'停止服务',replacing:'安装文件',integration:'更新系统集成','api-restart':'启动管理接口','service-start':'启动代理','health-check':'检查服务'};
+      st.textContent = '更新进行中：' + (labels[d.stage || status] || '处理中');
+      srUpdatePollTimer = setTimeout(srPollUpdate, 2000);
+      return;
+    }
+    if (status.indexOf('success:') === 0) st.textContent = '更新成功，健康检查通过。';
+    else if (status.indexOf('rolled-back:') === 0) st.textContent = '更新未通过检查，已恢复旧版并通过健康检查。';
+    else if (status.indexOf('rollback-failed:') === 0) st.textContent = '恢复未通过检查，备份已保留，请检查诊断日志。';
+    else if (status.indexOf('failed:') === 0) st.textContent = '更新失败：' + status;
+    else st.textContent = '当前没有更新任务。';
+    refreshStatus();
+  }, function () {
+    srElement('update-status').textContent = '等待管理接口恢复，正在重新查询更新结果…';
+    srUpdatePollTimer = setTimeout(srPollUpdate, 3000);
+  }, 10000);
+}
 function srApplyUpdate() {
   var st = srElement('update-status');
   if (!confirm('下载并安装最新完整插件？\n\n订阅、节点和规则会保留。服务将重启，网络连接可能短暂中断。')) return;
@@ -2784,10 +2806,10 @@ function srApplyUpdate() {
   srApi('apply_update', null, function (d) {
     toastResp(d);
     st.textContent = d.msg || '';
-    setTimeout(refreshStatus, 1500);
+    if (d.ok !== false) srPollUpdate();
   }, function () {
-    st.textContent = '安装失败，请检查网络后重试';
-    srShowMsg('安装失败', 'err');
+    st.textContent = '请求中断，正在查询实际更新结果…';
+    srPollUpdate();
   }, 180000);
 }
 
@@ -2844,6 +2866,7 @@ probeTransport(function () {
   // Opening the settings page must never change the user's stopped state.
   srLoadNodes();
   refreshStatus(true);
+  srPollUpdate();
   var tick = 0;
   setInterval(function () { if (!document.hidden) refreshStatus(++tick % 3 === 0); }, 10000);
 });
