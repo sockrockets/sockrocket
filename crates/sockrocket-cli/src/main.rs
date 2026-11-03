@@ -87,6 +87,26 @@ async fn async_main() -> Result<()> {
         return sockrocket_core::dns::check_dns_listener(([127, 0, 0, 1], port).into()).await;
     }
 
+    if let Some(index) = args.iter().position(|arg| arg == "--update-config-barrier") {
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let _guard = sockrocket_core::config::storage::MutationGuard::acquire(Path::new(path))?;
+        return Ok(());
+    }
+
+    // Validate an installed configuration without starting listeners, changing
+    // routes, fetching subscriptions, or rewriting the configuration file.
+    if let Some(index) = args.iter().position(|arg| arg == "--check-config") {
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
+        let _ = apply_reloaded_config(config).await?;
+        println!("Configuration compatible");
+        return Ok(());
+    }
+
     // Handle --init: generate a default config and exit
     if args.iter().any(|a| a == "--init") {
         let path = args
@@ -963,6 +983,14 @@ fn update_health_state(f: impl FnOnce(&mut HealthState)) {
 /// health checker already installed.
 fn persist_active_node(path: &str, key: &str) -> Result<()> {
     let _transaction = sockrocket_core::config::storage::MutationGuard::acquire(Path::new(path))?;
+    anyhow::ensure!(
+        !Path::new(path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".update-transaction")
+            .exists(),
+        "Software update in progress"
+    );
     let content = fs::read_to_string(path)?;
     let current = AppConfig::from_yaml_str(&content)?;
     let index = current
