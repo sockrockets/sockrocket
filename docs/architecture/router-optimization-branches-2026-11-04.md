@@ -19,6 +19,6 @@ bash tools/build-merlin-musl.sh
 
 The canonical script must continue to use Rust's `rust-lld` for final linking with `-C link-self-contained=yes`, preserving the musl allocator. Zig is only the C dependency compiler. Every candidate must pass `verify-merlin-allocator.py` before stripping, with zero Zig SMP symbols. Do not switch final linking to Zig to reproduce the size result.
 
-Use the same router configuration, node, URL set, request count and warmup for A/B/A testing. Record failures and tail latency, not only medians. The router currently runs the previously tested fat-LTO candidate `b320e53a596471a915475d44632f31fd83d141e1e60c9e2fc7a20e4604e1aa01`; creating these branches does not deploy or roll back the service. Historical measurements and builds predate this branch split; a fresh build may have a different hash.
+Use the same router configuration, node, URL set, request count and warmup for A/B/A testing. Record failures and tail latency, not only medians. The performance branch was subsequently built and deployed for comparison. Review fixes after that deployment are source changes until explicitly deployed. Creating or pushing branches does not deploy or roll back the router. Historical measurements belong to their recorded binaries; a fresh build may have a different hash.
 
 Original branch and its index/working files are preserved. The new branches have their own worktrees under the original repository's ignored `.local/branches/` directory. No credentials, `.local` build artifacts or Impeccable state are included in the snapshot.

@@ -189,3 +189,74 @@ async fn wire_flags_edns_qtype_exit_and_upstream_set_stay_isolated() {
     }
     assert!(resolver.wire_inflight.lock().unwrap().is_empty());
 }
+
+#[test]
+fn concurrent_last_callers_remove_wire_entry_even_with_extra_arc_owners() {
+    // Extra Arc owners must not participate in the caller lifetime count.
+    // In particular Drop's own Arc field survives until after its lock is freed.
+    for _ in 0..100 {
+        let key = WireInflightKey {
+            query: vec![0; 13],
+            servers: vec![],
+            outbound: 0,
+        };
+        let cell = Arc::new(WireInflight {
+            reply: tokio::sync::OnceCell::new(),
+            users: std::sync::atomic::AtomicUsize::new(2),
+        });
+        let map: WireInflightMap = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            key.clone(),
+            cell.clone(),
+        )])));
+        let first = WireInflightGuard {
+            map: map.clone(),
+            key: key.clone(),
+            cell: cell.clone(),
+        };
+        let last = WireInflightGuard {
+            map: map.clone(),
+            key,
+            cell: cell.clone(),
+        };
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                drop(first);
+            });
+            barrier.wait();
+            drop(last);
+        });
+        assert!(map.lock().unwrap().is_empty());
+        assert_eq!(cell.users.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn lookup_last_caller_cleanup_does_not_depend_on_arc_destructor_order() {
+    let key: CacheKey = ("cleanup.example.test".into(), 1, false);
+    let cell = Arc::new(InflightLookup {
+        reply: tokio::sync::OnceCell::new(),
+        users: std::sync::atomic::AtomicUsize::new(2),
+    });
+    let map: InflightMap = Arc::new(std::sync::Mutex::new(HashMap::from([(
+        key.clone(),
+        cell.clone(),
+    )])));
+    let first = InflightGuard {
+        map: map.clone(),
+        key: key.clone(),
+        cell: cell.clone(),
+    };
+    let last = InflightGuard {
+        map: map.clone(),
+        key,
+        cell: cell.clone(),
+    };
+    drop(first);
+    assert_eq!(map.lock().unwrap().len(), 1);
+    drop(last);
+    assert!(map.lock().unwrap().is_empty());
+    assert_eq!(cell.users.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
