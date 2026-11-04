@@ -43,9 +43,11 @@ Unlike fancyss’s single `fancyss_hnd` tree, Sockrocket uses **`hnd_v8` for BCM
 | `hnd` | TUF-AX3000 / 5400, RT-AX58U, RT-AX82U, ZenWiFi XT8 / XD4, RT-AX56U, RT-AX55 / 57 |
 | `arm` | RT-AC68U, RT-AC88U, RT-AC3100, RT-AC5300, RT-AC1900P |
 | `qca` | RT-AX89X |
-| `mtk` | TUF-AX4200 / 6000, RT-AX59U, ZenWiFi BD4 |
+| `mtk` | TUF-AX4200 / 6000, RT-AX59U, GS7 / GS7 Air / GS-BE7200X, RT-AX57 Go, TX-AX6000, ZenWiFi BT8P |
 
-Full model tables: [docs/merlin.md](../docs/merlin.md).
+ZenWiFi BD4 uses `sockrocket-merlin-ipq32.tar.gz`; TUF-BE6500 uses `sockrocket-merlin-ipq64.tar.gz`.
+
+Full model tables, including RT-BE88U / BE7200, other Wi-Fi 7 models, GS7 Pro / GS7 Pro Max, and firmware-platform checks: [docs/merlin.md](../docs/merlin.md).
 
 The [Merlin compatibility notes](../docs/architecture/merlin-compatibility.md) distinguish implemented behavior from device and network configurations that still require router validation. In particular, transparent interception currently targets the primary LAN, not separate Merlin 3006 Guest Network Pro / SDN bridges.
 
