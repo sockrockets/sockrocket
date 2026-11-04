@@ -51,76 +51,107 @@ Co-branded / limited editions (Gundam, Call of Duty, Haiyan, …) use the **same
 
 ### `hnd_v8` — BCM490x / BCM491x (aarch64)
 
-| Model | Typical SoC |
-|-------|-------------|
-| RT-AC86U | BCM4906 |
-| GT-AC2900 | BCM4906 |
-| GT-AC5300 | BCM4908 |
-| RT-AX88U | BCM4908 |
-| RT-AX88U_PRO | BCM4912 |
-| RAX80 | BCM4908 |
-| GT-AX11000 | BCM4908 |
-| GT-AX11000_PRO | BCM4912 |
-| RT-AX92U | BCM4906 |
-| RT-AX68U | BCM4906 |
-| RT-AX86U | BCM4908 |
-| RT-AX86U_PRO | BCM4908 |
-| RT-AX86S | BCM4908 |
-| GT-AXE11000 | BCM4908 |
-| GT-AXE16000 | BCM4916 |
-| GT-AX6000 | BCM4912 |
-| ZenWiFi Pro XT12 | BCM4912 |
+| Model | Typical SoC | Sockrocket installation package |
+|-------|-------------|---------------------------------|
+| RT-AC86U | BCM4906 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AC2900 | BCM4906 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AC5300 | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX88U | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX88U_PRO | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RAX80 | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AX11000 | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AX11000_PRO | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX92U | BCM4906 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX68U | BCM4906 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX86U | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX86U_PRO | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX86S | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AXE11000 | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AXE16000 | BCM4916 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AX6000 | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| ZenWiFi Pro XT12 | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
+
+### Additional models — explicit package selection
+
+These package assignments target KoolCenter / ASUSGO software-center firmware. They describe architecture compatibility, not completed on-device Sockrocket testing. BCM6764/6765/6766 firmware uses the 32-bit `hnd` package; Wi-Fi 7 does not imply `hnd_v8`. Upstream Merlin alone does not provide the software center, including on GT-BE19000AI.
+
+| Model / firmware name | SoC / firmware | Sockrocket installation package |
+|-----------------------|----------------|---------------------------------|
+| RT-BE88U / RT-BE7200 | BCM4916 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-BE86U | BCM4916 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-BE96U / GT-BE96 / GT-BE98 / GT-BE98 Pro | BCM4916 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-BE92U | BCM6765 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-BE82U | BCM6766 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-BE58 Go | BCM6764 | `sockrocket-merlin-hnd.tar.gz` |
+| GT-BE19000AI | BCM4916 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GS7 (ROG 魔盒) | MT7988D | `sockrocket-merlin-mtk.tar.gz` |
+| GS7 Air (ROG 魔盒 Air) | MediaTek | `sockrocket-merlin-mtk.tar.gz` |
+| GS-BE7200X (ROG 魔盒 X) | MediaTek | `sockrocket-merlin-mtk.tar.gz` |
+| GS7 Pro (ROG 魔盒 Pro) | BCM6766 | `sockrocket-merlin-hnd.tar.gz` |
+| GS7 Pro Max (ROG 魔盒 Pro Max) | BCM6766 | `sockrocket-merlin-hnd.tar.gz` |
+| TUF-BE3600 | BCM6764L | `sockrocket-merlin-hnd.tar.gz` |
+| TUF-BE3600 V2 | BCM6764 | `sockrocket-merlin-hnd.tar.gz` |
+| TUF-BE6500 | IPQ5322, 64-bit firmware | `sockrocket-merlin-ipq64.tar.gz` |
+| TX-AX6000 | MT7986A | `sockrocket-merlin-mtk.tar.gz` |
+| ZenWiFi BT8P | MT7988D | `sockrocket-merlin-mtk.tar.gz` |
+| TUF-AX5400 V2 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX57 Go | MT7981 | `sockrocket-merlin-mtk.tar.gz` |
+| ZenWiFi ET8 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| ZenWiFi XD6 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| ZenWiFi XT9 | BCM6756 | `sockrocket-merlin-hnd.tar.gz` |
+
+Research sources (2026-11-04): [fancyss 3.0 model and architecture table](https://github.com/hq450/fancyss/blob/3.0/README.md), [software-center platform selection](https://github.com/koolshare/rogsoft/blob/master/softcenter/softcenter/scripts/ks_tar_install.sh), [ASUSGO model documentation](https://doc.asusgo.com/zh/guide/asus/gs7_pro.html), [GS7 Pro Max](https://doc.asusgo.com/zh/guide/asus/gs7_promax.html), [BE82U](https://doc.asusgo.com/zh/guide/asus/rt-be82u.html), [BE58 Go](https://doc.asusgo.com/zh/guide/asus/rt-be58_go.html), [BE92U](https://doc.asusgo.com/zh/guide/asus/rt-be92u.html), and [TUF-BE3600 V2](https://doc.asusgo.com/zh/guide/asus/tuf-be3600_v2.html). Package names are mapped to Sockrocket's own build targets, not copied from another plugin's download links.
 
 ### `hnd` — BCM675x (armv7hf)
 
-| Model | Typical SoC |
-|-------|-------------|
-| TUF-AX3000 | BCM6750 |
-| TUF-AX3000_V2 | BCM6755 |
-| TUF-AX5400 | BCM6750 |
-| RT-AX58U | BCM6750 |
-| RT-AX58U_V2 | BCM6755 |
-| RAX50 | BCM6750 |
-| RT-AX82U | BCM6750 |
-| RT-AX82U_V2 | BCM6755 |
-| ZenWiFi XT8 | BCM6755 |
-| ZenWiFi XT8_V2 | BCM6755 |
-| ZenWiFi XD4 | BCM6755 |
-| ZenWiFi XD4_Plus | BCM6755 |
-| RT-AX56U | BCM6755 |
-| RT-AX56U_V2 | BCM6755 |
-| RT-AX57 | BCM6750 |
-| RT-AX55 | BCM6750 |
+| Model | Typical SoC | Sockrocket installation package |
+|-------|-------------|---------------------------------|
+| TUF-AX3000 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| TUF-AX3000_V2 | BCM6756 | `sockrocket-merlin-hnd.tar.gz` |
+| TUF-AX5400 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX58U | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX58U_V2 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| RAX50 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX82U | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX82U_V2 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| ZenWiFi XT8 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| ZenWiFi XT8_V2 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| ZenWiFi XD4 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| ZenWiFi XD4_Plus | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX56U | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX56U_V2 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX57 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX55 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
 
 ### `arm` — BCM4708 / BCM4709 (armv7sf)
 
 For koolshare Merlin **384/386** (and similar) on classic AC series — not stock Asus-only firmware without software center.
 
-| Model | Typical SoC |
-|-------|-------------|
-| RT-AC68U / RT-AC68U_V4 | BCM4708 |
-| RT-AC66U_B1 | BCM4708 |
-| RT-AC1900 / RT-AC1900P | BCM4708 |
-| RT-AC87U | BCM4708 |
-| RT-AC88U | BCM4709 |
-| RT-AC3100 | BCM4709 |
-| RT-AC3200 | BCM4709 |
-| RT-AC5300 | BCM4709 |
+| Model | Typical SoC | Sockrocket installation package |
+|-------|-------------|---------------------------------|
+| RT-AC68U / RT-AC68U_V4 | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC66U_B1 | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC1900 / RT-AC1900P | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC87U | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC88U | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC3100 | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC3200 | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
+| RT-AC5300 | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
 
 ### `qca` — IPQ807x
 
-| Model | Typical SoC |
-|-------|-------------|
-| RT-AX89X / RT-AC89X | IPQ8074 |
+| Model | Typical SoC | Sockrocket installation package |
+|-------|-------------|---------------------------------|
+| RT-AX89X / RT-AC89X | IPQ8074 | `sockrocket-merlin-qca.tar.gz` |
 
 ### `mtk` — MediaTek Filogic / MT798x (aarch64)
 
-| Model | Typical SoC |
-|-------|-------------|
-| TUF-AX4200 | MT7986 |
-| TUF-AX6000 | MT7986 |
-| RT-AX59U | MT7986 |
-| ZenWiFi BD4 | MT7981 |
+| Model | Typical SoC | Sockrocket installation package |
+|-------|-------------|---------------------------------|
+| TUF-AX4200 | MT7986 | `sockrocket-merlin-mtk.tar.gz` |
+| TUF-AX6000 | MT7986 | `sockrocket-merlin-mtk.tar.gz` |
+| RT-AX59U | MT7986 | `sockrocket-merlin-mtk.tar.gz` |
+
 
 Newer Filogic SKUs: if softcenter rejects the offline package, check which `.valid` tag your firmware’s software center expects (some forks use custom tags).
 
@@ -130,6 +161,8 @@ Newer Filogic SKUs: if softcenter rejects the offline package, check which `.val
 |----------|----------|
 | `ipq32` | `uname -m` is `armv7l` on an IPQ53xx board |
 | `ipq64` | `uname -m` is `aarch64` on an IPQ53xx board |
+
+ZenWiFi BD4 (IPQ5322, 32-bit firmware): **`sockrocket-merlin-ipq32.tar.gz`**. TUF-BE6500 (IPQ5322, 64-bit firmware): **`sockrocket-merlin-ipq64.tar.gz`**.
 
 Prefer `uname -m` over the marketing model name — the same chassis can ship 32-bit or 64-bit userspace depending on the firmware port.
 
