@@ -12,6 +12,8 @@ mod integration_tests;
 mod listener;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod wire_dedup_tests;
 pub use listener::check_listener as check_dns_listener;
 mod runtime;
 mod upstream;
@@ -107,7 +109,7 @@ pub enum DnsGroup {
 }
 
 /// DNS server types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DnsServer {
     /// Standard UDP DNS
     Udp(SocketAddr),
@@ -199,6 +201,35 @@ impl Drop for InflightGuard {
     }
 }
 
+// Wire callers may differ in EDNS/flags or request-scoped upstream policy.
+// Only the transaction ID is normalized. Never merge direct/proxy exits or
+// different selected upstream sets, even when the hostname is the same.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct WireInflightKey {
+    query: Vec<u8>,
+    servers: Vec<DnsServer>,
+    outbound: usize,
+}
+type WireInflightEntry = Arc<tokio::sync::OnceCell<Result<Vec<u8>, String>>>;
+type WireInflightMap = Arc<std::sync::Mutex<HashMap<WireInflightKey, WireInflightEntry>>>;
+struct WireInflightGuard {
+    map: WireInflightMap,
+    key: WireInflightKey,
+    cell: WireInflightEntry,
+}
+impl Drop for WireInflightGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        if Arc::strong_count(&self.cell) == 2
+            && map
+                .get(&self.key)
+                .is_some_and(|cell| Arc::ptr_eq(cell, &self.cell))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
 /// Number of slots in each proxy-DNS connection pool. Four concurrent
 /// international lookups cover a typical multi-domain page load without
 /// stampeding the proxy node with dials.
@@ -245,6 +276,7 @@ struct RuntimeDnsCache {
     cache: Arc<RwLock<LruCache<CacheKey, CacheEntry>>>,
     inflight: InflightMap,
     wire: Arc<Mutex<WireCache>>,
+    wire_inflight: WireInflightMap,
     bootstrap: Option<Arc<DnsResolver>>,
 }
 
@@ -316,6 +348,7 @@ pub struct DnsResolver {
     /// a cancelled leader can wake waiters from `Drop` without awaiting.
     endpoint_wait: Arc<std::sync::Mutex<HashMap<EndpointKey, Arc<tokio::sync::Notify>>>>,
     wire_cache: Arc<Mutex<WireCache>>,
+    wire_inflight: WireInflightMap,
     bootstrap: Option<Arc<DnsResolver>>,
     /// Shared DNS-over-TCP connections through the proxy. Small pool of
     /// slots, each independently locked: queries within one slot are
@@ -388,6 +421,7 @@ impl DnsResolver {
             endpoint_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap()))),
             endpoint_wait: Arc::new(std::sync::Mutex::new(HashMap::new())),
             wire_cache: Arc::new(Mutex::new(WireCache::new(capacity))),
+            wire_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bootstrap,
             proxy_tcp_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
             proxy_tls_conn: Arc::new(ProxyConnPool::new(PROXY_DNS_POOL_SIZE)),
@@ -521,6 +555,7 @@ impl DnsResolver {
                     config: snapshot.config.clone(),
                     bootstrap: Self::make_bootstrap(&snapshot.config),
                     wire: Arc::new(Mutex::new(WireCache::new(snapshot.config.cache_capacity))),
+                    wire_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     cache: Arc::new(RwLock::new(LruCache::new(
                         NonZeroUsize::new(snapshot.config.cache_capacity.clamp(16, 16384)).unwrap(),
                     ))),
@@ -531,6 +566,7 @@ impl DnsResolver {
             snapshot.cache = generation.cache.clone();
             snapshot.inflight = generation.inflight.clone();
             snapshot.wire_cache = generation.wire.clone();
+            snapshot.wire_inflight = generation.wire_inflight.clone();
             snapshot.bootstrap = generation.bootstrap.clone();
             snapshot.outbound = Some(current);
         }
@@ -923,6 +959,7 @@ impl DnsResolver {
     pub async fn clear_cache(&self) {
         let snapshot = self.query_snapshot();
         snapshot.cache.write().await.clear();
+        snapshot.wire_inflight.lock().unwrap().clear();
         // Address lookups and the UDP/TCP listener share the wire cache.
         // Clearing only parsed addresses would immediately restore old answers.
         *snapshot.wire_cache.lock().await = WireCache::new(snapshot.config.cache_capacity);
