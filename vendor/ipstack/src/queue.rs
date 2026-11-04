@@ -207,12 +207,12 @@ impl PacketSender {
         let charge = packet
             .payload
             .as_ref()
-            .map_or(0, Vec::len)
+            .map_or(0, |p| p.len())
             .saturating_add(256);
         // Reserve capacity for ACK/FIN/RST and DNS even under bulk load.
         let priority = match &packet.transport {
             crate::packet::TransportHeader::Tcp(_) => {
-                packet.payload.as_ref().is_none_or(Vec::is_empty)
+                packet.payload.as_ref().is_none_or(|p| p.is_empty())
             }
             crate::packet::TransportHeader::Udp(header) => {
                 header.source_port == 53 || header.destination_port == 53

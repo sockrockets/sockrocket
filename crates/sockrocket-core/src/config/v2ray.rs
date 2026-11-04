@@ -31,6 +31,8 @@ struct V2RayStreamSettings {
     tls_settings: Option<V2RayTlsSettings>,
     #[serde(rename = "wsSettings")]
     ws_settings: Option<V2RayWsSettings>,
+    #[serde(rename = "xhttpSettings")]
+    xhttp_settings: Option<XhttpConfig>,
     #[serde(rename = "realitySettings")]
     reality_settings: Option<V2RayRealitySettings>,
 }
@@ -437,6 +439,7 @@ pub fn parse_tuic_uri(uri: &str) -> Result<Node> {
             udp: true,
         },
         transport: Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Quic,
             tls: Some(TlsConfig {
                 sni,
@@ -474,6 +477,10 @@ pub fn parse_trojan_uri(uri: &str) -> Result<Node> {
     let params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
     let security = params.get("security").map(|s| s.as_str()).unwrap_or("tls");
     let transport_type_str = params.get("type").map(|s| s.as_str()).unwrap_or("tcp");
+    anyhow::ensure!(
+        transport_type_str != "xhttp",
+        "XHTTP is currently supported only for VLESS"
+    );
     let transport = build_uri_transport(security, transport_type_str, &params)?;
 
     Ok(Node {
@@ -660,6 +667,7 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
             udp: true,
         },
         transport: Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
                 sni: params.get("sni").cloned(),
@@ -741,6 +749,7 @@ pub fn parse_anytls_uri(uri: &str) -> Result<Node> {
             udp: true,
         },
         transport: Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
                 sni: params.get("peer").or_else(|| params.get("sni")).cloned(),
@@ -804,6 +813,14 @@ fn collect_alpn_values(query_pairs: &[(String, String)]) -> Vec<String> {
 }
 
 fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
+    anyhow::ensure!(
+        !outbound
+            .stream_settings
+            .as_ref()
+            .is_some_and(|s| s.network.as_deref() == Some("xhttp"))
+            || outbound.protocol == "vless",
+        "XHTTP is currently supported only for VLESS"
+    );
     match outbound.protocol.as_str() {
         "vmess" => {
             let vnext = outbound
@@ -909,6 +926,13 @@ fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
                 .transpose()?
                 .flatten();
 
+            anyhow::ensure!(
+                !transport
+                    .as_ref()
+                    .is_some_and(|t| t.transport_type == TransportType::Xhttp)
+                    || flow.as_deref().unwrap_or("").is_empty(),
+                "XHTTP does not support Vision flow"
+            );
             Ok(Some(Node {
                 name,
                 server,
@@ -984,7 +1008,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     let network = ss.network.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "raw" | "ws"),
+        matches!(network, "tcp" | "raw" | "ws" | "xhttp"),
         "Unsupported Xray transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -993,7 +1017,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     );
     anyhow::ensure!(
         security != "reality"
-            || (matches!(network, "tcp" | "raw")
+            || (matches!(network, "tcp" | "raw" | "xhttp")
                 && ss
                     .reality_settings
                     .as_ref()
@@ -1005,11 +1029,23 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
         return Ok(None);
     }
 
+    if network == "xhttp" {
+        ss.xhttp_settings.clone().unwrap_or_default().validate()?;
+    }
     if security == "reality"
         && let Some(ref rs) = ss.reality_settings
     {
         return Ok(Some(TransportConfig {
-            transport_type: TransportType::Reality,
+            xhttp: if network == "xhttp" {
+                Some(ss.xhttp_settings.clone().unwrap_or_default())
+            } else {
+                None
+            },
+            transport_type: if network == "xhttp" {
+                TransportType::Xhttp
+            } else {
+                TransportType::Reality
+            },
             tls: None,
             ws: None,
             reality: Some(RealityConfig {
@@ -1037,6 +1073,21 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
         None
     };
 
+    let xhttp = if network == "xhttp" {
+        let config = ss.xhttp_settings.clone().unwrap_or_default();
+        config.validate()?;
+        anyhow::ensure!(
+            tls.as_ref()
+                .and_then(|t| t.alpn.as_ref())
+                .is_none_or(|a| a.is_empty()
+                    || a.iter()
+                        .all(|s| matches!(s.as_str(), "h2" | "http/1.1" | "h3"))),
+            "Unsupported XHTTP ALPN"
+        );
+        Some(config)
+    } else {
+        None
+    };
     let ws = if network == "ws" {
         ss.ws_settings.as_ref().map(|w| {
             let host = w.headers.get("Host").cloned();
@@ -1052,11 +1103,13 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
 
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
+        "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Ok(Some(TransportConfig {
+        xhttp,
         transport_type,
         tls,
         ws,
@@ -1104,6 +1157,7 @@ fn build_vmess_transport(
     };
 
     Some(TransportConfig {
+        xhttp: None,
         transport_type,
         tls,
         ws,
@@ -1117,7 +1171,7 @@ fn build_uri_transport(
     params: &HashMap<String, String>,
 ) -> Result<Option<TransportConfig>> {
     anyhow::ensure!(
-        matches!(transport_type_str, "tcp" | "raw" | "ws"),
+        matches!(transport_type_str, "tcp" | "raw" | "ws" | "xhttp"),
         "Unsupported URI transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -1126,7 +1180,7 @@ fn build_uri_transport(
     );
     anyhow::ensure!(
         security != "reality"
-            || (matches!(transport_type_str, "tcp" | "raw")
+            || (matches!(transport_type_str, "tcp" | "raw" | "xhttp")
                 && params.get("pbk").is_some_and(|k| !k.is_empty())),
         "REALITY requires TCP and a public key"
     );
@@ -1136,7 +1190,16 @@ fn build_uri_transport(
 
     if security == "reality" {
         return Ok(Some(TransportConfig {
-            transport_type: TransportType::Reality,
+            xhttp: if transport_type_str == "xhttp" {
+                Some(uri_xhttp(params)?)
+            } else {
+                None
+            },
+            transport_type: if transport_type_str == "xhttp" {
+                TransportType::Xhttp
+            } else {
+                TransportType::Reality
+            },
             tls: None,
             ws: None,
             reality: Some(RealityConfig {
@@ -1178,13 +1241,34 @@ fn build_uri_transport(
         None
     };
 
+    let xhttp = if transport_type_str == "xhttp" {
+        anyhow::ensure!(
+            params.get("flow").is_none_or(|f| f.is_empty()),
+            "XHTTP does not support Vision flow"
+        );
+        let config = uri_xhttp(params)?;
+        config.validate()?;
+        anyhow::ensure!(
+            tls.as_ref()
+                .and_then(|t| t.alpn.as_ref())
+                .is_none_or(|a| a.is_empty()
+                    || a.iter()
+                        .all(|s| matches!(s.as_str(), "h2" | "http/1.1" | "h3"))),
+            "Unsupported XHTTP ALPN"
+        );
+        Some(config)
+    } else {
+        None
+    };
     let transport_type = match transport_type_str {
         "ws" => TransportType::WebSocket,
+        "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Ok(Some(TransportConfig {
+        xhttp,
         transport_type,
         tls,
         ws,
@@ -1203,20 +1287,25 @@ pub fn node_to_share_uri(node: &Node) -> String {
             Tcp => "tcp",
             Tls => "tcp",
             WebSocket => "ws",
+            Xhttp => "xhttp",
             Quic => "quic",
             Reality => "tcp",
         };
         qparams.push(format!("type={}", net));
 
-        let security = match tc.transport_type {
-            Tls | WebSocket => "tls",
-            Reality => "reality",
-            Quic => "quic",
-            _ => {
-                if tc.tls.is_some() {
-                    "tls"
-                } else {
-                    "none"
+        let security = if tc.reality.is_some() {
+            "reality"
+        } else {
+            match tc.transport_type {
+                Tls | WebSocket => "tls",
+                Reality => "reality",
+                Quic => "quic",
+                _ => {
+                    if tc.tls.is_some() {
+                        "tls"
+                    } else {
+                        "none"
+                    }
                 }
             }
         };
@@ -1228,6 +1317,33 @@ pub fn node_to_share_uri(node: &Node) -> String {
             }
             if tls.skip_cert_verify {
                 qparams.push("allowInsecure=1".to_string());
+            }
+        }
+        if let Some(xhttp) = &tc.xhttp {
+            for (key, value) in [
+                ("path", xhttp.path.as_deref()),
+                ("host", xhttp.host.as_deref()),
+                ("mode", Some(xhttp.mode.as_str())),
+            ] {
+                if let Some(value) = value {
+                    qparams.push(format!("{key}={}", urlencoding::encode(value)));
+                }
+            }
+            if let Some(alpn) = tc.tls.as_ref().and_then(|t| t.alpn.as_ref()) {
+                qparams.push(format!("alpn={}", urlencoding::encode(&alpn.join(","))));
+            }
+            let mut options = xhttp.options.clone();
+            if let Some(serde_json::Value::Object(extra)) = options.remove("extra") {
+                options = extra.into_iter().collect();
+                for key in ["host", "path", "mode"] {
+                    options.remove(key);
+                }
+            }
+            if !options.is_empty() {
+                qparams.push(format!(
+                    "extra={}",
+                    urlencoding::encode(&serde_json::to_string(&options).unwrap_or_default())
+                ));
             }
         }
         if let Some(ref ws) = tc.ws {
@@ -1900,8 +2016,24 @@ mod native_protocol_regressions {
     }
     #[test]
     fn unsupported_uri_transports_fail_closed() {
-        for transport in ["grpc", "xhttp", "httpupgrade"] {
+        for transport in ["grpc", "httpupgrade"] {
             assert!(parse_vless_uri(&format!("vless://00000000-0000-0000-0000-000000000001@vpn.example.invalid:443?security=tls&type={transport}")).is_err());
         }
     }
+}
+
+fn uri_xhttp(params: &HashMap<String, String>) -> Result<XhttpConfig> {
+    let mut config = XhttpConfig {
+        path: params.get("path").cloned(),
+        host: params.get("host").cloned(),
+        mode: params.get("mode").cloned().unwrap_or_else(|| "auto".into()),
+        options: Default::default(),
+    };
+    if let Some(extra) = params.get("extra") {
+        let extra: serde_json::Value = serde_json::from_str(extra)
+            .map_err(|_| anyhow::anyhow!("Invalid XHTTP extra options"))?;
+        config.options.insert("extra".into(), extra);
+    }
+    config.validate()?;
+    Ok(config)
 }

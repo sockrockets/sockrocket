@@ -75,6 +75,9 @@ pub struct AppConfig {
     /// Whether TUN mode was active when the app was last closed
     #[serde(default)]
     pub tun_was_enabled: bool,
+    /// None selects MTU at TUN startup; a value overrides discovery (1280..=9000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tun_mtu: Option<u16>,
     /// Node health check + auto-switch settings
     #[serde(default)]
     pub health_check: HealthCheckConfig,
@@ -106,6 +109,7 @@ impl Default for AppConfig {
             rules: Vec::new(),
             auto_connect: false,
             tun_was_enabled: false,
+            tun_mtu: None,
             health_check: HealthCheckConfig::default(),
             groups: Vec::new(),
             locale: default_locale(),
@@ -424,6 +428,9 @@ pub struct TransportConfig {
     pub tls: Option<TlsConfig>,
     /// WebSocket settings
     pub ws: Option<WsConfig>,
+    /// XHTTP transport settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhttp: Option<XhttpConfig>,
     /// Reality settings
     pub reality: Option<RealityConfig>,
 }
@@ -435,6 +442,7 @@ pub enum TransportType {
     Tcp,
     Tls,
     WebSocket,
+    Xhttp,
     Quic,
     Reality,
 }
@@ -748,5 +756,34 @@ locale: en
         let out = serde_yaml::to_string(&cfg).unwrap();
         assert!(out.contains("locale:"));
         assert!(out.contains("en"));
+    }
+}
+
+/// XHTTP settings shared by native, Clash and Xray imports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct XhttpConfig {
+    pub path: Option<String>,
+    pub host: Option<String>,
+    #[serde(default = "xhttp_default_mode")]
+    pub mode: String,
+    #[serde(flatten)]
+    pub options: std::collections::BTreeMap<String, serde_json::Value>,
+}
+impl Default for XhttpConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            host: None,
+            mode: xhttp_default_mode(),
+            options: Default::default(),
+        }
+    }
+}
+fn xhttp_default_mode() -> String {
+    "auto".into()
+}
+impl XhttpConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        super::xhttp::Settings::parse(self).map(|_| ())
     }
 }

@@ -34,6 +34,22 @@ impl CraftOptions {
         self.0.as_ref().unwrap()
     }
 
+    /// Fingerprint key shares take precedence over a previous connection's
+    /// negotiated-group hint. Otherwise a classic-only peer can silently
+    /// remove the hybrid share from later Chrome Auto ClientHellos.
+    pub(crate) fn preferred_key_share(&self) -> Option<NamedGroup> {
+        let options = self.0.as_ref()?;
+        if !options.override_keyshare { return None; }
+        options.fingerprint.extensions.iter().find_map(|extension| {
+            if let ExtensionSpec::Craft(CraftExtension::KeyShare(groups)) = extension {
+                groups.iter().find_map(|group| match group {
+                    GreaseOr::T(group) => Some(*group),
+                    Grease => None,
+                })
+            } else { None }
+        })
+    }
+
     pub(crate) fn patch_extension(
         &self,
         cx: &mut Context<'_, ClientConnectionData>,
@@ -87,6 +103,7 @@ pub(crate) struct CraftConnectionData {
     grease_seed: GreaseSeed,
     pub(crate) our_key_share_alt: Vec<Box<dyn ActiveKeyExchange>>,
     pub(crate) extension_order: Vec<usize>,
+    grease_ech: Option<Vec<u8>>,
     /// REALITY auth key derived during the ClientHello, used to verify
     /// the server certificate. !craft!
     pub(crate) reality_auth_key: Option<Arc<[u8; 32]>>,
@@ -117,6 +134,7 @@ impl CraftConnectionData {
             grease_seed: GreaseSeed(grease_seed),
             our_key_share_alt: Vec::new(),
             extension_order: Vec::new(),
+            grease_ech: None,
             reality_auth_key: None,
         }
     }
@@ -280,6 +298,12 @@ pub enum CraftExtension {
 
     /// Hardcoded fake BoringSSL ApplicationSettings.
     FakeApplicationSettings,
+
+    /// Chrome 133 ALPS codepoint (a protocol hint, not negotiated settings).
+    ApplicationSettingsNew,
+
+    /// Randomized ECH GREASE. This does not encrypt the SNI.
+    GreaseEncryptedClientHello,
 
     /// Hardcoded fake CompressCert extension that provides no compression algorithm
     FakeCompressCert,
@@ -489,6 +513,31 @@ impl CraftExtension {
             }
             Self::FakeApplicationSettings => {
                 Self::make_ext(17513.into(), vec![0, 3, 2, b'h', b'2'])
+            }
+            Self::ApplicationSettingsNew => {
+                Self::make_ext(17613.into(), vec![0, 3, 2, b'h', b'2'])
+            }
+            Self::GreaseEncryptedClientHello => {
+                // Match uTLS v1.8.8 BoringGREASEECH's wire shape. The
+                // encapsulated key is a fresh valid X25519 public key; the
+                // payload is GREASE, not an encrypted application secret.
+                if let Some(data) = &cx.data.craft_connection_data.grease_ech {
+                    return Ok(Self::make_ext(0xfe0d.into(), data.clone()));
+                }
+                let mut rng = rand::rngs::OsRng;
+                let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rng);
+                let key = x25519_dalek::PublicKey::from(&secret);
+                let payload_len: u16 = [144, 176, 208, 240][rng.gen_range(0..4)];
+                let mut data = vec![0, 0, 1, 0, 1, rng.r#gen(), 0, 32];
+                data.extend_from_slice(key.as_bytes());
+                data.extend_from_slice(&payload_len.to_be_bytes());
+                let start = data.len();
+                data.resize(start + payload_len as usize, 0);
+                rand::RngCore::fill_bytes(&mut rng, &mut data[start..]);
+                // Preserve the extension across HelloRetryRequest; only a new
+                // TLS connection gets fresh GREASE material.
+                cx.data.craft_connection_data.grease_ech = Some(data.clone());
+                Self::make_ext(0xfe0d.into(), data)
             }
             Self::Padding => {
                 ClientExtension::CraftPadding(CraftPadding {

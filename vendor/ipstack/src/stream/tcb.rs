@@ -62,6 +62,8 @@ pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
+    /// Receive MSS advertised by the peer, independent of the local TUN MTU.
+    send_mss: u16,
     last_received_ack: SeqNum,
     /// Peer's receive window in bytes. A raw TCP header only holds 16 bits;
     /// when window scaling was negotiated this is `header << snd_scale`.
@@ -120,6 +122,9 @@ impl Tcb {
             seq: seq.into(),
             ack,
             mtu,
+            // IpStackTcpStream installs the SYN option/family default before
+            // exposing this control block. Unit fixtures may use the MTU alone.
+            send_mss: u16::MAX,
             last_received_ack: seq.into(),
             // Until the peer's ACK arrives, allow one budget's worth. The
             // handshake ACK replaces this with the scaled header window.
@@ -163,11 +168,22 @@ impl Tcb {
             .buffer_limit()
             .min(self.get_send_window() as usize)
             .saturating_sub(outstanding);
-        let mtu = self.get_mtu() as usize;
-        std::cmp::min(
-            send_window,
-            mtu.saturating_sub(ip_header_size + tcp_header_size),
-        )
+        send_window.min(self.max_segment_payload_len(ip_header_size, tcp_header_size))
+    }
+
+    pub(super) fn set_peer_mss(&mut self, mss: u16) {
+        self.send_mss = mss.max(1);
+    }
+
+    pub(super) fn max_segment_payload_len(
+        &self,
+        ip_header_size: usize,
+        tcp_header_size: usize,
+    ) -> usize {
+        // MSS excludes the fixed IP/TCP headers; TCP options consume part of
+        // that allowance (RFC 9293 3.7.1). Outbound IP headers have no options.
+        let mss = usize::from(self.send_mss).saturating_sub(tcp_header_size.saturating_sub(20));
+        mss.min(usize::from(self.mtu).saturating_sub(ip_header_size + tcp_header_size))
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum, unchanged_pure_ack: bool) {
@@ -275,13 +291,21 @@ impl Tcb {
 
                 if payload_len <= remaining_bytes {
                     // current packet can be fully extracted
-                    data.extend(payload);
+                    if data.is_empty() {
+                        data = payload;
+                    } else {
+                        data.extend(payload);
+                    }
                     self.ack += payload_len as u32;
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
                     let mut remaining_payload = payload.split_off(remaining_bytes);
-                    data.extend_from_slice(&payload);
+                    if data.is_empty() {
+                        data = payload;
+                    } else {
+                        data.extend_from_slice(&payload);
+                    }
                     self.ack += remaining_bytes as u32;
                     // Splitting may land on another segment's starting sequence.
                     // Keep the longer tail and release only duplicate bytes.
@@ -307,18 +331,20 @@ impl Tcb {
     pub(super) fn can_queue_read(&self) -> bool {
         self.queued_read_chunks < 64
     }
+    #[cfg(test)]
+    pub(super) fn queued_read_chunks(&self) -> usize {
+        self.queued_read_chunks
+    }
     pub(super) fn queue_read(&mut self, n: usize) {
         self.queued_read_bytes += n;
         self.queued_read_chunks += 1;
     }
-    pub(super) fn consume_read(&mut self, n: usize, completed_chunk: bool) {
+    pub(super) fn consume_read(&mut self, n: usize, completed_chunks: usize) {
         let consumed = n.min(self.queued_read_bytes);
         self.payload_budget.release(consumed);
         self.read_reserved -= consumed;
         self.queued_read_bytes = self.queued_read_bytes.saturating_sub(n);
-        if completed_chunk {
-            self.queued_read_chunks = self.queued_read_chunks.saturating_sub(1);
-        }
+        self.queued_read_chunks = self.queued_read_chunks.saturating_sub(completed_chunks);
     }
     pub(super) fn increase_seq(&mut self) {
         self.seq += 1;
@@ -472,11 +498,11 @@ impl Tcb {
             .payload_budget
             .reserve(buf.len())
             .ok_or(std::io::ErrorKind::WouldBlock)?;
-        self.add_reserved_inflight_packet(buf, credit)
+        self.add_reserved_inflight_packet(buf.into(), credit)
     }
     pub(crate) fn add_reserved_inflight_packet(
         &mut self,
-        buf: Vec<u8>,
+        buf: bytes::Bytes,
         credit: crate::tcp_budget::Reservation,
     ) -> std::io::Result<()> {
         if buf.is_empty() {
@@ -516,32 +542,28 @@ impl Tcb {
         if ack > self.seq || ack < self.last_received_ack {
             return;
         }
-        let before = self.get_inflight_packets_total_len();
-        match self.inflight_packets.first_key_value() {
-            None => return,
-            Some((&seq, _)) if ack < seq => return,
-            _ => {}
-        }
-        if let Some(seq) = self
-            .inflight_packets
-            .iter()
-            .find(|(_, p)| p.contains_seq_num(ack - 1))
-            .map(|(&s, _)| s)
-        {
-            let mut inflight_packet = self.inflight_packets.remove(&seq).unwrap();
-            let distance = ack.distance(inflight_packet.seq) as usize;
-            if distance < inflight_packet.payload.len() {
+        // Cumulative ACKs only remove a prefix. Do not scan every outstanding
+        // packet (twice for byte sums plus retain) on every LAN ACK.
+        let mut released = 0;
+        while let Some(entry) = self.inflight_packets.first_entry() {
+            if ack <= *entry.key() {
+                break;
+            }
+            let distance = ack.distance(entry.get().seq) as usize;
+            let (_, mut inflight_packet) = entry.remove_entry();
+            let len = inflight_packet.payload.len();
+            if distance < len {
                 // `drain` would keep the already-acknowledged prefix's
                 // allocation until the rest of the segment is ACKed.
                 let payload = std::mem::take(&mut inflight_packet.payload);
-                inflight_packet.payload = into_tail(payload, distance);
+                inflight_packet.payload = bytes::Bytes::copy_from_slice(&payload[distance..]);
                 inflight_packet.seq = ack;
                 self.inflight_packets.insert(ack, inflight_packet);
+                released += distance;
+                break;
             }
+            released += len;
         }
-        self.inflight_packets
-            .retain(|_, p| ack < p.seq + p.payload.len() as u32);
-        let released = before - self.get_inflight_packets_total_len();
         self.send_reserved -= released;
         self.payload_budget.release(released);
         if released > 0 {
@@ -632,7 +654,7 @@ impl Tcb {
             .first_key_value()
             .map(|(&seq, packet)| {
                 // Re-send one owned byte, without advancing sequence or credit.
-                InflightPacket::new(seq, vec![packet.payload[0]])
+                InflightPacket::new(seq, bytes::Bytes::copy_from_slice(&packet.payload[..1]))
             })
     }
 
@@ -713,10 +735,7 @@ impl Tcb {
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
-        self.inflight_packets
-            .values()
-            .map(|p| p.payload.len())
-            .sum()
+        self.send_reserved
     }
 
     #[allow(dead_code)]
@@ -783,6 +802,105 @@ mod tests {
     }
 
     #[test]
+    fn in_order_receive_moves_the_existing_allocation_into_the_read_queue() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut tcb = flow(pool.clone());
+        let payload = vec![0x5a; 1400];
+        let original = payload.as_ptr();
+        tcb.add_unordered_packet(SeqNum(1), payload);
+        let read = tcb.consume_unordered_packets(8192).unwrap();
+        assert_eq!(read.as_ptr(), original);
+        assert_eq!(read, vec![0x5a; 1400]);
+        tcb.queue_read(read.len());
+        tcb.consume_read(read.len(), 1);
+        assert_eq!(pool.usage().0, 0);
+    }
+
+    #[test]
+    fn peer_mss_and_packet_options_both_limit_payload_without_changing_window_credit() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        tcb.set_peer_mss(900);
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), 900);
+        assert_eq!(tcb.calculate_payload_max_len(20, 32), 888);
+        assert_eq!(tcb.calculate_payload_max_len(40, 20), 900);
+        tcb.set_peer_mss(2000);
+        assert_eq!(tcb.max_segment_payload_len(20, 20), 1460);
+        assert_eq!(tcb.max_segment_payload_len(40, 20), 1440);
+        assert_eq!(tcb.payload_budget.usage().0, 0);
+    }
+
+    #[test]
+    fn cumulative_ack_prefix_matches_remaining_stream_across_wrap_and_invalid_acks() {
+        for base in [1, u32::MAX - 1000] {
+            let pool = crate::TcpPayloadBudget::new(1024 * 1024);
+            let mut tcb = flow(pool.clone());
+            tcb.seq = SeqNum(base);
+            tcb.last_received_ack = SeqNum(base);
+            let mut sent = Vec::new();
+            for n in 1..=128 {
+                let bytes = vec![n as u8; n * 7];
+                sent.extend_from_slice(&bytes);
+                tcb.add_inflight_packet(bytes).unwrap();
+            }
+            let mut consumed = 0;
+            while consumed < sent.len() {
+                let before = tcb.send_reserved;
+                let deadline = tcb.next_retransmit_deadline();
+                tcb.update_inflight_packet_queue(tcb.seq + 1);
+                assert_eq!(tcb.send_reserved, before);
+                assert_eq!(tcb.next_retransmit_deadline(), deadline);
+                consumed = (consumed + 631).min(sent.len());
+                let ack = SeqNum(base) + consumed as u32;
+                tcb.update_inflight_packet_queue(ack);
+                tcb.update_last_received_ack(ack);
+                let remaining: Vec<_> = tcb
+                    .inflight_packets
+                    .values()
+                    .flat_map(|p| p.payload.iter().copied())
+                    .collect();
+                assert_eq!(remaining, sent[consumed..]);
+                assert_eq!(tcb.send_reserved, remaining.len());
+                assert_eq!(tcb.get_inflight_packets_total_len(), remaining.len());
+                assert_eq!(pool.usage().0, remaining.len());
+                tcb.update_inflight_packet_queue(ack - 1);
+                assert_eq!(pool.usage().0, remaining.len());
+            }
+            assert!(tcb.inflight_packets.is_empty());
+            assert_eq!(pool.usage().0, 0);
+        }
+    }
+
+    /// Isolated cumulative-ACK cost, excluding connection/packet setup.
+    #[test]
+    #[ignore = "manual release-mode ACK processing microbenchmark"]
+    fn ack_prefix_microbenchmark() {
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..128 {
+            let pool = crate::TcpPayloadBudget::new(1024 * 1024);
+            let mut tcb = flow(pool.clone());
+            tcb.max_unacked_bytes = 512 * 1024;
+            tcb.read_buffer_size = 512 * 1024;
+            tcb.window_limit.store(512 * 1024, Ordering::Relaxed);
+            tcb.enable_window_scale(4, 4);
+            tcb.update_send_window(u16::MAX);
+            let start = tcb.get_seq();
+            for _ in 0..256 {
+                tcb.add_inflight_packet(vec![7; 1360]).unwrap();
+            }
+            let began = std::time::Instant::now();
+            for i in 1..=256 {
+                let ack = start + i * 1360;
+                tcb.update_inflight_packet_queue(std::hint::black_box(ack));
+                tcb.update_last_received_ack(ack);
+            }
+            elapsed += began.elapsed();
+            assert_eq!(tcb.get_inflight_packets_total_len(), 0);
+            assert_eq!(pool.usage().0, 0);
+        }
+        eprintln!("32768 cumulative ACKs (256 in-flight segments per round): {elapsed:?}");
+    }
+
+    #[test]
     fn receive_overlap_preserves_bytes_and_returns_duplicate_credit_across_wrap() {
         for base in [1u32, u32::MAX - 4] {
             let pool = crate::TcpPayloadBudget::new(8192);
@@ -798,7 +916,7 @@ mod tests {
             assert_eq!(tcb.get_ack(), SeqNum(base) + 8);
             assert_eq!(pool.usage().0, 8);
             tcb.queue_read(data.len());
-            tcb.consume_read(data.len(), true);
+            tcb.consume_read(data.len(), 1);
             assert_eq!(pool.usage().0, 0);
             tcb.add_unordered_packet(SeqNum(base) + 6, b"ghij".to_vec());
             let tail = tcb.consume_unordered_packets(8192).unwrap();
@@ -832,8 +950,8 @@ mod tests {
             tcb.queue_read(tail.len());
             assert_eq!(tcb.get_ack(), SeqNum(8193 + expected as u32));
             assert_eq!(pool.usage().0, 8192 + expected);
-            tcb.consume_read(first.len(), true);
-            tcb.consume_read(tail.len(), true);
+            tcb.consume_read(first.len(), 1);
+            tcb.consume_read(tail.len(), 1);
             assert_eq!(pool.usage().0, 0);
             drop(tcb);
             assert_eq!(pool.usage().0, 0);
@@ -997,7 +1115,7 @@ mod tests {
             "full shared pool must reject before ACK advances"
         );
         assert_eq!(second.get_ack(), SeqNum(1));
-        first.consume_read(3000, false);
+        first.consume_read(3000, 0);
         second.add_unordered_packet(SeqNum(1), vec![2; 3600]);
         assert_eq!(pool.usage().0, 6600);
         drop(first);
@@ -1128,19 +1246,16 @@ mod tests {
 #[derive(Debug, Clone)]
 pub struct InflightPacket {
     pub seq: SeqNum,
-    pub payload: Vec<u8>,
+    pub payload: bytes::Bytes,
     pub retransmit_count: usize,
 }
 
 impl InflightPacket {
-    fn new(seq: SeqNum, payload: Vec<u8>) -> Self {
+    fn new(seq: SeqNum, payload: bytes::Bytes) -> Self {
         Self {
             seq,
             payload,
             retransmit_count: 0,
         }
-    }
-    pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
-        self.seq <= seq && seq < self.seq + self.payload.len() as u32
     }
 }
