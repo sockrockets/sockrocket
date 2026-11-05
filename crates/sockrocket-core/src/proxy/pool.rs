@@ -1,220 +1,280 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use super::connector::BoxProxyStream;
 
-/// Max age for pooled connections before they're considered stale.
-const DEFAULT_MAX_AGE: Duration = Duration::from_secs(120);
-/// Default pool capacity (pre-established connections to keep warm).
-const DEFAULT_CAPACITY: usize = 16;
-/// Max concurrent connection creations during a single fill round
-/// (bounds burst load on the proxy server).
+// Idle pre-connects are useful for bursts, not long-term server reservations.
+const DEFAULT_MAX_AGE: Duration = Duration::from_secs(30);
+const DEMAND_WINDOW: Duration = Duration::from_secs(1);
 const FILL_CONCURRENCY: usize = 4;
 
-/// A pre-established TCP+TLS connection waiting to be used.
-struct PooledConn {
-    stream: BoxProxyStream,
+struct PooledConn<S> {
+    stream: S,
     created: Instant,
+    _permit: OwnedSemaphorePermit,
 }
 
-/// Async factory that creates new TCP+TLS connections to the proxy server.
-/// Each outbound (VLESS, VMess, Trojan) provides its own implementation.
-pub trait ConnFactory: Send + Sync + 'static {
+pub trait ConnFactory<S = BoxProxyStream>: Send + Sync + 'static {
     fn create(
         &self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<BoxProxyStream>> + Send + '_>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<S>> + Send + '_>>;
 }
 
-/// Inner state of the connection pool.
-struct PoolInner {
-    conns: Mutex<VecDeque<PooledConn>>,
-    factory: Arc<dyn ConnFactory>,
+struct PoolState<S> {
+    conns: VecDeque<PooledConn<S>>,
+    target: usize,
+    requests: usize,
+    window_started: Instant,
+    last_get: Instant,
+}
+
+struct PoolInner<S> {
+    state: Mutex<PoolState<S>>,
+    factory: Arc<dyn ConnFactory<S>>,
+    base: usize,
     capacity: usize,
-    max_age: Duration,
-    warmed: std::sync::atomic::AtomicBool,
-    filling: std::sync::atomic::AtomicBool,
+    budget: Arc<Semaphore>,
+    refill: Notify,
 }
 
-/// Connection pool that maintains pre-established TCP+TLS connections
-/// to avoid 2-3 RTTs (TCP handshake + TLS handshake) on each request.
-///
-/// Usage: call `get()` to obtain a stream. If a warm connection is
-/// available it's returned immediately; otherwise a new one is created.
-/// After taking a connection, a background refill task is spawned.
-#[derive(Clone)]
-pub struct ConnPool {
-    inner: Arc<PoolInner>,
+// Background work owns only PoolInner. Dropping the last public handle aborts
+// maintenance and its JoinSet, including any handshakes currently in flight.
+struct PoolOwner<S> {
+    inner: Arc<PoolInner<S>>,
+    task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+}
+impl<S> Drop for PoolOwner<S> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.lock().unwrap().take() {
+            task.abort();
+        }
+    }
 }
 
-impl ConnPool {
-    /// Create a new pool and start the initial warm-up.
-    pub fn new(factory: Arc<dyn ConnFactory>) -> Self {
-        Self::with_capacity(factory, DEFAULT_CAPACITY)
+pub struct ConnPool<S = BoxProxyStream> {
+    owner: Arc<PoolOwner<S>>,
+}
+
+impl<S> Clone for ConnPool<S> {
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> ConnPool<S> {
+    pub fn new(factory: Arc<dyn ConnFactory<S>>) -> Self {
+        let (base, capacity, _) = crate::resources::connection_pool_limits();
+        Self::with_limits(factory, base, capacity, shared_budget())
     }
 
-    /// Create a pool that never warms up in the background: every `get()`
-    /// creates a fresh connection on demand. Use this for one-shot
-    /// probe/latency outbounds so a single latency test doesn't fire a full
-    /// round of pre-connect handshakes at the server.
-    pub fn lazy(factory: Arc<dyn ConnFactory>) -> Self {
+    /// One-shot probes never create background connections.
+    pub fn lazy(factory: Arc<dyn ConnFactory<S>>) -> Self {
         Self::with_capacity(factory, 0)
     }
 
-    pub fn with_capacity(factory: Arc<dyn ConnFactory>, capacity: usize) -> Self {
+    pub fn with_capacity(factory: Arc<dyn ConnFactory<S>>, capacity: usize) -> Self {
+        Self::with_limits(factory, capacity, capacity, shared_budget())
+    }
+
+    fn with_limits(
+        factory: Arc<dyn ConnFactory<S>>,
+        base: usize,
+        capacity: usize,
+        budget: Arc<Semaphore>,
+    ) -> Self {
+        let now = Instant::now();
         let pool = Self {
-            inner: Arc::new(PoolInner {
-                conns: Mutex::new(VecDeque::with_capacity(capacity)),
-                factory,
-                capacity,
-                max_age: DEFAULT_MAX_AGE,
-                warmed: std::sync::atomic::AtomicBool::new(false),
-                filling: std::sync::atomic::AtomicBool::new(false),
+            owner: Arc::new(PoolOwner {
+                inner: Arc::new(PoolInner {
+                    state: Mutex::new(PoolState {
+                        conns: VecDeque::with_capacity(base),
+                        target: base,
+                        requests: 0,
+                        window_started: now,
+                        last_get: now,
+                    }),
+                    factory,
+                    base,
+                    capacity,
+                    budget,
+                    refill: Notify::new(),
+                }),
+                task: std::sync::Mutex::new(None),
             }),
         };
-        // Eager warm-up: start filling immediately when created inside a
-        // tokio runtime, instead of waiting for the first `get()`.
-        // A zero-capacity (lazy) pool has nothing to fill.
-        if capacity > 0 && tokio::runtime::Handle::try_current().is_ok() {
-            pool.inner
-                .warmed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            pool.schedule_fill();
-        }
+        pool.start_worker();
         pool
     }
 
-    /// Get a connection: returns a warm pooled one if available, else creates new.
-    /// On first call, kicks off background pool warmup.
-    pub async fn get(&self) -> anyhow::Result<BoxProxyStream> {
-        // Lazy warmup: start filling on first use
-        if !self
-            .inner
-            .warmed
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.schedule_fill();
+    fn start_worker(&self) {
+        let inner = &self.owner.inner;
+        if inner.capacity == 0 || tokio::runtime::Handle::try_current().is_err() {
+            return;
         }
+        let mut task = self.owner.task.lock().unwrap();
+        if task.as_ref().is_none_or(|t| t.is_finished()) {
+            let inner = inner.clone();
+            *task = Some(tokio::spawn(async move { inner.run().await }).abort_handle());
+        }
+    }
 
-        // Try to grab a non-stale connection from the pool
+    pub async fn get(&self) -> anyhow::Result<S> {
+        self.start_worker();
+        let inner = &self.owner.inner;
         {
-            let mut q = self.inner.conns.lock().await;
-            while let Some(pc) = q.pop_front() {
-                if pc.created.elapsed() < self.inner.max_age {
-                    drop(q);
-                    // Got a warm connection — schedule refill
-                    self.schedule_fill();
-                    return Ok(pc.stream);
-                }
-                // Stale — drop it and try next
+            let mut state = inner.state.lock().await;
+            if state.last_get.elapsed() >= DEFAULT_MAX_AGE {
+                state.target = inner.base;
+            }
+            if state.window_started.elapsed() >= DEMAND_WINDOW {
+                state.window_started = Instant::now();
+                state.requests = 0;
+                state.target = inner.base;
+            }
+            state.requests = state.requests.saturating_add(1).min(inner.capacity);
+            state.target = state
+                .target
+                .max(state.requests.next_power_of_two())
+                .min(inner.capacity);
+            state.last_get = Instant::now();
+        }
+        loop {
+            let candidate = inner.state.lock().await.conns.pop_front();
+            let Some(mut candidate) = candidate else {
+                break;
+            };
+            if candidate.created.elapsed() < DEFAULT_MAX_AGE
+                && idle_stream_is_ready(&mut candidate.stream).await
+            {
+                inner.refill.notify_one();
+                return Ok(candidate.stream);
             }
         }
-        // Pool empty — create directly (no extra latency beyond normal)
+        inner.refill.notify_one();
         tokio::time::timeout(
             super::connector::UPSTREAM_CONNECT_TIMEOUT,
-            self.inner.factory.create(),
+            inner.factory.create(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("Pool connect timed out"))?
     }
 
-    /// Schedule a background fill only if no fill is already in progress.
-    fn schedule_fill(&self) {
-        if self.inner.capacity == 0 {
-            // Lazy pool: never fill in the background.
-            return;
-        }
-        if !self
-            .inner
-            .filling
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let p = self.clone();
-            tokio::spawn(async move {
-                p.fill().await;
-                p.inner
-                    .filling
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            });
-        }
-    }
-
     #[cfg(test)]
-    async fn len(&self) -> usize {
-        self.inner.conns.lock().await.len()
+    pub(super) async fn len(&self) -> usize {
+        self.owner.inner.state.lock().await.conns.len()
+    }
+}
+
+fn shared_budget() -> Arc<Semaphore> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| Arc::new(Semaphore::new(crate::resources::connection_pool_limits().2)))
+        .clone()
+}
+
+/// A single non-blocking read poll detects FIN, TLS close/error, or unexpected
+/// server data before handing out an unused connection. Never replay user data.
+async fn idle_stream_is_ready<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> bool {
+    use std::{pin::Pin, task::Poll};
+    use tokio::io::ReadBuf;
+    let mut byte = [0];
+    let mut buf = ReadBuf::new(&mut byte);
+    std::future::poll_fn(|cx| {
+        Poll::Ready(matches!(
+            Pin::new(&mut *stream).poll_read(cx, &mut buf),
+            Poll::Pending
+        ))
+    })
+    .await
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> PoolInner<S> {
+    async fn run(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        self.fill().await;
+        loop {
+            tokio::select! {
+                _ = self.refill.notified() => self.fill().await,
+                _ = tick.tick() => {
+                    let mut state = self.state.lock().await;
+                    state.conns.retain(|c| c.created.elapsed() < DEFAULT_MAX_AGE);
+                    if state.last_get.elapsed() >= DEFAULT_MAX_AGE {
+                        state.target = self.base;
+                    }
+                    let target = state.target;
+                    state.conns.truncate(target);
+                    // No demand: do not replace expired idle connections.
+                }
+            }
+        }
     }
 
-    /// Fill the pool up to capacity. Only one fill runs at a time.
-    ///
-    /// Connections are created in concurrent batches of [`FILL_CONCURRENCY`]
-    /// so warm-up latency is bounded by one connect RTT per batch instead of
-    /// one per connection.
     async fn fill(&self) {
-        // Evict stale connections first
-        {
-            let mut q = self.inner.conns.lock().await;
-            q.retain(|pc| pc.created.elapsed() < self.inner.max_age);
-        }
-
-        let mut failed_rounds: u32 = 0;
-        loop {
+        self.state
+            .lock()
+            .await
+            .conns
+            .retain(|c| c.created.elapsed() < DEFAULT_MAX_AGE);
+        let mut failed_rounds = 0;
+        // Bound maintenance even if foreground demand continually drains it.
+        let mut attempts = 0;
+        while attempts < self.capacity.saturating_mul(3) {
             let deficit = {
-                let q = self.inner.conns.lock().await;
-                self.inner.capacity.saturating_sub(q.len())
+                let state = self.state.lock().await;
+                state.target.saturating_sub(state.conns.len())
             };
             if deficit == 0 {
-                break;
+                return;
             }
-            let batch = deficit.min(FILL_CONCURRENCY);
-
             let mut set = tokio::task::JoinSet::new();
-            for _ in 0..batch {
-                let factory = self.inner.factory.clone();
+            for _ in 0..deficit.min(FILL_CONCURRENCY) {
+                let Ok(permit) = self.budget.clone().try_acquire_owned() else {
+                    break;
+                };
+                let factory = self.factory.clone();
                 set.spawn(async move {
-                    tokio::time::timeout(
+                    let stream = tokio::time::timeout(
                         super::connector::UPSTREAM_CONNECT_TIMEOUT,
                         factory.create(),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("Pool pre-connect timed out"))?
+                    .map_err(|_| anyhow::anyhow!("Pool pre-connect timed out"))??;
+                    Ok::<_, anyhow::Error>(PooledConn {
+                        stream,
+                        created: Instant::now(),
+                        _permit: permit,
+                    })
                 });
             }
-
-            let mut failures: u32 = 0;
-            while let Some(res) = set.join_next().await {
-                match res {
-                    Ok(Ok(stream)) => {
-                        let mut q = self.inner.conns.lock().await;
-                        if q.len() < self.inner.capacity {
-                            q.push_back(PooledConn {
-                                stream,
-                                created: Instant::now(),
-                            });
+            let batch = set.len();
+            if batch == 0 {
+                return;
+            }
+            attempts += batch;
+            let mut successes = 0;
+            while let Some(result) = set.join_next().await {
+                match result {
+                    Ok(Ok(conn)) => {
+                        successes += 1;
+                        let mut state = self.state.lock().await;
+                        if state.conns.len() < state.target {
+                            state.conns.push_back(conn);
                         }
                     }
-                    Ok(Err(e)) => {
-                        failures += 1;
-                        tracing::debug!("Connection pool: pre-connect failed: {}", e);
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        tracing::debug!("Connection pool: pre-connect task failed: {}", e);
-                    }
+                    _ => tracing::debug!("Connection pool: pre-connect failed"),
                 }
             }
-
-            if failures == batch as u32 {
-                // Whole batch failed — don't give up on the first failure;
-                // transient errors (DNS, TCP reset) are common. Try up to 3
-                // consecutive failed rounds before abandoning the refill so
-                // the pool isn't left permanently underfilled.
+            if successes == 0 {
                 failed_rounds += 1;
                 if failed_rounds >= 3 {
-                    break;
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             } else {
@@ -231,6 +291,165 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    async fn filled(pool: &ConnPool, expected: usize) {
+        for _ in 0..200 {
+            if pool.len().await == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pool.len().await, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_grows_reserve_and_idle_maintenance_releases_it() {
+        let budget = Arc::new(Semaphore::new(16));
+        let pool = ConnPool::with_limits(
+            MockFactory::new(Duration::ZERO, false),
+            2,
+            8,
+            budget.clone(),
+        );
+        filled(&pool, 2).await;
+        for _ in 0..8 {
+            drop(pool.get().await.unwrap());
+        }
+        filled(&pool, 8).await;
+        tokio::time::advance(DEFAULT_MAX_AGE + Duration::from_secs(6)).await;
+        filled(&pool, 0).await;
+        assert_eq!(pool.owner.inner.state.lock().await.target, 2);
+        assert_eq!(budget.available_permits(), 16);
+        // A new request after idle returns to the small initial target.
+        drop(pool.get().await.unwrap());
+        filled(&pool, 2).await;
+    }
+
+    #[tokio::test]
+    async fn closed_preconnects_are_discarded_before_any_user_data() {
+        let factory = MockFactory::new(Duration::ZERO, false);
+        let pool = ConnPool::with_limits(factory.clone(), 2, 2, Arc::new(Semaphore::new(4)));
+        filled(&pool, 2).await;
+        factory.peers.lock().unwrap().clear();
+        let mut stream = pool.get().await.unwrap();
+        assert!(idle_stream_is_ready(&mut stream).await);
+        assert!(factory.attempts.load(AtomicOrdering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn idle_probe_preserves_tls_session_tickets_and_later_application_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct ReadyFactory(std::sync::Mutex<Option<BoxProxyStream>>);
+        impl ConnFactory for ReadyFactory {
+            fn create(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = anyhow::Result<BoxProxyStream>> + Send + '_>>
+            {
+                Box::pin(async {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("fixture exhausted"))
+                })
+            }
+        }
+        let cert = include_bytes!("testdata/localhost-cert.der");
+        let key = include_bytes!("testdata/localhost-key.der");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls_pki_types::CertificateDer::from(cert.to_vec())],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+                key.to_vec(),
+            )),
+        )
+        .unwrap();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                .accept(server)
+                .await
+                .unwrap();
+            let mut request = [0; 4];
+            tls.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            tls.write_all(b"pong").await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+        use sha2::Digest;
+        let pin: [u8; 32] = sha2::Sha256::digest(cert).into();
+        let client = super::super::transport::build_tls_connector_pinned(None, Some(pin))
+            .connect(
+                rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+                client,
+            )
+            .await
+            .unwrap();
+        let factory = Arc::new(ReadyFactory(std::sync::Mutex::new(Some(Box::new(client)))));
+        let pool = ConnPool::with_limits(factory, 1, 1, Arc::new(Semaphore::new(1)));
+        filled(&pool, 1).await;
+        let mut stream = pool.get().await.unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pools_share_a_hard_preconnect_budget() {
+        let budget = Arc::new(Semaphore::new(3));
+        let first = ConnPool::with_limits(
+            MockFactory::new(Duration::ZERO, false),
+            2,
+            8,
+            budget.clone(),
+        );
+        filled(&first, 2).await;
+        let second = ConnPool::with_limits(
+            MockFactory::new(Duration::ZERO, false),
+            2,
+            8,
+            budget.clone(),
+        );
+        filled(&second, 1).await;
+        assert_eq!(budget.available_permits(), 0);
+        // Foreground connections can still proceed when the warm budget is full.
+        drop(second.get().await.unwrap());
+        drop(second.get().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_last_pool_handle_cancels_inflight_warmup() {
+        let factory = MockFactory::new(Duration::from_secs(3600), false);
+        let budget = Arc::new(Semaphore::new(4));
+        let pool = ConnPool::with_limits(factory.clone(), 4, 4, budget.clone());
+        let weak = Arc::downgrade(&pool.owner.inner);
+        for _ in 0..200 {
+            if factory.attempts.load(AtomicOrdering::SeqCst) == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(budget.available_permits(), 0);
+        let last = pool.clone();
+        drop(pool);
+        assert!(weak.upgrade().is_some());
+        drop(last);
+        for _ in 0..200 {
+            if weak.upgrade().is_none() && budget.available_permits() == 4 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("warmup retained a dropped pool or its budget");
+    }
+
     /// Mock factory that creates in-memory duplex streams and records
     /// creation statistics (attempts, peak in-flight concurrency).
     struct MockFactory {
@@ -239,6 +458,7 @@ mod tests {
         in_flight: Arc<AtomicUsize>,
         delay: Duration,
         fail: bool,
+        peers: Arc<std::sync::Mutex<Vec<tokio::io::DuplexStream>>>,
     }
 
     impl MockFactory {
@@ -249,6 +469,7 @@ mod tests {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 delay,
                 fail,
+                peers: Arc::new(std::sync::Mutex::new(Vec::new())),
             })
         }
     }
@@ -262,6 +483,7 @@ mod tests {
             let in_flight = self.in_flight.clone();
             let delay = self.delay;
             let fail = self.fail;
+            let peers = self.peers.clone();
             Box::pin(async move {
                 attempts.fetch_add(1, AtomicOrdering::SeqCst);
                 let now = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
@@ -273,7 +495,8 @@ mod tests {
                 if fail {
                     anyhow::bail!("mock factory failure");
                 }
-                let (a, _b) = tokio::io::duplex(64);
+                let (a, b) = tokio::io::duplex(64);
+                peers.lock().unwrap().push(b);
                 Ok(Box::new(a) as BoxProxyStream)
             })
         }
@@ -292,29 +515,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_warms_up_eagerly_to_default_capacity() {
+    async fn pool_starts_with_a_small_device_tier_reserve() {
         let factory = MockFactory::new(Duration::ZERO, false);
         let pool = ConnPool::new(factory.clone());
 
-        // Eager warm-up (spawned by the constructor) fills to 16.
+        let base = crate::resources::connection_pool_limits().0;
         assert!(
             wait_for(Duration::from_secs(5), || {
-                factory.attempts.load(AtomicOrdering::SeqCst) >= 16
+                factory.attempts.load(AtomicOrdering::SeqCst) >= base
             })
             .await
         );
-        // Pool should hold 16 warm connections now.
         let mut ok = false;
         for _ in 0..100 {
-            if pool.len().await == 16 {
+            if pool.len().await == base {
                 ok = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(ok, "pool did not fill to capacity 16");
-        assert_eq!(DEFAULT_CAPACITY, 16);
-        assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(120));
+        assert!(ok, "pool did not fill its initial reserve");
     }
 
     #[tokio::test]

@@ -75,6 +75,14 @@ fn relay_buffer_for(memory_kib: u64) -> usize {
     }
 }
 
+pub(crate) fn connection_pool_limits() -> (usize, usize, usize) {
+    match detected_memory_kib() {
+        0..=307_200 => (2, 4, 16),
+        307_201..=614_400 => (2, 8, 32),
+        _ => (4, 16, 64),
+    }
+}
+
 /// Hard aggregate payload cap: includes both TCP receive queues and sends.
 pub fn tun_tcp_payload_budget_bytes() -> usize {
     tun_tcp_payload_budget_for(detected_memory_kib())

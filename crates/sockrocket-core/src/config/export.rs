@@ -348,6 +348,15 @@ fn apply_ws_and_tls(m: &mut Mapping, node: &Node, sni_key: &str) {
         return;
     };
 
+    if tc.transport_type == TransportType::Xhttp {
+        put(m, "network", s("xhttp"));
+        if let Some(xhttp) = &tc.xhttp {
+            m.insert(
+                s("xhttp-opts"),
+                serde_yaml::to_value(xhttp).unwrap_or(Value::Null),
+            );
+        }
+    }
     if tc.transport_type == TransportType::WebSocket {
         put(m, "network", s("ws"));
         let mut ws = Mapping::new();
@@ -458,6 +467,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::WebSocket,
                 tls: Some(TlsConfig {
                     sni: Some("cdn.example.com".to_string()),
@@ -489,6 +499,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::Reality,
                 tls: None,
                 ws: None,
@@ -518,6 +529,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::Quic,
                 tls: Some(TlsConfig {
                     sni: Some("sg.example.com".to_string()),
@@ -560,6 +572,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::Quic,
                 tls: Some(TlsConfig {
                     sni: Some("de.example.com".to_string()),

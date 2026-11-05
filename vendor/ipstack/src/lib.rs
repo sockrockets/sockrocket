@@ -373,6 +373,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = vec![0_u8; config.mtu as usize + offset];
+    let mut write_buffer = Vec::with_capacity(config.mtu as usize + offset);
     let (up_pkt_sender, mut up_pkt_receiver) = queue::channel(4 * 1024 * 1024, packet_budget);
 
     tokio::spawn(async move {
@@ -397,7 +398,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     remove_session(&mut sessions, network_tuple, &sender);
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
-                    tokio::time::timeout(std::time::Duration::from_secs(10), process_upstream_recv(packet, &mut device, #[cfg(unix)]pi))
+                    tokio::time::timeout(std::time::Duration::from_secs(10), process_upstream_recv(packet, &mut device, &mut write_buffer, #[cfg(unix)]pi))
                         .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut,"TUN device write timed out"))??;
                 }
             }
@@ -424,7 +425,7 @@ async fn process_device_read(
         let stream = IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
             packet.src_addr().ip(),
             packet.dst_addr().ip(),
-            packet.payload.unwrap_or_default(),
+            packet.payload.unwrap_or_default().into_vec(),
             &packet.ip,
             config.mtu,
             up_pkt_sender.clone(),
@@ -436,7 +437,7 @@ async fn process_device_read(
     let network_tuple = packet.network_tuple();
     let packet = match sessions.entry(network_tuple) {
         std::collections::hash_map::Entry::Occupied(entry) => {
-            let len = packet.payload.as_ref().map_or(0, Vec::len);
+            let len = packet.payload.as_ref().map_or(0, |p| p.len());
             log::trace!("packet sent to stream: {network_tuple} len {len}");
             match entry.get().send(packet) {
                 Ok(()) => return Ok(()),
@@ -512,7 +513,7 @@ fn create_stream(
             Ok(IpStackStream::Tcp(stream))
         }
         TransportHeader::Udp(_) => {
-            let payload = packet.payload.unwrap_or_default();
+            let payload = packet.payload.unwrap_or_default().into_vec();
             let stream = IpStackUdpStream::new(
                 src_addr,
                 dst_addr,
@@ -531,22 +532,25 @@ fn create_stream(
 async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     up_packet: NetworkPacket,
     device: &mut Device,
+    packet_bytes: &mut Vec<u8>,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()> {
-    #[allow(unused_mut)]
-    let Ok(mut packet_bytes) = up_packet.to_bytes() else {
-        log::warn!("to_bytes error");
-        return Ok(());
-    };
+    packet_bytes.clear();
     #[cfg(unix)]
     if packet_information {
         if up_packet.src_addr().is_ipv4() {
-            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
+            packet_bytes.extend_from_slice(&TUN_FLAGS);
+            packet_bytes.extend_from_slice(&TUN_PROTO_IP4);
         } else {
-            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
+            packet_bytes.extend_from_slice(&TUN_FLAGS);
+            packet_bytes.extend_from_slice(&TUN_PROTO_IP6);
         }
     }
-    device.write_all(&packet_bytes).await?;
+    if up_packet.write_to(packet_bytes).is_err() {
+        log::warn!("packet serialization error");
+        return Ok(());
+    }
+    device.write_all(packet_bytes).await?;
     // device.flush().await?;
 
     Ok(())

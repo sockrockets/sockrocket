@@ -3477,6 +3477,7 @@ name = "ipstack"
 version = "1.0.0"
 dependencies = [
  "ahash",
+ "bytes",
  "etherparse",
  "log 0.4.29",
  "rand 0.9.4",
@@ -6412,6 +6413,7 @@ dependencies = [
  "core-foundation 0.9.4",
  "crc32fast",
  "etherparse",
+ "h2",
  "h3",
  "h3-quinn",
  "hex",

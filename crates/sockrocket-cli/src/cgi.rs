@@ -1514,6 +1514,7 @@ fn act_add_node(post: &J) -> J {
         let sni = get("sni");
         use sockrocket_core::config::model::{TlsConfig, TransportConfig, TransportType};
         let transport = serde_yaml::to_value(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
                 sni: (!sni.is_empty()).then_some(sni),

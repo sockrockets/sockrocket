@@ -551,11 +551,27 @@ async fn async_main() -> Result<()> {
             );
             None
         } else {
-            match TunProxy::start_with_stats(
+            let mtu_node = selected.cloned();
+            let manual_mtu = config.tun_mtu;
+            let mtu_cache = Path::new(&config_path).with_file_name("tun-mtu.json");
+            let tun_mtu = tokio::task::spawn_blocking(move || {
+                let targets = if manual_mtu.is_none() {
+                    mtu_node.as_ref().map(|node| resolve_to_ips(&node.server)).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                sockrocket_core::proxy::tun::mtu::select(
+                    mtu_node.as_ref(), &targets, manual_mtu, Some(&mtu_cache),
+                )
+            })
+            .await
+            .context("TUN MTU selection worker failed")??;
+            match TunProxy::start_with_mtu_and_stats(
                 shared_outbound.clone(),
                 fakeip_pool.clone(),
                 router.clone(),
                 service.stats().clone(),
+                tun_mtu,
             ) {
                 Ok(tun) => {
                     let route_info = tun.route_info();
@@ -1502,6 +1518,7 @@ mod tests {
                 shadow_tls: None,
             },
             transport: Some(TransportConfig {
+                xhttp: None,
                 transport_type: TransportType::Tcp,
                 tls: None,
                 ws: None,

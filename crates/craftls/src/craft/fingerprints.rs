@@ -245,6 +245,43 @@ pub static CHROME_CIPHER: Vec<GreaseOrCipher> = {
 
 define_fingerprint!(CHROME_108 { &CHROME_108_EXT, &CHROME_CIPHER });
 define_fingerprint!(CHROME_112 { shuffle(&CHROME_108_EXT), &CHROME_CIPHER });
+// Reference: MetaCubeX/utls v1.8.8, HelloChrome_Auto = HelloChrome_133.
+// Preserve the browser's actual group order and generate real key shares.
+#[dynamic]
+pub static CHROME_133_EXT: Vec<ExtensionSpec> = {
+    use ExtensionSpec::*;
+    let mut extensions = Vec::new();
+    for extension in CHROME_108_EXT.iter() {
+        match extension {
+            Craft(CraftExtension::Padding) => continue,
+            Craft(CraftExtension::SupportedCurves(_)) => extensions.push(Craft(
+                CraftExtension::SupportedCurves(&[
+                    Grease, GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
+                    GreaseOrCurve::T(NamedGroup::X25519),
+                    GreaseOrCurve::T(NamedGroup::secp256r1),
+                    GreaseOrCurve::T(NamedGroup::secp384r1),
+                ])
+            )),
+            Craft(CraftExtension::KeyShare(_)) => extensions.push(Craft(
+                CraftExtension::KeyShare(&[
+                    Grease, GreaseOrCurve::T(NamedGroup::X25519MLKEM768),
+                    GreaseOrCurve::T(NamedGroup::X25519),
+                ])
+            )),
+            Craft(CraftExtension::FakeApplicationSettings) => extensions.push(Craft(CraftExtension::ApplicationSettingsNew)),
+            Craft(CraftExtension::Grease2) => {
+                extensions.push(Craft(CraftExtension::GreaseEncryptedClientHello));
+                extensions.push(extension.clone());
+            }
+            _ => extensions.push(extension.clone()),
+        }
+    }
+    extensions
+};
+define_fingerprint!(CHROME_133 { shuffle(&CHROME_133_EXT), &CHROME_CIPHER });
+/// Pinned Chrome Auto profile; update deliberately with wire and interop tests.
+pub use self::CHROME_133 as CHROME_AUTO;
+
 define_fingerprint!(RUSTLS_TEST { &EXT_TEST, &CHROME_CIPHER });
 
 /// The cipher list of Safari 17.1
