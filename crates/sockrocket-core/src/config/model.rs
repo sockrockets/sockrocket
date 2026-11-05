@@ -122,8 +122,13 @@ impl AppConfig {
     /// (Merlin installs historically omitted the key).
     pub fn from_yaml_str(content: &str) -> Result<Self, serde_yaml::Error> {
         let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
-        let mut cfg: Self = serde_yaml::from_value(raw.clone())?;
-        if raw.get("proxy_mode").is_none() {
+        Self::from_yaml_value(raw)
+    }
+
+    pub(super) fn from_yaml_value(raw: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
+        let legacy_mode = raw.get("proxy_mode").is_none();
+        let mut cfg: Self = serde_yaml::from_value(raw)?;
+        if legacy_mode {
             cfg.proxy_mode = ProxyMode::Rule;
         }
         super::group::validate_targets(&cfg.groups, &cfg.rules)

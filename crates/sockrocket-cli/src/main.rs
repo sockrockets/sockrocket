@@ -728,35 +728,7 @@ async fn async_main() -> Result<()> {
                                 field
                             );
                         }
-                        let content = match fs::read_to_string(&config_path) {
-                            Ok(content) => content,
-                            Err(error) => {
-                                tracing::error!(
-                                    "DNS config reload skipped, keeping previous config: {error:#}"
-                                );
-                                continue;
-                            }
-                        };
-                        let parsed: serde_yaml::Value = match serde_yaml::from_str(&content) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                tracing::error!(
-                                    "DNS config reload skipped, keeping previous config: {error:#}"
-                                );
-                                continue;
-                            }
-                        };
-                        let settings = match sockrocket_core::config::dns::DnsSettings::from_yaml(
-                            &parsed,
-                        ) {
-                            Ok(settings) => settings,
-                            Err(error) => {
-                                tracing::error!(
-                                    "DNS config reload skipped, keeping previous config: {error:#}"
-                                );
-                                continue;
-                            }
-                        };
+                        let settings = reloaded.dns_settings;
                         let decision = ipv6_reload_decision(
                             enable_tun && !setup_routes,
                             mode_changed,
