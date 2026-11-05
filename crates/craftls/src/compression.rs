@@ -24,7 +24,9 @@ pub struct CertificateCompression {
 /// todo
 pub trait CompressionProvider: Send + Sync + Debug {
     /// todo
-    fn compress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>>;
+    fn compress(&self, _writer: Vec<u8>, _input: &[u8]) -> Result<Vec<u8>> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
     /// todo
     fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>>;
 }
@@ -47,12 +49,7 @@ impl CompressionProvider for BrotliParams {
     }
 
     fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
-        let mut decompressor = DecompressorWriter::new(writer, self.buffer_size);
-        decompressor.write_all(input)?;
-        decompressor.flush()?;
-        decompressor
-            .into_inner()
-            .map_err(|_| std::io::ErrorKind::InvalidData.into())
+        decompress_brotli(writer, input, self.buffer_size)
     }
 }
 
@@ -148,11 +145,8 @@ impl CompressionProvider for ZlibParams {
         compressor.finish()
     }
 
-    fn decompress(&self, mut writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
-        let mut decompressor = ZlibDecoder::new(input);
-
-        decompressor.read_to_end(&mut writer)?;
-        Ok(writer)
+    fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+        decompress_zlib(writer, input)
     }
 }
 
@@ -179,10 +173,8 @@ impl CompressionProvider for ZstdParams {
         compressor.finish()
     }
 
-    fn decompress(&self, mut writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
-        let mut decompressor = zstd::Decoder::new(input)?;
-        decompressor.read_to_end(&mut writer)?;
-        Ok(writer)
+    fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+        decompress_zstd(writer, input)
     }
 }
 
@@ -193,3 +185,58 @@ pub static ZSTD_DEFAULT: &CertificateCompression = &CertificateCompression {
         compression_level: zstd::DEFAULT_COMPRESSION_LEVEL as u32,
     },
 };
+
+fn decompress_brotli(writer: Vec<u8>, input: &[u8], buffer_size: usize) -> Result<Vec<u8>> {
+    let mut decompressor = DecompressorWriter::new(writer, buffer_size);
+    decompressor.write_all(input)?;
+    decompressor.flush()?;
+    decompressor.into_inner().map_err(|_| std::io::ErrorKind::InvalidData.into())
+}
+fn decompress_zlib(mut writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+    ZlibDecoder::new(input).read_to_end(&mut writer)?;
+    Ok(writer)
+}
+fn decompress_zstd(mut writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+    zstd::Decoder::new(input)?.read_to_end(&mut writer)?;
+    Ok(writer)
+}
+
+// ClientHello advertises the ability to decode the server's certificate.
+// Separate vtables avoid retaining unused encoder code in client binaries.
+// Both provider variants call the very same decompression functions.
+#[derive(Debug)]
+struct BrotliClient;
+impl CompressionProvider for BrotliClient {
+    fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+        decompress_brotli(writer, input, 4096)
+    }
+}
+#[derive(Debug)]
+struct ZlibClient;
+impl CompressionProvider for ZlibClient {
+    fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+        decompress_zlib(writer, input)
+    }
+}
+#[derive(Debug)]
+struct ZstdClient;
+impl CompressionProvider for ZstdClient {
+    fn decompress(&self, writer: Vec<u8>, input: &[u8]) -> Result<Vec<u8>> {
+        decompress_zstd(writer, input)
+    }
+}
+
+/// A receive-only certificate codec for a TLS client fingerprint. Encoding
+/// returns Unsupported; the full *_DEFAULT providers remain available for
+/// callers that need both operations. The advertised algorithms are unchanged.
+pub fn client_certificate_decompressor(alg: CertificateCompressionAlgorithm) -> Option<&'static CertificateCompression> {
+    static BROTLI: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Brotli, provider: &BrotliClient };
+    static ZLIB: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Zlib, provider: &ZlibClient };
+    static ZSTD: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Zstd, provider: &ZstdClient };
+    match alg {
+        CertificateCompressionAlgorithm::Brotli => Some(&BROTLI),
+        CertificateCompressionAlgorithm::Zlib => Some(&ZLIB),
+        CertificateCompressionAlgorithm::Zstd => Some(&ZSTD),
+        _ => None,
+    }
+}

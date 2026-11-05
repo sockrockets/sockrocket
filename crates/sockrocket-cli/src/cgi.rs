@@ -314,7 +314,8 @@ fn ykey(k: &str) -> Y {
 
 fn load_conf() -> Result<Mapping> {
     let content = fs::read_to_string(conf_path()).context("Config file not found")?;
-    let value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
+    let mut value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
+    sockrocket_core::config::node_identity::migrate_references(&mut value)?;
     match value {
         Y::Mapping(m) => Ok(m),
         Y::Null => Ok(Mapping::new()),
@@ -919,7 +920,8 @@ fn persist_subscription_state(cfg: &sockrocket_core::AppConfig) -> Result<usize,
 fn load_app_config() -> Result<sockrocket_core::AppConfig, String> {
     let content =
         fs::read_to_string(conf_path()).map_err(|e| format!("Failed to read config: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))
+    sockrocket_core::AppConfig::from_yaml_str(&content)
+        .map_err(|e| format!("Config parse failed: {e}"))
 }
 
 fn act_add_sub(post: &J) -> J {

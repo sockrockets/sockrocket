@@ -209,6 +209,11 @@ pub fn node_public_id(fingerprint: &str) -> String {
 /// credentials + transport identity (but not the display name or other
 /// cosmetic metadata).
 pub fn node_fingerprint(node: &Node) -> String {
+    super::node_identity::fingerprint(node)
+}
+
+/// Pre-v0.0.18 identity, used only to migrate existing saved references.
+pub(crate) fn legacy_node_fingerprint(node: &Node) -> String {
     let credentials = match &node.protocol {
         ProxyProtocol::Wireguard { config } => format!(
             "wireguard|{}",

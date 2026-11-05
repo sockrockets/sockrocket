@@ -42,6 +42,8 @@ target/aarch64-unknown-linux-musl/release/sockrocket-cli.symbols
 
 这个入口只构建 ARM64 CLI。ARMv7 构建继续使用现有 `cross` 流程；不能把 ARM64 校验器直接用于 ARMv7。
 
+Actions 统一使用 `bash tools/build-merlin-cross.sh <target>`。ARM64 在剥离前同样执行分配器符号校验，再使用 `llvm-strip` 生成部署文件；构建机需要安装 LLVM 工具。该入口保留现有优化等级及 LTO 参数，不使用体积优先的优化等级。ARMv7 沿用原有 cross 构建。
+
 ## 分配器验收与来源记录
 
 可手工重跑构建脚本中的检查：

@@ -1,4 +1,5 @@
 mod cgi;
+mod config_apply;
 mod daemon_health;
 mod http_health;
 mod proxy_http;
@@ -545,6 +546,7 @@ async fn async_main() -> Result<()> {
     );
 
     let diagnostic_stats = service.stats().clone();
+    update_health_state(|health| health.config_apply = Default::default());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -708,6 +710,7 @@ async fn async_main() -> Result<()> {
                 let Some(event) = event else { break };
                 match event {
                     ConfigWatchEvent::ParseError(error) => {
+                        let _rejected = config_apply::ApplyAttempt::begin(&[]);
                         // Bad edit: keep the running config untouched.
                         tracing::error!(
                             "config reload failed, keeping previous config: {}",
@@ -715,6 +718,7 @@ async fn async_main() -> Result<()> {
                         );
                     }
                     ConfigWatchEvent::Reloaded(reloaded) => {
+                        let mut attempt = config_apply::ApplyAttempt::begin(&reloaded.requires_restart);
                         // Compare with the mode the firewall was last told about,
                         // not the one at process start: dual_stack and back to
                         // the original mode must still reapply the policy.
@@ -809,11 +813,12 @@ async fn async_main() -> Result<()> {
                                     new_config.nodes.len(),
                                     new_index
                                 );
+                                attempt.runtime_applied(decision == Ipv6Reload::Reapply);
                                 if decision == Ipv6Reload::Reapply {
                                     let path = config_path.clone();
                                     if std::thread::Builder::new()
                                         .name("ipv6-policy".into())
-                                        .spawn(move || reapply_merlin_policy(&path))
+                                        .spawn(move || attempt.policy_finished(reapply_merlin_policy(&path)))
                                         .is_err()
                                     {
                                         tracing::error!(
@@ -923,6 +928,8 @@ fn collect_server_domains(nodes: &[sockrocket_core::Node]) -> std::collections::
 /// probe updates cause no flash wear.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct HealthState {
+    #[serde(default)]
+    config_apply: config_apply::ApplyStatus,
     current_node: Option<usize>,
     current_node_name: Option<String>,
     last_probe_ms: Option<u32>,
@@ -1260,6 +1267,7 @@ fn ipv6_reload_decision(
 }
 
 fn sync_traffic_node(ledger: &TrafficLedger, config: &AppConfig, active_index: Option<usize>) {
+    ledger.migrate_node_identities(&config.nodes);
     let direct = config.proxy_mode == ProxyMode::Direct;
     publish_traffic_catalog(&config.nodes, &config.subscriptions, active_index, direct);
     if direct {
@@ -1279,9 +1287,9 @@ fn sync_traffic_node(ledger: &TrafficLedger, config: &AppConfig, active_index: O
     }
 }
 
-fn reapply_merlin_policy(config_path: &str) {
+fn reapply_merlin_policy(config_path: &str) -> bool {
     let Some(dir) = Path::new(config_path).parent() else {
-        return;
+        return false;
     };
     let script = dir.join("scripts/sockrocket.sh");
     if !script.is_file() {
@@ -1289,7 +1297,7 @@ fn reapply_merlin_policy(config_path: &str) {
             "ipv6_mode changed and DNS is updated, but {} is missing so the firewall was left unchanged",
             script.display()
         );
-        return;
+        return false;
     }
     match std::process::Command::new("sh")
         .arg(&script)
@@ -1298,12 +1306,15 @@ fn reapply_merlin_policy(config_path: &str) {
     {
         Ok(status) if status.success() => {
             tracing::info!("ipv6_mode applied to the Merlin firewall without stopping the proxy");
+            true
         }
         Ok(status) => {
             tracing::error!("ipv6_mode firewall reapply failed ({status})");
+            false
         }
         Err(error) => {
             tracing::error!("ipv6_mode firewall reapply failed: {error}");
+            false
         }
     }
 }
@@ -1533,6 +1544,7 @@ mod tests {
     #[test]
     fn new_run_drops_previous_health_and_success_clears_error() {
         let mut state = HealthState {
+            config_apply: Default::default(),
             current_node: Some(13),
             current_node_name: Some("previous".into()),
             last_probe_ms: Some(313),

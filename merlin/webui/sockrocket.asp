@@ -344,7 +344,7 @@ body.bg {min-width:0!important}
           </div>
         </div>
 
-        <div class="network-summary" role="status"><span>服务进程 <b id="sr-health-process">等待状态</b></span><span>路由器探测 <b id="sr-health-outbound">尚未检查</b></span><span>局域网设备 <b>需要设备侧验证</b></span><span id="sr-status-freshness">正在读取状态…</span></div>
+        <div class="network-summary" role="status"><span>服务进程 <b id="sr-health-process">等待状态</b></span><span>路由器探测 <b id="sr-health-outbound">尚未检查</b></span><span>局域网设备 <b>需要设备侧验证</b></span><span>配置 <b id="sr-config-apply">待确认</b></span><span id="sr-status-freshness">正在读取状态…</span></div>
         <div class="stat-grid">
           <div class="stat"><div class="label">活跃连接</div><div class="value" id="sr-st-connections">—</div><div class="sub" id="sr-st-connections-sub">等待运行数据</div></div>
           <div class="stat">
@@ -1165,6 +1165,8 @@ function renderChrome() {
   var probe = st.health || {}, age = Date.now() / 1000 - Number(probe.last_probe_at || 0);
   srElement('health-outbound').textContent = !SR_STATE.statusKnown ? '状态未知' : !running ? '未运行' : age >= 0 && age < 120
     ? (probe.consecutive_failures > 0 ? '最近探测失败' : '最近检查通过 · ' + Math.round(age) + ' 秒前') : '近期没有探测结果';
+  var applyLabels = {applied:'已生效',validating:'正在校验',rejected:'更新被拒绝，沿用原配置',restart_required:'部分设置待重启',policy_pending:'正在应用网络规则',policy_failed:'网络规则应用失败'};
+  srElement('config-apply').textContent = !SR_STATE.statusKnown ? '状态未知' : !running ? '待启动' : applyLabels[(probe.config_apply || {}).state] || '待确认';
   var runtime = probe.runtime || {}, tun = runtime.tun || {};
   var active = tun.running && typeof tun.active === 'number' ? tun.active : runtime.active_connections;
   srElement('st-connections').textContent = running && typeof active === 'number' ? String(active) : '—';

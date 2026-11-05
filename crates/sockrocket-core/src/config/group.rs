@@ -207,6 +207,7 @@ pub fn validate_targets(
         }
     }
     for rule in rules {
+        crate::router::validate_rule(rule)?;
         if let Some(name) = rule.target.strip_prefix("group:")
             && !names.contains(name)
         {

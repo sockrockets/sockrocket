@@ -125,7 +125,8 @@ impl AppConfig {
         Self::from_yaml_value(raw)
     }
 
-    pub(super) fn from_yaml_value(raw: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
+    pub(super) fn from_yaml_value(mut raw: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
+        super::node_identity::migrate_references(&mut raw)?;
         let legacy_mode = raw.get("proxy_mode").is_none();
         let mut cfg: Self = serde_yaml::from_value(raw)?;
         if legacy_mode {

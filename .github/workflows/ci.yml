@@ -230,6 +230,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'merlin/**'
+              - 'tools/build-merlin-cross.sh'
+              - 'tools/verify-merlin-allocator.py'
 
       - name: Install cross
         if: steps.changes.outputs.merlin == 'true'
@@ -237,9 +239,13 @@ jobs:
         with:
           tool: cross
 
+      - name: Install ARM64 artifact inspection tools
+        if: steps.changes.outputs.merlin == 'true' && matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update -y && sudo apt-get install -y llvm
+
       - name: Cross-compile CLI (${{ matrix.name }})
         if: steps.changes.outputs.merlin == 'true'
-        run: cross build --release --package sockrocket-cli --target ${{ matrix.target }}
+        run: bash tools/build-merlin-cross.sh ${{ matrix.target }}
 
       - name: Upload binary artifact
         if: steps.changes.outputs.merlin == 'true'
@@ -270,6 +276,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'merlin/**'
+              - 'tools/build-merlin-cross.sh'
+              - 'tools/verify-merlin-allocator.py'
 
       - name: Download aarch64 binary
         if: steps.changes.outputs.merlin == 'true'
