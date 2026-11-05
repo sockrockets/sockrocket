@@ -6388,6 +6388,7 @@ version = "0.0.17"
 dependencies = [
  "anyhow",
  "base64",
+ "libc",
  "rand 0.9.4",
  "serde",
  "serde_json",

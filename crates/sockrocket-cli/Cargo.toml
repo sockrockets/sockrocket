@@ -21,3 +21,6 @@ base64 = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
