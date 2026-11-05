@@ -32,7 +32,9 @@ where
 /// Under admission pressure, reclaim TCP relays with no payload for 60s.
 /// Busy streams and ordinary idle push connections below pressure are preserved.
 pub(crate) async fn relay_with_pressure<A, B>(
-    a: &mut A, b: &mut B, idle: std::time::Duration,
+    a: &mut A,
+    b: &mut B,
+    idle: std::time::Duration,
     pressure: Option<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
 ) -> io::Result<(u64, u64)>
 where
@@ -164,24 +166,41 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pressure_reclaims_idle_but_preserves_unpressured_relays() {
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         let active = Arc::new(AtomicUsize::new(1));
         let (_client, mut inbound) = tokio::io::duplex(64);
         let (mut outbound, _server) = tokio::io::duplex(64);
         let counter = active.clone();
         let task = tokio::spawn(async move {
-            relay_with_pressure(&mut inbound, &mut outbound,
-                std::time::Duration::from_secs(1800), Some((counter, 4))).await
+            relay_with_pressure(
+                &mut inbound,
+                &mut outbound,
+                std::time::Duration::from_secs(1800),
+                Some((counter, 4)),
+            )
+            .await
         });
         tokio::task::yield_now().await;
         tokio::time::advance(std::time::Duration::from_secs(120)).await;
         tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "normal idle push connection was reclaimed");
+        assert!(
+            !task.is_finished(),
+            "normal idle push connection was reclaimed"
+        );
         active.store(3, Ordering::Relaxed);
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
-        assert!(task.is_finished(), "admission pressure did not reclaim stale connection");
-        assert_eq!(task.await.unwrap().unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            task.is_finished(),
+            "admission pressure did not reclaim stale connection"
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 
     #[tokio::test]

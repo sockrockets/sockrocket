@@ -224,7 +224,9 @@ async fn probe_once(
                     }
                 }
                 None => {
-                    tracing::warn!("health check: failover found no reachable node within this round's probe budget");
+                    tracing::warn!(
+                        "health check: failover found no reachable node within this round's probe budget"
+                    );
                     let _ = events_tx.send(Some(HealthEvent::SwitchFailed {
                         reason: "no reachable node within this round's probe budget".to_string(),
                     }));
@@ -317,11 +319,18 @@ async fn run(
 async fn find_best_node(nodes: &[Node], cursor: &mut usize) -> Option<(usize, u32)> {
     find_best_node_with(nodes, cursor, |node| async move {
         let outbound = create_outbound_unwarmed(&node).ok()?;
-        http_latency_test(&outbound, CANDIDATE_TIMEOUT_SECS).await.ok()
-    }).await
+        http_latency_test(&outbound, CANDIDATE_TIMEOUT_SECS)
+            .await
+            .ok()
+    })
+    .await
 }
 
-async fn find_best_node_with<F, Fut>(nodes: &[Node], cursor: &mut usize, probe: F) -> Option<(usize, u32)>
+async fn find_best_node_with<F, Fut>(
+    nodes: &[Node],
+    cursor: &mut usize,
+    probe: F,
+) -> Option<(usize, u32)>
 where
     F: Fn(Node) -> Fut,
     Fut: std::future::Future<Output = Option<u32>> + Send + 'static,
@@ -329,7 +338,9 @@ where
     let mut set = tokio::task::JoinSet::new();
     let mut ordered: Vec<_> = nodes.iter().cloned().enumerate().collect();
     ordered.sort_by_key(|(_, node)| node.latency_ms.unwrap_or(u32::MAX));
-    if ordered.is_empty() { return None; }
+    if ordered.is_empty() {
+        return None;
+    }
     let count = ordered.len();
     ordered.rotate_left(*cursor % count);
     let mut candidates = ordered.into_iter();
@@ -415,14 +426,20 @@ mod tests {
         let nodes: Vec<_> = (0..12).map(|i| dead_node(&i.to_string())).collect();
         let mut cursor = 0;
         let probe = |node: Node| async move {
-            if node.name == "8" { Some(10) }
-            else { std::future::pending::<Option<u32>>().await }
+            if node.name == "8" {
+                Some(10)
+            } else {
+                std::future::pending::<Option<u32>>().await
+            }
         };
         assert_eq!(find_best_node_with(&nodes, &mut cursor, probe).await, None);
         assert_eq!(cursor, 4);
         assert_eq!(find_best_node_with(&nodes, &mut cursor, probe).await, None);
         assert_eq!(cursor, 8);
-        assert_eq!(find_best_node_with(&nodes, &mut cursor, probe).await, Some((8, 10)));
+        assert_eq!(
+            find_best_node_with(&nodes, &mut cursor, probe).await,
+            Some((8, 10))
+        );
     }
 
     #[tokio::test]

@@ -602,7 +602,10 @@ impl TunProxy {
 
         tracing::info!(
             "TUN device created: {} ({}, MTU {}, TCP MSS {})",
-            tun_name, TUN_IPV4, mtu, tun_tcp_mss(mtu)
+            tun_name,
+            TUN_IPV4,
+            mtu,
+            tun_tcp_mss(mtu)
         );
 
         // Relax reverse-path filtering on the TUN device (Linux only).
@@ -955,7 +958,15 @@ async fn handle_tun_stream(
             domestic,
             super::routing::with_tun_family(
                 destination.is_some_and(|ip| ip.is_ipv6()),
-                handle_tun_stream_inner(stream, outbound, dns_resolver, fakeip, router, stats, pressure),
+                handle_tun_stream_inner(
+                    stream,
+                    outbound,
+                    dns_resolver,
+                    fakeip,
+                    router,
+                    stats,
+                    pressure,
+                ),
             ),
         ),
     )

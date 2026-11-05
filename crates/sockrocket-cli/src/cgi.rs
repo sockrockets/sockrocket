@@ -1254,7 +1254,9 @@ fn act_update_subs() -> J {
 }
 
 fn socks_port() -> u16 {
-    load_conf().map(|m| conf_u16(&m, "socks_port", 1080)).unwrap_or(1080)
+    load_conf()
+        .map(|m| conf_u16(&m, "socks_port", 1080))
+        .unwrap_or(1080)
 }
 
 /// Cap concurrent node probes on the router. Each probe spins a current-thread
@@ -1274,7 +1276,12 @@ fn speedtest_semaphore() -> &'static tokio::sync::Semaphore {
 /// Resolve through the running daemon, independent of firmware curl features.
 fn latency_via_active_socks() -> Result<u32, String> {
     let start = std::time::Instant::now();
-    match crate::proxy_http::get(socks_port(), "www.gstatic.com", "/generate_204", Duration::from_secs(15)) {
+    match crate::proxy_http::get(
+        socks_port(),
+        "www.gstatic.com",
+        "/generate_204",
+        Duration::from_secs(15),
+    ) {
         Ok((200 | 204, _)) => Ok(start.elapsed().as_millis().min(u32::MAX as u128) as u32),
         _ => Err("Connection failed or timed out".into()),
     }
@@ -1295,7 +1302,10 @@ fn act_ip_check() -> J {
         return json!({"ok": false, "ip": "", "country": "", "msg": "Sockrocket is not running; start the service first"});
     }
     let parsed: J = match crate::proxy_http::get(
-        socks_port(), "ip-api.com", "/json?fields=query,country", Duration::from_secs(12),
+        socks_port(),
+        "ip-api.com",
+        "/json?fields=query,country",
+        Duration::from_secs(12),
     ) {
         Ok((200, body)) => serde_json::from_slice(&body).unwrap_or(J::Null),
         _ => J::Null,
@@ -3298,7 +3308,9 @@ fn act_update_status() -> J {
     let mut active = root.join(".update-transaction").is_dir();
     let status = fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
     active |= status.trim() == "queued";
-    if status.starts_with("rollback-failed:") { active = false; }
+    if status.starts_with("rollback-failed:") {
+        active = false;
+    }
     let stage = fs::read_to_string(root.join(".update-transaction/stage")).unwrap_or_default();
     json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim()})
 }
@@ -3418,7 +3430,10 @@ fn act_apply_update() -> J {
             Ok(())
         })();
         if let Err(e) = prepare {
-            let _ = fs::write(sockrocket_dir().join("update-status"), "failed: preparation\n");
+            let _ = fs::write(
+                sockrocket_dir().join("update-status"),
+                "failed: preparation\n",
+            );
             let _ = fs::remove_dir_all(&work);
             return Err(e);
         }
@@ -3845,12 +3860,19 @@ mod tests {
         let response = dispatch("save_config", &json!({}));
         assert_eq!(response["error_code"], "update_in_progress");
         assert_eq!(dispatch("update_status", &json!({}))["active"], true);
-        fs::write(root.join("update-status"), "rollback-failed: backup retained").unwrap();
+        fs::write(
+            root.join("update-status"),
+            "rollback-failed: backup retained",
+        )
+        .unwrap();
         assert_eq!(dispatch("update_status", &json!({}))["active"], false);
         fs::remove_dir(root.join(".update-transaction")).unwrap();
         assert!(storage::MutationGuard::acquire().is_ok());
         fs::write(root.join("update-status"), "success: plugin updated").unwrap();
-        assert_eq!(dispatch("update_status", &json!({}))["status"], "success: plugin updated");
+        assert_eq!(
+            dispatch("update_status", &json!({}))["status"],
+            "success: plugin updated"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 mod cgi;
+mod daemon_health;
 mod http_health;
 mod proxy_http;
-mod daemon_health;
 
 use std::collections::HashSet;
 use std::env;
@@ -91,7 +91,10 @@ async fn async_main() -> Result<()> {
     }
 
     if let Some(index) = args.iter().position(|arg| arg == "--daemon-health") {
-        let pid = args.get(index + 1).ok_or_else(|| anyhow::anyhow!("Daemon PID required"))?.parse::<u32>()?;
+        let pid = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Daemon PID required"))?
+            .parse::<u32>()?;
         return daemon_health::check(pid);
     }
 
@@ -104,7 +107,9 @@ async fn async_main() -> Result<()> {
     }
 
     if let Some(index) = args.iter().position(|arg| arg == "--update-config-barrier") {
-        let path = args.get(index + 1).ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
         let _guard = sockrocket_core::config::storage::MutationGuard::acquire(Path::new(path))?;
         return Ok(());
     }
@@ -112,7 +117,8 @@ async fn async_main() -> Result<()> {
     // Validate an installed configuration without starting listeners, changing
     // routes, fetching subscriptions, or rewriting the configuration file.
     if let Some(index) = args.iter().position(|arg| arg == "--check-config") {
-        let path = args.get(index + 1)
+        let path = args
+            .get(index + 1)
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
         let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
         let _ = apply_reloaded_config(config).await?;
@@ -563,12 +569,18 @@ async fn async_main() -> Result<()> {
             let mtu_cache = Path::new(&config_path).with_file_name("tun-mtu.json");
             let tun_mtu = tokio::task::spawn_blocking(move || {
                 let targets = if manual_mtu.is_none() {
-                    mtu_node.as_ref().map(|node| resolve_to_ips(&node.server)).unwrap_or_default()
+                    mtu_node
+                        .as_ref()
+                        .map(|node| resolve_to_ips(&node.server))
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
                 sockrocket_core::proxy::tun::mtu::select(
-                    mtu_node.as_ref(), &targets, manual_mtu, Some(&mtu_cache),
+                    mtu_node.as_ref(),
+                    &targets,
+                    manual_mtu,
+                    Some(&mtu_cache),
                 )
             })
             .await
@@ -1014,7 +1026,14 @@ fn update_health_state(f: impl FnOnce(&mut HealthState)) {
 /// health checker already installed.
 fn persist_active_node(path: &str, key: &str) -> Result<()> {
     let _transaction = sockrocket_core::config::storage::MutationGuard::acquire(Path::new(path))?;
-    anyhow::ensure!(!Path::new(path).parent().unwrap_or(Path::new(".")).join(".update-transaction").exists(), "Software update in progress");
+    anyhow::ensure!(
+        !Path::new(path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".update-transaction")
+            .exists(),
+        "Software update in progress"
+    );
     let content = fs::read_to_string(path)?;
     let current = AppConfig::from_yaml_str(&content)?;
     let index = current
