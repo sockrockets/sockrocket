@@ -10,8 +10,8 @@ impl ResourceBudget {
     pub fn for_memory_kib(total: u64) -> Self {
         // Leave room for ordinary multi-device LAN concurrency. The previous
         // 128/256/512 caps could reject new flows while ample memory remained.
-        // Halved relay buffers keep aggregate copy memory unchanged as admission
-        // doubles. TUN copies reserve 16 KiB per flow; retained receive/send
+        // Smaller relay buffers bound aggregate copy memory as admission grows.
+        // TUN copies reserve 8 KiB per flow; retained receive/send
         // payload has a separate shared cap. DNS has its own admission quota.
         if total <= 300 * 1024 {
             Self {
@@ -22,14 +22,14 @@ impl ResourceBudget {
             }
         } else if total <= 600 * 1024 {
             Self {
-                tun_streams: 512,
+                tun_streams: 1024,
                 dns_queries: 64,
                 dns_tcp_clients: 8,
                 api_requests: 4,
             }
         } else {
             Self {
-                tun_streams: 1024,
+                tun_streams: 2048,
                 dns_queries: 128,
                 dns_tcp_clients: 16,
                 api_requests: 6,
@@ -69,9 +69,9 @@ pub(crate) fn relay_buffer_bytes() -> usize {
 
 fn relay_buffer_for(memory_kib: u64) -> usize {
     match memory_kib {
-        0..=307_200 => 8 * 1024,
-        307_201..=614_400 => 16 * 1024,
-        _ => 32 * 1024,
+        0..=307_200 => 4 * 1024,
+        307_201..=614_400 => 8 * 1024,
+        _ => 16 * 1024,
     }
 }
 
@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     #[test]
     fn ordinary_relay_buffers_fit_each_memory_tier() {
-        for (memory, size) in [(256, 8), (512, 16), (1024, 32)] {
+        for (memory, size) in [(256, 4), (512, 8), (1024, 16)] {
             let memory_kib = memory * 1024;
             assert_eq!(relay_buffer_for(memory_kib), size * 1024);
             let copies = ResourceBudget::for_memory_kib(memory_kib).tun_streams
@@ -138,11 +138,11 @@ mod tests {
     }
     #[test]
     fn small_router_budgets_bound_worst_case_stream_buffers() {
-        for (memory, streams) in [(256, 256), (512, 512), (1024, 1024)] {
+        for (memory, streams) in [(256, 256), (512, 1024), (1024, 2048)] {
             let budget = ResourceBudget::for_memory_kib(memory * 1024);
             assert_eq!(budget.tun_streams, streams);
             let shared_payload_kib = tun_tcp_payload_budget_for(memory * 1024) as u64 / 1024;
-            assert!(budget.tun_streams as u64 * 16 + shared_payload_kib < memory * 1024 / 8);
+            assert!(budget.tun_streams as u64 * 8 + shared_payload_kib < memory * 1024 / 8);
             assert!(budget.dns_queries <= budget.tun_streams);
             assert!(budget.api_requests <= 6);
         }

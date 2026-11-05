@@ -1,5 +1,7 @@
 mod cgi;
 mod http_health;
+mod proxy_http;
+mod daemon_health;
 
 use std::collections::HashSet;
 use std::env;
@@ -86,6 +88,11 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("DNS port required"))?
             .parse::<u16>()?;
         return sockrocket_core::dns::check_dns_listener(([127, 0, 0, 1], port).into()).await;
+    }
+
+    if let Some(index) = args.iter().position(|arg| arg == "--daemon-health") {
+        let pid = args.get(index + 1).ok_or_else(|| anyhow::anyhow!("Daemon PID required"))?.parse::<u32>()?;
+        return daemon_health::check(pid);
     }
 
     if let Some(index) = args.iter().position(|arg| arg == "--http-health") {
@@ -620,6 +627,8 @@ async fn async_main() -> Result<()> {
     } else {
         None
     };
+
+    daemon_health::start(shared_outbound.clone());
 
     // When TUN dies unexpectedly the process must exit: SOCKS/DNS can still
     // look healthy while transparent proxy is gone, and Merlin's supervisor
