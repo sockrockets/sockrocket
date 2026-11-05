@@ -94,6 +94,7 @@ pub fn apply_subscription_refresh(
     let active = config.active_node.and_then(|index| config.nodes.get(index));
     let active_fp = active.map(node_fingerprint);
     let active_name = active.map(|node| node.name.clone());
+    let active_sources = active.map(subscription_sources).unwrap_or_default();
     let urls: HashSet<String> = refreshed.iter().map(|(url, _)| url.clone()).collect();
     let mut kept = std::mem::take(&mut config.nodes);
     detach_sources(&mut kept, &urls);
@@ -113,11 +114,23 @@ pub fn apply_subscription_refresh(
                 .iter()
                 .position(|node| node.name == *name && node_fingerprint(node) == fingerprint)
         });
-        named.or_else(|| {
-            merged
-                .iter()
-                .position(|node| node_fingerprint(node) == fingerprint)
-        })
+        named
+            .or_else(|| {
+                merged
+                    .iter()
+                    .position(|node| node_fingerprint(node) == fingerprint)
+            })
+            .or_else(|| {
+                // Providers can rotate credentials or endpoints while retaining
+                // the selected remark. Only accept an unambiguous match from the
+                // same subscription; another provider's equal name is unrelated.
+                let mut matches = merged.iter().enumerate().filter(|(_, node)| {
+                    active_name.as_ref() == Some(&node.name)
+                        && !subscription_sources(node).is_disjoint(&active_sources)
+                });
+                let (index, _) = matches.next()?;
+                matches.next().is_none().then_some(index)
+            })
     });
     uniquify_node_names(&mut merged);
     config.nodes = merged;
@@ -613,6 +626,85 @@ mod tests {
             .unwrap()
             .public_key = "key-two".to_string();
         assert_ne!(node_fingerprint(&r1), node_fingerprint(&r2));
+    }
+
+    #[test]
+    fn refresh_restores_selected_remark_after_endpoint_rotation() {
+        let url = "https://example.com/a";
+        let mut old = ss("Tokyo", "192.0.2.1", 443, "old-password");
+        tag_subscription_nodes(std::slice::from_mut(&mut old), url);
+        let mut config = AppConfig {
+            nodes: vec![old],
+            active_node: Some(0),
+            subscriptions: vec![Subscription {
+                name: "A".into(),
+                url: url.into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        let mut unrelated = ss("Tokyo", "192.0.2.7", 443, "other");
+        tag_subscription_nodes(
+            std::slice::from_mut(&mut unrelated),
+            "https://example.com/b",
+        );
+        config.nodes.push(unrelated);
+        assert!(apply_subscription_refresh(
+            &mut config,
+            vec![(
+                url.into(),
+                vec![
+                    ss("Singapore", "192.0.2.2", 443, "new-password"),
+                    ss("Tokyo", "192.0.2.3", 8443, "new-password"),
+                ]
+            )]
+        ));
+        let selected = &config.nodes[config.active_node.expect("selection survives refresh")];
+        assert_eq!(selected.server, "192.0.2.3");
+        assert_eq!(selected.port, 8443);
+        // The same remark in a different subscription must never be selected.
+        assert!(apply_subscription_refresh(
+            &mut config,
+            vec![(
+                url.into(),
+                vec![ss("Singapore", "192.0.2.2", 443, "new-password"),]
+            )]
+        ));
+        assert_eq!(config.active_node, None);
+    }
+
+    #[test]
+    fn refresh_does_not_guess_between_duplicate_rotated_remarks() {
+        let url = "https://example.com/a";
+        let mut old = ss("Tokyo", "192.0.2.1", 443, "old");
+        tag_subscription_nodes(std::slice::from_mut(&mut old), url);
+        let mut config = AppConfig {
+            nodes: vec![old],
+            active_node: Some(0),
+            subscriptions: vec![Subscription {
+                name: "A".into(),
+                url: url.into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        apply_subscription_refresh(
+            &mut config,
+            vec![(
+                url.into(),
+                vec![
+                    ss("Tokyo", "192.0.2.2", 443, "new"),
+                    ss("Tokyo", "192.0.2.3", 443, "new"),
+                ],
+            )],
+        );
+        assert_eq!(config.active_node, None);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod cgi;
+mod http_health;
 
 use std::collections::HashSet;
 use std::env;
@@ -85,6 +86,14 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("DNS port required"))?
             .parse::<u16>()?;
         return sockrocket_core::dns::check_dns_listener(([127, 0, 0, 1], port).into()).await;
+    }
+
+    if let Some(index) = args.iter().position(|arg| arg == "--http-health") {
+        let port = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("HTTP proxy port required"))?
+            .parse::<u16>()?;
+        return http_health::check(port).await;
     }
 
     if let Some(index) = args.iter().position(|arg| arg == "--update-config-barrier") {
