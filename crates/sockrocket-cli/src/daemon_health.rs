@@ -1,7 +1,17 @@
 //! Fresh watchdog evidence from the running daemon, independent of local listeners.
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+#[cfg(unix)]
+mod state;
+#[cfg(not(unix))]
+mod state {
+    pub(super) fn read(_: u32) -> anyhow::Result<super::Sample> {
+        anyhow::bail!("Daemon watchdog state requires Unix")
+    }
+    pub(super) fn write(_: u32, _: &super::Sample) -> anyhow::Result<()> {
+        anyhow::bail!("Daemon watchdog state requires Unix")
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Sample {
@@ -9,9 +19,6 @@ struct Sample {
     at: u64,
     ok: bool,
     domestic_http_ok: bool,
-}
-fn path(pid: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("sockrocket_watchdog_{pid}.json"))
 }
 fn identity(pid: u32) -> Result<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -36,9 +43,7 @@ fn validate(s: &Sample, id: &str, at: u64) -> Result<()> {
 }
 pub fn check(pid: u32) -> Result<()> {
     let id = identity(pid)?;
-    let bytes = std::fs::read(path(pid))?;
-    ensure!(bytes.len() <= 4096, "Invalid health sample");
-    validate(&serde_json::from_slice(&bytes)?, &id, now())
+    validate(&state::read(pid)?, &id, now())
 }
 /// Domestic HTTP reachability through the daemon's actual routing/DNS policy.
 /// Kept separate from proxy health; never used to withdraw LAN routing.
@@ -82,9 +87,7 @@ async fn domestic_http_check(outbound: &sockrocket_core::SharedOutbound) -> bool
 pub fn summary(pid: u32) -> serde_json::Value {
     let result = (|| -> Result<_> {
         let id = identity(pid)?;
-        let bytes = std::fs::read(path(pid))?;
-        ensure!(bytes.len() <= 4096, "Invalid health sample");
-        let sample: Sample = serde_json::from_slice(&bytes)?;
+        let sample = state::read(pid)?;
         let age = now()
             .checked_sub(sample.at)
             .ok_or_else(|| anyhow::anyhow!("Invalid sample time"))?;
@@ -119,11 +122,8 @@ pub fn start(outbound: sockrocket_core::SharedOutbound) {
                 ok,
                 domestic_http_ok,
             };
-            if let Ok(bytes) = serde_json::to_vec(&sample) {
-                let tmp = path(pid).with_extension("new");
-                if std::fs::write(&tmp, bytes).is_ok() {
-                    let _ = std::fs::rename(tmp, path(pid));
-                }
+            if let Err(error) = state::write(pid, &sample) {
+                tracing::warn!("Cannot publish watchdog health sample: {error}");
             }
         }
     });

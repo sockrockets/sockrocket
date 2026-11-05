@@ -9,7 +9,7 @@
 //! wins. Importing a subscription is the exception: the provider's own
 //! remarks stay, even when several of them share one endpoint.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::model::*;
 
@@ -17,6 +17,7 @@ use super::model::*;
 pub const SUB_URL_EXTRA_KEY: &str = "sub_url";
 
 const SOURCES_KEY: &str = "subscription_sources";
+const NAMES_KEY: &str = "subscription_names";
 const MANUAL_KEY: &str = "manual_copy";
 
 /// All source memberships, including the legacy single-source format.
@@ -30,6 +31,30 @@ pub fn subscription_sources(node: &Node) -> BTreeSet<String> {
         sources.insert(url.clone());
     }
     sources
+}
+// Provider remarks survive display-name suffixes and configuration round trips.
+fn subscription_names(node: &Node) -> BTreeMap<String, String> {
+    let mut names: BTreeMap<String, String> = node
+        .extra
+        .get(NAMES_KEY)
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    let sources = subscription_sources(node);
+    names.retain(|source, _| sources.contains(source));
+    for source in sources {
+        names.entry(source).or_insert_with(|| node.name.clone());
+    }
+    names
+}
+fn set_names(node: &mut Node, names: &BTreeMap<String, String>) {
+    if names.is_empty() {
+        node.extra.remove(NAMES_KEY);
+    } else {
+        node.extra.insert(
+            NAMES_KEY.into(),
+            serde_json::to_string(names).expect("string names"),
+        );
+    }
 }
 fn set_sources(node: &mut Node, sources: &BTreeSet<String>) {
     node.extra.remove(SUB_URL_EXTRA_KEY);
@@ -52,13 +77,20 @@ fn is_manual(node: &Node) -> bool {
 /// Stamp fresh results with exactly their producing source.
 pub fn tag_subscription_nodes(nodes: &mut [Node], url: &str) {
     for node in nodes {
+        let name = subscription_names(node)
+            .remove(url)
+            .unwrap_or_else(|| node.name.clone());
         node.extra.remove(MANUAL_KEY);
+        set_names(node, &BTreeMap::from([(url.to_owned(), name)]));
         set_sources(node, &BTreeSet::from([url.to_owned()]));
     }
 }
 fn detach_sources(nodes: &mut Vec<Node>, removed: &HashSet<String>) {
     nodes.retain_mut(|node| {
         let manual = is_manual(node);
+        let mut names = subscription_names(node);
+        names.retain(|source, _| !removed.contains(source));
+        set_names(node, &names);
         let mut sources = subscription_sources(node);
         sources.retain(|source| !removed.contains(source));
         set_sources(node, &sources);
@@ -94,6 +126,7 @@ pub fn apply_subscription_refresh(
     let active = config.active_node.and_then(|index| config.nodes.get(index));
     let active_fp = active.map(node_fingerprint);
     let active_name = active.map(|node| node.name.clone());
+    let active_names = active.map(subscription_names).unwrap_or_default();
     let urls: HashSet<String> = refreshed.iter().map(|(url, _)| url.clone()).collect();
     let mut kept = std::mem::take(&mut config.nodes);
     detach_sources(&mut kept, &urls);
@@ -113,11 +146,24 @@ pub fn apply_subscription_refresh(
                 .iter()
                 .position(|node| node.name == *name && node_fingerprint(node) == fingerprint)
         });
-        named.or_else(|| {
-            merged
-                .iter()
-                .position(|node| node_fingerprint(node) == fingerprint)
-        })
+        named
+            .or_else(|| {
+                merged
+                    .iter()
+                    .position(|node| node_fingerprint(node) == fingerprint)
+            })
+            .or_else(|| {
+                // Providers can rotate credentials or endpoints while retaining
+                // the selected remark. Only accept an unambiguous match from the
+                // same subscription; another provider's equal name is unrelated.
+                let mut matches = merged.iter().enumerate().filter(|(_, node)| {
+                    subscription_names(node)
+                        .iter()
+                        .any(|(source, name)| active_names.get(source) == Some(name))
+                });
+                let (index, _) = matches.next()?;
+                matches.next().is_none().then_some(index)
+            })
     });
     uniquify_node_names(&mut merged);
     config.nodes = merged;
@@ -308,6 +354,11 @@ fn transport_summary(transport: Option<&TransportConfig>) -> String {
 
 fn merge_duplicate(retained: &mut Node, incoming: &Node) {
     let manual = is_manual(retained) || is_manual(incoming);
+    let mut names = subscription_names(retained);
+    for (source, name) in subscription_names(incoming) {
+        names.entry(source).or_insert(name);
+    }
+    set_names(retained, &names);
     let mut sources = subscription_sources(retained);
     sources.extend(subscription_sources(incoming));
     set_sources(retained, &sources);
@@ -395,6 +446,9 @@ pub fn uniquify_node_names(nodes: &mut [Node]) -> bool {
         if seen.insert(node.name.clone()) {
             continue;
         }
+        // Backfill older nodes before adding a display-only suffix.
+        let names = subscription_names(node);
+        set_names(node, &names);
         let base = std::mem::take(&mut node.name);
         let mut n = 2u32;
         loop {
@@ -628,6 +682,85 @@ mod tests {
             .unwrap()
             .public_key = "key-two".to_string();
         assert_ne!(node_fingerprint(&r1), node_fingerprint(&r2));
+    }
+
+    #[test]
+    fn refresh_restores_selected_remark_after_endpoint_rotation() {
+        let url = "https://example.com/a";
+        let mut old = ss("Tokyo", "192.0.2.1", 443, "old-password");
+        tag_subscription_nodes(std::slice::from_mut(&mut old), url);
+        let mut config = AppConfig {
+            nodes: vec![old],
+            active_node: Some(0),
+            subscriptions: vec![Subscription {
+                name: "A".into(),
+                url: url.into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        let mut unrelated = ss("Tokyo", "192.0.2.7", 443, "other");
+        tag_subscription_nodes(
+            std::slice::from_mut(&mut unrelated),
+            "https://example.com/b",
+        );
+        config.nodes.push(unrelated);
+        assert!(apply_subscription_refresh(
+            &mut config,
+            vec![(
+                url.into(),
+                vec![
+                    ss("Singapore", "192.0.2.2", 443, "new-password"),
+                    ss("Tokyo", "192.0.2.3", 8443, "new-password"),
+                ]
+            )]
+        ));
+        let selected = &config.nodes[config.active_node.expect("selection survives refresh")];
+        assert_eq!(selected.server, "192.0.2.3");
+        assert_eq!(selected.port, 8443);
+        // The same remark in a different subscription must never be selected.
+        assert!(apply_subscription_refresh(
+            &mut config,
+            vec![(
+                url.into(),
+                vec![ss("Singapore", "192.0.2.2", 443, "new-password"),]
+            )]
+        ));
+        assert_eq!(config.active_node, None);
+    }
+
+    #[test]
+    fn refresh_does_not_guess_between_duplicate_rotated_remarks() {
+        let url = "https://example.com/a";
+        let mut old = ss("Tokyo", "192.0.2.1", 443, "old");
+        tag_subscription_nodes(std::slice::from_mut(&mut old), url);
+        let mut config = AppConfig {
+            nodes: vec![old],
+            active_node: Some(0),
+            subscriptions: vec![Subscription {
+                name: "A".into(),
+                url: url.into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        apply_subscription_refresh(
+            &mut config,
+            vec![(
+                url.into(),
+                vec![
+                    ss("Tokyo", "192.0.2.2", 443, "new"),
+                    ss("Tokyo", "192.0.2.3", 443, "new"),
+                ],
+            )],
+        );
+        assert_eq!(config.active_node, None);
     }
 
     #[test]

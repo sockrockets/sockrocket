@@ -45,6 +45,21 @@ pub(super) async fn serve(
     let udp = UdpSocket::bind((bind, port)).await?;
     let actual = udp.local_addr()?.port();
     let tcp = TcpListener::bind((bind, actual)).await?;
+    serve_bound(udp, tcp, resolver, shutdown, ipv6_open).await
+}
+
+/// Run the same listener lifecycle with sockets already owned by the caller.
+pub(super) async fn serve_bound(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    resolver: DnsResolver,
+    shutdown: Arc<tokio::sync::Notify>,
+    ipv6_open: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<()> {
+    let address = udp.local_addr()?;
+    let actual = address.port();
+    let bind = address.ip();
+    anyhow::ensure!(tcp.local_addr()? == address, "DNS socket addresses differ");
     // One Notify per UDP socket: notify_one stores a permit, so a socket
     // busy outside its select! still sees the stop.
     let udp_stop = Arc::new(tokio::sync::Notify::new());
@@ -113,6 +128,30 @@ pub(super) async fn serve(
         Some(Some(Ok(Err(e)))) => Err(e),
         _ => anyhow::bail!("DNS listener exited unexpectedly"),
     }
+}
+
+/// A port assigned to TCP need not be available to UDP (notably on Windows).
+/// Keep both sockets reserved, retrying only transient port conflicts or
+/// protocol-specific exclusions instead of closing and racing another test.
+#[cfg(test)]
+pub(super) async fn bind_test_sockets() -> std::io::Result<(UdpSocket, TcpListener)> {
+    let mut last_error = None;
+    for _ in 0..64 {
+        let tcp = TcpListener::bind("127.0.0.1:0").await?;
+        match UdpSocket::bind(tcp.local_addr()?).await {
+            Ok(udp) => return Ok((udp, tcp)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("at least one paired bind attempted"))
 }
 
 async fn serve_tcp(
