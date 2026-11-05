@@ -402,7 +402,7 @@ pin_dns_upstream() {
     dns_port=$(get_config_value dns_port)
     dns_port=${dns_port:-5300}
     # Only pin while our listener is actually answering.
-    netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" || return 0
+    dns_listener_healthy || return 0
     if merlin_3006; then
         # SDN instances can read the firmware's shared resolv.dnsmasq. The
         # main postconf hook reads this file and does not point them at it.
@@ -631,8 +631,6 @@ update_dnsmasq() {
         # Fail-safe: only hijack default DNS when Sockrocket's DNS listener is
         # actually up. The template's catch-all upstream would otherwise
         # blackhole every LAN lookup, taking the whole network offline.
-        # Matches ":port " (followed by the peer column) or ":port" at
-        # end-of-line, since busybox netstat column spacing varies.
         if ! dns_listener_healthy; then
             update_dnsmasq stop
             warn "Sockrocket DNS port $dns_port not listening -- DNS split not enabled (LAN DNS unchanged)"
@@ -1090,17 +1088,15 @@ wait_for_tun() {
     return 1
 }
 
-# Poll until Sockrocket's DNS listener is bound. sockrocket-cli binds the DNS port
+# Poll until Sockrocket's DNS listener answers. sockrocket-cli binds the DNS port
 # asynchronously after startup; update_dnsmasq's single-shot listener check
 # races it (observed on a cold start: the hijack was skipped even though the
 # port came up ~2s later, leaving dns_hijack=true with no hijack until the
 # next restart).
 wait_for_dns() {
-    local tries="${1:-15}" dns_port
-    dns_port=$(get_config_value dns_port)
-    dns_port=${dns_port:-5300}
+    local tries="${1:-15}"
     while [ "$tries" -gt 0 ]; do
-        netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)" && return 0
+        dns_listener_healthy && return 0
         # Stop early if the process died while we waited.
         is_running || return 1
         sleep 1
@@ -1765,28 +1761,20 @@ enter_lan_degraded() {
     ensure_sshd
 }
 
-# True when the local HTTP proxy returns a real 204. Router curl often has
-# no proxy support, so this speaks HTTP directly and never calls curl.
+# Fresh process-owned outbound evidence. No curl/nc or loopback proxy is needed.
+# Disabled auto-switch monitoring does not disable this watchdog probe.
 outbound_probe_ok() {
-    local http_port host line
+    local pid
     OUTBOUND_PROBE_FAILURE=""
-    http_port=$(get_config_value http_port)
-    http_port=${http_port:-1087}
-    # One blocked destination must not remove the whole LAN proxy path.
-    # Bound each request, and require the expected HTTP response rather
-    # than accepting a redirect or captive portal. No credentials or peer
-    # addresses are recorded; failures are logged by the watchdog only.
-    for host in www.gstatic.com cp.cloudflare.com www.google.com; do
-        line=$(printf 'GET http://%s/generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$host" "$host" \
-            | nc -w 5 127.0.0.1 "$http_port" 2>/dev/null | head -n 1)
-        case "$line" in
-            *' 204 '*)
-                OUTBOUND_PROBE_FAILURE=""
-                return 0
-                ;;
-        esac
-        OUTBOUND_PROBE_FAILURE="${OUTBOUND_PROBE_FAILURE}${host}: raw-http=${line:-none}; "
-    done
+    pid=$(cat "$SOCKROCKET_PID" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*)
+        OUTBOUND_PROBE_FAILURE="daemon PID unavailable"
+        return 1 ;;
+    esac
+    if "$SOCKROCKET_BIN" --daemon-health "$pid" >/dev/null 2>&1; then
+        return 0
+    fi
+    OUTBOUND_PROBE_FAILURE="daemon outbound probe failed, missing or stale"
     return 1
 }
 
@@ -1842,14 +1830,9 @@ try_recover_lan_proxy() {
         return $?
     fi
 
-    local dns_port
-    dns_port=$(get_config_value dns_port)
-    dns_port=${dns_port:-5300}
-    # Only require DNS port when hijack is intended.
+    # Only require a DNS answer when hijack is intended.
     if [ "$(conf_bool dns_hijack false)" = "true" ]; then
-        if ! netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
-            return 0
-        fi
+        dns_listener_healthy || return 0
     fi
     outbound_probe_ok || return 0
 
@@ -2077,22 +2060,6 @@ do_watchdog() {
             issues=$((issues + 1))
         fi
 
-        # Check proxy port reachable. Busybox builds without the `timeout`
-        # applet would make this probe fail permanently → false "unreachable"
-        # warnings every 5 minutes; fall back to plain nc in that case.
-        local http_port port port_ok=1
-        http_port=$(get_config_value http_port)
-        port=${http_port:-1087}
-        if which timeout >/dev/null 2>&1; then
-            timeout 3 sh -c "echo | nc -w1 127.0.0.1 $port >/dev/null 2>&1" || port_ok=0
-        else
-            nc -w1 127.0.0.1 "$port" </dev/null >/dev/null 2>&1 || port_ok=0
-        fi
-        if [ "$port_ok" = "0" ]; then
-            log_warn "Watchdog: HTTP proxy port $port unreachable"
-            issues=$((issues + 1))
-        fi
-
         # Outbound liveness while hijack/TP are supposed to be on: consecutive
         # probe failures → fail-open; success clears the counter and may recover.
         if [ ! -f "$DEGRADED_FILE" ] \
@@ -2190,7 +2157,7 @@ do_watchdog() {
     else
         local port_ok=0 i
         for i in 1 2; do
-            if netstat -lun 2>/dev/null | grep -qE ":${dns_port}([[:space:]]|$)"; then
+            if dns_listener_healthy; then
                 port_ok=1
                 break
             fi

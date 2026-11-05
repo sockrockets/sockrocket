@@ -79,6 +79,7 @@ pub enum HealthEvent {
 struct FailureTracker {
     threshold: u32,
     consecutive: u32,
+    candidate_cursor: usize,
 }
 
 impl FailureTracker {
@@ -86,6 +87,7 @@ impl FailureTracker {
         Self {
             threshold: threshold.max(1),
             consecutive: 0,
+            candidate_cursor: 0,
         }
     }
 
@@ -193,7 +195,7 @@ async fn probe_once(
             tracker.reset();
 
             let best = tokio::select! {
-                best = find_best_node(&setup.nodes) => best,
+                best = find_best_node(&setup.nodes, &mut tracker.candidate_cursor) => best,
                 _ = shutdown_rx.changed() => return false,
             };
             match best {
@@ -222,9 +224,11 @@ async fn probe_once(
                     }
                 }
                 None => {
-                    tracing::warn!("health check: failover found no reachable node");
+                    tracing::warn!(
+                        "health check: failover found no reachable node within this round's probe budget"
+                    );
                     let _ = events_tx.send(Some(HealthEvent::SwitchFailed {
-                        reason: "no reachable node among candidates".to_string(),
+                        reason: "no reachable node within this round's probe budget".to_string(),
                     }));
                 }
             }
@@ -312,10 +316,33 @@ async fn run(
 
 /// Latency-test all candidate nodes concurrently and return the index and
 /// latency of the fastest reachable one.
-async fn find_best_node(nodes: &[Node]) -> Option<(usize, u32)> {
+async fn find_best_node(nodes: &[Node], cursor: &mut usize) -> Option<(usize, u32)> {
+    find_best_node_with(nodes, cursor, |node| async move {
+        let outbound = create_outbound_unwarmed(&node).ok()?;
+        http_latency_test(&outbound, CANDIDATE_TIMEOUT_SECS)
+            .await
+            .ok()
+    })
+    .await
+}
+
+async fn find_best_node_with<F, Fut>(
+    nodes: &[Node],
+    cursor: &mut usize,
+    probe: F,
+) -> Option<(usize, u32)>
+where
+    F: Fn(Node) -> Fut,
+    Fut: std::future::Future<Output = Option<u32>> + Send + 'static,
+{
     let mut set = tokio::task::JoinSet::new();
     let mut ordered: Vec<_> = nodes.iter().cloned().enumerate().collect();
     ordered.sort_by_key(|(_, node)| node.latency_ms.unwrap_or(u32::MAX));
+    if ordered.is_empty() {
+        return None;
+    }
+    let count = ordered.len();
+    ordered.rotate_left(*cursor % count);
     let mut candidates = ordered.into_iter();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut best: Option<(usize, u32)> = None;
@@ -325,13 +352,10 @@ async fn find_best_node(nodes: &[Node]) -> Option<(usize, u32)> {
             let Some((index, node)) = candidates.next() else {
                 break;
             };
-            set.spawn(async move {
-                let outbound = create_outbound_unwarmed(&node).ok()?;
-                let ms = http_latency_test(&outbound, CANDIDATE_TIMEOUT_SECS)
-                    .await
-                    .ok()?;
-                Some((index, ms))
-            });
+            // Advance when scheduled, including probes canceled by the round deadline.
+            *cursor = (*cursor + 1) % count;
+            let future = probe(node);
+            set.spawn(async move { future.await.map(|ms| (index, ms)) });
         }
         let result = tokio::select! {
             result = set.join_next() => result,
@@ -394,7 +418,28 @@ mod tests {
     #[tokio::test]
     async fn find_best_node_returns_none_when_all_unreachable() {
         let nodes = vec![dead_node("a"), dead_node("b")];
-        assert_eq!(find_best_node(&nodes).await, None);
+        assert_eq!(find_best_node(&nodes, &mut 0).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_rounds_eventually_reach_candidates_after_silent_prefix() {
+        let nodes: Vec<_> = (0..12).map(|i| dead_node(&i.to_string())).collect();
+        let mut cursor = 0;
+        let probe = |node: Node| async move {
+            if node.name == "8" {
+                Some(10)
+            } else {
+                std::future::pending::<Option<u32>>().await
+            }
+        };
+        assert_eq!(find_best_node_with(&nodes, &mut cursor, probe).await, None);
+        assert_eq!(cursor, 4);
+        assert_eq!(find_best_node_with(&nodes, &mut cursor, probe).await, None);
+        assert_eq!(cursor, 8);
+        assert_eq!(
+            find_best_node_with(&nodes, &mut cursor, probe).await,
+            Some((8, 10))
+        );
     }
 
     #[tokio::test]

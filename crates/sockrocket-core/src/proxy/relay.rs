@@ -26,6 +26,21 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
+    relay_with_pressure(a, b, idle, None).await
+}
+
+/// Under admission pressure, reclaim TCP relays with no payload for 60s.
+/// Busy streams and ordinary idle push connections below pressure are preserved.
+pub(crate) async fn relay_with_pressure<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle: std::time::Duration,
+    pressure: Option<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -102,8 +117,8 @@ where
     let relay = tokio::io::copy_bidirectional_with_sizes(
         &mut observed_a,
         &mut observed_b,
-        16 * 1024,
-        16 * 1024,
+        4 * 1024,
+        4 * 1024,
     );
     tokio::pin!(relay);
     let mut tick = tokio::time::interval(idle.min(std::time::Duration::from_secs(30)));
@@ -123,7 +138,9 @@ where
                     // A previously idle established connection gets a fresh
                     // grace period at EOF; activity continues to extend it.
                     let since = eof.map_or(last_progress, |at| at.max(last_progress));
-                    let limit = if eof.is_some() {
+                    let pressured = pressure.as_ref().is_some_and(|(active, limit)|
+                        active.load(Ordering::Relaxed) >= limit.saturating_mul(3) / 4);
+                    let limit = if eof.is_some() || pressured {
                         idle.min(std::time::Duration::from_secs(60))
                     } else {
                         idle
@@ -146,6 +163,45 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn pressure_reclaims_idle_but_preserves_unpressured_relays() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let active = Arc::new(AtomicUsize::new(1));
+        let (_client, mut inbound) = tokio::io::duplex(64);
+        let (mut outbound, _server) = tokio::io::duplex(64);
+        let counter = active.clone();
+        let task = tokio::spawn(async move {
+            relay_with_pressure(
+                &mut inbound,
+                &mut outbound,
+                std::time::Duration::from_secs(1800),
+                Some((counter, 4)),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "normal idle push connection was reclaimed"
+        );
+        active.store(3, Ordering::Relaxed);
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "admission pressure did not reclaim stale connection"
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
 
     #[tokio::test]
     async fn test_relay_bidirectional() {

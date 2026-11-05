@@ -97,6 +97,9 @@ pub struct IpStackConfig {
     /// Timeout for UDP connections.
     /// Default is 30 seconds.
     pub udp_timeout: Duration,
+    /// Data admission limit; DNS has a separate reserve beyond this limit.
+    pub max_sessions: usize,
+    pub dns_session_reserve: usize,
 }
 
 impl Default for IpStackConfig {
@@ -106,6 +109,8 @@ impl Default for IpStackConfig {
             packet_information: false,
             tcp_config: Arc::new(TcpConfig::default()),
             udp_timeout: Duration::from_secs(30),
+            max_sessions: 1024,
+            dns_session_reserve: 32,
         }
     }
 }
@@ -459,7 +464,7 @@ async fn process_device_read(
     } else {
         accept_sender
     };
-    if sessions.len() >= if is_dns { 1056 } else { 1024 } || accept_sender.capacity() == 0 {
+    if sessions.len() >= config.max_sessions.saturating_add(if is_dns { config.dns_session_reserve } else { 0 }) || accept_sender.capacity() == 0 {
         return Ok(());
     }
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

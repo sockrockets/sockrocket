@@ -205,6 +205,21 @@ servers-file=/tmp/resolv.dnsmasq' "$(cat "$SOCKROCKET_DNS_MAIN_CONFIG")" 'SDN in
     check empty "$(test -s "$SANDBOX/hup" && echo nonempty || echo empty)" 'readable private upstream is left running'
 }
 
+test_dns_lifecycle_without_socket_listing_tools() {
+    netstat() { return 127; }
+    nc() { return 127; }
+    curl() { return 127; }
+    wait_for_dns 1
+    update_dnsmasq start
+    check 'server=127.0.0.1#5300' "$(cat "$SOCKROCKET_RESOLV_FILE")" 'DNS pin uses real answers without netstat'
+    echo fault > "$DEGRADED_FILE"
+    wait_for_tun() { return 0; }
+    try_recover_lan_proxy
+    check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'recovery does not depend on external socket tools'
+    printf '#!/bin/sh\nexit 1\n' > "$SOCKROCKET_BIN"
+    if wait_for_dns 1; then echo 'dead DNS accepted without socket tools' >&2; exit 1; fi
+}
+
 test_lost_listener_unpins_dns() {
     update_dnsmasq start
     netstat() { :; }
@@ -656,34 +671,24 @@ test_outbound_probe_fallback_and_failure_details() {
     # Restore the actual probe (the fixture normally stubs it).
     sed -n '/^outbound_probe_ok() {/,/^}/p' "$SOURCE" > "$SANDBOX/probe.sh"
     . "$SANDBOX/probe.sh"
-    nc() {
-        req=$(cat)
-        echo call >> "$SANDBOX/nc.calls"
-        case "$req" in
-            *www.gstatic.com*) printf 'HTTP/1.1 000 timeout\n' ;;
-            *) printf 'HTTP/1.1 204 No Content\n' ;;
-        esac
-    }
+    echo 12345 > "$SOCKROCKET_PID"
+    # Neither nc nor curl may be available on the target firmware.
+    nc() { echo 'unexpected nc dependency' >&2; exit 99; }
+    curl() { echo 'unexpected curl dependency' >&2; exit 99; }
+    cat > "$SOCKROCKET_BIN" <<'PROBE'
+#!/bin/sh
+[ "$1" = --daemon-health ] && [ "$2" = 12345 ]
+PROBE
     outbound_probe_ok
-    check 2 "$(wc -l < "$SANDBOX/nc.calls" | tr -d ' ')" 'blackholed primary reaches a fallback'
-    check 0 "${#OUTBOUND_PROBE_FAILURE}" 'successful fallback clears failures'
-    nc() { cat >/dev/null; printf 'HTTP/1.1 502 Bad Gateway\n'; }
-    if outbound_probe_ok; then echo 'HTTP error treated as healthy' >&2; exit 1; fi
-    case "$OUTBOUND_PROBE_FAILURE" in *'raw-http=HTTP/1.1 502'*) ;; *) echo 'missing HTTP failure diagnostics' >&2; exit 1 ;; esac
-    nc() { cat >/dev/null; return 1; }
-    if outbound_probe_ok; then echo 'all failed targets treated as healthy' >&2; exit 1; fi
-    case "$OUTBOUND_PROBE_FAILURE" in *'raw-http=none'*) ;; *) echo 'missing timeout diagnostics' >&2; exit 1 ;; esac
+    check 0 "${#OUTBOUND_PROBE_FAILURE}" 'built-in probe success clears failures'
+    printf '#!/bin/sh\nexit 1\n' > "$SOCKROCKET_BIN"
+    if outbound_probe_ok; then echo 'failed built-in probe treated as healthy' >&2; exit 1; fi
+    case "$OUTBOUND_PROBE_FAILURE" in *'daemon outbound probe'*) ;; *) echo 'missing failure diagnostics' >&2; exit 1 ;; esac
     echo 'outbound failed' > "$DEGRADED_FILE"
     wait_for_tun() { return 0; }
     try_recover_lan_proxy
     check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'failed probes cannot re-capture LAN'
-    nc() {
-        req=$(cat)
-        case "$req" in
-            *www.gstatic.com*) printf 'HTTP/1.1 000 timeout\n' ;;
-            *) printf 'HTTP/1.1 204 No Content\n' ;;
-        esac
-    }
+    printf '#!/bin/sh\nexit 0\n' > "$SOCKROCKET_BIN"
     try_recover_lan_proxy
     check absent "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'working fallback recovers LAN even with primary still blocked'
 }
@@ -929,6 +934,7 @@ run_test test_dns_drift_failed_reload_backs_off
 run_test test_missing_main_dns_config_and_listener_fail_open
 run_test test_firewall_restore_missing_tun_removes_hijack
 run_test test_firewall_rebuild_failure_restores_direct_dns
+run_test test_dns_lifecycle_without_socket_listing_tools
 run_test test_lost_listener_unpins_dns
 run_test test_missing_tun_never_recovers
 run_test test_firewall_failure_never_recovers
