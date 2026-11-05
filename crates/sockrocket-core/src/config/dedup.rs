@@ -270,13 +270,18 @@ pub fn node_fingerprint(node: &Node) -> String {
         ),
     };
 
-    format!(
+    let mut fingerprint = format!(
         "{}|{}|{}|{}",
         node.server.to_ascii_lowercase(),
         node.port,
         credentials,
         transport_summary(node.transport.as_ref())
-    )
+    );
+    if let Some(policy) = node.extra.get(super::server_dns::KEY) {
+        fingerprint.push_str("|server-dns:");
+        fingerprint.push_str(policy);
+    }
+    fingerprint
 }
 
 /// One-line summary of how the node is reached: transport type plus the
@@ -290,10 +295,17 @@ fn transport_summary(transport: Option<&TransportConfig>) -> String {
         TransportType::Tcp => "tcp",
         TransportType::Tls => "tls",
         TransportType::WebSocket => "ws",
+        TransportType::Xhttp => "xhttp",
         TransportType::Quic => "quic",
         TransportType::Reality => "reality",
     };
     let mut summary = ttype.to_string();
+    if let Some(xhttp) = &tc.xhttp {
+        summary.push_str(&format!(
+            "|{}",
+            serde_json::to_string(xhttp).unwrap_or_default()
+        ));
+    }
     if let Some(ws) = &tc.ws {
         summary.push_str(&format!(
             "|{}|{}",
@@ -569,6 +581,7 @@ mod tests {
         let tcp = vmess("tcp", "2.2.2.2", 443, "uuid-1");
         let mut ws = vmess("ws", "2.2.2.2", 443, "uuid-1");
         ws.transport = Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: Some(WsConfig {
@@ -591,6 +604,7 @@ mod tests {
     fn ws_path_and_reality_key_distinguish_fingerprints() {
         let mut a = vmess("a", "2.2.2.2", 443, "uuid-1");
         a.transport = Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
             ws: Some(WsConfig {
@@ -606,6 +620,7 @@ mod tests {
 
         let mut r1 = vmess("r1", "2.2.2.2", 443, "uuid-1");
         r1.transport = Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Reality,
             tls: None,
             ws: None,

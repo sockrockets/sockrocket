@@ -76,7 +76,7 @@ impl IpStackUdpStream {
             stream_sender,
             stream_receiver,
             up_pkt_sender,
-            first_payload: Some(payload),
+            first_payload: Some(payload.into()),
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
             mtu,
@@ -108,7 +108,7 @@ impl IpStackUdpStream {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
-                    payload: Some(payload),
+                    payload: Some(payload.into()),
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -136,7 +136,7 @@ impl IpStackUdpStream {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
-                    payload: Some(payload),
+                    payload: Some(payload.into()),
                 })
             }
             _ => unreachable!(),
@@ -249,7 +249,7 @@ impl IpStackUdpStream {
         Ok(NetworkPacket {
             ip: IpHeader::Ipv4(reply),
             transport: TransportHeader::Unknown,
-            payload: Some(payload),
+            payload: Some(payload.into()),
         })
     }
 
@@ -292,7 +292,7 @@ impl IpStackUdpStream {
         Ok(NetworkPacket {
             ip: IpHeader::Ipv6(reply),
             transport: TransportHeader::Unknown,
-            payload: Some(payload),
+            payload: Some(payload.into()),
         })
     }
 

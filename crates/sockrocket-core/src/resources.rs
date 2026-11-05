@@ -41,6 +41,11 @@ impl ResourceBudget {
 }
 
 fn detected_memory_kib() -> u64 {
+    static MEMORY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MEMORY.get_or_init(read_memory_kib)
+}
+
+fn read_memory_kib() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|text| {
@@ -53,6 +58,28 @@ fn detected_memory_kib() -> u64 {
             })
         })
         .unwrap_or(1024 * 1024)
+}
+
+/// Ordinary HTTP/SOCKS copies share the connection admission budget. Keep
+/// their fixed copy cost lower on devices with at most 600 MiB of RAM.
+pub(crate) fn relay_buffer_bytes() -> usize {
+    relay_buffer_for(detected_memory_kib())
+}
+
+fn relay_buffer_for(memory_kib: u64) -> usize {
+    match memory_kib {
+        0..=307_200 => 16 * 1024,
+        307_201..=614_400 => 32 * 1024,
+        _ => 64 * 1024,
+    }
+}
+
+pub(crate) fn connection_pool_limits() -> (usize, usize, usize) {
+    match detected_memory_kib() {
+        0..=307_200 => (2, 4, 16),
+        307_201..=614_400 => (2, 8, 32),
+        _ => (4, 16, 64),
+    }
 }
 
 /// Hard aggregate payload cap: includes both TCP receive queues and sends.
@@ -97,6 +124,17 @@ pub(crate) fn tun_tcp_window_for(memory_kib: u64, active_tcp: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_relay_buffers_fit_each_memory_tier() {
+        for (memory, size) in [(256, 16), (512, 32), (1024, 64)] {
+            let memory_kib = memory * 1024;
+            assert_eq!(relay_buffer_for(memory_kib), size * 1024);
+            let copies = ResourceBudget::for_memory_kib(memory_kib).tun_streams
+                * 2
+                * relay_buffer_for(memory_kib);
+            assert!(copies as u64 <= memory_kib * 1024 / 16);
+        }
+    }
     #[test]
     fn small_router_budgets_bound_worst_case_stream_buffers() {
         for (memory, streams) in [(256, 128), (512, 256), (1024, 512)] {

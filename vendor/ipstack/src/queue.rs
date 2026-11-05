@@ -3,7 +3,7 @@ use crate::packet::NetworkPacket;
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub(crate) struct Budget {
     used: AtomicUsize,
+    has_waiters: AtomicBool,
     limit: usize,
     waiters: Mutex<std::collections::VecDeque<std::sync::Weak<Mutex<Option<Waker>>>>>,
     flows: Mutex<Vec<std::sync::Weak<std::sync::Mutex<crate::stream::tcb::Tcb>>>>,
@@ -22,6 +23,7 @@ impl Budget {
     pub fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             used: AtomicUsize::new(0),
+            has_waiters: AtomicBool::new(false),
             limit,
             waiters: Mutex::new(std::collections::VecDeque::new()),
             flows: Mutex::new(Vec::new()),
@@ -84,6 +86,9 @@ impl Budget {
     }
     fn release(&self, n: usize) {
         self.used.fetch_sub(n, Ordering::AcqRel);
+        if !self.has_waiters.load(Ordering::Acquire) {
+            return;
+        }
         // Wake one blocked producer per released packet in round-robin
         // order. Waking every flow here creates a CPU storm under pressure.
         let ready = {
@@ -101,16 +106,25 @@ impl Budget {
                     }
                 }
             }
+            // A full scan finding no armed waker restores the fast path,
+            // even while registered (but idle) senders remain alive.
+            self.has_waiters.store(ready.is_some(), Ordering::Release);
             ready
         };
         if let Some(waker) = ready {
             waker.wake();
         }
     }
-    fn register(&self, waiter: &Arc<Mutex<Option<Waker>>>) {
+    fn arm(&self, waiter: &Arc<Mutex<Option<Waker>>>, cx: &Context<'_>, first: bool) {
+        // Serialize arming and disabling the fast path with release's scan.
+        // Setting a waker outside this lock could lose the last wakeup.
         let mut waiters = self.waiters.lock().unwrap();
-        waiters.retain(|waiter| waiter.strong_count() > 0);
-        waiters.push_back(Arc::downgrade(waiter));
+        if first {
+            waiters.retain(|waiter| waiter.strong_count() > 0);
+            waiters.push_back(Arc::downgrade(waiter));
+        }
+        *waiter.lock().unwrap() = Some(cx.waker().clone());
+        self.has_waiters.store(true, Ordering::Release);
     }
 }
 #[derive(Debug)]
@@ -195,10 +209,8 @@ impl PacketSender {
             (&self.global_waiter, &self.local_waiter, &self.global)
         };
         *other.lock().unwrap() = None;
-        *waiter.lock().unwrap() = Some(cx.waker().clone());
-        if self.registered.fetch_or(blocked, Ordering::AcqRel) & blocked == 0 {
-            budget.register(waiter);
-        }
+        let first = self.registered.fetch_or(blocked, Ordering::AcqRel) & blocked == 0;
+        budget.arm(waiter, cx, first);
     }
     pub fn send(&self, packet: NetworkPacket) -> Result<(), SendError> {
         if self.tx.is_closed() {
@@ -207,12 +219,12 @@ impl PacketSender {
         let charge = packet
             .payload
             .as_ref()
-            .map_or(0, Vec::len)
+            .map_or(0, |p| p.len())
             .saturating_add(256);
         // Reserve capacity for ACK/FIN/RST and DNS even under bulk load.
         let priority = match &packet.transport {
             crate::packet::TransportHeader::Tcp(_) => {
-                packet.payload.as_ref().is_none_or(Vec::is_empty)
+                packet.payload.as_ref().is_none_or(|p| p.is_empty())
             }
             crate::packet::TransportHeader::Udp(header) => {
                 header.source_port == 53 || header.destination_port == 53
@@ -294,6 +306,60 @@ mod tests {
         drop(receiver);
         assert_eq!(budget.used(), 0);
     }
+    #[test]
+    fn idle_waiters_restore_fast_path_and_can_be_rearmed_without_duplicates() {
+        let budget = Budget::new(4096);
+        let waiter = Arc::new(Mutex::new(None));
+        let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let cx = Context::from_waker(&waker);
+        assert!(budget.take(4, 0));
+        assert!(!budget.has_waiters.load(Ordering::Acquire));
+        budget.arm(&waiter, &cx, true);
+        budget.release(1);
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        budget.release(1);
+        assert!(!budget.has_waiters.load(Ordering::Acquire));
+        budget.arm(&waiter, &cx, false);
+        assert_eq!(budget.waiters.lock().unwrap().len(), 1);
+        budget.release(1);
+        assert_eq!(count.0.load(Ordering::Relaxed), 2);
+        drop(waiter);
+        budget.release(1);
+        assert!(!budget.has_waiters.load(Ordering::Acquire));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn racing_arm_and_release_does_not_disable_an_armed_waiter() {
+        let budget = Budget::new(4096);
+        let waiter = Arc::new(Mutex::new(None));
+        for round in 0..200 {
+            let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+            let waker = Waker::from(count.clone());
+            assert!(budget.take(2, 0));
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let barrier = &barrier;
+                let budget = &budget;
+                let waiter = &waiter;
+                let waker = &waker;
+                scope.spawn(move || {
+                    barrier.wait();
+                    budget.arm(waiter, &Context::from_waker(waker), round == 0);
+                });
+                barrier.wait();
+                budget.release(1);
+            });
+            // If the first release preceded registration, subsequent capacity
+            // must still wake this producer instead of skipping it forever.
+            budget.release(1);
+            assert_eq!(count.0.load(Ordering::Relaxed), 1);
+            assert_eq!(budget.used(), 0);
+        }
+        assert_eq!(budget.waiters.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn cancelled_producers_do_not_retain_task_wakers() {
         let budget = Budget::new(4096);

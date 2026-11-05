@@ -8,7 +8,7 @@ Sockrocket uses one native Rust core shared by the desktop client, CLI and Merli
 | --- | --- | --- | --- |
 | Shadowsocks | Yes | Yes | AEAD and SS2022; ShadowTLS wrapping is TCP only |
 | VMess | Yes | Yes | AEAD only (`alterId: 0`); native UDP has a per-packet size limit |
-| VLESS | Yes | Yes | Raw TCP, TLS, WebSocket or REALITY; Vision over TLS 1.3/REALITY TCP, XUDP (standard flow excludes UDP/443) |
+| VLESS | Yes | Yes | Raw TCP, TLS, WebSocket, XHTTP (HTTP/1.1–3) or REALITY; Vision over TLS 1.3/REALITY TCP, XUDP (standard flow excludes UDP/443) |
 | Trojan | Yes | Yes | TLS by default |
 | TUIC v5 | Yes | Yes | Native QUIC |
 | Hysteria2 | Yes | Yes | Native QUIC; certificate pinning, ALPN, bandwidth limits and Fast Open; obfuscation and port hopping are not implemented |
@@ -53,9 +53,9 @@ Limits: one peer per node, at most two local addresses (one per family), four DN
 
 ## Transport boundaries and remaining work
 
-Raw TCP, TLS, WebSocket and VLESS REALITY are implemented. Requested gRPC, XHTTP, HTTPUpgrade and other unsupported transports are rejected during conversion; they are never silently changed to raw TCP. VLESS `xtls-rprx-vision` is implemented natively over TLS 1.3 or REALITY/TCP: padding, fragmented frames, independent read/write raw-copy transitions, half-close and XUDP. The standard flow rejects UDP/443 to permit client TCP fallback. Other flows and Vision over WebSocket are rejected; the flow is never silently removed. Legacy VMess with nonzero `alterId` is also rejected.
+Raw TCP, TLS, WebSocket and VLESS REALITY are implemented. Requested gRPC, HTTPUpgrade and other unsupported transports are rejected during conversion; they are never silently changed to raw TCP. VLESS `xtls-rprx-vision` is implemented natively over TLS 1.3 or REALITY/TCP: padding, fragmented frames, independent read/write raw-copy transitions, half-close and XUDP. The standard flow rejects UDP/443 to permit client TCP fallback. Other flows and Vision over WebSocket are rejected; the flow is never silently removed. Legacy VMess with nonzero `alterId` is also rejected.
 
-Further protocol work must retain the native Rust core and pass independent interoperability tests before being listed as supported. Current remaining candidates include gRPC/XHTTP transports, Hysteria2 obfuscation and broader WireGuard profile compatibility.
+Further protocol work must retain the native Rust core and pass independent interoperability tests before being listed as supported. Current remaining candidates include gRPC, Hysteria2 obfuscation and broader WireGuard profile compatibility.
 
 ## Validation
 
@@ -93,3 +93,27 @@ buffering is kept separate from individual DATAGRAM frame limits.
 
 References: [uQUIC's versioned Chrome profiles](https://github.com/refraction-networking/uquic/blob/master/u_parrot.go)
 and [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html).
+
+## VLESS over XHTTP
+
+The native Rust client implements the XHTTP wire modes and options from [Xray v26.10.31](https://github.com/XTLS/Xray-core/tree/v26.10.31/transport/internet/splithttp). No external proxy core is launched by the application. The official Xray executable is used only by optional interoperability tests.
+
+| Feature | Behavior |
+|---|---|
+| Upload modes | `packet-up`, `stream-up`, `stream-one`; `auto` selects packet-up normally, stream-one for REALITY, or stream-up for REALITY with a separate download leg |
+| HTTP versions | HTTP/1.1, HTTP/2 and HTTP/3; stream-one requires HTTP/2 or HTTP/3 |
+| Transport security | Native TLS and REALITY over HTTP/2; HTTP/3 uses QUIC/TLS and the existing QUIC certificate policy |
+| Split download | Separate address, port, HTTP version, TLS/REALITY and XHTTP host/path/options in `downloadSettings` |
+| Metadata | Session and sequence in path, query, header or Cookie; configurable keys, session alphabet and length |
+| Packet upload | Body, header or Cookie payload; configurable chunk size, POST size, upload method and pacing |
+| Padding | Legacy Referer padding or obfuscated header/query/Cookie/query-in-header; repeat-x and HPACK-length-aware tokenish padding |
+| Multiplexing | Shared H2/H3 connections; configurable concurrency or connection target, reuse/request/age rotation and keepalive |
+| Formats | Native configuration, Clash YAML, Xray JSON and VLESS share URIs; exports preserve XHTTP options |
+
+Clash uses `network: xhttp` and `xhttp-opts`, while Xray JSON uses `xhttpSettings`. Advanced options may be direct fields or an `extra` object. As in Xray, an `extra` object replaces the direct advanced options, while the outer host/path/mode take precedence. Unknown options fail explicitly. `noSSEHeader`, `scMaxBufferedPosts`, `scStreamUpServerSecs`, `serverMaxHeaderBytes` and `h2Params` include server-side settings in Xray; accepting and preserving them does not apply them to an unrelated server. Their client-side counterparts remain locally bounded.
+
+Router budgets are deliberate: at most 32 cached connections per factory, 256 sessions per connection, an 8 MiB shared packet-upload budget, at most 4 MiB per upload packet and 128 KiB of HTTP headers. Stream pipes are 16 KiB; HTTP/2 stream windows are 64 KiB and ordinary QUIC connections use a 256 KiB receive window. Chrome QUIC preserves its required 15 MiB window and 2 MiB datagram budget; all XHTTP QUIC connections share a 96 MiB reservation limit. Cached idle connections are reclaimed after about 90 seconds. Expired reuse slots are retired without aborting existing requests. Dropping a tunnel cancels its request tasks; dropping the last connection owner stops its driver. Header timeouts and non-200 responses return errors without exposing response bodies.
+
+REALITY uses the existing native authentication and classic-key-share fallback. Vision remains restricted to native TLS/REALITY over TCP and cannot be layered over XHTTP. Download settings support the native XHTTP/TLS/REALITY fields, not arbitrary Xray socket options, dialer proxies or transport masks; those settings are rejected. HTTP/3 browser fingerprints use the existing supported QUIC profiles, rather than claiming every Xray/browser fingerprint is reproduced.
+
+Interoperability tests cover the HTTP/mode matrix, REALITY modes, separate download security, custom upload methods, metadata locations, header/Cookie uploads, both padding algorithms and connection rotation, with TCP and UDP traffic through official Xray. Resource regressions cover rejection, cancellation and busy-slot retirement. Xray stream-one can terminate its session at upload EOF, so end-to-end TCP half-close semantics depend on the peer; applications should normally read their response before closing the tunnel.

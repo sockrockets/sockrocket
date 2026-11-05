@@ -55,7 +55,7 @@ struct WatcherState {
     content_hash: u64,
     /// The listen settings of the running service; changes against this
     /// baseline are reported as `requires_restart`.
-    restart_baseline: (String, u16, u16, super::dns::Ipv6Mode),
+    restart_baseline: (String, u16, u16, super::dns::Ipv6Mode, Option<u16>),
 }
 
 /// Cloneable handle for writers to suppress self-triggered reloads.
@@ -76,6 +76,7 @@ impl ConfigWatchHandle {
             config.socks_port,
             config.http_port,
             config.ipv6_mode,
+            config.tun_mtu,
         );
     }
 }
@@ -106,6 +107,7 @@ impl ConfigWatcher {
                 current.socks_port,
                 current.http_port,
                 current.ipv6_mode,
+                current.tun_mtu,
             ),
         }));
 
@@ -221,7 +223,7 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
 
 /// Compare the restart-relevant listen fields against the running baseline.
 fn restart_fields(
-    baseline: &(String, u16, u16, super::dns::Ipv6Mode),
+    baseline: &(String, u16, u16, super::dns::Ipv6Mode, Option<u16>),
     config: &AppConfig,
 ) -> Vec<String> {
     let mut fields = Vec::new();
@@ -237,6 +239,9 @@ fn restart_fields(
     if config.ipv6_mode != baseline.3 {
         fields.push("ipv6_mode".into());
     }
+    if config.tun_mtu != baseline.4 {
+        fields.push("tun_mtu".into());
+    }
     fields
 }
 
@@ -244,6 +249,20 @@ fn restart_fields(
 mod tests {
     use super::*;
     use crate::config::model::Node;
+
+    #[test]
+    fn mtu_edit_requires_tun_restart() {
+        let mut config = AppConfig::default();
+        let baseline = (
+            config.listen_addr.clone(),
+            config.socks_port,
+            config.http_port,
+            config.ipv6_mode,
+            config.tun_mtu,
+        );
+        config.tun_mtu = Some(1400);
+        assert_eq!(restart_fields(&baseline, &config), vec!["tun_mtu"]);
+    }
 
     fn temp_config_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

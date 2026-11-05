@@ -22,6 +22,84 @@ pub const DIRECT_TRAFFIC_ID: &str = "direct";
 
 // A single background writer keeps flash I/O off proxy read/write polls.
 const PERSIST_INTERVAL: Duration = Duration::from_secs(60);
+const MERGE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One immutable attribution/day bucket. Relays only increment these atomics;
+/// the ledger merges them when read, saved, or on the one-second maintenance tick.
+struct PendingTraffic {
+    target: TrafficTarget,
+    day: u64,
+    up: AtomicU64,
+    down: AtomicU64,
+}
+
+#[derive(Default)]
+struct TrafficScope {
+    target: Mutex<Option<TrafficTarget>>,
+    generation: AtomicU64,
+}
+
+/// Owned by an observed stream. It never sends per-packet messages or takes a
+/// ledger lock in the steady state. A changed request scope rebinds attribution.
+pub(crate) struct TrafficRecorder {
+    ledger: Arc<TrafficLedger>,
+    scope: Option<Arc<TrafficScope>>,
+    versions: (u64, u64),
+    pending: Option<Arc<PendingTraffic>>,
+}
+
+impl TrafficRecorder {
+    pub(crate) fn record(&mut self, up: u64, down: u64) {
+        if up != 0 || down != 0 {
+            self.record_at(up, down, unix_now() / 86_400);
+        }
+    }
+
+    fn record_at(&mut self, up: u64, down: u64, day: u64) {
+        let versions = (
+            self.scope
+                .as_ref()
+                .map_or(0, |s| s.generation.load(Ordering::Acquire)),
+            self.ledger.current_generation.load(Ordering::Acquire),
+        );
+        if self.pending.as_ref().is_none_or(|p| p.day != day) || versions != self.versions {
+            let target = self
+                .scope
+                .as_ref()
+                .and_then(|s| s.target.lock().ok().and_then(|t| t.clone()))
+                .unwrap_or_else(|| self.ledger.current_target());
+            if self
+                .pending
+                .as_ref()
+                .is_none_or(|p| p.day != day || p.target != target)
+            {
+                if let Some(old) = self.pending.take() {
+                    self.ledger.retire_counter(&old);
+                }
+                let pending = Arc::new(PendingTraffic {
+                    target,
+                    day,
+                    up: AtomicU64::new(0),
+                    down: AtomicU64::new(0),
+                });
+                self.ledger.pending.lock().unwrap().push(pending.clone());
+                self.pending = Some(pending);
+            }
+            self.versions = versions;
+        }
+        let pending = self.pending.as_ref().unwrap();
+        pending.up.fetch_add(up, Ordering::Relaxed);
+        pending.down.fetch_add(down, Ordering::Relaxed);
+    }
+}
+
+impl Drop for TrafficRecorder {
+    fn drop(&mut self) {
+        if let Some(pending) = &self.pending {
+            self.ledger.retire_counter(pending);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrafficCounters {
@@ -252,6 +330,8 @@ fn prune_subscriptions(subscriptions: &mut BTreeMap<String, SubHistory>, keep_mo
 
 /// Shared ledger attached to [`crate::ProxyStats`].
 pub struct TrafficLedger {
+    pending: Mutex<Vec<Arc<PendingTraffic>>>,
+    current_generation: AtomicU64,
     current_id: Mutex<Option<String>>,
     current_name: Mutex<Option<String>>,
     current_sub_id: Mutex<Option<String>>,
@@ -290,6 +370,8 @@ impl TrafficLedger {
             subscriptions = file.subscriptions;
         }
         let ledger = Arc::new(Self {
+            pending: Mutex::new(Vec::new()),
+            current_generation: AtomicU64::new(0),
             current_id: Mutex::new(None),
             current_name: Mutex::new(None),
             current_sub_id: Mutex::new(None),
@@ -312,14 +394,19 @@ impl TrafficLedger {
         if let Err(error) = std::thread::Builder::new()
             .name("sockrocket-traffic-save".into())
             .spawn(move || {
+                let mut last_persist = std::time::Instant::now();
                 loop {
-                    std::thread::sleep(PERSIST_INTERVAL);
+                    std::thread::sleep(MERGE_INTERVAL);
                     let Some(ledger) = weak.upgrade() else { break };
-                    if ledger.generation.load(Ordering::Acquire)
-                        != ledger.persisted_generation.load(Ordering::Acquire)
-                        && let Err(error) = ledger.flush()
-                    {
-                        tracing::debug!("traffic ledger persist skipped/failed: {error:#}");
+                    ledger.merge_pending();
+                    if last_persist.elapsed() >= PERSIST_INTERVAL {
+                        last_persist = std::time::Instant::now();
+                        if ledger.generation.load(Ordering::Acquire)
+                            != ledger.persisted_generation.load(Ordering::Acquire)
+                            && let Err(error) = ledger.flush()
+                        {
+                            tracing::debug!("traffic ledger persist skipped/failed: {error:#}");
+                        }
                     }
                 }
             })
@@ -332,6 +419,8 @@ impl TrafficLedger {
     /// In-memory ledger only (tests / short-lived tools).
     pub fn memory_only() -> Arc<Self> {
         Arc::new(Self {
+            pending: Mutex::new(Vec::new()),
+            current_generation: AtomicU64::new(0),
             current_id: Mutex::new(None),
             current_name: Mutex::new(None),
             current_sub_id: Mutex::new(None),
@@ -373,10 +462,15 @@ impl TrafficLedger {
         if let Ok(mut slot) = self.current_sub_name.lock() {
             *slot = name;
         }
+        self.current_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Accumulate bytes against the current node (session + this month's history).
     pub fn record(&self, up: u64, down: u64) {
+        self.record_target(&self.current_target(), up, down);
+    }
+
+    fn current_target(&self) -> TrafficTarget {
         let id = self
             .current_id
             .lock()
@@ -399,7 +493,57 @@ impl TrafficLedger {
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
-        self.record_parts(&id, &name, sub_id.as_deref(), sub_name.as_deref(), up, down);
+        TrafficTarget {
+            id,
+            name,
+            subscription_id: sub_id,
+            subscription_name: sub_name,
+        }
+    }
+
+    pub(crate) fn recorder(self: &Arc<Self>) -> TrafficRecorder {
+        TrafficRecorder {
+            ledger: self.clone(),
+            scope: TRAFFIC_SLOT.try_with(Arc::clone).ok(),
+            versions: (u64::MAX, u64::MAX),
+            pending: None,
+        }
+    }
+
+    fn merge_counter(&self, counter: &PendingTraffic) {
+        let up = counter.up.swap(0, Ordering::Relaxed);
+        let down = counter.down.swap(0, Ordering::Relaxed);
+        if up == 0 && down == 0 {
+            return;
+        }
+        let (year, month, _) = civil_from_days(counter.day as i64);
+        let target = &counter.target;
+        self.record_parts_in_month(
+            &target.id,
+            &target.name,
+            target.subscription_id.as_deref(),
+            target.subscription_name.as_deref(),
+            up,
+            down,
+            format!("{year:04}-{month:02}"),
+        );
+    }
+
+    fn merge_pending(&self) {
+        // Serialize drainers through the registry so a snapshot/flush cannot
+        // overtake a drain which swapped bytes but has not merged them yet.
+        self.pending.lock().unwrap().retain(|counter| {
+            self.merge_counter(counter);
+            Arc::strong_count(counter) > 1
+        });
+    }
+
+    fn retire_counter(&self, counter: &Arc<PendingTraffic>) {
+        let mut pending = self.pending.lock().unwrap();
+        self.merge_counter(counter);
+        if let Some(index) = pending.iter().position(|p| Arc::ptr_eq(p, counter)) {
+            pending.swap_remove(index);
+        }
     }
 
     /// Accumulate bytes for a specific routed node, including its subscription.
@@ -422,6 +566,20 @@ impl TrafficLedger {
         sub_name: Option<&str>,
         up: u64,
         down: u64,
+    ) {
+        self.record_parts_in_month(id, name, sub_id, sub_name, up, down, month_key());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_parts_in_month(
+        &self,
+        id: &str,
+        name: &str,
+        sub_id: Option<&str>,
+        sub_name: Option<&str>,
+        up: u64,
+        down: u64,
+        month: String,
     ) {
         if up == 0 && down == 0 {
             return;
@@ -448,7 +606,6 @@ impl TrafficLedger {
             entry.up = entry.up.saturating_add(up);
             entry.down = entry.down.saturating_add(down);
         }
-        let month = month_key();
         if let Ok(mut history) = self.history.lock() {
             let node = history
                 .entry(id.to_string())
@@ -492,6 +649,7 @@ impl TrafficLedger {
 
     /// Per-node snapshot: this process session plus retained history totals.
     pub fn snapshots(&self) -> Vec<NodeTrafficSnapshot> {
+        self.merge_pending();
         let session = self.session.lock().map(|g| g.clone()).unwrap_or_default();
         let history = self.history.lock().map(|g| g.clone()).unwrap_or_default();
         let mut ids: BTreeMap<String, String> = BTreeMap::new();
@@ -538,6 +696,7 @@ impl TrafficLedger {
 
     /// Monthly series for one node, oldest first, within the retention window.
     pub fn monthly_series(&self, id: &str) -> Vec<(String, TrafficCounters)> {
+        self.merge_pending();
         let Ok(history) = self.history.lock() else {
             return Vec::new();
         };
@@ -559,6 +718,7 @@ impl TrafficLedger {
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.merge_pending();
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
@@ -821,7 +981,7 @@ impl Drop for TrafficLedger {
 }
 
 tokio::task_local! {
-    static TRAFFIC_SLOT: std::sync::Arc<std::sync::Mutex<Option<TrafficTarget>>>;
+    static TRAFFIC_SLOT: Arc<TrafficScope>;
 }
 
 struct TrafficCatalog {
@@ -950,15 +1110,16 @@ pub fn note_node(node: &crate::config::model::Node) {
 
 pub fn note_traffic(target: TrafficTarget) {
     let _ = TRAFFIC_SLOT.try_with(|slot| {
-        if let Ok(mut guard) = slot.lock() {
+        if let Ok(mut guard) = slot.target.lock() {
             *guard = Some(target);
+            slot.generation.fetch_add(1, Ordering::Release);
         }
     });
 }
 
 pub fn current_traffic_target() -> Option<TrafficTarget> {
     TRAFFIC_SLOT
-        .try_with(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
+        .try_with(|slot| slot.target.lock().ok().and_then(|guard| guard.clone()))
         .ok()
         .flatten()
 }
@@ -967,12 +1128,196 @@ pub fn current_traffic_target() -> Option<TrafficTarget> {
 pub fn with_traffic_scope<F: std::future::Future>(
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    TRAFFIC_SLOT.scope(std::sync::Arc::new(std::sync::Mutex::new(None)), future)
+    TRAFFIC_SLOT.scope(Arc::new(TrafficScope::default()), future)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Isolated accounting cost, not a network-throughput benchmark.
+    /// Run with cargo test -p sockrocket-core --release --lib
+    /// traffic_recording_microbenchmark -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual release-mode accounting microbenchmark"]
+    fn traffic_recording_microbenchmark() {
+        const SAMPLES: u64 = 200_000;
+        let target = TrafficTarget {
+            id: "bench-node".into(),
+            name: "Benchmark node".into(),
+            subscription_id: Some("bench-sub".into()),
+            subscription_name: Some("Benchmark subscription".into()),
+        };
+        for _ in 0..3 {
+            let baseline = TrafficLedger::memory_only();
+            let started = std::time::Instant::now();
+            for _ in 0..SAMPLES {
+                baseline.record_target(std::hint::black_box(&target), 1536, 4096);
+            }
+            let direct_time = started.elapsed();
+            let batched = TrafficLedger::memory_only();
+            batched.set_current_node(Some(target.id.clone()), Some(target.name.clone()));
+            batched.set_current_subscription(
+                target.subscription_id.clone(),
+                target.subscription_name.clone(),
+            );
+            let mut recorder = batched.recorder();
+            let started = std::time::Instant::now();
+            for _ in 0..SAMPLES {
+                recorder.record(std::hint::black_box(1536), 4096);
+            }
+            drop(recorder); // Include final merge cost.
+            let batched_time = started.elapsed();
+            assert_eq!(
+                baseline.snapshots()[0].session.total(),
+                SAMPLES * (1536 + 4096)
+            );
+            assert_eq!(
+                batched.snapshots()[0].session.total(),
+                baseline.snapshots()[0].session.total()
+            );
+            eprintln!(
+                "{SAMPLES} accounting samples: per-sample merge {direct_time:?}, batched {batched_time:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_save_preserves_deferred_bytes_for_retry() {
+        let dir =
+            std::env::temp_dir().join(format!("sockrocket-traffic-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("traffic.yaml");
+        let ledger = TrafficLedger::load_or_new(&path);
+        let mut recorder = ledger.recorder();
+        recorder.record(12, 34);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(ledger.flush().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        recorder.record(5, 6);
+        ledger.flush().unwrap();
+        let rows = TrafficLedger::read_file(&path).unwrap();
+        assert_eq!(rows[0].session, TrafficCounters { up: 17, down: 40 });
+        drop(recorder);
+        drop(ledger);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relay_samples_merge_on_snapshot_without_per_sample_ledger_updates() {
+        let ledger = TrafficLedger::memory_only();
+        let mut recorder = ledger.recorder();
+        for _ in 0..10_000 {
+            recorder.record(3, 7);
+        }
+        assert!(ledger.session.lock().unwrap().is_empty());
+        let rows = ledger.snapshots();
+        assert_eq!(
+            rows[0].session,
+            TrafficCounters {
+                up: 30_000,
+                down: 70_000
+            }
+        );
+        assert_eq!(ledger.snapshots()[0].session.total(), 100_000);
+        drop(recorder);
+        assert!(ledger.pending.lock().unwrap().is_empty());
+        assert_eq!(ledger.snapshots()[0].history.total(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn recorder_follows_request_scope_and_keeps_subscription_ownership() {
+        let ledger = TrafficLedger::memory_only();
+        with_traffic_scope(async {
+            let mut recorder = ledger.recorder();
+            note_traffic(TrafficTarget {
+                id: "a".into(),
+                name: "A".into(),
+                subscription_id: Some("sub-a".into()),
+                subscription_name: Some("Sub A".into()),
+            });
+            recorder.record(10, 20);
+            note_traffic(TrafficTarget {
+                id: "b".into(),
+                name: "B".into(),
+                subscription_id: None,
+                subscription_name: None,
+            });
+            recorder.record(5, 7);
+            drop(recorder);
+        })
+        .await;
+        let rows = ledger.snapshots();
+        assert_eq!(
+            rows.iter().find(|r| r.id == "a").unwrap().session.total(),
+            30
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.id == "b").unwrap().session.total(),
+            12
+        );
+        let subs = ledger.subscriptions.lock().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            subs["sub-a"]
+                .months
+                .values()
+                .map(|m| m.up + m.down)
+                .sum::<u64>(),
+            30
+        );
+    }
+
+    #[test]
+    fn recorder_keeps_months_when_drained_after_rollover_or_clock_reversal() {
+        let ledger = TrafficLedger::memory_only();
+        let mut recorder = ledger.recorder();
+        recorder.record_at(10, 20, 30); // 1970-01-31 UTC
+        recorder.record_at(3, 4, 31); // 1970-02-01 UTC
+        recorder.record_at(1, 2, 30); // clock adjustment back across boundary
+        let months = ledger.monthly_series(DIRECT_TRAFFIC_ID);
+        assert_eq!(
+            months[0],
+            ("1970-01".into(), TrafficCounters { up: 11, down: 22 })
+        );
+        assert_eq!(
+            months[1],
+            ("1970-02".into(), TrafficCounters { up: 3, down: 4 })
+        );
+    }
+
+    #[test]
+    fn concurrent_drains_and_recorder_drop_never_lose_or_duplicate_bytes() {
+        let ledger = TrafficLedger::memory_only();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let ledger = &ledger;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        let mut recorder = ledger.recorder();
+                        for _ in 0..100 {
+                            recorder.record(1, 2);
+                        }
+                    }
+                });
+            }
+            let ledger = &ledger;
+            scope.spawn(move || {
+                for _ in 0..100 {
+                    ledger.snapshots();
+                }
+            });
+        });
+        assert_eq!(
+            ledger.snapshots()[0].session,
+            TrafficCounters {
+                up: 40_000,
+                down: 80_000
+            }
+        );
+        assert!(ledger.pending.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn recording_traffic_does_not_write_on_the_proxy_path() {

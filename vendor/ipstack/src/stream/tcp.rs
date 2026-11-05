@@ -9,7 +9,7 @@ use crate::{
     },
     stream::tcb::{
         MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO,
-        Tcb, TcpState, into_tail, window_scale_shift,
+        Tcb, TcpState, window_scale_shift,
     },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
@@ -184,6 +184,7 @@ pub struct IpStackTcpStream {
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
     temp_read_buffer: Vec<u8>,
+    temp_read_offset: usize,
     config: Arc<TcpConfig>,
 }
 
@@ -208,6 +209,7 @@ impl IpStackTcpStream {
             config.window_limit.clone(),
             config.payload_budget.clone(),
         );
+        tcb.set_peer_mss(peer_mss(&tcp, src_addr.is_ipv6()));
         // Reply with a scale only when the client offered one. Otherwise the
         // header window stays a raw 16-bit byte count, maxing out at 64 KiB.
         if let Some(peer) = peer_window_scale(&tcp) {
@@ -265,6 +267,7 @@ impl IpStackTcpStream {
             task_handle: None,
             exit_notifier: None,
             temp_read_buffer: Vec::new(),
+            temp_read_offset: 0,
             config,
         };
 
@@ -279,10 +282,10 @@ impl IpStackTcpStream {
         Ok(stream)
     }
 
-    fn read_consumed(&self, n: usize, completed_chunk: bool) {
+    fn read_consumed(&self, n: usize, completed_chunks: usize) {
         let mut tcb = self.tcb.lock().unwrap();
         let old_window = tcb.get_recv_window();
-        tcb.consume_read(n, completed_chunk);
+        tcb.consume_read(n, completed_chunks);
         if old_window >= tcb.get_mtu() {
             return;
         }
@@ -350,53 +353,66 @@ impl AsyncRead for IpStackTcpStream {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        // if there is data in the temp buffer, read it first
-        if !self.temp_read_buffer.is_empty() {
-            let owned = std::mem::take(&mut self.temp_read_buffer);
-            let len = std::cmp::min(buf.remaining(), owned.len());
-            buf.put_slice(&owned[..len]);
-            let rest = into_tail(owned, len);
-            let done = rest.is_empty();
-            self.temp_read_buffer = rest;
-            self.read_consumed(len, done);
+        let before = buf.filled().len();
+        let mut completed_chunks = 0;
+        // Keep a cursor into the owned chunk. Reallocating its remaining tail
+        // on every short read makes small consumers unnecessarily expensive.
+        if self.temp_read_offset < self.temp_read_buffer.len() {
+            let start = self.temp_read_offset;
+            let n = buf.remaining().min(self.temp_read_buffer.len() - start);
+            buf.put_slice(&self.temp_read_buffer[start..start + n]);
+            self.temp_read_offset += n;
+            if self.temp_read_offset == self.temp_read_buffer.len() {
+                self.temp_read_buffer = Vec::new();
+                self.temp_read_offset = 0;
+                completed_chunks += 1;
+            }
+        }
+        // Register before inspecting reset/worker completion. A racing terminal
+        // transition must either appear below or wake this poll.
+        self.read_notify.lock().unwrap().replace(cx.waker().clone());
+        // Drain only already-ready chunks: no batching delay, and bounded work
+        // per poll so ACKs and unrelated flows keep getting scheduled.
+        for _ in 0..32 {
+            if buf.remaining() == 0
+                || self.read_eof
+                || self.reset.load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            match self.data_rx.poll_recv(cx) {
+                Poll::Ready(Some(data)) => {
+                    if data.is_empty() {
+                        self.read_eof = true;
+                        break;
+                    }
+                    let n = buf.remaining().min(data.len());
+                    buf.put_slice(&data[..n]);
+                    if n == data.len() {
+                        completed_chunks += 1;
+                    } else {
+                        self.temp_read_buffer = data;
+                        self.temp_read_offset = n;
+                    }
+                }
+                Poll::Ready(None) => {
+                    self.read_eof = true;
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+        let consumed = buf.filled().len() - before;
+        if consumed != 0 {
+            self.read_consumed(consumed, completed_chunks);
             self.reset_timeout();
             return Poll::Ready(Ok(()));
         }
-
-        // Register before checking terminal state, so a racing reset or
-        // worker completion either appears below or wakes this poll.
-        self.read_notify.lock().unwrap().replace(cx.waker().clone());
         if self.reset.load(std::sync::atomic::Ordering::Acquire) {
             return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
         }
         if self.read_eof {
             return Poll::Ready(Ok(()));
-        }
-        match self.data_rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                if data.is_empty() {
-                    self.read_eof = true;
-                } else {
-                    self.reset_timeout();
-                    let n = buf.remaining().min(data.len());
-                    buf.put_slice(&data[..n]);
-                    let rest = into_tail(data, n);
-                    let done = rest.is_empty();
-                    self.read_consumed(n, done);
-                    if !done {
-                        self.temp_read_buffer = rest;
-                    }
-                }
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Ready(None) => {
-                if self.reset.load(std::sync::atomic::Ordering::Acquire) {
-                    return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
-                }
-                self.read_eof = true;
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Pending => {}
         }
         if self.tcb.lock().unwrap().get_state() == TcpState::Closed {
             if self.reset.load(std::sync::atomic::Ordering::Acquire) {
@@ -480,60 +496,76 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Pending;
         }
 
+        // Bound work under the TCB lock for fairness. Recompute window/MSS
+        // and reserve credit per segment so a partial batch obeys backpressure.
+        const MAX_BATCH_BYTES: usize = 16 * 1024;
+        const MAX_BATCH_SEGMENTS: usize = 16;
         let sender = &self.up_packet_sender;
         let ip_header_len = if nt.src.is_ipv4() { 20 } else { 40 };
-        let size = buf
-            .len()
-            .min(tcb.calculate_payload_max_len(ip_header_len, 20));
-        let credit = match tcb.payload_budget.reserve(size) {
-            Some(credit) => credit,
-            None => {
-                *self.write_notify.lock().unwrap() = Some(cx.waker().clone());
-                tcb.payload_budget.register(&self.write_notify);
-                // Close the release/register race before returning Pending.
-                let Some(credit) = tcb.payload_budget.reserve(size) else {
-                    return Poll::Pending;
-                };
-                credit
+        let limit = buf.len().min(MAX_BATCH_BYTES);
+        let mut accepted = 0;
+        let mut outcome = Poll::Pending;
+        for _ in 0..MAX_BATCH_SEGMENTS {
+            if accepted == limit || tcb.is_send_buffer_full() {
+                break;
             }
-        };
-        let data = &buf[..size];
-        let mut result =
-            write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(data.to_vec()));
-        if result
-            .as_ref()
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
-        {
-            sender.register(cx);
-            result = write_packet_to_device(
-                sender,
-                nt,
-                &tcb,
-                None,
-                ACK | PSH,
-                None,
-                Some(data.to_vec()),
-            );
+            let size = (limit - accepted).min(tcb.calculate_payload_max_len(ip_header_len, 20));
+            if size == 0 {
+                break;
+            }
+            let credit = match tcb.payload_budget.reserve(size) {
+                Some(credit) => credit,
+                None => {
+                    *self.write_notify.lock().unwrap() = Some(cx.waker().clone());
+                    tcb.payload_budget.register(&self.write_notify);
+                    // Close the release/register race before returning Pending.
+                    let Some(credit) = tcb.payload_budget.reserve(size) else {
+                        break;
+                    };
+                    credit
+                }
+            };
+            // One MSS-sized backing allocation, shared by queued transmission
+            // and retransmission. No large batch buffer pinned by a tiny ACK tail.
+            let data = bytes::Bytes::copy_from_slice(&buf[accepted..accepted + size]);
+            let mut result =
+                write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(data.clone()));
+            if result
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                sender.register(cx);
+                result = write_packet_to_device(
+                    sender,
+                    nt,
+                    &tcb,
+                    None,
+                    ACK | PSH,
+                    None,
+                    Some(data.clone()),
+                );
+            }
+            let payload_len = match result {
+                Ok(n) => n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    outcome = Poll::Ready(Err(error));
+                    break;
+                }
+            };
+            tcb.add_reserved_inflight_packet(data.slice(..payload_len), credit)?;
+            accepted += payload_len;
         }
-        let payload_len = match result {
-            Ok(n) => n,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Poll::Pending,
-            Err(error) => return Poll::Ready(Err(error)),
-        };
-        tcb.add_reserved_inflight_packet(buf[..payload_len].to_vec(), credit)?;
-
-        let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-        if log::log_enabled!(log::Level::Trace) {
-            log::trace!(
-                "{nt} {state:?}: [poll_write] local {{ seq: {seq}, ack: {ack} }} upstream data written to device, len = {payload_len}"
-            );
-        }
+        // AsyncWrite must report an accepted prefix even if the next segment
+        // fails; returning Pending/Err here would let the relay resend bytes.
         drop(tcb);
-        if payload_len != 0 {
+        if accepted != 0 {
             self.reset_timeout();
             self.retransmit_notify.notify_one();
+            Poll::Ready(Ok(accepted))
+        } else {
+            outcome
         }
-        Poll::Ready(Ok(payload_len))
     }
 
     fn poll_flush(
@@ -1019,7 +1051,7 @@ async fn tcp_main_logic_loop(
             break;
         };
 
-        let payload = network_packet.payload.take().unwrap_or_default();
+        let payload = network_packet.payload.take().unwrap_or_default().into_vec();
         let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
             log::warn!("{network_tuple} Invalid TCP packet");
             continue;
@@ -1446,6 +1478,19 @@ fn peer_window_scale(header: &TcpHeader) -> Option<u8> {
     })
 }
 
+fn peer_mss(header: &TcpHeader, ipv6: bool) -> u16 {
+    // Ignore invalid zero values; duplicate offers cannot increase a smaller
+    // receive limit. A SYN without MSS has the RFC 9293 3.7.1 family default.
+    header
+        .options_iterator()
+        .filter_map(|option| match option {
+            Ok(TcpOptionElement::MaximumSegmentSize(mss)) if mss != 0 => Some(mss),
+            _ => None,
+        })
+        .min()
+        .unwrap_or(if ipv6 { 1220 } else { 536 })
+}
+
 fn syn_ack_options(
     configured: Option<&Vec<TcpOptions>>,
     scale: Option<u8>,
@@ -1466,7 +1511,7 @@ pub(crate) fn write_packet_to_device(
     options: Option<&Vec<TcpOptions>>,
     flags: u8,
     seq: Option<SeqNum>,
-    payload: Option<Vec<u8>>,
+    payload: Option<bytes::Bytes>,
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let owned_payload = seq.is_some() && payload.as_ref().is_some_and(|bytes| !bytes.is_empty());
@@ -1479,8 +1524,7 @@ pub(crate) fn write_packet_to_device(
             // Retries reuse existing sequence/credit. New-write allowance can
             // be zero precisely because these bytes are already in flight.
             // A closed-window probe is limited to one owned byte.
-            (tcb.get_mtu() as usize)
-                .saturating_sub(ip_header_len + tcp_header_len)
+            tcb.max_segment_payload_len(ip_header_len, tcp_header_len)
                 .min((tcb.get_send_window() as usize).max(1))
         } else {
             tcb.calculate_payload_max_len(ip_header_len, tcp_header_len)
@@ -1528,7 +1572,7 @@ pub(crate) fn create_raw_packet(
     seq: u32,
     ack: u32,
     win: u16,
-    mut payload: Vec<u8>,
+    mut payload: bytes::Bytes,
     options: Option<&Vec<TcpOptions>>,
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
@@ -1607,7 +1651,7 @@ pub(crate) fn create_raw_packet(
     Ok(NetworkPacket {
         ip: ip_header,
         transport: TransportHeader::Tcp(tcp_header),
-        payload: Some(payload),
+        payload: Some(payload.into()),
     })
 }
 
@@ -1648,5 +1692,224 @@ mod retry_queue_tests {
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         // Do not turn an ordinary receive ACK into a fatal flow error.
         assert!(write_packet_to_device(&sender, tuple, &tcb, None, ACK, None, None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod read_batch_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn reader() -> (IpStackTcpStream, PacketReceiver) {
+        let (sender, receiver) =
+            crate::queue::channel(65536, crate::queue::Budget::new(1024 * 1024));
+        let mut syn = TcpHeader::new(12345, 443, 1, 65535);
+        syn.syn = true;
+        let mut stream = IpStackTcpStream::new(
+            "192.0.2.2:12345".parse().unwrap(),
+            "198.51.100.2:443".parse().unwrap(),
+            syn,
+            sender,
+            1500,
+            None,
+            Arc::new(TcpConfig::default()),
+        )
+        .unwrap();
+        // This fixture exercises the application read side with already
+        // reassembled data. Packet/state-machine coverage lives in integration tests.
+        stream.task_handle.take().unwrap().abort();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        stream.data_tx = Some(tx);
+        stream.data_rx = rx;
+        stream
+            .tcb
+            .lock()
+            .unwrap()
+            .change_state(TcpState::Established);
+        (stream, receiver)
+    }
+
+    fn writer(queue_limit: usize, payload_limit: usize) -> (IpStackTcpStream, PacketReceiver) {
+        let (stream, _) = reader();
+        let (sender, receiver) =
+            crate::queue::channel(queue_limit, crate::queue::Budget::new(1024 * 1024));
+        let mut stream = stream;
+        stream.up_packet_sender = sender;
+        {
+            let mut tcb = stream.tcb.lock().unwrap();
+            tcb.set_peer_mss(900);
+            tcb.payload_budget = crate::TcpPayloadBudget::new(payload_limit);
+        }
+        (stream, receiver)
+    }
+
+    #[tokio::test]
+    async fn write_batch_is_bounded_and_shares_each_segment_with_retransmission() {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, mut packets) = writer(65536, 65536);
+        let seq = stream.tcb.lock().unwrap().get_seq();
+        let bytes: Vec<_> = (0..32768).map(|n| (n % 251) as u8).collect();
+        let accepted = stream.write(&bytes).await.unwrap();
+        // Sixteen MSS-sized segments is the fairness bound for this peer.
+        assert_eq!(accepted, 16 * 900);
+        let mut offset = 0;
+        while offset < accepted {
+            let packet = packets.recv().await.unwrap();
+            let payload = packet.payload.as_ref().unwrap();
+            assert_eq!(&payload[..], &bytes[offset..offset + payload.len()]);
+            let tcb = stream.tcb.lock().unwrap();
+            let retry = tcb.find_inflight_packet(seq + offset as u32).unwrap();
+            assert_eq!(payload.as_ptr(), retry.payload.as_ptr());
+            offset += payload.len();
+        }
+        let mut tcb = stream.tcb.lock().unwrap();
+        assert_eq!(tcb.payload_budget.usage().0, accepted);
+        let original = tcb.find_inflight_packet(seq).unwrap().payload.as_ptr();
+        tcb.update_inflight_packet_queue(seq + 450);
+        let tail = &tcb.find_inflight_packet(seq + 450).unwrap().payload;
+        assert_ne!(tail.as_ptr(), original.wrapping_add(450));
+        assert_eq!(&tail[..], &bytes[450..900]);
+        assert_eq!(tcb.payload_budget.usage().0, accepted - 450);
+        tcb.update_inflight_packet_queue(seq + accepted as u32);
+        assert_eq!(tcb.payload_budget.usage().0, 0);
+        tcb.update_last_received_ack(seq + accepted as u32);
+        tcb.set_peer_mss(1460);
+        drop(tcb);
+        // A larger MSS hits the byte cap before the segment-count cap.
+        assert_eq!(stream.write(&bytes).await.unwrap(), 16 * 1024);
+        let mut received = 0;
+        while received < 16 * 1024 {
+            let packet = packets.recv().await.unwrap();
+            let payload = packet.payload.unwrap();
+            assert_eq!(payload.len(), 1460.min(16 * 1024 - received));
+            assert_eq!(&payload[..], &bytes[received..received + payload.len()]);
+            received += payload.len();
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_write_on_queue_pressure_returns_prefix_and_resumes_without_duplication() {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, mut packets) = writer(3000, 65536);
+        let seq = stream.tcb.lock().unwrap().get_seq();
+        assert_eq!(stream.write(&[7; 4000]).await.unwrap(), 1800);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            Pin::new(&mut stream)
+                .poll_write(&mut cx, &[8; 2200])
+                .is_pending()
+        );
+        assert_eq!(stream.tcb.lock().unwrap().payload_budget.usage().0, 1800);
+        for offset in [0, 900] {
+            let packet = packets.recv().await.unwrap();
+            let TransportHeader::Tcp(header) = packet.transport else {
+                panic!()
+            };
+            assert_eq!(header.sequence_number, (seq + offset).0);
+            assert_eq!(&packet.payload.unwrap()[..], &[7; 900]);
+        }
+        assert_eq!(stream.write(&[8; 2200]).await.unwrap(), 1800);
+        let packet = packets.recv().await.unwrap();
+        let TransportHeader::Tcp(header) = packet.transport else {
+            panic!()
+        };
+        assert_eq!(header.sequence_number, (seq + 1800).0);
+        assert_eq!(&packet.payload.unwrap()[..], &[8; 900]);
+    }
+
+    #[tokio::test]
+    async fn batch_respects_peer_window_and_aggregate_payload_credit() {
+        use tokio::io::AsyncWriteExt;
+        for (window, budget, expected) in [(1500, 65536, 1500), (65535, 1800, 1800)] {
+            let (mut stream, mut packets) = writer(65536, budget);
+            stream.tcb.lock().unwrap().update_send_window(window);
+            assert_eq!(stream.write(&[7; 4000]).await.unwrap(), expected);
+            let mut received = 0;
+            while received < expected {
+                received += packets.recv().await.unwrap().payload.unwrap().len();
+            }
+            assert_eq!(received, expected);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_write(&mut cx, &[8; 900])
+                    .is_pending()
+            );
+            assert_eq!(
+                stream.tcb.lock().unwrap().payload_budget.usage().0,
+                expected
+            );
+        }
+    }
+
+    fn queue(stream: &mut IpStackTcpStream, payload: Vec<u8>) -> *const u8 {
+        let mut tcb = stream.tcb.lock().unwrap();
+        let seq = tcb.get_ack();
+        tcb.add_unordered_packet(seq, payload);
+        let data = tcb.consume_unordered_packets(8192).unwrap();
+        let pointer = data.as_ptr();
+        tcb.queue_read(data.len());
+        stream.data_tx.as_ref().unwrap().send(data).unwrap();
+        pointer
+    }
+
+    #[tokio::test]
+    async fn ready_chunks_are_coalesced_without_waiting_and_refund_all_credits() {
+        let (mut stream, _packets) = reader();
+        for n in 0..8 {
+            queue(&mut stream, vec![n; 128]);
+        }
+        let mut out = [0; 2048];
+        let count = stream.read(&mut out).await.unwrap();
+        assert_eq!(count, 1024);
+        for n in 0..8 {
+            assert_eq!(&out[n * 128..(n + 1) * 128], &[n as u8; 128]);
+        }
+        let tcb = stream.tcb.lock().unwrap();
+        assert_eq!(tcb.queued_read_chunks(), 0);
+        assert_eq!(tcb.payload_budget.usage().0, 0);
+    }
+
+    #[tokio::test]
+    async fn tiny_reads_keep_the_owned_chunk_and_return_byte_credit_incrementally() {
+        let (mut stream, _packets) = reader();
+        let expected: Vec<_> = (0..1400).map(|i| (i % 251) as u8).collect();
+        let pointer = queue(&mut stream, expected.clone());
+        for (i, expected) in expected.into_iter().enumerate() {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte[0], expected);
+            if i < 1399 {
+                assert_eq!(stream.temp_read_buffer.as_ptr(), pointer);
+            }
+            assert_eq!(
+                stream.tcb.lock().unwrap().payload_budget.usage().0,
+                1399 - i
+            );
+        }
+        assert!(stream.temp_read_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batching_is_bounded_and_reset_preserves_a_partially_read_chunk() {
+        let (mut stream, _packets) = reader();
+        for _ in 0..64 {
+            queue(&mut stream, vec![7]);
+        }
+        let mut out = [0; 128];
+        assert_eq!(stream.read(&mut out).await.unwrap(), 32);
+        assert_eq!(stream.read(&mut out).await.unwrap(), 32);
+        queue(&mut stream, b"hello".to_vec());
+        assert_eq!(stream.read(&mut out[..1]).await.unwrap(), 1);
+        stream
+            .reset
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(stream.read(&mut out).await.unwrap(), 4);
+        assert_eq!(&out[..4], b"ello");
+        assert_eq!(
+            stream.read(&mut out).await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(stream.tcb.lock().unwrap().payload_budget.usage().0, 0);
     }
 }

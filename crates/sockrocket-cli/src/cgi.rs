@@ -3331,7 +3331,9 @@ fn act_update_status() -> J {
     let mut active = root.join(".update-transaction").is_dir();
     let status = fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
     active |= status.trim() == "queued";
-    if status.starts_with("rollback-failed:") { active = false; }
+    if status.starts_with("rollback-failed:") {
+        active = false;
+    }
     let stage = fs::read_to_string(root.join(".update-transaction/stage")).unwrap_or_default();
     json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim()})
 }
@@ -3451,7 +3453,10 @@ fn act_apply_update() -> J {
             Ok(())
         })();
         if let Err(e) = prepare {
-            let _ = fs::write(sockrocket_dir().join("update-status"), "failed: preparation\n");
+            let _ = fs::write(
+                sockrocket_dir().join("update-status"),
+                "failed: preparation\n",
+            );
             let _ = fs::remove_dir_all(&work);
             return Err(e);
         }
@@ -3878,12 +3883,19 @@ mod tests {
         let response = dispatch("save_config", &json!({}));
         assert_eq!(response["error_code"], "update_in_progress");
         assert_eq!(dispatch("update_status", &json!({}))["active"], true);
-        fs::write(root.join("update-status"), "rollback-failed: backup retained").unwrap();
+        fs::write(
+            root.join("update-status"),
+            "rollback-failed: backup retained",
+        )
+        .unwrap();
         assert_eq!(dispatch("update_status", &json!({}))["active"], false);
         fs::remove_dir(root.join(".update-transaction")).unwrap();
         assert!(storage::MutationGuard::acquire().is_ok());
         fs::write(root.join("update-status"), "success: plugin updated").unwrap();
-        assert_eq!(dispatch("update_status", &json!({}))["status"], "success: plugin updated");
+        assert_eq!(
+            dispatch("update_status", &json!({}))["status"],
+            "success: plugin updated"
+        );
     }
 
     #[test]

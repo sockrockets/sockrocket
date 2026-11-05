@@ -16,6 +16,16 @@ impl Drop for Reference {
 #[tokio::test]
 #[ignore = "requires SOCKROCKET_REFERENCE_SING_BOX, an independently verified test-only executable"]
 async fn reference_vision_plain_tls_direct_udp_and_shutdown() {
+    reference_vision(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires SOCKROCKET_REFERENCE_SING_BOX, an independently verified test-only executable"]
+async fn reference_vision_warmed_tls_direct_udp_and_shutdown() {
+    reference_vision(true).await;
+}
+
+async fn reference_vision(warm: bool) {
     let executable =
         std::env::var_os("SOCKROCKET_REFERENCE_SING_BOX").expect("reference server executable");
     let dir = std::env::temp_dir().join(format!(
@@ -76,6 +86,7 @@ async fn reference_vision_plain_tls_direct_udp_and_shutdown() {
     .await
     .unwrap();
     let transport = TransportConfig {
+        xhttp: None,
         transport_type: TransportType::Tls,
         tls: Some(TlsConfig {
             sni: Some("localhost".into()),
@@ -86,7 +97,17 @@ async fn reference_vision_plain_tls_direct_udp_and_shutdown() {
         ws: None,
         reality: None,
     };
-    let outbound = VlessOutbound::new_vision("127.0.0.1", port, id, Some(&transport)).unwrap();
+    let outbound =
+        VlessOutbound::new_vision("127.0.0.1", port, id, Some(&transport), warm).unwrap();
+    if warm {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while outbound.vision.as_ref().unwrap().len().await != 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         // Plain TCP, fragmented writes and half-close/EOF.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -137,6 +158,11 @@ async fn reference_vision_plain_tls_direct_udp_and_shutdown() {
                     tls.write_all(&bytes).await.unwrap();
                     tls.flush().await.unwrap();
                 }
+                // Wait for client close_notify before closing the server side;
+                // otherwise a fast warmed client races a peer-initiated FIN.
+                let mut tail = Vec::new();
+                tls.read_to_end(&mut tail).await.unwrap();
+                assert!(tail.is_empty());
                 tls.shutdown().await.unwrap();
             });
             let mut roots = rustls::RootCertStore::empty();

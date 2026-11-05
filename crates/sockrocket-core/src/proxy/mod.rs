@@ -104,6 +104,7 @@ struct StatsInner {
     completed: AtomicU64,
     interrupted: AtomicU64,
     ledger: std::sync::Mutex<Option<std::sync::Arc<crate::traffic::TrafficLedger>>>,
+    ledger_generation: AtomicU64,
 }
 
 impl Default for ProxyStats {
@@ -122,6 +123,7 @@ impl Default for ProxyStats {
                 bytes_received: AtomicU64::new(0),
                 recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
                 ledger: std::sync::Mutex::new(None),
+                ledger_generation: AtomicU64::new(0),
             }),
         }
     }
@@ -175,6 +177,7 @@ impl ProxyStats {
     pub fn set_ledger(&self, ledger: Option<std::sync::Arc<crate::traffic::TrafficLedger>>) {
         if let Ok(mut slot) = self.inner.ledger.lock() {
             *slot = ledger;
+            self.inner.ledger_generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -429,6 +432,8 @@ impl ConnectionGuard {
             stream,
             stats: self.stats.clone(),
             counts: self.counts.clone(),
+            recorder: None,
+            ledger_generation: u64::MAX,
         }
     }
     pub(crate) fn observe<'a, S: ?Sized>(&self, stream: &'a mut S) -> ObservedIo<&'a mut S> {
@@ -436,6 +441,8 @@ impl ConnectionGuard {
             stream,
             stats: self.stats.clone(),
             counts: self.counts.clone(),
+            recorder: None,
+            ledger_generation: u64::MAX,
         }
     }
 }
@@ -443,6 +450,34 @@ pub(crate) struct ObservedIo<S> {
     stream: S,
     stats: ProxyStats,
     counts: std::sync::Arc<(AtomicU64, AtomicU64)>,
+    recorder: Option<crate::traffic::TrafficRecorder>,
+    ledger_generation: u64,
+}
+impl<S> ObservedIo<S> {
+    fn record_bytes(&mut self, up: u64, down: u64) {
+        if up == 0 && down == 0 {
+            return;
+        }
+        self.stats.inner.bytes_sent.fetch_add(up, Ordering::Relaxed);
+        self.stats
+            .inner
+            .bytes_received
+            .fetch_add(down, Ordering::Relaxed);
+        let generation = self.stats.inner.ledger_generation.load(Ordering::Acquire);
+        if generation != self.ledger_generation {
+            self.recorder = self
+                .stats
+                .inner
+                .ledger
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(|ledger| ledger.recorder()));
+            self.ledger_generation = generation;
+        }
+        if let Some(recorder) = &mut self.recorder {
+            recorder.record(up, down);
+        }
+    }
 }
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ObservedIo<S> {
     fn poll_read(
@@ -455,7 +490,7 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ObservedIo<S> {
         let n = (buf.filled().len() - before) as u64;
         if n > 0 {
             self.counts.0.fetch_add(n, Ordering::Relaxed);
-            self.stats.add_bytes(n, 0);
+            self.record_bytes(n, 0);
         }
         result
     }
@@ -469,7 +504,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ObservedIo<S> {
         let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
         if let std::task::Poll::Ready(Ok(n)) = result {
             self.counts.1.fetch_add(n as u64, Ordering::Relaxed);
-            self.stats.add_bytes(0, n as u64);
+            self.record_bytes(0, n as u64);
         }
         result
     }
@@ -573,6 +608,41 @@ mod tests {
         assert_eq!(stats.bytes_sent(), 15);
         assert_eq!(stats.bytes_received(), 27);
     }
+
+    #[tokio::test]
+    async fn observed_bytes_remain_live_and_ledger_changes_do_not_replay_samples() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stats = ProxyStats::default();
+        let first = crate::traffic::TrafficLedger::memory_only();
+        let second = crate::traffic::TrafficLedger::memory_only();
+        stats.set_ledger(Some(first.clone()));
+        let guard = stats.track("test:443".into(), "HTTP");
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let mut observed = guard.observe_owned(stream);
+        let mut bytes = [0; 5];
+        peer.write_all(b"hello").await.unwrap();
+        observed.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(stats.bytes_sent(), 5);
+        assert_eq!(first.snapshots()[0].session.total(), 5);
+        stats.set_ledger(None);
+        peer.write_all(b"world").await.unwrap();
+        observed.read_exact(&mut bytes).await.unwrap();
+        stats.set_ledger(Some(second.clone()));
+        observed.write_all(b"ok").await.unwrap();
+        assert_eq!(stats.bytes_received(), 2);
+        drop(observed);
+        // Cancellation/drop must preserve counted bytes without double counting.
+        drop(guard);
+        assert_eq!(stats.bytes_sent(), 10);
+        assert_eq!(first.snapshots()[0].session.total(), 5);
+        assert_eq!(second.snapshots()[0].session.total(), 2);
+        let rows = stats.recent_connections(1, |_| true);
+        assert_eq!((rows[0].bytes_up, rows[0].bytes_down), (10, 2));
+        assert_eq!(rows[0].completion, Some("interrupted"));
+    }
 }
 
 pub mod wireguard;
+
+mod server_dns;
+pub(crate) mod xhttp;

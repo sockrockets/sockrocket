@@ -190,7 +190,7 @@ impl IpStackUnknownTransport {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Unknown,
-                    payload: Some(p),
+                    payload: Some(p.into()),
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -214,7 +214,7 @@ impl IpStackUnknownTransport {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Unknown,
-                    payload: Some(p),
+                    payload: Some(p.into()),
                 })
             }
             _ => unreachable!(),

@@ -67,7 +67,7 @@ jobs:
             gui_asset: sockrocket-linux-aarch64.tar.gz
             arch_label: aarch64
             ext: ""
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             cli_artifact: sockrocket-cli
             gui_artifact: sockrocket
