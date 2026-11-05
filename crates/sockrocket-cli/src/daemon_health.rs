@@ -8,7 +8,7 @@ struct Sample {
     identity: String,
     at: u64,
     ok: bool,
-    direct_dns_ok: bool,
+    domestic_http_ok: bool,
 }
 fn path(pid: u32) -> PathBuf {
     std::env::temp_dir().join(format!("sockrocket_watchdog_{pid}.json"))
@@ -40,30 +40,34 @@ pub fn check(pid: u32) -> Result<()> {
     ensure!(bytes.len() <= 4096, "Invalid health sample");
     validate(&serde_json::from_slice(&bytes)?, &id, now())
 }
-/// A separate domestic direct-path check; never used to withdraw LAN routing.
-async fn direct_dns_check() -> bool {
+/// Domestic HTTP reachability through the daemon's actual routing/DNS policy.
+/// Kept separate from proxy health; never used to withdraw LAN routing.
+async fn domestic_http_check(outbound: &sockrocket_core::SharedOutbound) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for server in ["223.5.5.5", "119.29.29.29"] {
+    for host in ["www.baidu.com", "www.qq.com"] {
         let probe = async {
-            let mut stream = sockrocket_core::SharedOutbound::direct()
-                .connect(server, 53)
-                .await?;
-            let query = b"\x73\x72\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x05baidu\x03com\x00\x00\x01\x00\x01";
+            let mut stream = outbound.connect(host, 80).await?;
             stream
-                .write_all(&(query.len() as u16).to_be_bytes())
+                .write_all(
+                    format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
                 .await?;
-            stream.write_all(query).await?;
-            let n = stream.read_u16().await? as usize;
-            ensure!((12..=4096).contains(&n), "Invalid direct DNS response size");
-            let mut reply = vec![0; n];
-            stream.read_exact(&mut reply).await?;
+            let mut line = Vec::new();
+            while line.len() < 1024 {
+                let b = stream.read_u8().await?;
+                line.push(b);
+                if b == b'\n' {
+                    break;
+                }
+            }
+            let mut words = std::str::from_utf8(&line)?.split_whitespace();
             ensure!(
-                reply[..2] == query[..2]
-                    && reply[2] & 0x80 != 0
-                    && reply[3] & 0x0f == 0
-                    && u16::from_be_bytes([reply[6], reply[7]]) > 0,
-                "Invalid direct DNS response"
+                matches!(words.next(), Some("HTTP/1.0" | "HTTP/1.1")),
+                "Invalid domestic response"
             );
+            let code: u16 = words.next().unwrap_or("").parse()?;
+            ensure!((200..500).contains(&code), "Domestic HTTP request failed");
             Ok::<_, anyhow::Error>(())
         };
         if tokio::time::timeout(std::time::Duration::from_secs(5), probe)
@@ -86,7 +90,7 @@ pub fn summary(pid: u32) -> serde_json::Value {
             .ok_or_else(|| anyhow::anyhow!("Invalid sample time"))?;
         ensure!(sample.identity == id && age <= 90, "Stale sample");
         Ok(
-            serde_json::json!({"outbound_ok":sample.ok,"direct_dns_ok":sample.direct_dns_ok,"age_secs":age}),
+            serde_json::json!({"outbound_ok":sample.ok,"domestic_http_ok":sample.domestic_http_ok,"age_secs":age}),
         )
     })();
     result.unwrap_or(serde_json::Value::Null)
@@ -108,12 +112,12 @@ pub fn start(outbound: sockrocket_core::SharedOutbound) {
             )
             .await
             .is_ok_and(|result| result.is_ok());
-            let direct_dns_ok = direct_dns_check().await;
+            let domestic_http_ok = domestic_http_check(&outbound).await;
             let sample = Sample {
                 identity: id.clone(),
                 at: now(),
                 ok,
-                direct_dns_ok,
+                domestic_http_ok,
             };
             if let Ok(bytes) = serde_json::to_vec(&sample) {
                 let tmp = path(pid).with_extension("new");
@@ -133,7 +137,7 @@ mod tests {
             identity: "boot:start".into(),
             at: 100,
             ok: true,
-            direct_dns_ok: true,
+            domestic_http_ok: true,
         };
         assert!(validate(&s, "boot:start", 190).is_ok());
         assert!(validate(&s, "boot:start", 191).is_err());
