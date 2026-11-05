@@ -671,18 +671,19 @@ test_outbound_probe_fallback_and_failure_details() {
     # Restore the actual probe (the fixture normally stubs it).
     sed -n '/^outbound_probe_ok() {/,/^}/p' "$SOURCE" > "$SANDBOX/probe.sh"
     . "$SANDBOX/probe.sh"
+    echo 12345 > "$SOCKROCKET_PID"
     # Neither nc nor curl may be available on the target firmware.
     nc() { echo 'unexpected nc dependency' >&2; exit 99; }
     curl() { echo 'unexpected curl dependency' >&2; exit 99; }
     cat > "$SOCKROCKET_BIN" <<'PROBE'
 #!/bin/sh
-[ "$1" = --http-health ] && [ "$2" = 1087 ]
+[ "$1" = --daemon-health ] && [ "$2" = 12345 ]
 PROBE
     outbound_probe_ok
     check 0 "${#OUTBOUND_PROBE_FAILURE}" 'built-in probe success clears failures'
     printf '#!/bin/sh\nexit 1\n' > "$SOCKROCKET_BIN"
     if outbound_probe_ok; then echo 'failed built-in probe treated as healthy' >&2; exit 1; fi
-    case "$OUTBOUND_PROBE_FAILURE" in *'built-in HTTP probe'*) ;; *) echo 'missing failure diagnostics' >&2; exit 1 ;; esac
+    case "$OUTBOUND_PROBE_FAILURE" in *'daemon outbound probe'*) ;; *) echo 'missing failure diagnostics' >&2; exit 1 ;; esac
     echo 'outbound failed' > "$DEGRADED_FILE"
     wait_for_tun() { return 0; }
     try_recover_lan_proxy

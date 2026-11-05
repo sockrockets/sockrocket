@@ -1761,18 +1761,20 @@ enter_lan_degraded() {
     ensure_sshd
 }
 
-# True when the local HTTP proxy returns a real 204. Use our own bounded
-# probe: Merlin firmware may ship neither nc nor a proxy-capable curl.
-# This also works with health_check disabled; no stale health file is trusted.
+# Fresh process-owned outbound evidence. No curl/nc or loopback proxy is needed.
+# Disabled auto-switch monitoring does not disable this watchdog probe.
 outbound_probe_ok() {
-    local http_port
+    local pid
     OUTBOUND_PROBE_FAILURE=""
-    http_port=$(get_config_value http_port)
-    http_port=${http_port:-1087}
-    if "$SOCKROCKET_BIN" --http-health "$http_port" >/dev/null 2>&1; then
+    pid=$(cat "$SOCKROCKET_PID" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*)
+        OUTBOUND_PROBE_FAILURE="daemon PID unavailable"
+        return 1 ;;
+    esac
+    if "$SOCKROCKET_BIN" --daemon-health "$pid" >/dev/null 2>&1; then
         return 0
     fi
-    OUTBOUND_PROBE_FAILURE="built-in HTTP probe: no target returned 204"
+    OUTBOUND_PROBE_FAILURE="daemon outbound probe failed, missing or stale"
     return 1
 }
 
