@@ -36,6 +36,66 @@ impl DnsResolver {
                 DnsGroup::Fallback => &self.config.fallback,
             }
         };
+        // Large/custom wire requests keep the original path. Limit retained
+        // keys as well as entry count; listener admission still bounds tasks.
+        let guard = if key.len() <= 512 {
+            let inflight_key = WireInflightKey {
+                query: key.clone(),
+                servers: servers.to_vec(),
+                outbound: self
+                    .outbound
+                    .as_ref()
+                    .map_or(0, |outbound| Arc::as_ptr(&outbound.0) as *const () as usize),
+            };
+            let mut map = self.wire_inflight.lock().unwrap();
+            let cell = if let Some(cell) = map.get(&inflight_key) {
+                cell.users
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(cell.clone())
+            } else if map.len() < self.config.cache_capacity.clamp(16, 1024) {
+                let cell = Arc::new(WireInflight {
+                    reply: tokio::sync::OnceCell::new(),
+                    users: std::sync::atomic::AtomicUsize::new(1),
+                });
+                map.insert(inflight_key.clone(), cell.clone());
+                Some(cell)
+            } else {
+                None
+            };
+            cell.map(|cell| WireInflightGuard {
+                map: self.wire_inflight.clone(),
+                key: inflight_key,
+                cell,
+            })
+        } else {
+            None
+        };
+        let Some(guard) = guard else {
+            return self.exchange_raw_uncached(query, key, servers).await;
+        };
+        // OnceCell transfers leadership to a waiter if its initializer is
+        // cancelled. The upstream JoinSet belongs to that initializer, so no
+        // orphan exchange continues after the last caller goes away.
+        let reply = guard
+            .cell
+            .reply
+            .get_or_init(|| async {
+                self.exchange_raw_uncached(query, key, servers)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        let mut reply = reply.clone().map_err(|error| anyhow::anyhow!(error))?;
+        reply[..2].copy_from_slice(&query[..2]);
+        Ok(reply)
+    }
+
+    async fn exchange_raw_uncached(
+        &self,
+        query: &[u8],
+        key: Vec<u8>,
+        servers: &[DnsServer],
+    ) -> Result<Vec<u8>> {
         let mut pending = tokio::task::JoinSet::new();
         for server in servers {
             let resolver = self.clone();

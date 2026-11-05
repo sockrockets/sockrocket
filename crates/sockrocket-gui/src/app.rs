@@ -211,6 +211,8 @@ pub struct AppState {
     // Nodes page can cache its filtered+sorted index list across repaints
     // (latency batch tests otherwise re-run the whole filter/sort per frame).
     pub(crate) nodes_generation: u64,
+    pub(crate) nodes_content_generation: u64,
+    pub(crate) node_list_cache: sockrocket_gui::node_list::NodeListCache,
     // Semaphore to cap concurrent latency tests and avoid network saturation
     pub(crate) latency_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     // Debounce flag: a persist task is already scheduled (avoid 50+ writes during batch test)
@@ -774,6 +776,8 @@ impl AppState {
             latency_failed: std::collections::HashSet::new(),
             latency_fail_reason: std::collections::HashMap::new(),
             nodes_generation: 0,
+            nodes_content_generation: 0,
+            node_list_cache: Default::default(),
             latency_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
             pending_persist: false,
             persistence_waiting: false,
@@ -2362,6 +2366,8 @@ impl AppState {
             None => return,
         };
 
+        let probe_identity = node_fingerprint(&node);
+
         // Mark as testing; keep the previous latency value visible while the test
         // runs (cleared only if the new test fails).  Clear the failed flag so the
         // spinner renders instead of "✗" while in-flight.
@@ -2423,6 +2429,23 @@ impl AppState {
                 .await;
 
             weak.update(cx, |this: &mut AppState, cx| {
+                let index = if this.nodes.get(index)
+                    .is_some_and(|n| node_fingerprint(n) == probe_identity) {
+                    index
+                } else if let Some(current) = this.nodes.iter()
+                    .position(|n| node_fingerprint(n) == probe_identity) {
+                    current
+                } else {
+                    this.pending_latency_batch = this.pending_latency_batch.saturating_sub(1);
+                    if this.pending_latency_batch == 0 {
+                        this.auto_select_best = false;
+                        this.auto_select_scope = None;
+                        this.group_test_pending = None;
+                    }
+                    cx.notify();
+                    return; // Deleted/replaced nodes must not receive old probe results.
+                };
+
                 this.latency_testing.remove(&index);
                 match result {
                     Ok(Ok(ms)) => {
@@ -3204,74 +3227,21 @@ impl AppState {
     }
 
     pub(crate) fn sort_nodes_by_latency(&mut self, cx: &mut Context<Self>) {
-        // Remember selected/active node names before sorting
-        let selected_name = self
-            .selected_node
-            .and_then(|i| self.nodes.get(i))
-            .map(|n| n.name.clone());
-        let active_name = self
-            .active_proxy_node
-            .and_then(|i| self.nodes.get(i))
-            .map(|n| n.name.clone());
-
-        // Index-keyed probe state (failed marks + reasons, testing spinners)
-        // must follow its node to the new position — capture by fingerprint
-        // before the sort, rebuild after. (Failed nodes sort to the bottom
-        // because their latency is None.)
-        let fail_state: Vec<(String, sockrocket_core::ProbeFailureKind)> = self
-            .latency_failed
-            .iter()
-            .filter_map(|&i| {
-                self.nodes.get(i).map(|n| {
-                    (
-                        node_fingerprint(n),
-                        self.latency_fail_reason
-                            .get(&i)
-                            .copied()
-                            .unwrap_or(sockrocket_core::ProbeFailureKind::Other),
-                    )
-                })
-            })
+        let remap = sockrocket_gui::node_list::sort_by_latency(&mut self.nodes);
+        let map = |i: usize| remap.get(i).copied();
+        self.selected_node = self.selected_node.and_then(map);
+        self.active_proxy_node = self.active_proxy_node.and_then(map);
+        self.selected_node_indices = self.selected_node_indices.drain().filter_map(map).collect();
+        self.latency_failed = self.latency_failed.drain().filter_map(map).collect();
+        self.latency_testing = self.latency_testing.drain().filter_map(map).collect();
+        self.latency_fail_reason = self
+            .latency_fail_reason
+            .drain()
+            .filter_map(|(i, kind)| map(i).map(|new| (new, kind)))
             .collect();
-        let testing_fps: Vec<String> = self
-            .latency_testing
-            .iter()
-            .filter_map(|&i| self.nodes.get(i))
-            .map(node_fingerprint)
-            .collect();
-
-        self.nodes
-            .sort_by(|a, b| match (a.latency_ms, b.latency_ms) {
-                (Some(a_ms), Some(b_ms)) => a_ms.cmp(&b_ms),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            });
-
-        self.latency_failed.clear();
-        self.latency_fail_reason.clear();
-        self.latency_testing.clear();
-        for (i, n) in self.nodes.iter().enumerate() {
-            let fp = node_fingerprint(n);
-            if let Some((_, kind)) = fail_state.iter().find(|(f, _)| *f == fp) {
-                self.latency_failed.insert(i);
-                self.latency_fail_reason.insert(i, *kind);
-            }
-            if testing_fps.contains(&fp) {
-                self.latency_testing.insert(i);
-            }
+        if let Some(scope) = &mut self.auto_select_scope {
+            *scope = scope.iter().copied().filter_map(map).collect();
         }
-
-        // Restore selected/active indices by name
-        if let Some(name) = selected_name {
-            self.selected_node = self.nodes.iter().position(|n| n.name == name);
-        }
-        if let Some(name) = active_name {
-            self.active_proxy_node = self.nodes.iter().position(|n| n.name == name);
-        }
-        // Node order changed: the Nodes page's cached filtered index list
-        // points at stale positions until this bumps.
-        self.nodes_generation = self.nodes_generation.wrapping_add(1);
         self.schedule_persist(cx);
         cx.notify();
     }
@@ -3586,6 +3556,7 @@ impl AppState {
     /// Commit user edits before returning to the event loop, so an immediate
     /// quit or elevation handoff cannot discard subscription URLs or nodes.
     pub(crate) fn schedule_persist(&mut self, cx: &mut Context<Self>) {
+        self.nodes_content_generation = self.nodes_content_generation.wrapping_add(1);
         self.nodes_generation = self.nodes_generation.wrapping_add(1);
         if !self.persist_on_exit {
             return;
@@ -3625,9 +3596,8 @@ impl AppState {
     /// Debounced persist: coalesces multiple rapid calls (e.g. batch latency tests)
     /// into a single disk write 500ms after the last call.
     fn schedule_metadata_persist(&mut self, cx: &mut Context<Self>) {
-        // Persisted state changed — invalidate the Nodes page filter/sort cache.
-        // (Cheap over-invalidation: also fires for rules/subscription edits.)
-        self.nodes_generation = self.nodes_generation.wrapping_add(1);
+        // Probe completion already invalidates ordering; normalized search
+        // metadata remains valid through the whole latency batch.
         if self.pending_persist {
             return; // write already queued
         }
@@ -3968,6 +3938,7 @@ impl AppState {
 
                 // Runtime-changeable parts take effect immediately.
                 self.nodes = new_config.nodes.clone();
+                self.nodes_content_generation = self.nodes_content_generation.wrapping_add(1);
                 // The node list changed wholesale — invalidate the Nodes page
                 // filter/sort cache (keyed on this counter).
                 self.nodes_generation = self.nodes_generation.wrapping_add(1);
@@ -5856,16 +5827,7 @@ pub(crate) fn protocol_name(protocol: &ProxyProtocol) -> &'static str {
 }
 
 pub(crate) fn protocol_short_name(protocol: &ProxyProtocol) -> &'static str {
-    match protocol {
-        ProxyProtocol::Shadowsocks { .. } => "ss",
-        ProxyProtocol::VMess { .. } => "vmess",
-        ProxyProtocol::VLess { .. } => "vless",
-        ProxyProtocol::Tuic { .. } => "tuic",
-        ProxyProtocol::Trojan { .. } => "trojan",
-        ProxyProtocol::Hysteria2 { .. } => "hy2",
-        ProxyProtocol::AnyTls { .. } => "anytls",
-        ProxyProtocol::Wireguard { .. } => "wireguard",
-    }
+    sockrocket_gui::node_list::protocol_short_name(protocol)
 }
 
 pub(crate) fn node_transport_summary(node: &Node) -> String {

@@ -13,6 +13,16 @@ use super::connector::{BoxProxyStream, Outbound};
 use super::pool::ConnPool;
 use super::transport::TlsConnFactory;
 
+type VisionTlsStream = craft_tls::client::TlsStream<super::vision::RecordIo<tokio::net::TcpStream>>;
+
+struct VisionFactory(Arc<TlsConnFactory>);
+
+impl super::pool::ConnFactory<VisionTlsStream> for VisionFactory {
+    fn create(&self) -> Pin<Box<dyn Future<Output = Result<VisionTlsStream>> + Send + '_>> {
+        Box::pin(self.0.connect_vision())
+    }
+}
+
 /// Factory that creates TCP+TLS connections to the VLESS proxy server.
 /// VLESS outbound connector.
 pub struct VlessOutbound {
@@ -20,7 +30,7 @@ pub struct VlessOutbound {
     port: u16,
     uuid: [u8; 16],
     pool: ConnPool,
-    vision: Option<Arc<TlsConnFactory>>,
+    vision: Option<ConnPool<VisionTlsStream>>,
 }
 
 impl VlessOutbound {
@@ -50,6 +60,7 @@ impl VlessOutbound {
         port: u16,
         uuid_str: &str,
         transport: Option<&TransportConfig>,
+        warm_pool: bool,
     ) -> Result<Self> {
         use crate::config::model::TransportType;
         let transport =
@@ -73,7 +84,14 @@ impl VlessOutbound {
             port,
             uuid: *uuid::Uuid::parse_str(uuid_str)?.as_bytes(),
             pool: ConnPool::lazy(factory.clone()),
-            vision: Some(factory),
+            vision: Some(if warm_pool {
+                // Keep the concrete TLS stream: Vision later needs raw TCP access.
+                // Share the global warm budget with ordinary transport pools.
+                let (_, capacity, _) = crate::resources::connection_pool_limits();
+                ConnPool::with_capacity(Arc::new(VisionFactory(factory)), capacity.min(2))
+            } else {
+                ConnPool::lazy(Arc::new(VisionFactory(factory)))
+            }),
         })
     }
 
@@ -115,8 +133,8 @@ impl Outbound for VlessOutbound {
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
         let target_host = host.to_string();
         Box::pin(async move {
-            if let Some(factory) = &self.vision {
-                let mut tls = factory.connect_vision().await?;
+            if let Some(pool) = &self.vision {
+                let mut tls = pool.get().await?;
                 let mut header = build_vless_request(&self.uuid, &target_host, port)?;
                 let flow = super::vision::FLOW.as_bytes();
                 let mut addon = vec![0x0a, flow.len() as u8];
@@ -154,14 +172,14 @@ impl Outbound for VlessOutbound {
     ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
         let host = host.to_owned();
         Box::pin(async move {
-            if let Some(factory) = &self.vision {
+            if let Some(pool) = &self.vision {
                 if port == 443 {
                     return Err(super::connector::UdpUnsupported::new(
                         "Vision blocks UDP/443 so clients can fall back to HTTPS over TCP",
                     )
                     .into());
                 }
-                let mut tls = factory.connect_vision().await?;
+                let mut tls = pool.get().await?;
                 // Vision UDP travels as XUDP inside a Vision-framed mux
                 // connection; sending a plain UDP command loses the flow.
                 let request = build_vless_request(&self.uuid, &host, port)?;
@@ -355,6 +373,37 @@ impl Unpin for VlessStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vision_latency_probe_does_not_preconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = TransportConfig {
+            transport_type: crate::config::model::TransportType::Tls,
+            tls: Some(crate::config::model::TlsConfig {
+                sni: Some("localhost".into()),
+                skip_cert_verify: true,
+                alpn: None,
+                fingerprint: None,
+            }),
+            ws: None,
+            reality: None,
+            xhttp: None,
+        };
+        let outbound = VlessOutbound::new_vision(
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+            "00000000-0000-0000-0000-000000000000",
+            Some(&transport),
+            false,
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(outbound.vision.as_ref().unwrap().len().await, 0);
+    }
 
     #[tokio::test]
     async fn udp_command_and_length_framing_work_over_transport() {

@@ -114,6 +114,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     node.port,
                     uuid,
                     node.transport.as_ref(),
+                    warm_pool,
                 )?,
                 Some(_) => anyhow::bail!("Unsupported VLESS flow"),
                 None if warm_pool => {
