@@ -3344,7 +3344,15 @@ fn act_apply_update() -> J {
         fs::create_dir(&work)?;
         let prepare = (|| -> anyhow::Result<()> {
             let archive = work.join("package.tar.gz");
-            rt.block_on(sockrocket_core::download_file(&url, &archive))?;
+            rt.block_on(sockrocket_core::download_file_with_proxy_fallback(
+                &url,
+                &archive,
+                if is_running() {
+                    local_socks_addr()
+                } else {
+                    None
+                },
+            ))?;
             let listing = Command::new("tar").arg("-tzvf").arg(&archive).output()?;
             anyhow::ensure!(listing.status.success(), "Invalid package archive");
             for line in String::from_utf8_lossy(&listing.stdout).lines() {
@@ -3443,7 +3451,7 @@ fn act_apply_update() -> J {
             json!({"ok":true,"msg":"完整插件更新已启动；稍后刷新页面查看版本。失败时自动恢复旧版。"}),
         )
     })();
-    result.unwrap_or_else(|e| err_msg(&format!("Plugin update failed: {e}")))
+    result.unwrap_or_else(|e| err_msg(&format!("Plugin update failed: {e:#}")))
 }
 
 fn act_diagnose() -> J {
