@@ -1,10 +1,9 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 const elements={},requests=[],messages=[];
-const element=id=>elements[id]||={value:'',checked:true,hidden:false,disabled:false,innerHTML:'',textContent:'',setAttribute(){},scrollIntoView(){}};
-const c=vm.createContext({SR_PROXY_GROUPS:[],setProxyGroupTargets(){},renderDevicePolicies(){},srElement:element,srApi:(...args)=>requests.push(args),srShowMsg:m=>messages.push(m),toastResp:d=>messages.push(d.msg),srEsc:v=>String(v??'').replace(/[&<>"']/g,'_'),SR_PAGE_LOADED:{},SR_STATE:{status:{running:false,proxy_mode:'rule'},ruleRows:[]}});
-vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var RULE_PATTERN_HINT')),c);
-vm.runInContext(source.slice(source.indexOf('var RULE_COLLAPSED'),source.indexOf('function useRuleGroup')),c);
+const element=id=>elements[id]||={value:'',checked:true,hidden:false,style:{},parentElement:{style:{}},disabled:false,innerHTML:'',textContent:'',setAttribute(){},scrollIntoView(){}};
+const c=vm.createContext({confirm:()=>true,toastResp(){},SR_PROXY_GROUPS:[],setProxyGroupTargets(){},renderDevicePolicies(){},srElement:element,srApi:(...args)=>requests.push(args),srShowMsg:m=>messages.push(m),toastResp:d=>messages.push(d.msg),srEsc:v=>String(v??'').replace(/[&<>"']/g,'_'),SR_PAGE_LOADED:{},SR_STATE:{status:{running:false,proxy_mode:'rule'},ruleRows:[]}});
+vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')), c);
 vm.runInContext(source.slice(source.indexOf('function setRuleGroupEnabled'),source.indexOf('function deleteRuleGroup')),c);
 const presets=[{id:'ai',title:'AI 服务',description:'示例 AI 域名',group:'预设 · AI 服务',target:'proxy',domains:['example.com','api.example.net']},{id:'domestic',title:'国内常用网站',description:'国内直连',group:'预设 · 国内常用网站',target:'direct',domains:['example.cn']}];
 const request=action=>{const at=requests.findIndex(r=>r[0]===action);assert.ok(at>=0,action);return requests.splice(at,1)[0];};
@@ -31,7 +30,7 @@ assert.equal(element('rule-preset-enable').hidden,true);assert.equal(element('ru
 c.toggleRulePreset(false);let disable=request('set_rule_group_enabled');assert.equal(disable[1].enabled,false);
 disable[2]({ok:true});refresh(rows,'disabled');
 assert.equal(element('rule-preset-enable').hidden,false);
-c.viewRulePreset();assert.equal(element('rule-search').value,presets[0].group);assert.equal(element('rule-filter-state').value,'');
+c.viewRulePreset();assert.equal(c.RULE_SELECTED_GROUP,presets[0].group);assert.equal(element('rule-filter-state').value,'');
 element('rule-preset').value='domestic';c.renderRulePreset();c.srLoadRules();refresh(rows);
 assert.equal(element('rule-preset').value,'domestic','refresh preserves the selected preset');
 c.addRulePreset();add=request('add_rule_preset');add[3]();
