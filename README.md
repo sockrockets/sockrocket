@@ -115,7 +115,7 @@ Before upgrading, quit the old client and its elevated background instance. Runn
 
 ## AsusWRT-Merlin
 
-**Smaller packages in v0.0.19:** Merlin packages remove duplicate executables and Web UI files while retaining all features. Local packaging comparisons using the same binaries reduced ARM64 from 12.67 MiB to 6.37 MiB and ARMv7 from 12.53 MiB to 6.30 MiB — about 50% smaller. This reduces downloads and extraction space without changing executable contents or runtime performance; installed executable size and runtime memory are not halved. These are comparison samples; actual release sizes vary.
+**Smaller packages in v0.0.19:** Merlin packages remove duplicate executables while retaining the required Software Center Web UI entry and all features. Local packaging comparisons using the same binaries reduced ARM64 from 12.67 MiB to 6.43 MiB and ARMv7 from 12.53 MiB to 6.36 MiB — about 49% smaller. This reduces downloads and extraction space without changing executable contents or runtime performance; installed executable size and runtime memory are not halved. These are comparison samples; actual release sizes vary.
 
 The router plugin includes a WebUI, transparent proxy, DNS capture and service checks, sharing the engine across LAN devices.
 

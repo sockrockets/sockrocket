@@ -115,7 +115,7 @@ Trước khi nâng cấp, thoát bản cũ và tiến trình nền chạy với 
 
 ## AsusWRT-Merlin
 
-**Gói nhỏ hơn từ v0.0.19:** Loại bỏ bản sao chương trình và WebUI, giữ nguyên chức năng. So sánh đóng gói cùng tệp thực thi: ARM64 từ 12.67 xuống 6.37 MiB, ARMv7 từ 12.53 xuống 6.30 MiB, giảm khoảng 50%. Giảm dung lượng tải và giải nén tạm thời, không đổi chương trình hay hiệu năng. Dung lượng chương trình sau cài đặt và RAM không giảm một nửa; kích thước bản phát hành thực tế có thể khác.
+**Gói nhỏ hơn từ v0.0.19:** Loại bỏ bản sao chương trình, giữ trang WebUI cần thiết cho Software Center và toàn bộ chức năng. So sánh đóng gói cùng tệp thực thi: ARM64 từ 12.67 xuống 6.43 MiB, ARMv7 từ 12.53 xuống 6.36 MiB, giảm khoảng 49%. Giảm dung lượng tải và giải nén tạm thời, không đổi chương trình hay hiệu năng. Dung lượng chương trình sau cài đặt và RAM không giảm một nửa; kích thước bản phát hành thực tế có thể khác.
 
 Plugin router cung cấp WebUI, proxy trong suốt, chuyển DNS và kiểm tra dịch vụ cho các thiết bị LAN.
 

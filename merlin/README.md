@@ -1,6 +1,6 @@
 # Sockrocket — AsusWRT-Merlin plugin
 
-**Smaller packages in v0.0.19:** Merlin packages remove duplicate executables and Web UI files while retaining all features. Local packaging comparisons using the same binaries reduced ARM64 from 12.67 MiB to 6.37 MiB and ARMv7 from 12.53 MiB to 6.30 MiB — about 50% smaller. This reduces downloads and extraction space without changing executable contents or runtime performance; installed executable size and runtime memory are not halved. These are comparison samples; actual release sizes vary.
+**Smaller packages in v0.0.19:** Merlin packages remove duplicate executables while retaining the required Software Center Web UI entry and all features. Local packaging comparisons using the same binaries reduced ARM64 from 12.67 MiB to 6.43 MiB and ARMv7 from 12.53 MiB to 6.36 MiB — about 49% smaller. This reduces downloads and extraction space without changing executable contents or runtime performance; installed executable size and runtime memory are not halved. These are comparison samples; actual release sizes vary.
 
 Transparent proxy integration for **AsusWRT-Merlin** routers.
 
@@ -27,11 +27,12 @@ Preset coverage is a curated starting point, not a complete service endpoint lis
 
 Packages are named `sockrocket-merlin-<platform>.tar.gz` with a matching `.valid` tag:
 
-Each package contains one executable at `bin/sockrocket-cli` and one Web UI
-source at `webui/sockrocket.asp`. The bundled installer publishes the Web UI
+Each package contains one executable at `bin/sockrocket-cli` and a Web UI
+source at `webui/sockrocket.asp` plus `webs/Module_sockrocket.asp` for Software Center preflight. The bundled installer publishes the Web UI
 to the firmware's required locations, including `Module_sockrocket.asp`.
-Architecture-suffixed duplicate executables and the duplicate `webs/` payload
-are not included; standalone release binary names are unchanged. Packages use
+Architecture-suffixed duplicate executables are not included; standalone
+release binary names are unchanged. The `webs/` entry must remain because
+Software Center checks it before invoking the bundled installer. Packages use
 regular files and directories because the online updater rejects archive links.
 
 | Platform | CPU binary | SoC family |
