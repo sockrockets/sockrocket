@@ -47,30 +47,6 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Node list filter/sort cache: (filter text, protocol filter, tag filter,
-/// nodes generation, filtered+sorted indices).
-type NodeFilterCache = (
-    String,
-    Option<&'static str>,
-    Option<String>,
-    u64,
-    std::rc::Rc<Vec<usize>>,
-);
-
-thread_local! {
-    /// Filtered + latency-sorted node index list, keyed on (filter text,
-    /// protocol filter, tag filter, nodes generation). Latency batch tests
-    /// repaint the Nodes page constantly; without this cache every repaint
-    /// re-ran the whole filter pass (4 `to_lowercase()` per node) + sort.
-    static NODE_FILTER_CACHE: std::cell::RefCell<NodeFilterCache> = std::cell::RefCell::new((
-        String::new(),
-        None,
-        None,
-        u64::MAX,
-        std::rc::Rc::new(Vec::new()),
-    ));
-}
-
 /// Shared with the Config page ("Clear Nodes" two-step confirm).
 pub(crate) fn confirm_armed(slot: &AtomicU64) -> bool {
     let armed_at = slot.load(Ordering::Relaxed);
@@ -169,98 +145,20 @@ impl AppState {
             self.node_filter = filter_text.clone();
         }
 
-        // Collect distinct protocols present in the node list for chips
-        let mut present_protocols: Vec<&'static str> = {
-            let mut seen = std::collections::HashSet::new();
-            self.nodes
-                .iter()
-                .map(|n| protocol_short_name(&n.protocol))
-                .filter(|s| seen.insert(*s))
-                .collect()
-        };
-        // Stable order: SS, VMess, VLESS, Trojan, TUIC, Hy2
-        let protocol_order = [
-            "ss",
-            "vmess",
-            "vless",
-            "trojan",
-            "tuic",
-            "hy2",
-            "anytls",
-            "wireguard",
-        ];
-        present_protocols.sort_by_key(|p| protocol_order.iter().position(|o| o == p).unwrap_or(99));
-
         let proto_filter = self.protocol_filter;
-        let tag_filter = self.tag_filter.clone();
-        let nodes_generation = self.nodes_generation;
-        let filtered_indices: std::rc::Rc<Vec<usize>> = NODE_FILTER_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if cache.0 != filter_text
-                || cache.1 != proto_filter
-                || cache.2 != tag_filter
-                || cache.3 != nodes_generation
-            {
-                let mut indices: Vec<usize> = (0..node_count)
-                    .filter(|&i| {
-                        let n = &self.nodes[i];
-                        // Protocol chip filter
-                        let proto_match = match proto_filter {
-                            None => true,
-                            Some(pf) => protocol_short_name(&n.protocol) == pf,
-                        };
-                        // Tag filter
-                        let tag_match = match &tag_filter {
-                            None => true,
-                            Some(tf) => n.tags.iter().any(|t| t == tf),
-                        };
-                        // Text filter
-                        let text_match = filter_text.is_empty()
-                            || n.name.to_lowercase().contains(&filter_text)
-                            || n.server.to_lowercase().contains(&filter_text)
-                            || protocol_short_name(&n.protocol)
-                                .to_lowercase()
-                                .contains(&filter_text)
-                            || n.tags
-                                .iter()
-                                .any(|t| t.to_lowercase().contains(&filter_text));
-                        proto_match && tag_match && text_match
-                    })
-                    .collect();
-                // Sort: tested nodes by latency ascending, untested last
-                indices.sort_by(|&a, &b| {
-                    match (self.nodes[a].latency_ms, self.nodes[b].latency_ms) {
-                        (Some(a_ms), Some(b_ms)) => a_ms.cmp(&b_ms),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => std::cmp::Ordering::Equal,
-                    }
-                });
-                *cache = (
-                    filter_text.clone(),
-                    proto_filter,
-                    tag_filter.clone(),
-                    nodes_generation,
-                    std::rc::Rc::new(indices),
-                );
-            }
-            cache.4.clone()
-        });
-        let _shown_count = filtered_indices.len();
+        let view = self.node_list_cache.prepare(
+            &self.nodes,
+            self.nodes_content_generation,
+            self.nodes_generation,
+            &filter_text,
+            proto_filter,
+            self.tag_filter.as_deref(),
+        );
+        let filtered_indices = view.indices;
+        let present_protocols = view.protocols;
+        let all_tags = view.tags;
         let node_filter_input = self.node_filter_input.clone();
 
-        // Collect all unique tags across all nodes for filter chips
-        let all_tags: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
-            let mut tags: Vec<String> = self
-                .nodes
-                .iter()
-                .flat_map(|n| n.tags.iter().cloned())
-                .filter(|t| seen.insert(t.clone()))
-                .collect();
-            tags.sort();
-            tags
-        };
         let cur_tag_filter = self.tag_filter.clone();
 
         let delete_all_armed = confirm_armed(&DELETE_ALL_ARMED_AT);
@@ -447,7 +345,7 @@ impl AppState {
                             },
                         )),
                     );
-                    for proto_key in &present_protocols {
+                    for proto_key in present_protocols.iter() {
                         let key: &'static str = proto_key;
                         let active = proto_filter == Some(key);
                         let display = match key {
@@ -486,7 +384,7 @@ impl AppState {
                             cx.notify();
                         },
                     )));
-                    for tag in &all_tags {
+                    for tag in all_tags.iter() {
                         let tag_clone = tag.clone();
                         let active = cur_tag_filter.as_deref() == Some(tag.as_str());
                         let btn_id = format!("tag-{}", tag);

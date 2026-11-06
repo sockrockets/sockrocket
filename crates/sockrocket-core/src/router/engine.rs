@@ -196,27 +196,23 @@ impl Default for RuleSet {
     }
 }
 
-/// Cache key for route lookups: rule evaluation lowercases the host
-/// before matching, so the cache must be keyed by the lowercased host too
-/// (otherwise "EXAMPLE.com" and "example.com" are two entries). Destination
-/// port is included because `dst-port` rules can diverge by port for the
-/// same host.
-fn cache_key(host: &str, port: u16) -> String {
-    let host_part = if host.is_ascii() && !host.bytes().any(|b| b.is_ascii_uppercase()) {
-        host.to_string()
-    } else {
-        host.to_lowercase()
-    };
-    format!("{host_part}:{port}")
+/// Keep addresses and ports in their native representation: cache hits should
+/// not format IPs or allocate intermediate host/port/context strings.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RouteCacheKey {
+    host: String,
+    port: u16,
+    source: Option<IpAddr>,
+    destination: (Option<IpAddr>, bool),
 }
 
-fn client_cache_key(host: &str, port: u16) -> String {
-    let source = crate::proxy::routing::client_source();
-    let hint = crate::proxy::routing::tun_destination();
-    if source.is_none() && hint == (None, false) {
-        return cache_key(host, port);
+fn client_cache_key(host: &str, port: u16) -> RouteCacheKey {
+    RouteCacheKey {
+        host: host.to_lowercase(),
+        port,
+        source: crate::proxy::routing::client_source(),
+        destination: crate::proxy::routing::tun_destination(),
     }
-    format!("{source:?}|{hint:?}|{}", cache_key(host, port))
 }
 
 /// Router evaluates rules against connection targets.
@@ -224,8 +220,8 @@ pub struct Router {
     rules: RuleSet,
     geoip: Option<Arc<GeoIpDb>>,
     /// LRU route cache: evicts least-recently-used entries when full (avoids thundering-herd on full flush).
-    /// Keyed by lowercased host (see [`cache_key`]).
-    cache: RwLock<LruCache<String, RouteAction>>,
+    /// Keyed by lowercased host, port, and the complete client/TUN context.
+    cache: RwLock<LruCache<RouteCacheKey, RouteAction>>,
 }
 
 impl Router {
@@ -597,6 +593,62 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cache_preserves_client_destination_hint_and_port_isolation() {
+        use crate::proxy::routing::{with_client_source, with_tun_destination};
+        let mut rules = RuleSet::new();
+        rules.add_rule(MatchRule::DomesticHint, RouteAction::Direct);
+        rules.add_rule(
+            MatchRule::IpCidr {
+                addr: "192.0.2.0".parse().unwrap(),
+                prefix_len: 24,
+            },
+            RouteAction::Reject,
+        );
+        rules.add_rule(MatchRule::DstPort { min: 80, max: 80 }, RouteAction::Direct);
+        let router = Router::new(rules);
+        for source in [
+            None,
+            Some("192.168.1.2".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap()),
+        ] {
+            with_client_source(source, async {
+                for destination in [
+                    None,
+                    Some("192.0.2.1".parse().unwrap()),
+                    Some("2001:db8::1".parse().unwrap()),
+                ] {
+                    for domestic in [false, true] {
+                        with_tun_destination(destination, domestic, async {
+                            for port in [80, 443] {
+                                let expected = if domestic {
+                                    RouteAction::Direct
+                                } else if destination == Some("192.0.2.1".parse().unwrap()) {
+                                    RouteAction::Reject
+                                } else if port == 80 {
+                                    RouteAction::Direct
+                                } else {
+                                    RouteAction::Proxy
+                                };
+                                assert_eq!(router.route("Example.com", port), expected);
+                                assert_eq!(router.route("EXAMPLE.COM", port), expected);
+                                if destination.is_some() {
+                                    assert_eq!(
+                                        router.route_resolving("example.com", port).await,
+                                        expected
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                }
+            })
+            .await;
+        }
+        assert_eq!(router.cache.read().unwrap().len(), 36);
+    }
+
+    #[tokio::test]
     async fn test_route_resolving_geoip_matches_domain_via_dns() {
         let make = || {
             let mut rules = RuleSet::new();
@@ -869,8 +921,8 @@ mod tests {
 
         // Cached under lowercased host:port.
         let cache = router.cache.read().unwrap();
-        assert!(cache.peek("example.com:80").is_some());
-        assert!(cache.peek("EXAMPLE.COM:80").is_none());
+        assert!(cache.peek(&client_cache_key("example.com", 80)).is_some());
+        assert_eq!(cache.iter().next().unwrap().0.host, "example.com");
         assert_eq!(cache.len(), 1);
     }
 
@@ -897,7 +949,7 @@ mod tests {
         let cache = router.cache.read().unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(
-            cache.peek("www.example.com:443"),
+            cache.peek(&client_cache_key("www.example.com", 443)),
             Some(&RouteAction::Direct)
         );
     }

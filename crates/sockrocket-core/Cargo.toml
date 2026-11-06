@@ -44,6 +44,7 @@ qrcode = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
 http = { workspace = true }
+h2 = "0.4.13"
 hyper = { version = "1.9", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -53,6 +54,9 @@ ipstack = { workspace = true }
 etherparse = { workspace = true }
 
 [dev-dependencies]
+# Independent ML-KEM/HRR server fixtures require aws-lc, not the production
+# client. Resolver v2 keeps this backend out of release CLI dependencies.
+rustls = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 # Windows: tolerant reading of the proxy registry keys (and PAC cleanup)

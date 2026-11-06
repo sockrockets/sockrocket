@@ -337,6 +337,46 @@ async fn http_latency_probe(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("HTTP probe timed out")))
 }
 
+/// Health probes exercise destination TLS, with one deadline including connect.
+pub(crate) async fn https_health_probe(outbound: &SharedOutbound, seconds: u64) -> Result<u32> {
+    let start = tokio::time::Instant::now();
+    let mut probes = tokio::task::JoinSet::new();
+    for (i, host) in ["www.gstatic.com", "cp.cloudflare.com"]
+        .into_iter()
+        .enumerate()
+    {
+        let outbound = outbound.clone();
+        probes.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(i as u64 * 750)).await;
+            let stream = outbound.connect(host, 443).await?;
+            // Explicit HTTP/1.1: the response parser below does not speak HTTP/2.
+            let config = crate::config::model::TlsConfig {
+                alpn: Some(vec!["http/1.1".into()]),
+                sni: None,
+                skip_cert_verify: false,
+                fingerprint: None,
+            };
+            let connector = super::transport::build_tls_connector(Some(&config));
+            let name = rustls_pki_types::ServerName::try_from(host.to_string())?;
+            let stream = connector.connect(name, stream).await?;
+            probe_response(Box::new(stream), host, "GET").await
+        });
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(seconds), async {
+        let mut last = anyhow::anyhow!("HTTPS health probe failed");
+        while let Some(result) = probes.join_next().await {
+            match result {
+                Ok(Ok(())) => return Ok(start.elapsed().as_millis().max(1) as u32),
+                Ok(Err(e)) => last = e,
+                Err(e) => last = e.into(),
+            }
+        }
+        Err(last)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("HTTPS health probe timed out"))?
+}
+
 async fn http_probe_exchange(outbound: &SharedOutbound, host: &str, port: u16) -> Result<()> {
     http_probe_exchange_method(outbound, host, port, "GET").await
 }
@@ -347,7 +387,15 @@ async fn http_probe_exchange_method(
     port: u16,
     method: &str,
 ) -> Result<()> {
-    let mut stream = outbound.connect(host, port).await?;
+    let stream = outbound.connect(host, port).await?;
+    probe_response(stream, host, method).await
+}
+
+async fn probe_response(
+    mut stream: super::connector::BoxProxyStream,
+    host: &str,
+    method: &str,
+) -> Result<()> {
     let request =
         format!("{method} /generate_204 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
@@ -465,6 +513,14 @@ mod tests {
         fn name(&self) -> &str {
             "mock HTTP probe"
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn https_probe_rejects_http_only_tunnel_with_total_deadline() {
+        let outbound = http_probe_outbound(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let start = tokio::time::Instant::now();
+        assert!(https_health_probe(&outbound, 5).await.is_err());
+        assert!(start.elapsed() <= std::time::Duration::from_secs(5));
     }
 
     fn http_probe_outbound(reply: &'static [u8]) -> SharedOutbound {

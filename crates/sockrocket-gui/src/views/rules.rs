@@ -247,45 +247,114 @@ impl AppState {
                     sockrocket_gui::i18n::t("rules.subtitle"),
                 ))
                 .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .pt_1()
-                        .child(
-                            text_action(
-                                "rules-export",
-                                sockrocket_gui::i18n::t("rules.export"),
-                                TEXT_SECONDARY,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_rules_to_clipboard(cx);
-                            })),
-                        )
-                        .child(
-                            text_action(
-                                "clear-rules",
-                                if clear_armed {
-                                    sockrocket_gui::i18n::t("rules.clear_confirm")
-                                } else {
-                                    sockrocket_gui::i18n::t("rules.clear")
-                                },
-                                if clear_armed { DANGER } else { TEXT_SECONDARY },
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
-                                    CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
-                                    this.clear_rules(cx);
-                                } else {
-                                    CLEAR_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
-                                    schedule_confirm_reset(this, cx);
-                                    cx.notify();
-                                }
-                            })),
-                        ),
+                    primary_button("rules-add", sockrocket_gui::i18n::t("rules.add.row")).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.rule_filter_input
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                            this.begin_add_in_group("", window, cx);
+                        }),
+                    ),
                 ),
         );
+        content = content.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(mini_badge(
+                    format!(
+                        "{} {} · {} {}",
+                        rule_count,
+                        sockrocket_gui::i18n::t("rules.count"),
+                        self.rules.iter().filter(|r| r.enabled).count(),
+                        sockrocket_gui::i18n::t("rules.enabled")
+                    ),
+                    TEXT_SECONDARY,
+                ))
+                .child(div().flex_1())
+                .when(rule_count > 0, |row| {
+                    row.child(
+                        filter_chip(
+                            "rules-presets",
+                            sockrocket_gui::i18n::t("rules.scenes.title"),
+                            self.rules_presets_open,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.rules_presets_open = !this.rules_presets_open;
+                            cx.notify();
+                        })),
+                    )
+                })
+                .child(
+                    filter_chip(
+                        "rules-manage",
+                        sockrocket_gui::i18n::t("rules.manage"),
+                        self.rules_manage_open,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.rules_manage_open = !this.rules_manage_open;
+                        cx.notify();
+                    })),
+                ),
+        );
+        if self.rules_manage_open {
+            content = content.child(
+                card()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(MICRO))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sockrocket_gui::i18n::t("rules.manage.hint")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                text_action(
+                                    "rules-export",
+                                    sockrocket_gui::i18n::t("rules.export"),
+                                    TEXT_SECONDARY,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.export_rules_to_clipboard(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                text_action(
+                                    "clear-rules",
+                                    if clear_armed {
+                                        sockrocket_gui::i18n::t("rules.delete.confirm")
+                                    } else {
+                                        sockrocket_gui::i18n::t("rules.clear")
+                                    },
+                                    if clear_armed { DANGER } else { TEXT_SECONDARY },
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if confirm_slot_armed(&CLEAR_CONFIRM_AT) {
+                                            CLEAR_CONFIRM_AT.store(0, Ordering::Relaxed);
+                                            this.clear_rules(cx);
+                                        } else {
+                                            CLEAR_CONFIRM_AT.store(now_millis(), Ordering::Relaxed);
+                                            schedule_confirm_reset(this, cx);
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        }
+        if self.rules_presets_open && rule_count > 0 {
+            content = content.child(self.render_scene_bar("scene", cx));
+        }
         let filter_q = self
             .rule_filter_input
             .read(cx)
@@ -301,7 +370,7 @@ impl AppState {
                 .child(
                     div()
                         .flex()
-                        .flex_row()
+                        .flex_wrap()
                         .items_center()
                         .gap_2()
                         .child(
@@ -311,6 +380,56 @@ impl AppState {
                                     .w_full(),
                             ),
                         )
+                        .when(!filter_q.is_empty(), |d| {
+                            d.child(
+                                text_action(
+                                    "rules-reset-search",
+                                    sockrocket_gui::i18n::t("rules.search.clear"),
+                                    TEXT_SECONDARY,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.rule_filter_input.update(cx, |state, cx| {
+                                            state.set_value("", window, cx)
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
+                        .when(rule_count > 0 && filter_q.is_empty(), |d| {
+                            let all_collapsed =
+                                sockrocket_core::group_rules_for_display(&self.rules)
+                                    .iter()
+                                    .all(|g| self.rules_collapsed_groups.contains(&g.name));
+                            d.child(
+                                text_action(
+                                    "rules-fold-all",
+                                    sockrocket_gui::i18n::t(if all_collapsed {
+                                        "rules.expand"
+                                    } else {
+                                        "rules.collapse"
+                                    }),
+                                    TEXT_SECONDARY,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if all_collapsed {
+                                            this.rules_collapsed_groups.clear();
+                                        } else {
+                                            this.rules_collapsed_groups =
+                                                sockrocket_core::group_rules_for_display(
+                                                    &this.rules,
+                                                )
+                                                .into_iter()
+                                                .map(|g| g.name)
+                                                .collect();
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
                         .when(!new_group_open, |d| {
                             d.child(
                                 tint_action(
@@ -334,7 +453,7 @@ impl AppState {
                     d.child(
                         div()
                             .flex()
-                            .flex_row()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(
@@ -412,16 +531,11 @@ impl AppState {
                                 .child(
                                     tint_action(
                                         "empty-new-group",
-                                        sockrocket_gui::i18n::t("rules.empty.cta"),
+                                        sockrocket_gui::i18n::t("rules.add.row"),
                                     )
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
-                                            this.rules_new_group_open = true;
-                                            this.rule_group_input.update(cx, |state, cx| {
-                                                state.set_value("", window, cx);
-                                                state.focus(window, cx);
-                                            });
-                                            cx.notify();
+                                            this.begin_add_in_group("", window, cx);
                                         },
                                     )),
                                 )
@@ -484,7 +598,10 @@ impl AppState {
                 let count_label = if !filter_q.is_empty() && shown.len() != count {
                     format!("{} / {count}", shown.len())
                 } else {
-                    format!("{count}")
+                    format!(
+                        "{enabled_n}/{count} {}",
+                        sockrocket_gui::i18n::t("rules.enabled")
+                    )
                 };
 
                 let header_group = SharedString::from(format!("grp-hover-{gkey}"));
@@ -524,11 +641,7 @@ impl AppState {
                                             .w(px(16.0))
                                             .text_size(px(TINY))
                                             .text_color(rgb(TEXT_MUTED))
-                                            .child(if collapsed && !batch_here && !adding_here {
-                                                "▸"
-                                            } else {
-                                                "▾"
-                                            }),
+                                            .child(if !expanded { "▸" } else { "▾" }),
                                     )
                                     .child(
                                         div()
@@ -538,91 +651,117 @@ impl AppState {
                                             .child(title),
                                     )
                                     .child(mini_badge(count_label, TEXT_MUTED)),
-                            )
-                            .child(self.render_group_outlet(gkey_outlet, cx))
-                            .child(
-                                text_action(
-                                    SharedString::from(format!("grp-add-{gkey}")),
-                                    sockrocket_gui::i18n::t("rules.group.add"),
-                                    if adding_here {
-                                        TEXT_ACCENT
-                                    } else {
-                                        TEXT_SECONDARY
-                                    },
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        if this.adding_rule_group.as_deref()
-                                            == Some(gkey_add.as_str())
-                                        {
-                                            this.cancel_edit_rule(window, cx);
-                                        } else {
-                                            this.begin_add_in_group(&gkey_add, window, cx);
-                                        }
-                                    },
-                                )),
-                            )
-                            .child(
-                                text_action(
-                                    SharedString::from(format!("grp-edit-{gkey}")),
-                                    sockrocket_gui::i18n::t("rules.batch.mode"),
-                                    if batch_here {
-                                        TEXT_ACCENT
-                                    } else {
-                                        TEXT_SECONDARY
-                                    },
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        if this.batch_edit_group.as_deref()
-                                            == Some(gkey_edit.as_str())
-                                        {
-                                            this.cancel_edit_rule(window, cx);
-                                        } else {
-                                            this.begin_batch_edit_group(&gkey_edit, window, cx);
-                                        }
-                                    },
-                                )),
-                            )
-                            .child(
-                                quiet_mark(
-                                    SharedString::from(format!("grp-switch-{gkey}")),
-                                    all_on,
-                                    partial,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.set_rule_group_enabled(&gkey_switch, !all_on, cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                text_action(
-                                    SharedString::from(format!("grp-del-{gkey}")),
-                                    if del_armed {
-                                        sockrocket_gui::i18n::t("rules.clear_confirm")
-                                    } else {
-                                        "×"
-                                    },
-                                    if del_armed { DANGER } else { TEXT_SECONDARY },
-                                )
-                                .when(!del_armed, |d| {
-                                    d.invisible().group_hover(header_group, |s| s.visible())
-                                })
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        if group_delete_armed(&gkey_del) {
-                                            GROUP_DEL_AT.store(0, Ordering::Relaxed);
-                                            this.delete_rule_group(&gkey_del, cx);
-                                        } else {
-                                            arm_group_delete(&gkey_del);
-                                            schedule_confirm_reset(this, cx);
-                                            cx.notify();
-                                        }
-                                    },
-                                )),
                             ),
-                    );
+                    )
+                    .when(expanded, |section| {
+                        section.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .pb_2()
+                                .child(
+                                    div()
+                                        .text_size(px(MICRO))
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(sockrocket_gui::i18n::t("rules.group.outlet")),
+                                )
+                                .child(self.render_group_outlet(gkey_outlet, cx))
+                                .child(
+                                    text_action(
+                                        SharedString::from(format!("grp-add-{gkey}")),
+                                        sockrocket_gui::i18n::t("rules.group.add"),
+                                        if adding_here {
+                                            TEXT_ACCENT
+                                        } else {
+                                            TEXT_SECONDARY
+                                        },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            if this.adding_rule_group.as_deref()
+                                                == Some(gkey_add.as_str())
+                                            {
+                                                this.cancel_edit_rule(window, cx);
+                                            } else {
+                                                this.begin_add_in_group(&gkey_add, window, cx);
+                                            }
+                                        },
+                                    )),
+                                )
+                                .when(self.rules_manage_open, |row| {
+                                    row.child(
+                                        text_action(
+                                            SharedString::from(format!("grp-edit-{gkey}")),
+                                            sockrocket_gui::i18n::t("rules.batch.mode"),
+                                            if batch_here {
+                                                TEXT_ACCENT
+                                            } else {
+                                                TEXT_SECONDARY
+                                            },
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                if this.batch_edit_group.as_deref()
+                                                    == Some(gkey_edit.as_str())
+                                                {
+                                                    this.cancel_edit_rule(window, cx);
+                                                } else {
+                                                    this.begin_batch_edit_group(
+                                                        &gkey_edit, window, cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(MICRO))
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child(sockrocket_gui::i18n::t("rules.group.enable_all")),
+                                )
+                                .child(
+                                    quiet_mark(
+                                        SharedString::from(format!("grp-switch-{gkey}")),
+                                        all_on,
+                                        partial,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.set_rule_group_enabled(&gkey_switch, !all_on, cx);
+                                        },
+                                    )),
+                                )
+                                .when(self.rules_manage_open, |row| {
+                                    row.child(
+                                        text_action(
+                                            SharedString::from(format!("grp-del-{gkey}")),
+                                            if del_armed {
+                                                sockrocket_gui::i18n::t("rules.delete.confirm")
+                                            } else {
+                                                sockrocket_gui::i18n::t("rules.group.delete")
+                                            },
+                                            if del_armed { DANGER } else { TEXT_SECONDARY },
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if group_delete_armed(&gkey_del) {
+                                                    GROUP_DEL_AT.store(0, Ordering::Relaxed);
+                                                    this.delete_rule_group(&gkey_del, cx);
+                                                } else {
+                                                    arm_group_delete(&gkey_del);
+                                                    schedule_confirm_reset(this, cx);
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ),
+                                    )
+                                }),
+                        )
+                    });
 
                 if batch_here {
                     section = section.child(
@@ -637,7 +776,7 @@ impl AppState {
                         .flex_col()
                         .border_t_1()
                         .border_color(rgba(with_alpha(BORDER, 0x40)));
-                    let show_footer = adding_here || filter_q.is_empty();
+                    let show_footer = adding_here;
                     let last = *shown.last().unwrap_or(&0);
                     for (pos, &i) in shown.iter().enumerate() {
                         let is_last_row = !show_footer && (i == last || pos + 1 == shown.len());
@@ -645,23 +784,6 @@ impl AppState {
                     }
                     if adding_here {
                         rows = rows.child(self.render_add_composer(cx));
-                    } else if filter_q.is_empty() {
-                        let gkey_footer = gkey.clone();
-                        rows = rows.child(
-                            div()
-                                .id(SharedString::from(format!("grp-add-row-{gkey}")))
-                                .px_3()
-                                .py_2()
-                                .cursor_pointer()
-                                .text_size(px(SMALL))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(TEXT_ACCENT))
-                                .hover(|s| s.bg(rgba(with_alpha(BG_HOVER, 0x55))))
-                                .child(format!("+ {}", sockrocket_gui::i18n::t("rules.add.row")))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.begin_add_in_group(&gkey_footer, window, cx);
-                                })),
-                        );
                     }
                     section = section.child(rows);
                 }
@@ -751,7 +873,6 @@ impl AppState {
                 );
             }
             content = content.child(list);
-            content = content.child(self.render_scene_bar("scene", cx));
         }
 
         content
@@ -1160,6 +1281,26 @@ impl AppState {
             .flex_col()
             .gap_1p5()
             .bg(rgba(with_alpha(ACCENT, 0x0c)))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(SMALL))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(sockrocket_gui::i18n::t("rules.field.type")),
+                    )
+                    .child(self.render_rule_menu(RuleMenu::Type, cx)),
+            )
+            .child(
+                div()
+                    .text_size(px(SMALL))
+                    .text_color(rgb(TEXT_SECONDARY))
+                    .child(sockrocket_gui::i18n::t("rules.field.pattern")),
+            )
             .when_some(hint_key, |d, key| {
                 d.child(
                     div()
@@ -1191,9 +1332,28 @@ impl AppState {
                                     .w_full(),
                             )
                             .into_any_element()
-                    })
-                    .child(self.render_rule_menu(RuleMenu::Type, cx))
-                    .child(self.render_rule_menu(RuleMenu::Target, cx))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(SMALL))
+                            .text_color(rgb(TEXT_SECONDARY))
+                            .child(sockrocket_gui::i18n::t("rules.field.target")),
+                    )
+                    .child(self.render_rule_menu(RuleMenu::Target, cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
                     .child(
                         text_action(
                             SharedString::from(format!("{id_prefix}-cancel")),
@@ -1282,6 +1442,16 @@ impl AppState {
             .child(mini_badge(type_label, TEXT_MUTED))
             .child(mini_badge(target_label, tgt_color))
             .child(
+                text_action(
+                    ("rule-edit", index),
+                    sockrocket_gui::i18n::t("rules.edit"),
+                    TEXT_SECONDARY,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_edit_rule(index, window, cx);
+                })),
+            )
+            .child(
                 toggle_switch(("rule-switch", index), is_enabled).on_click(cx.listener(
                     move |this, _, _, cx| {
                         if let Some(rule) = this.rules.get_mut(index) {
@@ -1298,7 +1468,7 @@ impl AppState {
             .child(if del_armed {
                 text_action(
                     ("rule-del-confirm", index),
-                    sockrocket_gui::i18n::t("rules.clear_confirm"),
+                    sockrocket_gui::i18n::t("rules.delete.confirm"),
                     DANGER,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {

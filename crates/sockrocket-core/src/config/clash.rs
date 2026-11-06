@@ -73,6 +73,8 @@ struct ClashProxy {
     network: Option<String>,
     #[serde(rename = "ws-opts")]
     ws_opts: Option<ClashWsOpts>,
+    #[serde(rename = "xhttp-opts")]
+    xhttp_opts: Option<XhttpConfig>,
     // TUIC
     #[serde(rename = "congestion-controller")]
     congestion_controller: Option<String>,
@@ -130,6 +132,11 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
     let config: ClashConfig =
         serde_yaml::from_str(yaml_str).context("Failed to parse Clash YAML")?;
 
+    let root: serde_yaml::Value = serde_yaml::from_str(yaml_str)
+        .map_err(|_| anyhow::anyhow!("Invalid Clash configuration"))?;
+    let server_dns = super::server_dns::import(&root)?
+        .map(|p| serde_json::to_string(&p))
+        .transpose()?;
     let mut nodes = Vec::new();
     for value in config.proxies {
         if value.get("type").and_then(serde_yaml::Value::as_str) == Some("wireguard") {
@@ -156,6 +163,12 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
         }
     }
 
+    if let Some(policy) = server_dns {
+        for node in &mut nodes {
+            node.extra
+                .insert(super::server_dns::KEY.into(), policy.clone());
+        }
+    }
     Ok(nodes)
 }
 
@@ -366,12 +379,52 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     let network = proxy.network.as_deref().unwrap_or("tcp");
     let proxy_type = proxy.proxy_type.as_str();
 
-    // Only plain TCP and WebSocket are supported. Anything else
-    // (grpc/h2/http/httpupgrade/xhttp/...) must be rejected loudly — silently
+    // TCP, WebSocket and VLESS XHTTP are supported. Anything else
+    // (grpc/h2/http/httpupgrade/...) must be rejected loudly — silently
     // downgrading to bare TCP/TLS produces a node that imports fine but can
     // never connect.
-    if !matches!(network, "tcp" | "ws") {
-        anyhow::bail!("Unsupported Clash transport; only TCP and WebSocket are supported");
+    if !matches!(network, "tcp" | "ws" | "xhttp") {
+        anyhow::bail!("Unsupported Clash transport; expected TCP, WebSocket or VLESS XHTTP");
+    }
+
+    if network == "xhttp" {
+        anyhow::ensure!(proxy_type == "vless", "XHTTP requires VLESS");
+        anyhow::ensure!(
+            proxy.flow.as_deref().unwrap_or("").is_empty(),
+            "XHTTP does not support Vision flow"
+        );
+        let xhttp = proxy.xhttp_opts.clone().unwrap_or_default();
+        if let Some(reality) = &proxy.reality_opts {
+            anyhow::ensure!(
+                reality.public_key.as_ref().is_some_and(|k| !k.is_empty()),
+                "REALITY public key is required"
+            );
+        }
+        xhttp.validate()?;
+        anyhow::ensure!(
+            proxy.alpn.as_ref().is_none_or(|a| a.is_empty()
+                || a.iter()
+                    .all(|s| matches!(s.as_str(), "h2" | "http/1.1" | "h3"))),
+            "Unsupported XHTTP ALPN"
+        );
+        return Ok(Some(TransportConfig {
+            transport_type: TransportType::Xhttp,
+            tls: proxy.tls.then(|| TlsConfig {
+                sni: proxy.servername.clone().or_else(|| proxy.sni.clone()),
+                skip_cert_verify: proxy.skip_cert_verify,
+                alpn: proxy.alpn.clone(),
+                fingerprint: proxy.client_fingerprint.clone(),
+            }),
+            ws: None,
+            reality: proxy.reality_opts.as_ref().map(|r| RealityConfig {
+                public_key: r.public_key.clone().unwrap_or_default(),
+                short_id: r.short_id.clone().unwrap_or_default(),
+                sni: proxy.servername.clone().or_else(|| proxy.sni.clone()),
+                client_fingerprint: proxy.client_fingerprint.clone(),
+                skip_cert_verify: proxy.skip_cert_verify,
+            }),
+            xhttp: Some(xhttp),
+        }));
     }
 
     // TUIC and Hysteria2 always use QUIC (TLS is implicit)
@@ -389,6 +442,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
             .filter(|s| !s.is_empty())
             .context("REALITY public key is required")?;
         return Ok(Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Reality,
             tls: None,
             ws: None,
@@ -440,6 +494,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     };
 
     Ok(Some(TransportConfig {
+        xhttp: None,
         transport_type,
         tls,
         ws,
@@ -776,5 +831,129 @@ proxies:
             .expect("reality transport");
         assert_eq!(reality.client_fingerprint.as_deref(), Some("chrome"));
         assert!(reality.skip_cert_verify);
+    }
+}
+
+#[cfg(test)]
+mod xhttp_tests {
+    use super::*;
+    const YAML: &str = r#"proxies:
+  - name: synthetic-xhttp
+    type: vless
+    server: example.invalid
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000001
+    network: xhttp
+    tls: true
+    alpn: [h2]
+    servername: tls.example.invalid
+    xhttp-opts: {path: /synthetic?key=value, host: front.example.invalid, mode: stream-one}
+"#;
+    #[test]
+    fn xhttp_clash_native_export_and_uri_preserve_connection_settings() {
+        let nodes = parse_clash_config(YAML).unwrap();
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        let t = node.transport.as_ref().unwrap();
+        assert_eq!(t.transport_type, TransportType::Xhttp);
+        assert_eq!(
+            t.tls.as_ref().unwrap().sni.as_deref(),
+            Some("tls.example.invalid")
+        );
+        assert_eq!(
+            t.xhttp.as_ref().unwrap().host.as_deref(),
+            Some("front.example.invalid")
+        );
+        let native = serde_yaml::to_string(node).unwrap();
+        let restored: Node = serde_yaml::from_str(&native).unwrap();
+        assert_eq!(
+            super::super::dedup::node_fingerprint(node),
+            super::super::dedup::node_fingerprint(&restored)
+        );
+        let export = super::super::export::export_clash_config(&nodes);
+        let restored = parse_clash_config(&export).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].transport.as_ref().unwrap().xhttp, t.xhttp);
+        let uri = super::super::v2ray::node_to_share_uri(node);
+        let restored = super::super::v2ray::parse_vless_uri(&uri).unwrap();
+        assert_eq!(restored.transport.as_ref().unwrap().xhttp, t.xhttp);
+        let mut different = node.clone();
+        different
+            .transport
+            .as_mut()
+            .unwrap()
+            .xhttp
+            .as_mut()
+            .unwrap()
+            .path = Some("/other".into());
+        assert_ne!(
+            super::super::dedup::node_fingerprint(node),
+            super::super::dedup::node_fingerprint(&different)
+        );
+    }
+    #[test]
+    fn xhttp_unsupported_options_are_not_silently_discarded() {
+        for yaml in [
+            YAML.replace("stream-one", "invalid-mode"),
+            YAML.replace("stream-one", "invalid-mode-2"),
+            YAML.replace("alpn: [h2]", "alpn: [invalid-alpn]"),
+            YAML.replace(
+                "mode: stream-one",
+                "mode: stream-one, extra: {unknownOption: true}",
+            ),
+            YAML.replace(
+                "network: xhttp",
+                "network: xhttp\n    flow: xtls-rprx-vision",
+            ),
+        ] {
+            assert!(parse_clash_config(&yaml).unwrap().is_empty());
+        }
+        let node = parse_clash_config(&YAML.replace("mode: stream-one", "mode: auto")).unwrap();
+        assert_eq!(node.len(), 1);
+    }
+    #[test]
+    fn xhttp_missing_options_select_auto_and_invalid_reality_is_rejected() {
+        let yaml = YAML
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("xhttp-opts:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let nodes = parse_clash_config(&yaml).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0]
+                .transport
+                .as_ref()
+                .unwrap()
+                .xhttp
+                .as_ref()
+                .unwrap()
+                .mode,
+            "auto"
+        );
+        let invalid = YAML.replace("network: xhttp", "network: xhttp\n    reality-opts: {}");
+        assert!(parse_clash_config(&invalid).unwrap().is_empty());
+    }
+    #[test]
+    fn xhttp_json_import_and_malformed_targets() {
+        let config = serde_json::json!({"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"example.invalid","port":443,"users":[{"id":"00000000-0000-0000-0000-000000000001"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"tls.example.invalid","alpn":["h2"]},"xhttpSettings":{"path":"/synthetic","host":"front.example.invalid","mode":"stream-one"}}}]});
+        let nodes = super::super::v2ray::parse_v2ray_config(&config.to_string()).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].transport.as_ref().unwrap().transport_type,
+            TransportType::Xhttp
+        );
+        for host in [
+            "evil.invalid/path",
+            "user@example.invalid",
+            "example.invalid\r\nx: y",
+        ] {
+            let config = XhttpConfig {
+                options: Default::default(),
+                host: Some(host.into()),
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
     }
 }

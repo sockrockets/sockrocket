@@ -46,11 +46,51 @@ pub(crate) enum TransportHeader {
     Unknown,
 }
 
+/// Ingress owns its Vec so delivery can move it without copying. TCP egress
+/// shares one bounded segment allocation with its retransmission entry.
+#[derive(Debug, Clone)]
+pub(crate) enum PacketPayload {
+    Owned(Vec<u8>),
+    Shared(bytes::Bytes),
+}
+impl Default for PacketPayload {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+impl From<Vec<u8>> for PacketPayload {
+    fn from(data: Vec<u8>) -> Self {
+        Self::Owned(data)
+    }
+}
+impl From<bytes::Bytes> for PacketPayload {
+    fn from(data: bytes::Bytes) -> Self {
+        Self::Shared(data)
+    }
+}
+impl std::ops::Deref for PacketPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+impl PacketPayload {
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(data) => data,
+            Self::Shared(data) => data.to_vec(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkPacket {
     pub(crate) ip: IpHeader,
     pub(crate) transport: TransportHeader,
-    pub(crate) payload: Option<Vec<u8>>,
+    pub(crate) payload: Option<PacketPayload>,
 }
 
 impl NetworkPacket {
@@ -81,7 +121,7 @@ impl NetworkPacket {
         let payload = if payload.is_empty() {
             None
         } else {
-            Some(payload.to_vec())
+            Some(payload.to_vec().into())
         };
 
         Ok(NetworkPacket {
@@ -131,20 +171,36 @@ impl NetworkPacket {
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpStackError> {
         let mut buf = Vec::new();
+        self.write_to(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Append one packet to reusable storage (possibly after a TUN PI header).
+    pub(crate) fn write_to(&self, buf: &mut Vec<u8>) -> Result<(), IpStackError> {
+        let ip_len = match &self.ip {
+            IpHeader::Ipv4(ip) => ip.header_len(),
+            IpHeader::Ipv6(_) => Ipv6Header::LEN,
+        };
+        let transport_len = match &self.transport {
+            TransportHeader::Tcp(h) => h.header_len() as usize,
+            TransportHeader::Udp(_) => UdpHeader::LEN,
+            TransportHeader::Unknown => 0,
+        };
+        buf.reserve(ip_len + transport_len + self.payload.as_ref().map_or(0, |p| p.len()));
         match self.ip {
-            IpHeader::Ipv4(ref ip) => ip.write(&mut buf)?,
-            IpHeader::Ipv6(ref ip) => ip.write(&mut buf)?,
+            IpHeader::Ipv4(ref ip) => ip.write(&mut *buf)?,
+            IpHeader::Ipv6(ref ip) => ip.write(&mut *buf)?,
         }
         match self.transport {
-            TransportHeader::Tcp(ref h) => h.write(&mut buf)?,
-            TransportHeader::Udp(ref h) => h.write(&mut buf)?,
+            TransportHeader::Tcp(ref h) => h.write(&mut *buf)?,
+            TransportHeader::Udp(ref h) => h.write(&mut *buf)?,
             _ => {}
         };
 
         if let Some(payload) = &self.payload {
             buf.extend_from_slice(payload);
         }
-        Ok(buf)
+        Ok(())
     }
     pub fn ttl(&self) -> u8 {
         match &self.ip {
@@ -216,6 +272,44 @@ pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
     }
 
     flags
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn reusable_packet_storage_preserves_headers_payload_and_optional_prefix() {
+        for ipv6 in [false, true] {
+            for udp in [false, true] {
+                let ip = if ipv6 {
+                    etherparse::PacketBuilder::ipv6([1; 16], [2; 16], 64)
+                } else {
+                    etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 1], 64)
+                };
+                let mut wire = Vec::new();
+                if udp {
+                    ip.udp(1234, 443).write(&mut wire, &[0x5a; 1360]).unwrap();
+                } else {
+                    ip.tcp(1234, 443, 123, 65535)
+                        .ack(456)
+                        .write(&mut wire, &[0x5a; 1360])
+                        .unwrap();
+                }
+                let packet = NetworkPacket::parse(&wire).unwrap();
+                assert_eq!(packet.to_bytes().unwrap(), wire);
+                let mut scratch = Vec::with_capacity(1600);
+                let original = scratch.as_ptr();
+                for _ in 0..100 {
+                    scratch.clear();
+                    scratch.extend_from_slice(&[0, 0, 0x86, 0xdd]);
+                    packet.write_to(&mut scratch).unwrap();
+                    assert_eq!(&scratch[4..], wire);
+                    assert_eq!(scratch.as_ptr(), original);
+                }
+            }
+        }
+    }
 }
 
 // pub struct UdpPacket {

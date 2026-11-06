@@ -2,8 +2,6 @@
 use std::io;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-const RELAY_BUF_SIZE: usize = 64 * 1024;
-
 /// Preserve the reverse direction after EOF and finish both asynchronous
 /// writer shutdowns before reporting success. Errors cancel both directions.
 pub async fn relay_bidirectional<A, B>(a: &mut A, b: &mut B) -> io::Result<(u64, u64)>
@@ -11,7 +9,8 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    tokio::io::copy_bidirectional_with_sizes(a, b, RELAY_BUF_SIZE, RELAY_BUF_SIZE).await
+    let size = crate::resources::relay_buffer_bytes();
+    tokio::io::copy_bidirectional_with_sizes(a, b, size, size).await
 }
 
 /// Bound abandoned TUN relays even after EOF stops polling one read half.
@@ -103,8 +102,8 @@ where
     let relay = tokio::io::copy_bidirectional_with_sizes(
         &mut observed_a,
         &mut observed_b,
-        16 * 1024,
-        16 * 1024,
+        8 * 1024,
+        8 * 1024,
     );
     tokio::pin!(relay);
     let mut tick = tokio::time::interval(idle.min(std::time::Duration::from_secs(30)));
@@ -147,41 +146,32 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
     async fn test_relay_bidirectional() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            loop {
-                match s.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if s.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
+        let (mut client, mut inbound) = tokio::io::duplex(1024);
+        let (mut outbound, mut server) = tokio::io::duplex(1024);
+        let request = vec![0x5a; 200_000];
+        let expected = request.clone();
+        let relay = tokio::spawn(async move {
+            relay_bidirectional(&mut inbound, &mut outbound)
+                .await
+                .unwrap()
         });
-
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        let (_server_half, _) = tokio::io::duplex(1024);
-
-        // Simple test: write data from one side and verify it's relayed
-        client.write_all(b"hello relay").await.unwrap();
+        let response = tokio::spawn(async move {
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            // The reverse direction must survive request EOF and backpressure.
+            server.write_all(&received).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+        client.write_all(&request).await.unwrap();
         client.shutdown().await.unwrap();
-
-        // Wait for echo server
-        let _ = server.await;
-    }
-
-    #[test]
-    fn test_buf_size() {
-        assert_eq!(RELAY_BUF_SIZE, 65536);
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, request);
+        response.await.unwrap();
+        assert_eq!(relay.await.unwrap(), (200_000, 200_000));
     }
 }

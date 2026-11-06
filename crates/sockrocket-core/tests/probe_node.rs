@@ -31,6 +31,7 @@ async fn probe_local_reality() {
             udp: true,
         },
         transport: Some(TransportConfig {
+            xhttp: None,
             transport_type: TransportType::Tcp,
             tls: Some(TlsConfig {
                 sni: Some("localhost".into()),

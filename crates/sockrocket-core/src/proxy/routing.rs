@@ -169,6 +169,10 @@ impl Outbound for RoutingOutbound {
         })
     }
 
+    fn default_proxy(&self) -> Option<SharedOutbound> {
+        Some(self.proxy_outbound.clone())
+    }
+
     fn with_default_proxy(&self, proxy: SharedOutbound) -> Option<SharedOutbound> {
         Some(SharedOutbound(Arc::new(Self {
             router: self.router.clone(),

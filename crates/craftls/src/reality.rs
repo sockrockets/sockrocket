@@ -112,6 +112,10 @@ const MLKEM768_CT_SIZE: usize = 1088;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealityX25519MlKem768Group;
 
+/// The same hybrid key exchange for ordinary TLS (no REALITY auth is applied
+/// unless the client configuration explicitly enables REALITY).
+pub static X25519_MLKEM768: RealityX25519MlKem768Group = RealityX25519MlKem768Group;
+
 impl SupportedKxGroup for RealityX25519MlKem768Group {
     fn name(&self) -> NamedGroup {
         NamedGroup::X25519MLKEM768

@@ -1252,10 +1252,10 @@ fn act_update_subs() -> J {
     })
 }
 
-fn socks_port() -> u16 {
+fn active_http_port() -> u16 {
     load_conf()
-        .map(|m| conf_u16(&m, "socks_port", 1080))
-        .unwrap_or(1080)
+        .map(|m| conf_u16(&m, "http_port", 1087))
+        .unwrap_or(1087)
 }
 
 /// Cap concurrent node probes on the router. Each probe spins a current-thread
@@ -1272,10 +1272,8 @@ fn speedtest_semaphore() -> &'static tokio::sync::Semaphore {
 /// Per-node list probes use [`act_speedtest_node`] so every node is measured
 /// the same way (warm through-proxy), not a mix of SOCKS vs cold outbound.
 ///
-/// --socks5-HOSTNAME: resolve on the daemon side. Plain --socks5 lets the
-/// router's dnsmasq answer AAAA first; an IPv4-only exit then returns
-/// "host unreachable" (SOCKS REP 4). time_TOTAL is the full RTT through
-/// the exit (local TCP to 127.0.0.1 is ~0ms).
+/// Use the local HTTP proxy because router curl builds may omit SOCKS support.
+/// Absolute HTTP URLs leave target name resolution to the daemon.
 fn latency_via_active_socks() -> Result<u32, String> {
     let out = run_cmd(
         "curl",
@@ -1289,8 +1287,10 @@ fn latency_via_active_socks() -> Result<u32, String> {
             "10",
             "--max-time",
             "15",
-            "--socks5-hostname",
-            &format!("127.0.0.1:{}", socks_port()),
+            "--noproxy",
+            "",
+            "--proxy",
+            &format!("http://127.0.0.1:{}", active_http_port()),
             "http://www.gstatic.com/generate_204",
         ],
     )
@@ -1327,8 +1327,10 @@ fn act_ip_check() -> J {
             "8",
             "--max-time",
             "12",
-            "--socks5-hostname",
-            &format!("127.0.0.1:{}", socks_port()),
+            "--noproxy",
+            "",
+            "--proxy",
+            &format!("http://127.0.0.1:{}", active_http_port()),
             "http://ip-api.com/json?fields=query,country",
         ],
     )
@@ -3332,7 +3334,9 @@ fn act_update_status() -> J {
     let mut active = root.join(".update-transaction").is_dir();
     let status = fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
     active |= status.trim() == "queued";
-    if status.starts_with("rollback-failed:") { active = false; }
+    if status.starts_with("rollback-failed:") {
+        active = false;
+    }
     let stage = fs::read_to_string(root.join(".update-transaction/stage")).unwrap_or_default();
     json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim()})
 }
@@ -3452,7 +3456,10 @@ fn act_apply_update() -> J {
             Ok(())
         })();
         if let Err(e) = prepare {
-            let _ = fs::write(sockrocket_dir().join("update-status"), "failed: preparation\n");
+            let _ = fs::write(
+                sockrocket_dir().join("update-status"),
+                "failed: preparation\n",
+            );
             let _ = fs::remove_dir_all(&work);
             return Err(e);
         }
@@ -3879,12 +3886,19 @@ mod tests {
         let response = dispatch("save_config", &json!({}));
         assert_eq!(response["error_code"], "update_in_progress");
         assert_eq!(dispatch("update_status", &json!({}))["active"], true);
-        fs::write(root.join("update-status"), "rollback-failed: backup retained").unwrap();
+        fs::write(
+            root.join("update-status"),
+            "rollback-failed: backup retained",
+        )
+        .unwrap();
         assert_eq!(dispatch("update_status", &json!({}))["active"], false);
         fs::remove_dir(root.join(".update-transaction")).unwrap();
         assert!(storage::MutationGuard::acquire().is_ok());
         fs::write(root.join("update-status"), "success: plugin updated").unwrap();
-        assert_eq!(dispatch("update_status", &json!({}))["status"], "success: plugin updated");
+        assert_eq!(
+            dispatch("update_status", &json!({}))["status"],
+            "success: plugin updated"
+        );
     }
 
     #[test]
