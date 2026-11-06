@@ -177,6 +177,8 @@ pub struct AppState {
     pub(crate) rule_outlet_open: Option<String>,
     /// Toolbar expands the new-group name field.
     pub(crate) rules_new_group_open: bool,
+    pub(crate) rules_manage_open: bool,
+    pub(crate) rules_presets_open: bool,
     /// Group currently open in batch text edit (one rule per line).
     pub(crate) batch_edit_group: Option<String>,
     /// Group / pattern field focus — drives “committed” tint when blurred with text.
@@ -762,6 +764,8 @@ impl AppState {
             rule_menu: None,
             rule_outlet_open: None,
             rules_new_group_open: false,
+            rules_manage_open: false,
+            rules_presets_open: false,
             batch_edit_group: None,
             rule_group_focused: false,
             rule_pattern_focused: false,

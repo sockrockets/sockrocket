@@ -38,6 +38,11 @@ pub trait Outbound: Send + Sync + 'static {
         None
     }
     /// Retain the latest routing/group snapshot during default-node failover.
+    /// The default proxy without domain rules, for node health checks.
+    fn default_proxy(&self) -> Option<SharedOutbound> {
+        None
+    }
+
     fn with_default_proxy(&self, _proxy: SharedOutbound) -> Option<SharedOutbound> {
         None
     }
@@ -325,6 +330,38 @@ impl SwappableOutbound {
             state.resolver = resolver;
             state.outbound = outbound;
             return;
+        }
+    }
+
+    /// Commit a health failover only if no manual switch/reload superseded it.
+    pub(crate) fn set_if_current(
+        &self,
+        expected: &SharedOutbound,
+        outbound: SharedOutbound,
+    ) -> bool {
+        loop {
+            let dns = {
+                let state = self.inner.read().unwrap();
+                if !Arc::ptr_eq(&state.outbound.0, &expected.0) {
+                    return false;
+                }
+                state.dns.clone()
+            };
+            let resolver = dns.as_ref().map(|config| {
+                let mut resolver = crate::dns::DnsResolver::with_config((**config).clone());
+                resolver.follow_runtime(outbound.clone());
+                resolver
+            });
+            let mut state = self.inner.write().unwrap();
+            if !Arc::ptr_eq(&state.outbound.0, &expected.0) {
+                return false;
+            }
+            if !same_dns(&state.dns, &dns) {
+                continue;
+            }
+            state.outbound = outbound;
+            state.resolver = resolver;
+            return true;
         }
     }
 

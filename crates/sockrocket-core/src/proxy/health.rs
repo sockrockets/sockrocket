@@ -1,8 +1,8 @@
 //! Periodic health checking of the active proxy node, with optional
 //! automatic failover to the lowest-latency reachable node.
 //!
-//! The monitor probes through the current [`SwappableOutbound`] using the
-//! same HTTP latency test as the speed tester. After `failure_threshold`
+//! The monitor snapshots the current [`SwappableOutbound`] and checks its
+//! default proxy with HTTPS, independently of domain routing rules. After `failure_threshold`
 //! consecutive failures (and with `auto_switch` on) it latency-tests all
 //! candidate nodes concurrently and swaps the shared outbound to the best
 //! one — the local listeners keep running untouched.
@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use crate::config::model::{HealthCheckConfig, Node};
 use crate::proxy::connector::{SharedOutbound, SwappableOutbound};
 use crate::proxy::factory::create_outbound_unwarmed;
-use crate::proxy::speedtest::http_latency_test;
+use crate::proxy::speedtest::https_health_probe;
 
 /// Timeout for a single health probe of the active node.
 const PROBE_TIMEOUT_SECS: u64 = 5;
@@ -80,6 +80,10 @@ struct FailureTracker {
     threshold: u32,
     consecutive: u32,
     candidate_cursor: usize,
+    current: Option<usize>,
+    avoided: std::collections::HashMap<usize, tokio::time::Instant>,
+    recent: Vec<usize>,
+    last_outbound: Option<SharedOutbound>,
 }
 
 impl FailureTracker {
@@ -88,6 +92,10 @@ impl FailureTracker {
             threshold: threshold.max(1),
             consecutive: 0,
             candidate_cursor: 0,
+            current: None,
+            avoided: Default::default(),
+            recent: vec![],
+            last_outbound: None,
         }
     }
 
@@ -154,24 +162,59 @@ impl Drop for HealthMonitor {
     }
 }
 
+// Retry only failed checks, and keep the whole operation cancellation-safe.
+async fn confirm_probe<F, Fut>(confirm: bool, mut probe: F) -> anyhow::Result<u32>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<u32>>,
+{
+    let first = probe().await;
+    if first.is_ok() || !confirm {
+        return first;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    probe().await
+}
+
 /// Run one probe (+ optional failover). Returns `false` when shutdown was
 /// signalled mid-probe so the outer loop can exit cleanly.
 async fn probe_once(
     setup: &HealthCheckSetup,
     config: &HealthCheckConfig,
     tracker: &mut FailureTracker,
-    probe_outbound: &SharedOutbound,
     events_tx: &watch::Sender<Option<HealthEvent>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> bool {
+    let snapshot = setup.swappable.current();
+    if tracker
+        .last_outbound
+        .as_ref()
+        .is_some_and(|old| !Arc::ptr_eq(&old.0, &snapshot.0))
+    {
+        // A manual switch owns the decision; do not quarantine the old index.
+        tracker.current = None;
+        tracker.reset();
+    }
+    tracker.last_outbound = Some(snapshot.clone());
+    let probe_outbound = snapshot
+        .0
+        .default_proxy()
+        .unwrap_or_else(|| snapshot.clone());
     let probe = tokio::select! {
-        result = http_latency_test(probe_outbound, PROBE_TIMEOUT_SECS) => result,
+        result = confirm_probe(config.auto_switch, || https_health_probe(&probe_outbound, PROBE_TIMEOUT_SECS)) => result,
         _ = shutdown_rx.changed() => return false,
     };
-
+    if !Arc::ptr_eq(&snapshot.0, &setup.swappable.current().0) {
+        return true;
+    }
     match probe {
         Ok(ms) => {
             tracker.record_success();
+            if let Some(index) = tracker.current {
+                tracker.recent.retain(|i| *i != index);
+                tracker.recent.insert(0, index);
+                tracker.recent.truncate(4);
+            }
             let _ = events_tx.send(Some(HealthEvent::ProbeOk { latency_ms: ms }));
         }
         Err(e) => {
@@ -193,9 +236,16 @@ async fn probe_once(
             }
             // Reset so a failed failover does not re-trigger on every tick.
             tracker.reset();
+            let now = tokio::time::Instant::now();
+            tracker.avoided.retain(|_, until| *until > now);
+            if let Some(index) = tracker.current {
+                tracker
+                    .avoided
+                    .insert(index, now + std::time::Duration::from_secs(120));
+            }
 
             let best = tokio::select! {
-                best = find_best_node(&setup.nodes, &mut tracker.candidate_cursor) => best,
+                best = tokio::time::timeout(std::time::Duration::from_secs(30), find_replacement(&setup.nodes, tracker)) => best.ok().flatten(),
                 _ = shutdown_rx.changed() => return false,
             };
             match best {
@@ -203,7 +253,17 @@ async fn probe_once(
                     let node = &setup.nodes[index];
                     match (setup.outbound_factory)(node) {
                         Some(outbound) => {
-                            setup.swappable.set(outbound);
+                            if !Arc::ptr_eq(&snapshot.0, &setup.swappable.current().0) {
+                                return true;
+                            }
+                            if !setup.swappable.set_if_current(&snapshot, outbound.clone()) {
+                                return true;
+                            }
+                            tracker.last_outbound = Some(outbound);
+                            tracker.current = Some(index);
+                            tracker.recent.retain(|i| *i != index);
+                            tracker.recent.insert(0, index);
+                            tracker.recent.truncate(4);
                             tracing::info!(
                                 "health check: auto-switched to node index {} ({} ms)",
                                 index,
@@ -246,8 +306,7 @@ async fn run(
     let interval_secs = config.interval_secs.clamp(5, 3600);
 
     let mut tracker = FailureTracker::new(config.failure_threshold);
-    // Probing through the swappable always exercises the *current* node.
-    let probe_outbound = SharedOutbound(setup.swappable.clone());
+    tracker.current = setup.active_node;
 
     tracing::info!(
         "health check started: startup burst {}×{}s then every {}s, {} consecutive failure(s) trigger failover (auto_switch={})",
@@ -271,16 +330,7 @@ async fn run(
                 }
             }
         }
-        if !probe_once(
-            &setup,
-            &config,
-            &mut tracker,
-            &probe_outbound,
-            &events_tx,
-            &mut shutdown_rx,
-        )
-        .await
-        {
+        if !probe_once(&setup, &config, &mut tracker, &events_tx, &mut shutdown_rx).await {
             tracing::info!("health check stopped");
             return;
         }
@@ -297,16 +347,7 @@ async fn run(
             _ = shutdown_rx.changed() => break,
         }
 
-        if !probe_once(
-            &setup,
-            &config,
-            &mut tracker,
-            &probe_outbound,
-            &events_tx,
-            &mut shutdown_rx,
-        )
-        .await
-        {
+        if !probe_once(&setup, &config, &mut tracker, &events_tx, &mut shutdown_rx).await {
             break;
         }
     }
@@ -316,10 +357,62 @@ async fn run(
 
 /// Latency-test all candidate nodes concurrently and return the index and
 /// latency of the fastest reachable one.
+// Previously successful nodes are revalidated before reuse; no blind switch.
+async fn find_replacement(nodes: &[Node], tracker: &mut FailureTracker) -> Option<(usize, u32)> {
+    for index in tracker
+        .recent
+        .iter()
+        .copied()
+        .filter(|i| !tracker.avoided.contains_key(i))
+        .take(1)
+        .collect::<Vec<_>>()
+    {
+        if tracker.avoided.contains_key(&index) {
+            continue;
+        }
+        if let Some(node) = nodes.get(index) {
+            if let Ok(outbound) = create_outbound_unwarmed(node)
+                && let Ok(ms) = https_health_probe(&outbound, CANDIDATE_TIMEOUT_SECS).await
+            {
+                return Some((index, ms));
+            }
+            tracker.avoided.insert(
+                index,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(120),
+            );
+        }
+    }
+    let available = eligible_candidates(nodes, &tracker.avoided);
+    let candidates: Vec<_> = available.iter().map(|(_, node)| (*node).clone()).collect();
+    let (index, ms) = find_best_node(&candidates, &mut tracker.candidate_cursor).await?;
+    Some((available[index].0, ms))
+}
+
+fn eligible_candidates<'a>(
+    nodes: &'a [Node],
+    avoided: &std::collections::HashMap<usize, tokio::time::Instant>,
+) -> Vec<(usize, &'a Node)> {
+    let excluded: std::collections::HashSet<_> = avoided
+        .keys()
+        .filter_map(|i| nodes.get(*i))
+        .map(crate::config::dedup::node_fingerprint)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let available: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            let key = crate::config::dedup::node_fingerprint(node);
+            !excluded.contains(&key) && seen.insert(key)
+        })
+        .collect();
+    available
+}
+
 async fn find_best_node(nodes: &[Node], cursor: &mut usize) -> Option<(usize, u32)> {
     find_best_node_with(nodes, cursor, |node| async move {
         let outbound = create_outbound_unwarmed(&node).ok()?;
-        http_latency_test(&outbound, CANDIDATE_TIMEOUT_SECS)
+        https_health_probe(&outbound, CANDIDATE_TIMEOUT_SECS)
             .await
             .ok()
     })
@@ -378,6 +471,67 @@ mod tests {
     use super::*;
     use crate::config::model::ProxyProtocol;
 
+    #[tokio::test(start_paused = true)]
+    async fn transient_failure_is_confirmed_without_failover() {
+        let mut calls = 0;
+        let start = tokio::time::Instant::now();
+        let result = confirm_probe(true, || {
+            calls += 1;
+            std::future::ready(if calls == 1 {
+                Err(anyhow::anyhow!("transient"))
+            } else {
+                Ok(42)
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 2);
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_probe_does_not_add_delay_or_traffic() {
+        let mut calls = 0;
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            confirm_probe(true, || {
+                calls += 1;
+                std::future::ready(Ok(7))
+            })
+            .await
+            .unwrap(),
+            7
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_failure_stays_failed() {
+        let mut calls = 0;
+        assert!(
+            confirm_probe(true, || {
+                calls += 1;
+                std::future::ready(Err(anyhow::anyhow!("down")))
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn stale_failover_cannot_overwrite_manual_switch() {
+        let old = SharedOutbound::direct();
+        let live = SwappableOutbound::new(old.clone());
+        let manual = SharedOutbound::direct();
+        live.set(manual.clone());
+        assert!(!live.set_if_current(&old, SharedOutbound::direct()));
+        assert!(Arc::ptr_eq(&manual.0, &live.current().0));
+        assert!(live.set_if_current(&manual, old.clone()));
+        assert!(Arc::ptr_eq(&old.0, &live.current().0));
+    }
+
     #[test]
     fn failure_tracker_triggers_at_threshold() {
         let mut tracker = FailureTracker::new(2);
@@ -413,6 +567,21 @@ mod tests {
             tags: vec![],
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn candidate_filter_excludes_failed_aliases_and_deduplicates() {
+        let a = dead_node("a");
+        let alias = dead_node("alias");
+        let mut b = dead_node("b");
+        b.port = 2;
+        let nodes = vec![a, alias, b];
+        let mut avoided = std::collections::HashMap::new();
+        assert_eq!(eligible_candidates(&nodes, &avoided).len(), 2);
+        avoided.insert(0, tokio::time::Instant::now());
+        let candidates = eligible_candidates(&nodes, &avoided);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, 2);
     }
 
     #[tokio::test]
@@ -506,7 +675,7 @@ mod tests {
         };
         let (events_tx, mut events_rx) = watch::channel(None);
         let mut monitor = HealthMonitor::spawn(setup, events_tx);
-        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 events_rx.changed().await.unwrap();
                 let event = events_rx.borrow().clone();

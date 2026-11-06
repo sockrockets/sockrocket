@@ -57,8 +57,10 @@ shadowsocks = { version = "1", default-features = false, features = [
 quinn = "0.11"
 quinn-proto = { version = "0.11.17", default-features = false }
 sysproxy = "0.3.0"
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+# Production uses ring explicitly; keep TLS 1.2, std and logging without
+# enabling a second crypto backend through default features.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 craft-tls = { package = "tokio-rustls", version = "0.25" }
 webpki-roots = "0.26"
 rustls-pki-types = "1"

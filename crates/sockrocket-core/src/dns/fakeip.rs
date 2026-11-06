@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
+mod persistence;
+use persistence::CoalescingWriter;
+
 /// Fake-IP range: 198.18.0.0/16 — the RFC 2544 benchmarking range, never
 /// routed on the public internet and the de-facto standard for this
 /// purpose (Clash/sing-box use the same). The router's mangle rules do NOT
@@ -87,7 +90,8 @@ pub fn fake_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
 /// stream handler share one instance so an address handed out by the
 /// resolver is always resolvable by the stream handler.
 pub struct FakeIpPool {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
+    writer: Option<CoalescingWriter>,
     persist_path: Option<PathBuf>,
     last_persist: Mutex<Option<Instant>>,
 }
@@ -111,7 +115,7 @@ impl FakeIpPool {
     }
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 next: FIRST_HOST_OFFSET,
                 by_domain: HashMap::new(),
                 by_ip: HashMap::new(),
@@ -119,7 +123,8 @@ impl FakeIpPool {
                 domestic: LruCache::new(
                     NonZeroUsize::new(DOMESTIC_MAX_ENTRIES).expect("capacity is non-zero"),
                 ),
-            }),
+            })),
+            writer: None,
             persist_path: None,
             last_persist: Mutex::new(None),
         })
@@ -130,8 +135,8 @@ impl FakeIpPool {
     /// subsequent [`Self::persist`] / debounced writes from [`Self::allocate`].
     pub fn load_or_new(path: impl Into<PathBuf>) -> Arc<Self> {
         let path = path.into();
-        let pool = Arc::new(Self {
-            inner: Mutex::new(Inner {
+        let mut pool = Self {
+            inner: Arc::new(Mutex::new(Inner {
                 next: FIRST_HOST_OFFSET,
                 by_domain: HashMap::new(),
                 by_ip: HashMap::new(),
@@ -139,10 +144,11 @@ impl FakeIpPool {
                 domestic: LruCache::new(
                     NonZeroUsize::new(DOMESTIC_MAX_ENTRIES).expect("capacity is non-zero"),
                 ),
-            }),
+            })),
+            writer: None,
             persist_path: Some(path.clone()),
             last_persist: Mutex::new(None),
-        });
+        };
         if let Err(e) = pool.load_from(&path) {
             tracing::warn!(
                 "fake-IP store load from {}: {e:#} — starting empty",
@@ -158,7 +164,17 @@ impl FakeIpPool {
                 );
             }
         }
-        pool
+        let inner = pool.inner.clone();
+        let store_path = path.clone();
+        match CoalescingWriter::new(PERSIST_MIN_INTERVAL, move || {
+            persist_snapshot(&inner, &store_path)
+        }) {
+            Ok(writer) => pool.writer = Some(writer),
+            Err(error) => tracing::warn!(
+                "fake-IP background writer unavailable; using synchronous fallback: {error}"
+            ),
+        }
+        Arc::new(pool)
     }
 
     fn load_from(&self, path: &Path) -> std::io::Result<()> {
@@ -205,6 +221,9 @@ impl FakeIpPool {
 
     /// Flush the domain↔IP map to disk. No-op when persistence is disabled.
     pub fn persist(&self) -> std::io::Result<()> {
+        if let Some(writer) = &self.writer {
+            return writer.flush();
+        }
         let mut last = self.last_persist.lock().unwrap_or_else(|e| e.into_inner());
         self.persist_locked(&mut last)
     }
@@ -213,30 +232,16 @@ impl FakeIpPool {
         let Some(path) = self.persist_path.as_ref() else {
             return Ok(());
         };
-        let (next, rows) = {
-            let inner = self.inner.lock().expect("fake-ip pool poisoned");
-            let rows: Vec<(Ipv4Addr, String)> = inner
-                .order
-                .iter()
-                .filter_map(|d| inner.by_domain.get(d).map(|ip| (*ip, d.clone())))
-                .collect();
-            (inner.next, rows)
-        };
-        let mut out = String::from("# sockrocket fake-ip store v1\n");
-        out.push_str(&format!("next={next}\n"));
-        for (ip, domain) in rows {
-            out.push_str(&format!("{ip} {domain}\n"));
-        }
-        // The guard covers snapshot and commit, so concurrent allocations or
-        // shutdown saves cannot rename a shared temporary file out from under
-        // another writer. The shared atomic writer uses a private unique temp.
-        crate::config::storage::atomic_write_private(path, &out, false)
-            .map_err(std::io::Error::other)?;
+        persist_snapshot(&self.inner, path)?;
         *last = Some(Instant::now());
         Ok(())
     }
 
     fn maybe_persist(&self) {
+        if let Some(writer) = &self.writer {
+            writer.schedule();
+            return;
+        }
         let mut last = self.last_persist.lock().unwrap_or_else(|e| e.into_inner());
         if last.is_some_and(|t| t.elapsed() < PERSIST_MIN_INTERVAL) {
             return;
@@ -332,6 +337,31 @@ impl FakeIpPool {
     }
 }
 
+// Called only by the single background writer, or by the serialized fallback
+// if the OS could not create that worker. The pool lock covers snapshotting,
+// never formatting or disk I/O.
+fn persist_snapshot(inner: &Mutex<Inner>, path: &Path) -> std::io::Result<()> {
+    let (next, rows) = {
+        let inner = inner.lock().expect("fake-ip pool poisoned");
+        let rows: Vec<(Ipv4Addr, String)> = inner
+            .order
+            .iter()
+            .filter_map(|d| inner.by_domain.get(d).map(|ip| (*ip, d.clone())))
+            .collect();
+        (inner.next, rows)
+    };
+    let mut out = String::from("# sockrocket fake-ip store v1\n");
+    out.push_str(&format!("next={next}\n"));
+    for (ip, domain) in rows {
+        out.push_str(&format!("{ip} {domain}\n"));
+    }
+    // The writer serializes snapshot and commit, including shutdown barriers.
+    // The shared atomic writer uses a private unique temporary file.
+    crate::config::storage::atomic_write_private(path, &out, false)
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +432,53 @@ mod tests {
         let v6 = IpAddr::V6("2001:db8::1".parse().unwrap());
         pool.record_domestic(v6, "example.cn");
         assert_eq!(pool.lookup_domestic(v6).as_deref(), Some("example.cn"));
+    }
+
+    #[test]
+    fn allocation_and_reverse_lookup_continue_while_disk_is_blocked() {
+        let mut pool = FakeIpPool::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = std::sync::atomic::AtomicBool::new(false);
+        Arc::get_mut(&mut pool).unwrap().writer = Some(
+            CoalescingWriter::new(PERSIST_MIN_INTERVAL, move || {
+                if !blocked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap(),
+        );
+        pool.allocate("first.example");
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        for i in 0..1000 {
+            let host = format!("d{i}.example");
+            let ip = pool.allocate(&host);
+            assert_eq!(pool.lookup(ip).as_deref(), Some(host.as_str()));
+        }
+        release_tx.send(()).unwrap();
+        pool.persist().unwrap();
+    }
+
+    #[test]
+    fn last_pool_drop_flushes_mapping_and_allocation_cursor() {
+        let dir = std::env::temp_dir().join(format!("sockrocket-fakeip-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fakeip.store");
+        let pool = FakeIpPool::load_or_new(&path);
+        pool.allocate("first.example");
+        pool.persist().unwrap();
+        let last = pool.allocate("last.example");
+        drop(pool);
+        let restored = FakeIpPool::load_or_new(&path);
+        assert_eq!(restored.lookup(last).as_deref(), Some("last.example"));
+        assert_eq!(
+            u32::from(restored.allocate("new.example")),
+            u32::from(last) + 1
+        );
+        drop(restored);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

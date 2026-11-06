@@ -54,6 +54,9 @@ ipstack = { workspace = true }
 etherparse = { workspace = true }
 
 [dev-dependencies]
+# Independent ML-KEM/HRR server fixtures require aws-lc, not the production
+# client. Resolver v2 keeps this backend out of release CLI dependencies.
+rustls = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 # Windows: tolerant reading of the proxy registry keys (and PAC cleanup)

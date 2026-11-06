@@ -842,15 +842,6 @@ async fn async_main() -> Result<()> {
     tracing::info!("Shutdown signal received");
     config_watcher.shutdown();
 
-    // Keep the map across a TUN restart (proxy-off starts a new process).
-    // Router stop removes network settings but retains this private cache so
-    // clients with cached Fake-IP DNS answers still work after the next start.
-    if let Some(pool) = &fakeip_pool
-        && let Err(e) = pool.persist()
-    {
-        tracing::warn!("fake-IP store persist on shutdown failed: {e}");
-    }
-
     // Stop the DNS listener before the proxy/TUN so dnsmasq's forwarded
     // queries fail fast instead of hitting a half-torn-down resolver.
     if let Some((shutdown, task)) = dns_listener {
@@ -865,6 +856,16 @@ async fn async_main() -> Result<()> {
         tun.stop().await;
     }
     service.stop().await;
+
+    // Quiesce DNS allocation before the durable Fake-IP flush barrier.
+    // Keep the map across a TUN restart (proxy-off starts a new process).
+    // Router stop removes network settings but retains this private cache so
+    // clients with cached Fake-IP DNS answers still work after the next start.
+    if let Some(pool) = &fakeip_pool
+        && let Err(e) = pool.persist()
+    {
+        tracing::warn!("fake-IP store persist on shutdown failed: {e}");
+    }
 
     if let Err(error) = traffic_ledger.flush() {
         tracing::warn!("traffic ledger flush on shutdown failed: {error:#}");
