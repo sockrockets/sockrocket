@@ -99,6 +99,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 tests/integration/merlin_install_test.py
+          python3 tests/integration/merlin_pack_test.py
           python3 tests/integration/merlin_rpc_test.py
           python3 tests/integration/merlin_update_test.py
           node tests/integration/merlin_update_webui_test.mjs

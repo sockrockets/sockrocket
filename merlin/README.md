@@ -25,6 +25,13 @@ Preset coverage is a curated starting point, not a complete service endpoint lis
 
 Packages are named `sockrocket-merlin-<platform>.tar.gz` with a matching `.valid` tag:
 
+Each package contains one executable at `bin/sockrocket-cli` and one Web UI
+source at `webui/sockrocket.asp`. The bundled installer publishes the Web UI
+to the firmware's required locations, including `Module_sockrocket.asp`.
+Architecture-suffixed duplicate executables and the duplicate `webs/` payload
+are not included; standalone release binary names are unchanged. Packages use
+regular files and directories because the online updater rejects archive links.
+
 | Platform | CPU binary | SoC family |
 |----------|------------|------------|
 | `arm` | armv7 softfloat | BCM4708/4709 |
