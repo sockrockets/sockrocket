@@ -48,17 +48,17 @@ fi
 pack_one() {
   local platform="$1"
   local src_bin="$2"
-  local cpu_arch="$3"   # armv7 | aarch64 — used by install.sh fallback naming
   local work
   work="$(mktemp -d)"
   local pkg="$work/sockrocket"
 
-  mkdir -p "$pkg/bin" "$pkg/webui" "$pkg/scripts" "$pkg/webs" "$pkg/res"
+  mkdir -p "$pkg/bin" "$pkg/webui" "$pkg/scripts" "$pkg/res"
 
-  # Primary name used by install.sh; keep arch-suffixed copy for older scripts.
+  # Both the bundled installer and online updater use this canonical path.
+  # Do not duplicate the binary under an architecture suffix or add links:
+  # online updates deliberately accept only regular files and directories.
   cp "$src_bin" "$pkg/bin/sockrocket-cli"
-  cp "$src_bin" "$pkg/bin/sockrocket-cli-${cpu_arch}"
-  chmod +x "$pkg/bin/sockrocket-cli" "$pkg/bin/sockrocket-cli-${cpu_arch}"
+  chmod +x "$pkg/bin/sockrocket-cli"
 
   cp "$ROOT/merlin/install.sh" "$ROOT/merlin/uninstall.sh" \
      "$ROOT/merlin/config.yaml.template" "$ROOT/merlin/version" "$pkg/"
@@ -70,7 +70,7 @@ pack_one() {
      "$ROOT/merlin/scripts/sockrocket_status.sh" \
      "$pkg/scripts/"
   cp "$ROOT/merlin/webui/sockrocket.asp" "$pkg/webui/sockrocket.asp"
-  cp "$ROOT/merlin/webui/sockrocket.asp" "$pkg/webs/Module_sockrocket.asp"
+  # install.sh publishes this source to koolshare/webs/Module_sockrocket.asp.
   if [ -f "$ROOT/merlin/res/icon-sockrocket.png" ]; then
     cp "$ROOT/merlin/res/icon-sockrocket.png" "$pkg/res/icon-sockrocket.png"
   fi
@@ -94,17 +94,17 @@ pack_one() {
 }
 
 # aarch64 platforms
-pack_one hnd_v8 "$AARCH64_BIN" aarch64
-pack_one mtk    "$AARCH64_BIN" aarch64
-pack_one ipq64  "$AARCH64_BIN" aarch64
+pack_one hnd_v8 "$AARCH64_BIN"
+pack_one mtk    "$AARCH64_BIN"
+pack_one ipq64  "$AARCH64_BIN"
 
 # armv7 hardfloat platforms
-pack_one hnd   "$ARMV7HF_BIN" armv7
-pack_one qca   "$ARMV7HF_BIN" armv7
-pack_one ipq32 "$ARMV7HF_BIN" armv7
+pack_one hnd   "$ARMV7HF_BIN"
+pack_one qca   "$ARMV7HF_BIN"
+pack_one ipq32 "$ARMV7HF_BIN"
 
 # legacy arm (prefer softfloat when available)
-pack_one arm "$ARMV7SF_BIN" armv7
+pack_one arm "$ARMV7SF_BIN"
 
 # Standalone binaries for --online / manual replace
 cp "$AARCH64_BIN" "$OUT_DIR/sockrocket-cli-linux-aarch64"
