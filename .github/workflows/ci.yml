@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
-    branches: ["main", "master", "dev", "feat/**", "fix/**"]
+    branches: ["main", "master", "dev", "feat/**", "fix/**", "codex/**"]
   pull_request:
     branches: ["main", "master", "dev"]
 
@@ -223,6 +224,7 @@ jobs:
         with:
           filters: |
             merlin:
+              - '.github/workflows/ci.yml'
               - 'crates/sockrocket-core/**'
               - 'crates/sockrocket-cli/**'
               - 'crates/craftls/**'
@@ -269,6 +271,7 @@ jobs:
         with:
           filters: |
             merlin:
+              - '.github/workflows/ci.yml'
               - 'crates/sockrocket-core/**'
               - 'crates/sockrocket-cli/**'
               - 'crates/craftls/**'
