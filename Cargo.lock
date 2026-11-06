@@ -6384,10 +6384,11 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-cli"
-version = "0.0.16"
+version = "0.0.18"
 dependencies = [
  "anyhow",
  "base64",
+ "libc",
  "rand 0.9.4",
  "serde",
  "serde_json",
@@ -6402,7 +6403,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-core"
-version = "0.0.16"
+version = "0.0.18"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6458,7 +6459,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-gui"
-version = "0.0.16"
+version = "0.0.18"
 dependencies = [
  "anyhow",
  "chrono",

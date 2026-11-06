@@ -48,9 +48,8 @@ async fn raw_txt_and_nxdomain_are_preserved() {
 }
 #[tokio::test]
 async fn truncated_udp_retries_same_upstream_over_tcp() {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (udp, tcp) = super::listener::bind_test_sockets().await.unwrap();
     let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).await.unwrap();
     let server = tokio::spawn(async move {
         let mut buf = [0; 4096];
         let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
@@ -84,15 +83,15 @@ async fn tcp_listener_answers_multiple_frames_and_stops_idle_clients() {
             upstream.send_to(&txt_reply(&buf[..n]), peer).await.unwrap();
         }
     });
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = probe.local_addr().unwrap();
-    drop(probe);
+    let (udp, tcp) = super::listener::bind_test_sockets().await.unwrap();
+    let address = tcp.local_addr().unwrap();
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let task = tokio::spawn(serve_dns_udp(
-        "127.0.0.1",
-        address.port(),
+    let task = tokio::spawn(super::listener::serve_bound(
+        udp,
+        tcp,
         resolver,
         shutdown.clone(),
+        None,
     ));
     let mut client = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

@@ -1145,19 +1145,19 @@ impl TlsConnFactory {
             _ => None,
         };
         let mut tls_config = tls_config;
-        if transport.is_some_and(|t| t.transport_type == TransportType::Xhttp) {
-            if let Some(tls) = tls_config.as_mut() {
-                let alpn = if transport.is_some_and(|t| t.reality.is_some()) {
-                    "h2"
-                } else {
-                    match tls.alpn.as_deref() {
-                        Some([one]) if one == "http/1.1" => "http/1.1",
-                        Some([one]) if one == "h3" => "h3",
-                        _ => "h2",
-                    }
-                };
-                tls.alpn = Some(vec![alpn.into()]);
-            }
+        if transport.is_some_and(|t| t.transport_type == TransportType::Xhttp)
+            && let Some(tls) = tls_config.as_mut()
+        {
+            let alpn = if transport.is_some_and(|t| t.reality.is_some()) {
+                "h2"
+            } else {
+                match tls.alpn.as_deref() {
+                    Some([one]) if one == "http/1.1" => "http/1.1",
+                    Some([one]) if one == "h3" => "h3",
+                    _ => "h2",
+                }
+            };
+            tls.alpn = Some(vec![alpn.into()]);
         }
         let mut factory = Self::build(
             server,

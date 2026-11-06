@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
-    branches: ["main", "master", "dev", "feat/**", "fix/**"]
+    branches: ["main", "master", "dev", "feat/**", "fix/**", "codex/**"]
   pull_request:
     branches: ["main", "master", "dev"]
 
@@ -23,7 +24,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: linux-aarch64
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: macos-x86_64
           - os: macos-latest
@@ -99,6 +100,8 @@ jobs:
         run: |
           python3 tests/integration/merlin_install_test.py
           python3 tests/integration/merlin_rpc_test.py
+          python3 tests/integration/merlin_update_test.py
+          node tests/integration/merlin_update_webui_test.mjs
           node tests/integration/webui_transport_test.cjs
           node tests/integration/webui_subscription_jobs_test.cjs
           node tests/integration/webui_rule_flow_test.cjs
@@ -221,6 +224,7 @@ jobs:
         with:
           filters: |
             merlin:
+              - '.github/workflows/ci.yml'
               - 'crates/sockrocket-core/**'
               - 'crates/sockrocket-cli/**'
               - 'crates/craftls/**'
@@ -228,6 +232,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'merlin/**'
+              - 'tools/build-merlin-cross.sh'
+              - 'tools/verify-merlin-allocator.py'
 
       - name: Install cross
         if: steps.changes.outputs.merlin == 'true'
@@ -235,9 +241,13 @@ jobs:
         with:
           tool: cross
 
+      - name: Install ARM64 artifact inspection tools
+        if: steps.changes.outputs.merlin == 'true' && matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update -y && sudo apt-get install -y llvm
+
       - name: Cross-compile CLI (${{ matrix.name }})
         if: steps.changes.outputs.merlin == 'true'
-        run: cross build --release --package sockrocket-cli --target ${{ matrix.target }}
+        run: bash tools/build-merlin-cross.sh ${{ matrix.target }}
 
       - name: Upload binary artifact
         if: steps.changes.outputs.merlin == 'true'
@@ -261,6 +271,7 @@ jobs:
         with:
           filters: |
             merlin:
+              - '.github/workflows/ci.yml'
               - 'crates/sockrocket-core/**'
               - 'crates/sockrocket-cli/**'
               - 'crates/craftls/**'
@@ -268,6 +279,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'merlin/**'
+              - 'tools/build-merlin-cross.sh'
+              - 'tools/verify-merlin-allocator.py'
 
       - name: Download aarch64 binary
         if: steps.changes.outputs.merlin == 'true'

@@ -26,6 +26,40 @@ pub fn resolve_members(group: &ProxyGroupConfig, nodes: &[Node]) -> Vec<usize> {
         .collect()
 }
 
+/// Temporary index for one immutable configuration snapshot. Never retained
+/// across subscription updates; first occurrence and member order are preserved.
+pub(crate) struct NodeIndex(std::collections::HashMap<String, usize>);
+
+impl NodeIndex {
+    pub(crate) fn new(nodes: &[Node]) -> Self {
+        let mut index = std::collections::HashMap::with_capacity(nodes.len());
+        for (position, node) in nodes.iter().enumerate() {
+            index.entry(node_fingerprint(node)).or_insert(position);
+        }
+        Self(index)
+    }
+
+    pub(crate) fn get(&self, fingerprint: &str) -> Option<usize> {
+        self.0.get(fingerprint).copied()
+    }
+
+    pub(crate) fn resolve_members(&self, group: &ProxyGroupConfig) -> Vec<usize> {
+        group.members.iter().filter_map(|fp| self.get(fp)).collect()
+    }
+
+    pub(crate) fn selected_member(&self, group: &ProxyGroupConfig) -> Option<usize> {
+        match &group.current {
+            Some(current) => group
+                .members
+                .iter()
+                .any(|fp| fp == current)
+                .then(|| self.get(current))
+                .flatten(),
+            None => group.members.iter().find_map(|fp| self.get(fp)),
+        }
+    }
+}
+
 /// `url-test` pick: the member with the lowest successful probe latency.
 /// Returns the node's fingerprint (to store in `group.current`), or `None`
 /// when no member probed successfully.
@@ -173,6 +207,7 @@ pub fn validate_targets(
         }
     }
     for rule in rules {
+        crate::router::validate_rule(rule)?;
         if let Some(name) = rule.target.strip_prefix("group:")
             && !names.contains(name)
         {
@@ -248,6 +283,79 @@ mod tests {
     fn resolve_members_empty_group() {
         let nodes = vec![ss("a", "1.1.1.1", 8388, "pw")];
         assert!(resolve_members(&group(vec![]), &nodes).is_empty());
+    }
+
+    #[test]
+    fn indexed_groups_preserve_duplicates_stale_members_and_selection() {
+        let nodes = vec![
+            ss("first", "1.1.1.1", 8388, "pw"),
+            ss("renamed duplicate", "1.1.1.1", 8388, "pw"),
+            ss("other", "2.2.2.2", 8388, "pw"),
+        ];
+        let fp = fps(&nodes);
+        let index = NodeIndex::new(&nodes);
+        for members in [
+            vec![],
+            vec!["removed".into()],
+            vec![
+                fp[2].clone(),
+                "removed".into(),
+                fp[0].clone(),
+                fp[1].clone(),
+            ],
+            vec![fp[0].clone()],
+        ] {
+            for current in [
+                None,
+                Some(fp[0].clone()),
+                Some(fp[2].clone()),
+                Some("removed".into()),
+            ] {
+                let mut g = group(members.clone());
+                g.current = current;
+                assert_eq!(index.resolve_members(&g), resolve_members(&g, &nodes));
+                assert_eq!(index.selected_member(&g), selected_member(&g, &nodes));
+            }
+        }
+        assert_eq!(index.get(&fp[1]), Some(0));
+        let refreshed = vec![nodes[2].clone(), nodes[0].clone()];
+        assert_eq!(NodeIndex::new(&refreshed).get(&fp[0]), Some(1));
+    }
+
+    #[test]
+    #[ignore = "manual CPU comparison; no network or router configuration changes"]
+    fn benchmark_group_snapshot_index() {
+        use std::{hint::black_box, time::Instant};
+        let nodes: Vec<_> = (0..1000)
+            .map(|i| ss("node", "example.invalid", 10000 + i, "pw"))
+            .collect();
+        let fp = fps(&nodes);
+        let groups: Vec<_> = (0..32)
+            .map(|g| {
+                group(
+                    (0..128)
+                        .map(|m| fp[(g * 31 + m * 7) % nodes.len()].clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        let start = Instant::now();
+        let expected: Vec<_> = groups
+            .iter()
+            .map(|g| resolve_members(black_box(g), black_box(&nodes)))
+            .collect();
+        let linear = start.elapsed();
+        let start = Instant::now();
+        let index = NodeIndex::new(black_box(&nodes));
+        let actual: Vec<_> = groups
+            .iter()
+            .map(|g| index.resolve_members(black_box(g)))
+            .collect();
+        let indexed = start.elapsed();
+        assert_eq!(actual, expected);
+        eprintln!(
+            "1000 nodes / 32 groups / 128 members: linear={linear:?}, indexed including construction={indexed:?}"
+        );
     }
 
     #[test]

@@ -3018,12 +3018,17 @@ impl AppState {
                                 ));
                             }
                             let mtu_targets = if manual_mtu.is_none() {
-                                node.as_ref().map(|n| resolve_to_ips(&n.server)).unwrap_or_default()
+                                node.as_ref()
+                                    .map(|n| resolve_to_ips(&n.server))
+                                    .unwrap_or_default()
                             } else {
                                 Vec::new()
                             };
                             let mtu = sockrocket_core::proxy::tun::mtu::select(
-                                node.as_ref(), &mtu_targets, manual_mtu, mtu_cache.as_deref(),
+                                node.as_ref(),
+                                &mtu_targets,
+                                manual_mtu,
+                                mtu_cache.as_deref(),
                             )?;
                             let tun_proxy = TunProxy::start_with_mtu_and_stats(
                                 tun_outbound, None, None, tun_stats, mtu,
@@ -5696,13 +5701,13 @@ pub(crate) fn load_gui_state() -> Option<AppConfig> {
     }
     match std::fs::read_to_string(&path)
         .ok()
-        .and_then(|content| serde_yaml::from_str(&content).ok())
+        .and_then(|content| AppConfig::from_yaml_str(&content).ok())
     {
         Some(config) => Some(config),
         None => {
             tracing::error!("GUI configuration could not be loaded; trying private backup");
             let content = std::fs::read_to_string(path.with_extension("yaml.bak")).ok()?;
-            serde_yaml::from_str(&content).ok()
+            AppConfig::from_yaml_str(&content).ok()
         }
     }
 }

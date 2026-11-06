@@ -337,17 +337,18 @@ impl Settings {
             &options.uplink_data_key,
             &options.x_padding_key,
             &options.x_padding_header,
-        ] {
-            if let Some(key) = key {
-                ensure!(
-                    !key.is_empty()
-                        && key.len() <= 128
-                        && key
-                            .bytes()
-                            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
-                    "Invalid XHTTP metadata key"
-                );
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(
+                !key.is_empty()
+                    && key.len() <= 128
+                    && key
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
+                "Invalid XHTTP metadata key"
+            );
         }
         ensure!(
             options.xmux.max_concurrency.is_none() || options.xmux.max_connections.is_none(),

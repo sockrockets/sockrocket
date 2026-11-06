@@ -307,9 +307,8 @@ async fn direct_tcp_and_udp_use_direct_dns_after_proxy_answer_is_cached() {
     use crate::proxy::routing::RoutingOutbound;
     use crate::router::{MatchRule, RouteAction, Router, RuleSet};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (udp, tcp) = super::listener::bind_test_sockets().await.unwrap();
     let port = tcp.local_addr().unwrap().port();
-    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).await.unwrap();
     let echo = tokio::spawn(async move {
         let (mut stream, _) = tcp.accept().await.unwrap();
         let mut buf = [0; 1];

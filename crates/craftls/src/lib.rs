@@ -495,7 +495,7 @@ pub mod client {
 
 pub use crate::compression::{
     BrotliParams, CertificateCompression, CompressionProvider, ZlibParams, ZstdParams,
-    BROTLI_DEFAULT, ZLIB_DEFAULT, ZSTD_DEFAULT,
+    BROTLI_DEFAULT, ZLIB_DEFAULT, ZSTD_DEFAULT, client_certificate_decompressor,
 };
 pub use client::{ClientConfig, ClientConnection};
 pub use msgs::enums::CertificateCompressionAlgorithm;

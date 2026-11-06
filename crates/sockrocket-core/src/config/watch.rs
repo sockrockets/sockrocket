@@ -36,6 +36,9 @@ pub fn config_content_hash(content: &str) -> u64 {
 pub struct ReloadedConfig {
     /// The newly parsed config.
     pub config: AppConfig,
+    /// Effective DNS policy, including legacy Merlin fields, parsed from the
+    /// same file contents as `config`. Consumers must not re-read the file.
+    pub dns_settings: super::dns::DnsSettings,
     /// Fields that changed relative to the running baseline and only take
     /// effect after a service restart (e.g. `listen_addr`, `socks_port`).
     pub requires_restart: Vec<String>,
@@ -145,8 +148,8 @@ impl ConfigWatcher {
                     }
                 }
 
-                match AppConfig::from_yaml_str(&content) {
-                    Ok(config) => {
+                match parse_reload(&content) {
+                    Ok((config, dns_settings)) => {
                         let requires_restart = {
                             let mut state = task_state.lock().unwrap();
                             state.content_hash = hash;
@@ -160,6 +163,7 @@ impl ConfigWatcher {
                         let _ = events_tx
                             .send(ConfigWatchEvent::Reloaded(Box::new(ReloadedConfig {
                                 config,
+                                dns_settings,
                                 requires_restart,
                             })))
                             .await;
@@ -219,6 +223,13 @@ impl Drop for ConfigWatcher {
 
 fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn parse_reload(content: &str) -> anyhow::Result<(AppConfig, super::dns::DnsSettings)> {
+    let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
+    let dns_settings = super::dns::DnsSettings::from_yaml(&raw)?;
+    let config = AppConfig::from_yaml_value(raw)?;
+    Ok((config, dns_settings))
 }
 
 /// Compare the restart-relevant listen fields against the running baseline.
@@ -301,6 +312,36 @@ mod tests {
     fn content_hash_is_stable() {
         assert_eq!(config_content_hash("abc"), config_content_hash("abc"));
         assert_ne!(config_content_hash("abc"), config_content_hash("abd"));
+    }
+
+    #[test]
+    fn reload_captures_legacy_dns_and_nodes_from_one_revision() {
+        let mut config = AppConfig::default();
+        config.nodes.push(node("revision-a"));
+        let content = format!(
+            "{}\ndns_direct_server: 9.9.9.9\n",
+            serde_yaml::to_string(&config).unwrap()
+        );
+        let (snapshot, dns) = parse_reload(&content).unwrap();
+        config.nodes[0].name = "revision-b".into();
+        let next = format!(
+            "{}\ndns_direct_server: 1.1.1.1\n",
+            serde_yaml::to_string(&config).unwrap()
+        );
+        let (_, next_dns) = parse_reload(&next).unwrap();
+        assert_eq!(snapshot.nodes[0].name, "revision-a");
+        assert_eq!(dns.direct_servers, vec!["udp://9.9.9.9:53"]);
+        assert_eq!(next_dns.direct_servers, vec!["udp://1.1.1.1:53"]);
+    }
+
+    #[test]
+    fn reload_rejects_bad_legacy_dns_and_honors_explicit_policy() {
+        let mut config = AppConfig::default();
+        let legacy = "\ndns_direct_server: invalid\n";
+        assert!(parse_reload(&(serde_yaml::to_string(&config).unwrap() + legacy)).is_err());
+        config.dns = Some(super::super::dns::DnsSettings::default());
+        let (_, dns) = parse_reload(&(serde_yaml::to_string(&config).unwrap() + legacy)).unwrap();
+        assert_eq!(dns, config.dns.unwrap());
     }
 
     #[tokio::test]

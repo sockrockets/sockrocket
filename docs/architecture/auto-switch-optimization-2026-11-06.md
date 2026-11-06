@@ -19,3 +19,9 @@
 原始测试与编译日志：`.local/auto-switch-review/`。本轮没有进行路由器端 HTTPS 连通率、故障恢复时间或吞吐对照测量；代码测试通过不能替代线上网络验证。仍待后续优化：候选多轮评分、主动预验证备用池、GPT 固定线路独立健康策略。
 
 验证结果：`cargo test -p sockrocket-core -p sockrocket-cli --lib --bins --offline` 共 692 通过、0 失败、9 忽略；`cargo check -p sockrocket-gui --offline` 通过；`git diff --check` 通过。依赖及已有未使用代码警告仍存在。
+
+## PR #24 合并同步
+
+已将 `origin/main` 的 `ece88bc` 合入功能分支，工作区版本随主分支更新为 0.0.18。保留主分支的 DNS 在途查询引用计数修复、订阅节点身份恢复、守护进程健康探测、MTU 缓存与资源预算改进，同时保留本报告所述自动切换和持久化优化。此同步未部署路由器。
+
+合并后验证：core、CLI、ipstack 的库/二进制/集成测试 868 通过、0 失败、22 忽略；桌面端编译检查通过；Merlin 脚本 45 个稳定性场景通过；差异空白检查通过。日志位于 `.local/merge-pr24/`。

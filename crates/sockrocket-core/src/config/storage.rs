@@ -222,6 +222,8 @@ pub fn write_nodes_and_subscriptions(
 ) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    // Migrate references against the old catalog before replacing its nodes.
+    super::node_identity::migrate_references(&mut value)?;
     let Some(map) = value.as_mapping_mut() else {
         anyhow::bail!("config root is not a mapping");
     };

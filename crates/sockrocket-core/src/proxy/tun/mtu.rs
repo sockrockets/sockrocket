@@ -81,13 +81,22 @@ pub fn select(
     let mut observed = false;
     // Bound work even for multi-address DNS answers. Inconclusive/unexamined
     // paths cap the result at the fallback; probing one IP proves no others.
-    for target in targets.iter().take(CACHE_ENTRIES) {
+    for (path_index, target) in targets.iter().take(CACHE_ENTRIES).enumerate() {
+        let family = if target.is_ipv4() { "ipv4" } else { "ipv6" };
         let Some(link) = inspect_link(*target, deadline) else {
             if route_unreachable(*target, deadline) {
-                tracing::info!(%target, "TUN MTU: skipping node address with no outbound route");
+                tracing::info!(
+                    path_index,
+                    family,
+                    "TUN MTU: skipping node address with no outbound route"
+                );
                 continue;
             }
-            tracing::info!(%target, "TUN MTU: egress discovery unavailable; using conservative fallback");
+            tracing::info!(
+                path_index,
+                family,
+                "TUN MTU: egress discovery unavailable; using conservative fallback"
+            );
             selected = selected.min(FALLBACK_MTU);
             continue;
         };
@@ -124,7 +133,7 @@ pub fn select(
             }
             None => fallback,
         };
-        tracing::info!(%target, link_mtu = link.interface_mtu, route_mtu = link.mtu, path_mtu = ?measured, reused = cached.is_some(), reserve, mtu,
+        tracing::info!(path_index, family, link_mtu = link.interface_mtu, route_mtu = link.mtu, path_mtu = ?measured, reused = cached.is_some(), reserve, mtu,
             "TUN startup MTU (outer-path ICMP is advisory, not proxy validation)");
         selected = selected.min(mtu);
     }
@@ -431,13 +440,7 @@ fn inspect_link(target: IpAddr, deadline: Instant) -> Option<Link> {
         if mtu < MIN_MTU {
             return None;
         }
-        // Route output contains expiring metrics. Use stable identity fields.
-        let fingerprint = format!(
-            "{}|{}|{}",
-            iface,
-            token_after(&route, "gateway:").unwrap_or(""),
-            config
-        );
+        let fingerprint = macos_route_fingerprint(&route, &config, mtu)?;
         Some(Link {
             interface_mtu: mtu,
             mtu,
@@ -449,6 +452,19 @@ fn inspect_link(target: IpAddr, deadline: Instant) -> Option<Link> {
         let _ = (target, deadline);
         None
     }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_route_fingerprint(route: &str, config: &str, link_mtu: u16) -> Option<String> {
+    // Avoid MAC addresses, address lifetimes and volatile interface flags.
+    Some(format!(
+        "route-v2|{}|{}|{}|{}|{}",
+        token_after(route, "interface:")?,
+        link_mtu,
+        token_after(route, "gateway:").unwrap_or(""),
+        token_after(config, "inet").unwrap_or(""),
+        token_after(config, "inet6").unwrap_or(""),
+    ))
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -671,7 +687,7 @@ mod tests {
 
     #[test]
     fn route_identity_ignores_cache_expiry_but_tracks_network_changes() {
-        let base = "43.207.59.210 via 192.168.1.1 dev eth0 src 192.168.1.2 uid 0\n cache";
+        let base = "203.0.113.10 via 192.0.2.1 dev eth0 src 192.0.2.2 uid 0\n cache";
         let learned = format!("{base} expires 597sec mtu 1492");
         assert_eq!(
             linux_route_fingerprint(base, 1500),
@@ -679,11 +695,31 @@ mod tests {
         );
         assert_ne!(
             linux_route_fingerprint(base, 1500),
-            linux_route_fingerprint(&base.replace("192.168.1.1", "192.168.1.254"), 1500)
+            linux_route_fingerprint(&base.replace("192.0.2.1", "192.0.2.254"), 1500)
         );
         assert_ne!(
             linux_route_fingerprint(base, 1500),
             linux_route_fingerprint(base, 1492)
+        );
+    }
+
+    #[test]
+    fn macos_cache_identity_ignores_lifetimes_and_tracks_address_changes() {
+        let route = "gateway: 192.0.2.1 interface: en0 expire: 60";
+        let config =
+            "en0: flags=8863 mtu 1500 inet 192.0.2.2 inet6 fe80::1 pltime 3600 vltime 7200";
+        let key = macos_route_fingerprint(route, config, 1500);
+        assert_eq!(
+            key,
+            macos_route_fingerprint(
+                &route.replace("60", "30"),
+                &config.replace("3600", "3000"),
+                1500
+            )
+        );
+        assert_ne!(
+            key,
+            macos_route_fingerprint(route, &config.replace("192.0.2.2", "192.0.2.3"), 1500)
         );
     }
 

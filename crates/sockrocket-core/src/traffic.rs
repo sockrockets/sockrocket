@@ -356,6 +356,35 @@ impl std::fmt::Debug for TrafficLedger {
 }
 
 impl TrafficLedger {
+    /// Run before recording with a newly loaded catalog. Old collisions retain
+    /// their historical first-node attribution; migration is idempotent.
+    pub fn migrate_node_identities(&self, nodes: &[crate::config::model::Node]) {
+        let mut changed = false;
+        let mut history = self.history.lock().unwrap();
+        for node in nodes {
+            let old = crate::node_public_id(&crate::config::dedup::legacy_node_fingerprint(node));
+            if let Some(previous) = history.remove(&old) {
+                let new = crate::node_public_id(&crate::node_fingerprint(node));
+                let target = history.entry(new).or_insert_with(|| NodeHistory {
+                    name: node.name.clone(),
+                    months: BTreeMap::new(),
+                });
+                for (month, entry) in previous.months {
+                    let current = target
+                        .months
+                        .entry(month)
+                        .or_insert(MonthEntry { up: 0, down: 0 });
+                    current.up = current.up.saturating_add(entry.up);
+                    current.down = current.down.saturating_add(entry.down);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// Load durable history from `path` (if present) and start a fresh session.
     pub fn load_or_new(path: impl Into<PathBuf>) -> Arc<Self> {
         let path = path.into();

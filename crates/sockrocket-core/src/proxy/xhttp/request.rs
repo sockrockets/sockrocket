@@ -90,8 +90,8 @@ fn padding(length: usize, method: &str) -> String {
         }
     }
     let mut s = String::new();
-    let mut n = 0;
-    while (n + 7) / 8 < length {
+    let mut n: usize = 0;
+    while n.div_ceil(8) < length {
         let c = TABLE[rand::random::<u32>() as usize % TABLE.len()];
         s.push(c as char);
         n += bits(c);

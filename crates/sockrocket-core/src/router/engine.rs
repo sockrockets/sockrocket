@@ -13,6 +13,44 @@ pub use trace::{RouteTrace, RouteTraceStep};
 /// Maximum number of cached route decisions.
 const ROUTE_CACHE_CAP: usize = 4096;
 
+/// Validate saved rules before publishing a new runtime. Invalid enabled
+/// rules must not silently disappear or turn an unknown target into proxy.
+pub fn validate_rule(rule: &RoutingRule) -> Result<(), &'static str> {
+    if !rule.enabled {
+        return Ok(());
+    }
+    let target = rule.target.as_str();
+    if !matches!(
+        target.to_ascii_lowercase().as_str(),
+        "direct" | "proxy" | "reject" | "block"
+    ) && !target
+        .strip_prefix("group:")
+        .is_some_and(crate::config::group::valid_group_name)
+        && crate::config::group::node_target_id(target).is_none()
+    {
+        return Err("Invalid routing target");
+    }
+    match rule.rule_type.to_ascii_lowercase().as_str() {
+        "domain" | "domain-suffix" | "domain-keyword" => {
+            if rule.pattern.trim_matches('.').is_empty()
+                || rule.pattern.chars().any(char::is_whitespace)
+            {
+                return Err("Invalid domain routing pattern");
+            }
+        }
+        "ip-cidr" if parse_cidr(&rule.pattern).is_some() => {}
+        "geoip"
+            if rule.pattern.eq_ignore_ascii_case("PRIVATE")
+                || (rule.pattern.len() == 2
+                    && rule.pattern.bytes().all(|b| b.is_ascii_alphabetic())) => {}
+        "dst-port" | "port" if parse_port_range(&rule.pattern).is_some_and(|(min, _)| min > 0) => {}
+        "match" | "final" => {}
+        _ => return Err("Unknown rule type or invalid routing pattern"),
+    }
+    normalize_rule_source(&rule.source).map_err(|_| "Invalid routing source")?;
+    Ok(())
+}
+
 /// Action to take for a matched connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteAction {

@@ -314,7 +314,8 @@ fn ykey(k: &str) -> Y {
 
 fn load_conf() -> Result<Mapping> {
     let content = fs::read_to_string(conf_path()).context("Config file not found")?;
-    let value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
+    let mut value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
+    sockrocket_core::config::node_identity::migrate_references(&mut value)?;
     match value {
         Y::Mapping(m) => Ok(m),
         Y::Null => Ok(Mapping::new()),
@@ -602,6 +603,7 @@ fn act_status() -> J {
         "cn_ipset_direct": conf_bool(&map, "cn_ipset_direct", false),
         "version": version_string(),
         "health": health,
+        "watchdog": if running { pid.parse::<u32>().ok().map(crate::daemon_health::summary).unwrap_or(J::Null) } else { J::Null },
     })
 }
 
@@ -918,7 +920,8 @@ fn persist_subscription_state(cfg: &sockrocket_core::AppConfig) -> Result<usize,
 fn load_app_config() -> Result<sockrocket_core::AppConfig, String> {
     let content =
         fs::read_to_string(conf_path()).map_err(|e| format!("Failed to read config: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| format!("Config parse failed: {e}"))
+    sockrocket_core::AppConfig::from_yaml_str(&content)
+        .map_err(|e| format!("Config parse failed: {e}"))
 }
 
 fn act_add_sub(post: &J) -> J {
@@ -1252,10 +1255,10 @@ fn act_update_subs() -> J {
     })
 }
 
-fn active_http_port() -> u16 {
+fn socks_port() -> u16 {
     load_conf()
-        .map(|m| conf_u16(&m, "http_port", 1087))
-        .unwrap_or(1087)
+        .map(|m| conf_u16(&m, "socks_port", 1080))
+        .unwrap_or(1080)
 }
 
 /// Cap concurrent node probes on the router. Each probe spins a current-thread
@@ -1272,36 +1275,17 @@ fn speedtest_semaphore() -> &'static tokio::sync::Semaphore {
 /// Per-node list probes use [`act_speedtest_node`] so every node is measured
 /// the same way (warm through-proxy), not a mix of SOCKS vs cold outbound.
 ///
-/// Use the local HTTP proxy because router curl builds may omit SOCKS support.
-/// Absolute HTTP URLs leave target name resolution to the daemon.
+/// Resolve through the running daemon, independent of firmware curl features.
 fn latency_via_active_socks() -> Result<u32, String> {
-    let out = run_cmd(
-        "curl",
-        &[
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{time_total}|%{http_code}",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "15",
-            "--noproxy",
-            "",
-            "--proxy",
-            &format!("http://127.0.0.1:{}", active_http_port()),
-            "http://www.gstatic.com/generate_204",
-        ],
-    )
-    .ok_or_else(|| "Connection failed or timed out".to_string())?;
-    let mut parts = out.trim().split('|');
-    let conn: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let code = parts.next().unwrap_or("");
-    if code == "204" || code == "200" {
-        Ok((conn * 1000.0) as u32)
-    } else {
-        Err("Connection failed or timed out".into())
+    let start = std::time::Instant::now();
+    match crate::proxy_http::get(
+        socks_port(),
+        "www.gstatic.com",
+        "/generate_204",
+        Duration::from_secs(15),
+    ) {
+        Ok((200 | 204, _)) => Ok(start.elapsed().as_millis().min(u32::MAX as u128) as u32),
+        _ => Err("Connection failed or timed out".into()),
     }
 }
 
@@ -1319,23 +1303,15 @@ fn act_ip_check() -> J {
     if !is_running() {
         return json!({"ok": false, "ip": "", "country": "", "msg": "Sockrocket is not running; start the service first"});
     }
-    let out = run_cmd(
-        "curl",
-        &[
-            "-s",
-            "--connect-timeout",
-            "8",
-            "--max-time",
-            "12",
-            "--noproxy",
-            "",
-            "--proxy",
-            &format!("http://127.0.0.1:{}", active_http_port()),
-            "http://ip-api.com/json?fields=query,country",
-        ],
-    )
-    .unwrap_or_default();
-    let parsed: J = serde_json::from_str(&out).unwrap_or(J::Null);
+    let parsed: J = match crate::proxy_http::get(
+        socks_port(),
+        "ip-api.com",
+        "/json?fields=query,country",
+        Duration::from_secs(12),
+    ) {
+        Ok((200, body)) => serde_json::from_slice(&body).unwrap_or(J::Null),
+        _ => J::Null,
+    };
     let ip = parsed.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let country = parsed.get("country").and_then(|v| v.as_str()).unwrap_or("");
     if ip.is_empty() {

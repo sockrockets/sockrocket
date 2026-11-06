@@ -49,9 +49,14 @@ impl DnsResolver {
             };
             let mut map = self.wire_inflight.lock().unwrap();
             let cell = if let Some(cell) = map.get(&inflight_key) {
+                cell.users
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Some(cell.clone())
             } else if map.len() < self.config.cache_capacity.clamp(16, 1024) {
-                let cell = Arc::new(tokio::sync::OnceCell::new());
+                let cell = Arc::new(WireInflight {
+                    reply: tokio::sync::OnceCell::new(),
+                    users: std::sync::atomic::AtomicUsize::new(1),
+                });
                 map.insert(inflight_key.clone(), cell.clone());
                 Some(cell)
             } else {
@@ -73,6 +78,7 @@ impl DnsResolver {
         // orphan exchange continues after the last caller goes away.
         let reply = guard
             .cell
+            .reply
             .get_or_init(|| async {
                 self.exchange_raw_uncached(query, key, servers)
                     .await

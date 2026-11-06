@@ -52,7 +52,7 @@ jobs:
             gui_out: sockrocket-macos-aarch64.dmg
             arch_label: aarch64
             artifact: sockrocket-macos-aarch64
-          - os: macos-14
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             cli_bin: sockrocket-cli
             gui_bin: sockrocket
@@ -209,8 +209,12 @@ jobs:
         with:
           tool: cross
 
+      - name: Install ARM64 artifact inspection tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update -y && sudo apt-get install -y llvm
+
       - name: Cross-compile CLI (${{ matrix.name }})
-        run: cross build --package sockrocket-cli --release --target ${{ matrix.target }}
+        run: bash tools/build-merlin-cross.sh ${{ matrix.target }}
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

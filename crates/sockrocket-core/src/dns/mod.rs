@@ -177,7 +177,11 @@ struct LookupAnswer {
     addresses: Vec<IpAddr>,
     ttl: u32,
 }
-type InflightEntry = Arc<tokio::sync::OnceCell<Result<LookupAnswer, String>>>;
+struct InflightLookup {
+    reply: tokio::sync::OnceCell<Result<LookupAnswer, String>>,
+    users: std::sync::atomic::AtomicUsize,
+}
+type InflightEntry = Arc<InflightLookup>;
 type InflightMap = Arc<std::sync::Mutex<HashMap<CacheKey, InflightEntry>>>;
 
 // Synchronous cleanup also runs when a DNS request future is cancelled.
@@ -190,8 +194,13 @@ struct InflightGuard {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         let mut map = self.map.lock().unwrap();
-        // Keep the shared cell while another caller is still using it.
-        if Arc::strong_count(&self.cell) == 2
+        // Arc fields are dropped after this method; count callers under the
+        // registry lock rather than inferring them from transient Arc owners.
+        if self
+            .cell
+            .users
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            == 1
             && map
                 .get(&self.key)
                 .is_some_and(|entry| Arc::ptr_eq(entry, &self.cell))
@@ -210,7 +219,11 @@ struct WireInflightKey {
     servers: Vec<DnsServer>,
     outbound: usize,
 }
-type WireInflightEntry = Arc<tokio::sync::OnceCell<Result<Vec<u8>, String>>>;
+struct WireInflight {
+    reply: tokio::sync::OnceCell<Result<Vec<u8>, String>>,
+    users: std::sync::atomic::AtomicUsize,
+}
+type WireInflightEntry = Arc<WireInflight>;
 type WireInflightMap = Arc<std::sync::Mutex<HashMap<WireInflightKey, WireInflightEntry>>>;
 struct WireInflightGuard {
     map: WireInflightMap,
@@ -220,7 +233,14 @@ struct WireInflightGuard {
 impl Drop for WireInflightGuard {
     fn drop(&mut self) {
         let mut map = self.map.lock().unwrap();
-        if Arc::strong_count(&self.cell) == 2
+        // Count callers explicitly while holding the registry lock. Arc's
+        // destructor runs after Drop returns, so concurrent guard drops can
+        // both observe an extra strong reference even when no caller remains.
+        if self
+            .cell
+            .users
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            == 1
             && map
                 .get(&self.key)
                 .is_some_and(|cell| Arc::ptr_eq(cell, &self.cell))
@@ -845,10 +865,15 @@ impl DnsResolver {
         let key: CacheKey = (domain.to_string(), qtype, self.direct_resolution);
         let cell = {
             let mut inflight = self.inflight.lock().unwrap();
-            inflight
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
-                .clone()
+            let cell = inflight.entry(key.clone()).or_insert_with(|| {
+                Arc::new(InflightLookup {
+                    reply: tokio::sync::OnceCell::new(),
+                    users: std::sync::atomic::AtomicUsize::new(0),
+                })
+            });
+            cell.users
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cell.clone()
         };
 
         let guard = InflightGuard {
@@ -859,6 +884,7 @@ impl DnsResolver {
         // Only the first caller runs resolve_uncached(); others wait for its result.
         let result = guard
             .cell
+            .reply
             .get_or_init(|| async {
                 self.resolve_uncached(domain, qtype)
                     .await

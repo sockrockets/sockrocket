@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tun::AbstractDevice;
 
 use super::connector::{SharedOutbound, connect_upstream};
-use super::relay::relay_bidirectional_with_idle_timeout;
+use super::relay::relay_with_pressure;
 use super::routing::RoutingState;
 use crate::dns::DnsResolver;
 use crate::dns::fakeip::FakeIpPool;
@@ -564,6 +564,7 @@ impl TunProxy {
         Self::start_with_mtu_and_stats(outbound, fakeip, router, stats, mtu::FALLBACK_MTU)
     }
 
+    /// Start with a validated selection applied to the device, stack and TCP MSS.
     pub fn start_with_mtu_and_stats(
         outbound: SharedOutbound,
         fakeip: Option<Arc<FakeIpPool>>,
@@ -602,7 +603,10 @@ impl TunProxy {
 
         tracing::info!(
             "TUN device created: {} ({}, MTU {}, TCP MSS {})",
-            tun_name, TUN_IPV4, mtu, tun_tcp_mss(mtu)
+            tun_name,
+            TUN_IPV4,
+            mtu,
+            tun_tcp_mss(mtu)
         );
 
         // Relax reverse-path filtering on the TUN device (Linux only).
@@ -647,6 +651,9 @@ impl TunProxy {
         ipstack_config.with_tcp_config(tcp_config);
         ipstack_config.udp_timeout(std::time::Duration::from_secs(30));
 
+        let budget = crate::resources::ResourceBudget::detect();
+        ipstack_config.max_sessions = budget.tun_streams;
+        ipstack_config.dns_session_reserve = budget.dns_queries;
         let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun_dev);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -658,7 +665,6 @@ impl TunProxy {
 
         // Cap concurrent stream tasks so a LAN scan / download burst cannot
         // grow the JoinSet (and ipstack session table) without bound.
-        let budget = crate::resources::ResourceBudget::detect();
         let max_tun_streams = budget.tun_streams;
         let max_dns_streams = budget.dns_queries;
         let active_streams = Arc::new(AtomicUsize::new(0));
@@ -817,10 +823,11 @@ impl TunProxy {
                         active.fetch_add(1, Ordering::Relaxed);
                         let stats = stats.clone();
                         let flow_window = window_limit.clone();
+                        let pressure = (active_streams.clone(), max_tun_streams);
                         streams.spawn(async move {
                             let _slot = StreamSlot(active, tcp_counter, flow_window);
                             if let Err(e) = crate::traffic::with_traffic_scope(handle_tun_stream(
-                                stream, outbound, resolver, fakeip, router, stats,
+                                stream, outbound, resolver, fakeip, router, stats, pressure,
                             ))
                             .await
                             {
@@ -927,6 +934,7 @@ async fn handle_tun_stream(
     fakeip: Option<Arc<FakeIpPool>>,
     router: Option<Arc<Router>>,
     stats: super::ProxyStats,
+    pressure: (Arc<AtomicUsize>, usize),
 ) -> Result<()> {
     let source = match &stream {
         IpStackStream::Tcp(tcp) => Some(tcp.local_addr().ip()),
@@ -951,7 +959,15 @@ async fn handle_tun_stream(
             domestic,
             super::routing::with_tun_family(
                 destination.is_some_and(|ip| ip.is_ipv6()),
-                handle_tun_stream_inner(stream, outbound, dns_resolver, fakeip, router, stats),
+                handle_tun_stream_inner(
+                    stream,
+                    outbound,
+                    dns_resolver,
+                    fakeip,
+                    router,
+                    stats,
+                    pressure,
+                ),
             ),
         ),
     )
@@ -965,6 +981,7 @@ async fn handle_tun_stream_inner(
     fakeip: Option<Arc<FakeIpPool>>,
     router: Option<Arc<Router>>,
     stats: super::ProxyStats,
+    pressure: (Arc<AtomicUsize>, usize),
 ) -> Result<()> {
     match stream {
         IpStackStream::Tcp(mut tcp) => {
@@ -994,10 +1011,11 @@ async fn handle_tun_stream_inner(
             let connection = stats.track_active(format!("{}:{}", host, port), "TUN TCP");
             match connect_tun_upstream(&outbound, &host, port, force_direct).await {
                 Ok(mut remote) => {
-                    let result = relay_bidirectional_with_idle_timeout(
+                    let result = relay_with_pressure(
                         &mut connection.observe(&mut tcp),
                         &mut remote,
                         std::time::Duration::from_secs(1800),
+                        Some(pressure),
                     )
                     .await;
                     // The relay completes graceful half-closes itself. On an
@@ -1410,12 +1428,14 @@ fn relax_tun_rp_filter(tun_name: &str) {
 /// decision about the proxy; IPv6 on other interfaces and forwarding stay
 /// untouched. Missing sysctl means this kernel has no IPv6 for the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
 enum TunIpv6Enable {
     AlreadyOn,
     TurnOn,
     Missing,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn tun_ipv6_enable_action(current: Option<&str>) -> TunIpv6Enable {
     match current.map(str::trim) {
         None => TunIpv6Enable::Missing,

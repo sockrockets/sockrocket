@@ -48,9 +48,9 @@ assert.equal(JSON.parse(requests.at(-1).body).params[0], 'version');
 let bootCalls = [];
 const boot = source.slice(source.lastIndexOf('probeTransport(function () {'), source.lastIndexOf('</script>'));
 vm.runInNewContext(boot, {probeTransport: cb => cb(), srLoadNodes: () => bootCalls.push('nodes'),
-  refreshStatus: () => bootCalls.push('status'), setInterval() {},
+  refreshStatus: () => bootCalls.push('status'), srPollUpdate: () => bootCalls.push('update-status'), setInterval() {},
   api: action => assert.fail('page boot must not invoke lifecycle: ' + action)});
-assert.deepEqual(bootCalls, ['nodes', 'status']);
+assert.deepEqual(bootCalls, ['nodes', 'status', 'update-status']);
 console.log('PASS: private request nonce/key, priority Stop, result cleanup, timeout and passive boot');
 
 const payload={name:'示例 " \\ 节点',url:'https://example.invalid/sub?a=1&b=2'};

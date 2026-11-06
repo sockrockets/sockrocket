@@ -644,6 +644,5 @@ mod tests {
 
 pub mod wireguard;
 
-pub(crate) mod xhttp;
-
 mod server_dns;
+pub(crate) mod xhttp;

@@ -993,12 +993,8 @@ impl FingerprintBuilder {
                     }
                     config.certificate_compression_algorithms = algos
                         .iter()
-                        .map(|algo| match algo {
-                            crate::CertificateCompressionAlgorithm::Zlib => crate::ZLIB_DEFAULT,
-                            crate::CertificateCompressionAlgorithm::Brotli => crate::BROTLI_DEFAULT,
-                            crate::CertificateCompressionAlgorithm::Zstd => crate::ZSTD_DEFAULT,
-                            crate::CertificateCompressionAlgorithm::Unknown(_) => unimplemented!(),
-                        })
+                        .map(|algo| crate::client_certificate_decompressor(*algo)
+                            .expect("supported certificate compression algorithm"))
                         .collect();
                 }
                 _ => (),

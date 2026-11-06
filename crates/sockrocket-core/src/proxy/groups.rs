@@ -3,7 +3,7 @@
 use super::connector::{BoxProxyStream, Outbound, SharedOutbound};
 use super::datagram::{BoxDatagram, DatagramFuture};
 use crate::config::{
-    group::{resolve_members, selected_member},
+    group::NodeIndex,
     model::{GroupType, Node, ProxyGroupConfig},
 };
 use anyhow::Result;
@@ -299,22 +299,23 @@ pub fn build_groups(
     groups: &[ProxyGroupConfig],
     nodes: &[Node],
 ) -> HashMap<String, SharedOutbound> {
+    if groups.is_empty() {
+        return HashMap::new();
+    }
+    let index = NodeIndex::new(nodes);
     let mut shared = HashMap::<usize, Arc<Member>>::new();
     groups
         .iter()
         .map(|group| {
             let indices = match group.gtype {
-                GroupType::Fallback | GroupType::UrlTest => resolve_members(group, nodes),
-                GroupType::Select => selected_member(group, nodes).into_iter().collect(),
+                GroupType::Fallback | GroupType::UrlTest => index.resolve_members(group),
+                GroupType::Select => index.selected_member(group).into_iter().collect(),
             };
             let preferred = group
                 .current
                 .as_ref()
-                .and_then(|current| {
-                    indices.iter().position(|index| {
-                        crate::config::dedup::node_fingerprint(&nodes[*index]) == *current
-                    })
-                })
+                .and_then(|current| index.get(current))
+                .and_then(|selected| indices.iter().position(|index| *index == selected))
                 .unwrap_or(0);
             let kind = match group.gtype {
                 GroupType::Fallback => GroupKind::Fallback,
