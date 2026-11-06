@@ -95,14 +95,14 @@ fn run(shared: Arc<Shared>, interval: Duration, write: impl Fn() -> io::Result<(
                     state = shared.changed.wait(state).unwrap();
                     continue;
                 }
-                if !state.force && !state.stopping {
-                    if let Some(remaining) = state
+                if !state.force
+                    && !state.stopping
+                    && let Some(remaining) = state
                         .last_attempt
                         .and_then(|at| interval.checked_sub(at.elapsed()))
-                    {
-                        state = shared.changed.wait_timeout(state, remaining).unwrap().0;
-                        continue;
-                    }
+                {
+                    state = shared.changed.wait_timeout(state, remaining).unwrap().0;
+                    continue;
                 }
                 state.force = false;
                 break state.requested;

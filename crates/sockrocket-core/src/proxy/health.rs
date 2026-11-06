@@ -371,10 +371,10 @@ async fn find_replacement(nodes: &[Node], tracker: &mut FailureTracker) -> Optio
             continue;
         }
         if let Some(node) = nodes.get(index) {
-            if let Ok(outbound) = create_outbound_unwarmed(node) {
-                if let Ok(ms) = https_health_probe(&outbound, CANDIDATE_TIMEOUT_SECS).await {
-                    return Some((index, ms));
-                }
+            if let Ok(outbound) = create_outbound_unwarmed(node)
+                && let Ok(ms) = https_health_probe(&outbound, CANDIDATE_TIMEOUT_SECS).await
+            {
+                return Some((index, ms));
             }
             tracker.avoided.insert(
                 index,
