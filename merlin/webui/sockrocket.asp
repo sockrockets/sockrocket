@@ -565,12 +565,12 @@ body.bg {min-width:0!important}
         </section>
         <section class="card" aria-labelledby="sr-rule-presets-title">
           <h3 id="sr-rule-presets-title">常用规则预设</h3>
-          <p class="hint">默认不生效；添加后仍为停用状态，再由你选择开启。已有同域名后缀规则会跳过，保留原有设置。仅规则模式生效。</p>
+          <p class="hint">默认不生效；添加后仍为停用状态，再由你选择开启。重复添加同一预设会跳过已有条目。仅规则模式生效。</p>
           <div class="toolbar" style="margin-top:12px"><div class="fg" style="flex:1;min-width:180px"><label for="sr-rule-preset">选择预设</label><select id="sr-rule-preset" onchange="renderRulePreset()" disabled><option value="">正在加载…</option></select></div><span class="badge" id="sr-rule-preset-target"></span><div class="fg"><label for="sr-preset-route-target">添加时的出口</label><select id="sr-preset-route-target"><option value="">使用预设默认</option></select></div></div>
           <p class="hint" id="sr-rule-preset-description"></p>
           <p class="hint" id="sr-rule-preset-state" role="status" aria-live="polite"></p>
           <div class="toolbar" style="margin-top:10px"><button class="btn btn-sm" id="sr-rule-preset-add" disabled onclick="addRulePreset()">添加为停用规则</button><button class="btn btn-sm" id="sr-rule-preset-view" hidden onclick="viewRulePreset()">查看已添加规则</button><button class="btn btn-accent btn-sm" id="sr-rule-preset-enable" hidden onclick="toggleRulePreset(true)">开启该组</button><button class="btn btn-sm" id="sr-rule-preset-disable" hidden onclick="toggleRulePreset(false)">停用该组</button></div>
-          <details style="margin-top:10px"><summary>查看预设域名及匹配方式</summary><p class="hint">域名及其子域名 · 全局来源 · 初始优先级 −10。通常低于手动规则的默认优先级 0；设备规则仍优先。添加后可单条或按组编辑，开启以当前规则内容为准。</p><pre class="rule-preview" id="sr-rule-preset-domains"></pre></details>
+          <details style="margin-top:10px"><summary>查看预设域名及匹配方式</summary><p class="hint">DOMAIN 匹配完整域名，DOMAIN-SUFFIX 同时匹配子域名。初始优先级 −10。通常低于手动规则的默认优先级 0；设备规则仍优先。添加后可单条或按组编辑，开启以当前规则内容为准。</p><pre class="rule-preview" id="sr-rule-preset-domains"></pre></details>
         </section>
         <section class="card" id="sr-rule-workspace" aria-labelledby="sr-rule-workspace-title">
           <div class="toolbar"><h3 id="sr-rule-workspace-title">分流规则编辑</h3><div class="spacer"></div><button class="btn btn-sm" onclick="exportRules()">导出</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
@@ -2461,11 +2461,12 @@ function renderRulePreset() {
   ['view','enable','disable'].forEach(function(id){srElement('rule-preset-'+id).hidden=true;srElement('rule-preset-'+id).disabled=unavailable||busy;});
   if(unavailable){srElement('rule-preset-state').textContent=RULE_FLOW_ERROR?'规则加载失败，请先刷新。':'预设尚不可用，请加载规则或通过软件中心安装完整新版插件。';srElement('rule-preset-domains').textContent='';srElement('rule-preset-target').textContent='';srElement('rule-preset-description').textContent='';return;}
   var rows=SR_STATE.ruleRows||[],members=rows.filter(function(r){return (r.group||'').trim()===p.group;}),enabled=members.filter(function(r){return r.enabled!==false;}).length;
-  var missing=p.domains.filter(function(d){return !rows.some(function(r){return !r.source && r.rule_type==='domain-suffix' && String(r.pattern).replace(/^\.+/,'').toLowerCase()===d.toLowerCase();});}).length;
+  var ruleType=p.rule_type||'domain-suffix';
+  var missing=p.domains.filter(function(d){return !rows.some(function(r){return (ruleType!=='domain' || r.group===p.group) && !r.source && r.rule_type===ruleType && String(r.pattern).replace(/^\.+/,'').toLowerCase()===d.toLowerCase();});}).length;
   srElement('rule-preset-target').textContent='默认：'+RULE_TARGET_LABEL[p.target];
   srElement('rule-preset-description').textContent=p.description;
   srElement('rule-preset-state').textContent=(members.length?'当前组 '+members.length+' 条 · 已启用 '+enabled+' 条':'尚未添加 · 未启用')+' · 预设共 '+p.domains.length+' 个域名'+(missing?' · 可添加 '+missing+' 条':' · 域名规则已存在，不重复添加');
-  srElement('rule-preset-domains').textContent=p.domains.map(function(d){return 'DOMAIN-SUFFIX,'+d+','+p.target.toUpperCase();}).join('\n');
+  srElement('rule-preset-domains').textContent=p.domains.map(function(d){return ruleType.toUpperCase()+','+d+','+p.target.toUpperCase();}).join('\n');
   srElement('rule-preset-add').textContent=members.length?'补充缺失规则（停用）':'添加为停用规则';
   srElement('rule-preset-add').disabled=busy||!missing;
   srElement('rule-preset-view').hidden=!members.length;

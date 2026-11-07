@@ -4794,12 +4794,49 @@ dns_direct_domains:
     }
 
     #[test]
+    fn emby_presets_import_exact_domains_without_activating() {
+        let _env = TestEnv::new(SAMPLE);
+        for (id, count, target) in [
+            ("emby_jp", 70, "proxy"),
+            ("emby_us", 43, "proxy"),
+            ("emby_direct", 80, "direct"),
+        ] {
+            let preset = rule_presets::catalog()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap()
+                .clone();
+            assert_eq!(preset["rule_type"], "domain");
+            assert_eq!(preset["domains"].as_array().unwrap().len(), count);
+            let add = || {
+                dispatch(
+                    "add_rule_preset",
+                    &json!({"preset":id,"expected_revision":act_get_rules()["revision"]}),
+                )
+            };
+            let saved = add();
+            assert_eq!(saved["ok"], true);
+            assert!(saved["added"].as_u64().unwrap() > 0);
+            let rules = load_routing_rules(&load_conf().unwrap());
+            assert!(
+                rules
+                    .iter()
+                    .filter(|r| r.group == preset["group"].as_str().unwrap())
+                    .all(|r| r.rule_type == "domain" && !r.enabled && r.target == target)
+            );
+            assert_eq!(add()["added"], 0);
+        }
+    }
+
+    #[test]
     fn rule_presets_are_opt_in_idempotent_and_preserve_custom_rules() {
         let env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain-suffix, pattern: '.OPENAI.COM', target: reject, priority: 99, enabled: false, group: Custom}\n  - {rule_type: domain-suffix, pattern: chatgpt.com, target: direct, source: 192.0.2.8, priority: 10}"));
         fs::write(env.dir.join("stopped"), "").unwrap();
         let before = fs::read(conf_path()).unwrap();
         let catalog = dispatch("get_rules", &json!({}));
-        assert_eq!(catalog["presets"].as_array().unwrap().len(), 7);
+        assert_eq!(catalog["presets"].as_array().unwrap().len(), 10);
         assert_eq!(
             fs::read(conf_path()).unwrap(),
             before,

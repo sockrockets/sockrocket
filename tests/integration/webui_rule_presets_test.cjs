@@ -47,3 +47,11 @@ assert.equal(c.rulePending,false);assert.equal(requests.length,0,'application fa
 c.srLoadRules();request('get_rules')[3]();assert.equal(element('rule-preset-add').disabled,true);
 c.addRulePreset();assert.equal(requests.length,0,'failed rule load blocks stale imports');
 console.log('PASS: catalog is passive, imports remain off, guarded group toggles, duplicate clicks, selection, filters and error recovery');
+
+presets.push({id:'emby_jp',title:'Emby 日本域名',group:'预设 · Emby 日本域名',target:'proxy',rule_type:'domain',domains:['example.com']});
+c.srLoadRules();refresh(rows);
+element('rule-preset').value='emby_jp';c.renderRulePreset();
+assert.equal(element('rule-preset-domains').textContent,'DOMAIN,example.com,PROXY');
+assert.equal(element('rule-preset-add').disabled,false,'a suffix rule does not replace an exact rule');
+c.srLoadRules();refresh(rows.concat({...rows[0],group:presets[2].group,rule_type:'domain'}));
+assert.equal(element('rule-preset-add').disabled,true,'an existing exact rule is skipped');
