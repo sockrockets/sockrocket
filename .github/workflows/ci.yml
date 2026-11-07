@@ -107,6 +107,8 @@ jobs:
           node tests/integration/webui_subscription_jobs_test.cjs
           node tests/integration/webui_rule_flow_test.cjs
           node tests/integration/webui_rule_presets_test.cjs
+          node tests/integration/webui_rule_workspace_test.cjs
+          node tests/integration/webui_rule_import_test.cjs
           node tests/integration/webui_network_controls_test.cjs
           node tests/integration/webui_dns_policy_test.cjs
           node tests/integration/webui_proxy_groups_test.cjs
@@ -192,6 +194,8 @@ jobs:
     # (…-unknown-linux-musl) into the Actions UI job title.
     name: Merlin binaries (${{ matrix.name }})
     runs-on: ubuntu-24.04
+    outputs:
+      relevant_changes: ${{ steps.changes.outputs.merlin }}
     strategy:
       fail-fast: false
       matrix:
@@ -260,52 +264,33 @@ jobs:
 
   merlin-pack:
     name: Merlin packages
+    # Only the Merlin matrix gates packaging; desktop builds and lint run independently.
     needs: merlin
+    if: needs.merlin.outputs.relevant_changes == 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Detect Merlin-relevant changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            merlin:
-              - '.github/workflows/ci.yml'
-              - 'crates/sockrocket-core/**'
-              - 'crates/sockrocket-cli/**'
-              - 'crates/craftls/**'
-              - 'vendor/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'merlin/**'
-              - 'tools/build-merlin-cross.sh'
-              - 'tools/verify-merlin-allocator.py'
-
       - name: Download aarch64 binary
-        if: steps.changes.outputs.merlin == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ci-merlin-bin-aarch64
           path: target/aarch64-unknown-linux-musl/release
 
       - name: Download armv7hf binary
-        if: steps.changes.outputs.merlin == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ci-merlin-bin-armv7hf
           path: target/armv7-unknown-linux-musleabihf/release
 
       - name: Download armv7sf binary
-        if: steps.changes.outputs.merlin == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ci-merlin-bin-armv7sf
           path: target/armv7-unknown-linux-musleabi/release
 
       - name: Pack all platforms
-        if: steps.changes.outputs.merlin == 'true'
         run: |
           chmod +x target/aarch64-unknown-linux-musl/release/sockrocket-cli
           chmod +x target/armv7-unknown-linux-musleabihf/release/sockrocket-cli
@@ -313,7 +298,6 @@ jobs:
           ./merlin/pack.sh
 
       - name: Upload Merlin plugin artifacts
-        if: steps.changes.outputs.merlin == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: sockrocket-merlin-all

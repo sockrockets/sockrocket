@@ -2,11 +2,11 @@
 //! nor logged; URL paths, queries and credentials are never echoed in results.
 use super::*;
 use sha2::{Digest, Sha256};
-use sockrocket_core::router::{RouteAction, Router, china_geoip_db, rule_mode_ruleset};
+use sockrocket_core::router::{RouteAction, Router, china_geoip_db, rule_mode_with_bindings};
 use std::net::IpAddr;
 
 pub(super) fn rules_revision(map: &Mapping) -> String {
-    let input = json!({"groups":map.get(ykey("groups")), "nodes":map.get(ykey("nodes")), "rules": load_routing_rules(map),
+    let input = json!({"device_rule_groups":map.get(ykey("device_rule_groups")),"groups":map.get(ykey("groups")), "nodes":map.get(ykey("nodes")), "rules": load_routing_rules(map),
         "mode": conf_str(map,"proxy_mode").unwrap_or_else(||"rule".into()).to_lowercase(),
         "active_node": conf_usize(map,"active_node"), "dns":map.get(ykey("dns")),"dns_direct_server":map.get(ykey("dns_direct_server")),"dns_direct_domains":map.get(ykey("dns_direct_domains")),"ipv6_mode":map.get(ykey("ipv6_mode"))});
     format!(
@@ -145,7 +145,23 @@ pub(super) fn act_trace_route(post: &J) -> J {
         return failure("route_trace_config", "当前分流模式无效");
     }
     let mut trace = if mode == "rule" {
-        let router = Router::new(rule_mode_ruleset(&rules))
+        let Ok(links) = super::devices::links(&map) else {
+            return failure("route_trace_config", "设备规则组关联配置无效");
+        };
+        if !links.is_empty() {
+            let exits = serde_yaml::from_value(
+                map.get(ykey("groups"))
+                    .cloned()
+                    .unwrap_or(Y::Sequence(vec![])),
+            );
+            if !exits.is_ok_and(|exits: Vec<sockrocket_core::ProxyGroupConfig>| {
+                sockrocket_core::config::model::validate_device_rule_groups(&links, &rules, &exits)
+                    .is_ok()
+            }) {
+                return failure("route_trace_config", "设备规则组关联配置无效");
+            }
+        }
+        let router = Router::new(rule_mode_with_bindings(&rules, &links, true))
             .with_geoip(std::sync::Arc::new(china_geoip_db()));
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()

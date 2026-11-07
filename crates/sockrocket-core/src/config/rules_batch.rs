@@ -256,11 +256,23 @@ pub fn merge_batch_rules(
     incoming: Vec<RoutingRule>,
     conflict: BatchConflict,
 ) -> BatchMergeStats {
+    merge_rules(existing, incoming, conflict, false)
+}
+
+pub fn merge_rules(
+    existing: &mut Vec<RoutingRule>,
+    incoming: Vec<RoutingRule>,
+    conflict: BatchConflict,
+    within_group: bool,
+) -> BatchMergeStats {
     let mut stats = BatchMergeStats::default();
     // Insert newest-first among the batch so the first pasted line stays highest.
     for rule in incoming.into_iter().rev() {
         if let Some(pos) = existing.iter().position(|e| {
-            e.rule_type == rule.rule_type && e.pattern == rule.pattern && e.source == rule.source
+            (!within_group || e.group.trim() == rule.group.trim())
+                && e.rule_type == rule.rule_type
+                && e.pattern == rule.pattern
+                && e.source == rule.source
         }) {
             match conflict {
                 BatchConflict::Skip => stats.skipped += 1,
@@ -306,7 +318,7 @@ fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, Strin
         {
             return Err("Nested SOURCE is not supported".into());
         }
-        let mut rule = parse_clash_line(rest)?;
+        let mut rule = parse_clash_line(rest, default_target)?;
         rule.source = crate::router::normalize_rule_source(scope)?;
         if rule.source.is_empty() {
             return Err("SOURCE requires an IP address or network".into());
@@ -315,7 +327,7 @@ fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, Strin
     }
     // Clash CSV: TYPE,value,action  or MATCH,action
     if line.contains(',') {
-        return parse_clash_line(line);
+        return parse_clash_line(line, default_target);
     }
     // Explicit arrow: type:pattern->target  /  type pattern -> target
     if let Some((left, right)) = line.split_once("->") {
@@ -343,7 +355,7 @@ fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, Strin
     auto_detect(line, default_target)
 }
 
-fn parse_clash_line(line: &str) -> Result<RoutingRule, String> {
+fn parse_clash_line(line: &str, default_target: &str) -> Result<RoutingRule, String> {
     let parts: Vec<&str> = line
         .split(',')
         .map(str::trim)
@@ -371,11 +383,11 @@ fn parse_clash_line(line: &str) -> Result<RoutingRule, String> {
     let pattern = parts[1];
     // Public Clash lists name a policy group this config does not have.
     // Keep the rule on the proxy path instead of dropping the line.
-    let target = parts
-        .get(2)
-        .copied()
-        .and_then(normalize_target)
-        .unwrap_or("proxy");
+    let target = match parts.get(2).copied() {
+        None => default_target,
+        Some(flag) if flag.eq_ignore_ascii_case("no-resolve") => default_target,
+        Some(action) => normalize_target(action).unwrap_or("proxy"),
+    };
     build_rule(typ, pattern, target)
 }
 
@@ -427,7 +439,13 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
         }
         "ip-cidr" => normalize_cidr(pattern)?,
         "domain" | "domain-suffix" => {
-            let s = pattern.trim().trim_start_matches('.').to_lowercase();
+            let mut s = pattern.trim().trim_start_matches('.').to_lowercase();
+            if !s.is_ascii() {
+                s = match url::Host::parse(&s) {
+                    Ok(url::Host::Domain(domain)) => domain,
+                    _ => return Err(format!("Invalid domain '{pattern}'")),
+                };
+            }
             if !looks_like_domain(&s) {
                 return Err(format!("Invalid domain '{pattern}'"));
             }
@@ -601,6 +619,24 @@ fn valid_port_pattern(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csv_lists_inherit_selected_exit_and_normalize_idn() {
+        let node = format!("node:{}", "a".repeat(64));
+        for target in ["direct", "group:Japan", node.as_str()] {
+            let parsed = parse_batch_rules_in_group(
+                "# comment\nDOMAIN,example.invalid\nDOMAIN-SUFFIX,media.invalid\nIP-CIDR,192.0.2.0/24,no-resolve\nSOURCE,192.0.2.8,DOMAIN,device.invalid\nDOMAIN,explicit.invalid,REJECT\nDOMAIN,hgemby.帝acg.xyz",
+                target,
+                "Emby",
+            );
+            assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+            assert!(parsed.rules[..4].iter().all(|r| r.target == target));
+            assert_eq!(parsed.rules[4].target, "reject");
+            assert!(parsed.rules[5].pattern.is_ascii());
+            assert!(parsed.rules[5].pattern.contains("xn--"));
+            assert!(parsed.rules.iter().all(|r| r.group == "Emby"));
+        }
+    }
 
     #[test]
     fn parses_plain_domains_and_cidrs() {

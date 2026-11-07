@@ -89,7 +89,7 @@ The desktop app shares this core. These controls live in the router Web UI.
 | Overview | Start turns DNS interception and transparent proxy on together. Either can be turned off while the proxy is running. Traffic here is since this process started |
 | Nodes | Use one node, or a node group. A missing pinned node fails closed and does not fall back to the global node. Health auto-switch moves only the global node |
 | Subscriptions | Update subscriptions. The last three calendar months include manual nodes and Direct. A subscription total is the sum of nodes that currently belong to it. Addresses are not shown |
-| Routing rules | Set a rule folder's exit, check where a site would match without opening a connection, or add presets. Presets start disabled: AI, overseas video, Telegram web, developer tools, Apple, Microsoft and domestic sites. They are common domains, not every endpoint |
+| Routing rules | Set a rule folder's exit, preview and append rules from a URL, check where a site would match without opening a connection, or add presets. Presets start disabled: AI, overseas video, Telegram web, developer tools, Apple, Microsoft and domestic sites. They are common domains, not every endpoint |
 | Device default | A final exit for one device or prefix. Other devices keep the shared rules. Use a DHCP reservation. Inherit removes that source's final rule and leaves destination exceptions |
 | Network & DNS | Compatibility is the default and does not need ISP IPv6. Dual-stack is for firmware that already has an IPv6 address and a LAN prefix. Saving reapplies the firewall without restarting a running proxy |
 

@@ -16,6 +16,7 @@
 //! Paths default to the router layout under `/jffs/addons/sockrocket` and can be
 //! overridden with `SOCKROCKET_DIR` (used by unit tests and local debugging).
 
+mod devices;
 mod http;
 mod network_settings;
 mod proxy_groups;
@@ -317,8 +318,15 @@ fn load_conf() -> Result<Mapping> {
     let mut value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
     sockrocket_core::config::node_identity::migrate_references(&mut value)?;
     match value {
-        Y::Mapping(m) => Ok(m),
-        Y::Null => Ok(Mapping::new()),
+        Y::Mapping(mut m) => {
+            devices::migrate_bindings(&mut m)?;
+            Ok(m)
+        }
+        Y::Null => {
+            let mut m = Mapping::new();
+            devices::migrate_bindings(&mut m)?;
+            Ok(m)
+        }
         _ => bail!("config root must be a mapping"),
     }
 }
@@ -330,8 +338,15 @@ fn save_conf(map: &Mapping) -> Result<()> {
             .unwrap_or(Y::Sequence(vec![])),
     )
     .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
-    sockrocket_core::config::group::validate_targets(&groups, &load_routing_rules(map))
+    let rules = load_routing_rules(map);
+    sockrocket_core::config::group::validate_targets(&groups, &rules)
         .map_err(anyhow::Error::msg)?;
+    sockrocket_core::config::model::validate_device_rule_groups(
+        &devices::links(map)?,
+        &rules,
+        &groups,
+    )
+    .map_err(anyhow::Error::msg)?;
     let text = serde_yaml::to_string(&Y::Mapping(map.clone()))?;
     storage::atomic_write(&text)
 }
@@ -464,6 +479,7 @@ fn read_only_action(action: &str) -> bool {
             | "sysinfo"
             | "get_direct_domains"
             | "get_rules"
+            | "fetch_rule_list"
             | "trace_route"
             | "proxy_groups"
             | "network_settings"
@@ -537,11 +553,14 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "proxy_groups" => proxy_groups::get(),
         "save_proxy_group" => proxy_groups::save(post),
         "delete_proxy_group" => proxy_groups::delete(post),
+        "save_device_binding" => devices::save_binding(post),
+        "save_device_alias" => devices::save_alias(post),
         "save_device_policy" => proxy_groups::device(post),
         "network_settings" => network_settings::get(),
         "save_network_settings" => network_settings::save(post),
         "dns_test" => network_settings::test(post),
         "get_rules" => act_get_rules(),
+        "fetch_rule_list" => act_fetch_rule_list(post),
         "add_rule_preset" => rule_presets::add(post),
         "trace_route" => route_trace::act_trace_route(post),
         "add_rule" => act_add_rule(post),
@@ -2350,7 +2369,15 @@ fn load_routing_rules(map: &Mapping) -> Vec<sockrocket_core::RoutingRule> {
         .unwrap_or_default()
 }
 
+fn prune_device_links(map: &mut Mapping, rules: &[sockrocket_core::RoutingRule]) {
+    if let Ok(mut links) = devices::links(map) {
+        links.retain(|b| rules.iter().any(|r| r.group.trim() == b.group));
+        devices::store_links(map, &links);
+    }
+}
+
 fn save_routing_rules(map: &mut Mapping, rules: Vec<sockrocket_core::RoutingRule>) {
+    prune_device_links(map, &rules);
     let seq: Vec<Y> = rules.into_iter().map(routing_rule_to_yaml).collect();
     map.insert(ykey("rules"), Y::Sequence(seq));
 }
@@ -2411,6 +2438,15 @@ fn act_get_rules() -> J {
     {
         return err_msg("部分规则配置损坏，未返回不完整的规则列表，请检查诊断");
     }
+    // Keep editor snapshots unchanged. Index this separate list by saved rule
+    // number so the diagram uses the same accepted rules and actions as routing.
+    let compiled = sockrocket_core::router::RuleSet::from_config(&parsed);
+    let mut compiled_targets = vec![None; parsed.len()];
+    for entry in compiled.rules() {
+        if let Some(index) = entry.config_index {
+            compiled_targets[index] = Some(&entry.action);
+        }
+    }
     let rules: Vec<J> = parsed
         .into_iter()
         .enumerate()
@@ -2428,7 +2464,10 @@ fn act_get_rules() -> J {
             })
         })
         .collect();
-    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    let Ok(links) = devices::links(&map) else {
+        return err_msg("设备规则组关联配置无效");
+    };
+    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2462,9 +2501,14 @@ fn act_add_rule(post: &J) -> J {
         Ok(value) => value,
         Err(error) => return err_msg(&error),
     };
-    // Duplicate check: same type+pattern already present.
+    let group = post["group"].as_str().unwrap_or("").trim();
     let dup = seq.iter().any(|r| {
-        r.get(ykey("rule_type")).and_then(|v| v.as_str()) == Some(rule_type)
+        r.get(ykey("group"))
+            .and_then(Y::as_str)
+            .unwrap_or("")
+            .trim()
+            == group
+            && r.get(ykey("rule_type")).and_then(|v| v.as_str()) == Some(rule_type)
             && r.get(ykey("pattern")).and_then(|v| v.as_str()) == Some(pattern.as_str())
             && r.get(ykey("source")).and_then(Y::as_str).unwrap_or("") == source
     });
@@ -2566,6 +2610,7 @@ fn act_update_rule(post: &J) -> J {
     };
     if rules.iter().enumerate().any(|(i, r)| {
         i != index
+            && r.group.trim() == post["group"].as_str().unwrap_or(&old.group).trim()
             && rule_kind(&r.rule_type) == rule_kind(typ)
             && r.pattern == pattern
             && r.source == source
@@ -2630,6 +2675,8 @@ fn act_del_rule(post: &J) -> J {
     }
     seq.remove(index);
     map.insert(ykey("rules"), Y::Sequence(seq));
+    let remaining = load_routing_rules(&map);
+    prune_device_links(&mut map, &remaining);
     match save_conf(&map) {
         Ok(()) => {
             if is_running()
@@ -2731,6 +2778,35 @@ fn act_move_rule(post: &J) -> J {
     }
 }
 
+/// Read a remote list for preview without changing saved configuration.
+fn act_fetch_rule_list(post: &J) -> J {
+    let url = post.get("url").and_then(J::as_str).unwrap_or("").trim();
+    let target = post.get("target").and_then(J::as_str).unwrap_or("proxy");
+    let group = post.get("group").and_then(J::as_str).unwrap_or("").trim();
+    if !proxy_groups::valid_target(target) {
+        return err_msg("请选择有效的规则出口");
+    }
+    let result = (|| -> Result<_> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(sockrocket_core::config::rule_list::fetch_rule_list(
+            url,
+            target,
+            group,
+            if is_running() {
+                local_socks_addr()
+            } else {
+                None
+            },
+        ))
+    })();
+    match result {
+        Ok(preview) => json!({"ok":true,"text":preview.text,"count":preview.count}),
+        Err(error) => err_msg(&format!("{error:#}")),
+    }
+}
+
 /// Batch paste / import: multiline text → many rules (same parser as desktop GUI).
 fn act_batch_add_rules(post: &J) -> J {
     let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -2817,6 +2893,12 @@ fn act_batch_add_rules(post: &J) -> J {
     };
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
+        if post.get("group_only").and_then(J::as_bool) == Some(true) {
+            if group.is_empty() || !source.is_empty() || !rule.is_global_destination() {
+                return err_msg("请选择具名规则组并导入目的规则；设备来源和默认出口请在绑定处配置");
+            }
+            rule.group = group.to_string();
+        }
         if post.get("source").is_some() {
             if !rule.source.is_empty() && rule.source != source {
                 return err_msg("每行 SOURCE 与所选来源不一致；未保存任何更改");
@@ -2829,7 +2911,8 @@ fn act_batch_add_rules(post: &J) -> J {
             existing
                 .iter()
                 .find(|r| {
-                    rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
+                    r.group.trim() == rule.group.trim()
+                        && rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
                         && r.pattern == rule.pattern
                         && r.source == rule.source
                 })
@@ -2837,7 +2920,12 @@ fn act_batch_add_rules(post: &J) -> J {
         };
     }
     let n_in = parsed.rules.len();
-    let stats = sockrocket_core::merge_batch_rules(&mut existing, parsed.rules, conflict);
+    let stats = sockrocket_core::config::rules_batch::merge_rules(
+        &mut existing,
+        parsed.rules,
+        conflict,
+        true,
+    );
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
@@ -3186,6 +3274,16 @@ fn act_replace_rule_group(post: &J) -> J {
         Ok(n) => n,
         Err(e) => return err_msg(&e),
     };
+    if old_group != new_group
+        && let Ok(mut links) = devices::links(&map)
+    {
+        for b in &mut links {
+            if b.group == old_group {
+                b.group.clone_from(&new_group);
+            }
+        }
+        devices::store_links(&mut map, &links);
+    }
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
@@ -4696,12 +4794,49 @@ dns_direct_domains:
     }
 
     #[test]
+    fn emby_presets_import_exact_domains_without_activating() {
+        let _env = TestEnv::new(SAMPLE);
+        for (id, count, target) in [
+            ("emby_jp", 70, "proxy"),
+            ("emby_us", 43, "proxy"),
+            ("emby_direct", 80, "direct"),
+        ] {
+            let preset = rule_presets::catalog()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap()
+                .clone();
+            assert_eq!(preset["rule_type"], "domain");
+            assert_eq!(preset["domains"].as_array().unwrap().len(), count);
+            let add = || {
+                dispatch(
+                    "add_rule_preset",
+                    &json!({"preset":id,"expected_revision":act_get_rules()["revision"]}),
+                )
+            };
+            let saved = add();
+            assert_eq!(saved["ok"], true);
+            assert!(saved["added"].as_u64().unwrap() > 0);
+            let rules = load_routing_rules(&load_conf().unwrap());
+            assert!(
+                rules
+                    .iter()
+                    .filter(|r| r.group == preset["group"].as_str().unwrap())
+                    .all(|r| r.rule_type == "domain" && !r.enabled && r.target == target)
+            );
+            assert_eq!(add()["added"], 0);
+        }
+    }
+
+    #[test]
     fn rule_presets_are_opt_in_idempotent_and_preserve_custom_rules() {
         let env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain-suffix, pattern: '.OPENAI.COM', target: reject, priority: 99, enabled: false, group: Custom}\n  - {rule_type: domain-suffix, pattern: chatgpt.com, target: direct, source: 192.0.2.8, priority: 10}"));
         fs::write(env.dir.join("stopped"), "").unwrap();
         let before = fs::read(conf_path()).unwrap();
         let catalog = dispatch("get_rules", &json!({}));
-        assert_eq!(catalog["presets"].as_array().unwrap().len(), 7);
+        assert_eq!(catalog["presets"].as_array().unwrap().len(), 10);
         assert_eq!(
             fs::read(conf_path()).unwrap(),
             before,
@@ -4856,6 +4991,268 @@ dns_direct_domains:
             )))
             .route("www.apple.com", 443),
             RouteAction::Proxy
+        );
+    }
+
+    #[test]
+    fn imported_group_is_inactive_until_a_source_binds_it() {
+        let _env = TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain, group: Legacy, pattern: video.invalid, target: direct}"));
+        let winner = |source: &str| {
+            dispatch(
+                "trace_route",
+                &json!({"destination":"video.invalid","source":source,"resolve_dns":false}),
+            )["trace"]["action"]
+                .clone()
+        };
+        let bind = |source: &str, target: &str, remove: bool| {
+            let revision = act_get_rules()["revision"].clone();
+            dispatch(
+                "save_device_binding",
+                &json!({"revision":revision,"source":source,"all_devices":source.is_empty(),"group":"Imported","target":target,"priority":10,"remove":remove}),
+            )
+        };
+        assert_eq!(act_get_rules()["global_rule_groups"][0]["group"], "Legacy");
+        assert_eq!(
+            dispatch(
+                "batch_add_rules",
+                &json!({"text":"DOMAIN,video.invalid,REJECT","group_only":true,"group":"Imported"})
+            )["ok"],
+            true
+        );
+        assert_eq!(act_get_rules()["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(winner(""), "direct");
+        assert_eq!(bind("192.0.2.8", "reject", false)["ok"], true);
+        assert_eq!(winner("192.0.2.8"), "reject");
+        assert_eq!(winner("192.0.2.9"), "direct");
+        assert_eq!(bind("", "proxy", false)["ok"], true);
+        assert_eq!(winner("192.0.2.8"), "reject");
+        assert_eq!(winner("192.0.2.9"), "proxy");
+        assert_eq!(bind("", "", true)["ok"], true);
+        assert_eq!(winner("192.0.2.9"), "direct");
+        assert_eq!(winner("192.0.2.8"), "reject");
+    }
+
+    #[test]
+    fn device_binding_priority_changes_the_winner_only_for_that_source() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Media, pattern: tv.invalid, target: direct, priority: 100}\n  - {rule_type: domain, group: Japan, pattern: tv.invalid, target: proxy}",
+        ));
+        let save = |source: &str, changes: J| {
+            let mut body = changes;
+            body["source"] = json!(source);
+            body["revision"] = json!(route_trace::rules_revision(&load_conf().unwrap()));
+            dispatch("save_device_binding", &body)
+        };
+        let tv = "192.0.2.8";
+        let laptop = "192.0.2.9";
+        for src in [tv, laptop] {
+            assert_eq!(save(src, json!({"groups":["Media","Japan"]}))["ok"], true);
+        }
+        let winner = |source: &str| {
+            let trace = dispatch(
+                "trace_route",
+                &json!({"source":source,"destination":"tv.invalid","resolve_dns":false}),
+            );
+            (
+                trace["trace"]["matched_rule"].clone(),
+                trace["trace"]["action"].clone(),
+            )
+        };
+        assert_eq!(winner(tv), (json!(0), json!("direct")));
+        assert_eq!(
+            save(tv, json!({"group":"Japan","priority":20,"target":"reject"}))["ok"],
+            true
+        );
+        assert_eq!(winner(tv), (json!(1), json!("reject")));
+        assert_eq!(winner(laptop), (json!(0), json!("direct")));
+        assert_eq!(winner(""), (json!(0), json!("direct")));
+        // Older clients can update the outlet without resetting the saved priority.
+        assert_eq!(save(tv, json!({"group":"Japan","target":""}))["ok"], true);
+        assert_eq!(winner(tv), (json!(1), json!("proxy")));
+        for invalid in [json!(-1), json!(65536), json!(1.5)] {
+            assert_eq!(
+                save(tv, json!({"group":"Japan","target":"","priority":invalid}))["ok"],
+                false
+            );
+        }
+        assert_eq!(
+            save(tv, json!({"group":"Japan","target":"","priority":0}))["ok"],
+            true
+        );
+        assert_eq!(winner(tv), (json!(0), json!("direct")));
+    }
+
+    #[test]
+    fn device_bindings_follow_edits_and_aliases_are_independent_of_routing() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Video, pattern: tv.invalid, target: direct}",
+        ));
+        let revision = || route_trace::rules_revision(&load_conf().unwrap());
+        let trace = |ip: &str, host: &str| {
+            dispatch(
+                "trace_route",
+                &json!({"source":ip,"destination":host,"resolve_dns":false}),
+            )["trace"]["action"]
+                .clone()
+        };
+        assert_eq!(act_get_rules()["compiled_targets"], json!(["direct"]));
+        let original = revision();
+        let bind = dispatch(
+            "save_device_binding",
+            &json!({"revision":original,"source":"192.0.2.8","group":"Video","target":"reject"}),
+        );
+        assert_eq!(bind["ok"], true, "{bind}");
+        assert_eq!(load_routing_rules(&load_conf().unwrap()).len(), 1);
+        assert_eq!(trace("192.0.2.8", "tv.invalid"), "reject");
+        assert_eq!(trace("192.0.2.9", "tv.invalid"), "direct");
+        let stale = dispatch(
+            "save_device_binding",
+            &json!({"revision":original,"source":"192.0.2.8","group":"Video","target":"","remove":true}),
+        );
+        assert_eq!(stale["ok"], false);
+        let added = dispatch(
+            "batch_add_rules",
+            &json!({"group":"Video","text":"DOMAIN,new.invalid,DIRECT","target":"proxy"}),
+        );
+        assert_eq!(added["ok"], true, "{added}");
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "reject");
+        for (group, host) in [("Music", "music.invalid"), ("Work", "work.invalid")] {
+            let added = dispatch(
+                "batch_add_rules",
+                &json!({"group":group,"text":format!("DOMAIN,{host},DIRECT"),"target":"proxy"}),
+            );
+            assert_eq!(added["ok"], true, "{added}");
+        }
+        let add_groups = |groups: &[&str]| {
+            dispatch(
+                "save_device_binding",
+                &json!({"revision":revision(),"source":"192.0.2.8","groups":groups}),
+            )
+        };
+        assert_eq!(add_groups(&["Music", "Missing"])["ok"], false);
+        assert_eq!(
+            act_get_rules()["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(add_groups(&["Music", "Work", "Video", "Music"])["ok"], true);
+        assert_eq!(
+            act_get_rules()["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let changed = dispatch(
+            "save_device_binding",
+            &json!({"revision":revision(),"source":"192.0.2.8","group":"Music","target":"proxy"}),
+        );
+        assert_eq!(changed["ok"], true);
+        assert_eq!(trace("192.0.2.8", "tv.invalid"), "reject");
+        assert_eq!(trace("192.0.2.8", "music.invalid"), "proxy");
+        assert_eq!(trace("192.0.2.8", "work.invalid"), "direct");
+        let saved_config = fs::read(conf_path()).unwrap();
+        let alias = json!({"source":"192.0.2.8","key":"mac:02:00:00:00:00:01","name":"客厅电视","previous":""});
+        assert_eq!(dispatch("save_device_alias", &alias)["ok"], true);
+        assert_eq!(
+            dispatch("save_device_alias", &alias)["ok"],
+            false,
+            "stale rename must not overwrite"
+        );
+        assert_eq!(fs::read(conf_path()).unwrap(), saved_config);
+        assert!(
+            act_get_rules()["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["alias"] == "客厅电视")
+        );
+        let removed = dispatch(
+            "save_device_binding",
+            &json!({"revision":revision(),"source":"192.0.2.8","group":"Video","target":"","remove":true}),
+        );
+        assert_eq!(removed["ok"], true);
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
+        assert_eq!(
+            act_get_rules()["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(trace("192.0.2.8", "music.invalid"), "proxy");
+    }
+
+    #[test]
+    fn rule_link_preview_is_read_only_and_import_stays_in_selected_group() {
+        use std::io::Write;
+        let _env = TestEnv::new(SAMPLE);
+        assert!(read_only_action("fetch_rule_list"));
+        let before = fs::read(conf_path()).unwrap();
+        for url in ["file:///etc/passwd", "https://"] {
+            assert_eq!(
+                dispatch("fetch_rule_list", &json!({"url":url}))["ok"],
+                false
+            );
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = "# > test\nDOMAIN,example.invalid\n# @group Foreign\nDOMAIN,example.invalid\nGEOIP,CN,DIRECT";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let target = format!("node:{}", "a".repeat(64));
+        let preview = dispatch(
+            "fetch_rule_list",
+            &json!({"url":format!("http://{address}/rules.list"),"target":target,"group":"Emby"}),
+        );
+        server.join().unwrap();
+        assert_eq!(preview["ok"], true, "{preview}");
+        assert_eq!(preview["count"], 3);
+        assert_eq!(
+            fs::read(conf_path()).unwrap(),
+            before,
+            "reading must not save or restart"
+        );
+        let text = format!("# @group Foreign\n{}", preview["text"].as_str().unwrap());
+        let added = dispatch(
+            "batch_add_rules",
+            &json!({"group":"Emby","text":text,"target":target,"group_only":true,"replace":false}),
+        );
+        assert_eq!(added["ok"], true, "{added}");
+        let rows = act_get_rules()["rules"].as_array().unwrap().clone();
+        assert_eq!(rows.len(), 2, "duplicates are skipped");
+        assert!(rows.iter().all(|r| r["group"] == "Emby"));
+        assert_eq!(rows[0]["target"], target);
+        assert_eq!(rows[1]["target"], "direct");
+        let saved = fs::read(conf_path()).unwrap();
+        assert_eq!(
+            dispatch(
+                "batch_add_rules",
+                &json!({"group":"Emby","text":text,"target":target,"group_only":true,"replace":false})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            fs::read(conf_path()).unwrap(),
+            saved,
+            "repeated import must preserve existing rules"
         );
     }
 
