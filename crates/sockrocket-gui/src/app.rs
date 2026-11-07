@@ -45,9 +45,8 @@ use sockrocket_core::{
     format_rules_export, generate_token, get_system_proxy as get_os_proxy, group_member_indices,
     local_lan_ip, make_typed_rule, merge_batch_rules, new_shared_state, node_fingerprint,
     normalize_node_names, parse_batch_rules_in_group, parse_proxy_uri, replace_rule_group,
-    resolve_members, resolve_to_ips, rule_mode_ruleset, rule_scene_by_id, same_rule_group,
-    setup_tun_routes, start_share_server, system_proxy_supported, uniquify_node_names,
-    url_test_pick,
+    resolve_members, resolve_to_ips, rule_scene_by_id, same_rule_group, setup_tun_routes,
+    start_share_server, system_proxy_supported, uniquify_node_names, url_test_pick,
 };
 
 /// Main application state
@@ -157,6 +156,7 @@ pub struct AppState {
     // Rules management
     pub(crate) rules: Vec<RoutingRule>,
     router_rules: Vec<(usize, RoutingRule)>,
+    explicit_group_bindings: bool,
     device_rule_groups: Vec<sockrocket_core::config::model::DeviceRuleGroup>,
     pub(crate) rule_group_input: Entity<InputState>,
     pub(crate) rule_pattern_input: Entity<InputState>,
@@ -424,14 +424,13 @@ pub(crate) fn rule_mode_summary(rules: &[RoutingRule]) -> String {
 pub(crate) fn apply_proxy_mode(
     outbound: SharedOutbound,
     mode: &ProxyMode,
-    rules: &[RoutingRule],
+    ruleset: sockrocket_core::router::RuleSet,
     groups: &[ProxyGroupConfig],
     nodes: &[Node],
 ) -> SharedOutbound {
     match mode {
         ProxyMode::Global => outbound,
         ProxyMode::Rule => {
-            let ruleset = rule_mode_ruleset(rules);
             let router = std::sync::Arc::new(
                 Router::new(ruleset)
                     .with_geoip(std::sync::Arc::new(sockrocket_core::china_geoip_db())),
@@ -444,6 +443,19 @@ pub(crate) fn apply_proxy_mode(
 }
 
 impl AppState {
+    fn desktop_ruleset(&self) -> sockrocket_core::router::RuleSet {
+        let shared: Vec<_> = self
+            .device_rule_groups
+            .iter()
+            .filter(|link| link.source.is_empty())
+            .cloned()
+            .collect();
+        sockrocket_core::router::rule_mode_with_bindings(
+            &self.rules,
+            &shared,
+            self.explicit_group_bindings,
+        )
+    }
     pub fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -756,6 +768,7 @@ impl AppState {
             tun_stop_tx: None,
             rules,
             router_rules,
+            explicit_group_bindings: persisted.explicit_group_bindings,
             device_rule_groups: persisted.device_rule_groups.clone(),
             rule_group_input,
             rule_pattern_input,
@@ -1519,7 +1532,7 @@ impl AppState {
                 apply_proxy_mode(
                     outbound,
                     &ProxyMode::Rule,
-                    &self.rules,
+                    self.desktop_ruleset(),
                     &self.groups,
                     &self.nodes,
                 )
@@ -2915,7 +2928,7 @@ impl AppState {
         let final_outbound = match self.proxy_mode {
             ProxyMode::Global => outbound,
             ProxyMode::Rule => {
-                let ruleset = rule_mode_ruleset(&self.rules);
+                let ruleset = self.desktop_ruleset();
                 let router = std::sync::Arc::new(
                     Router::new(ruleset)
                         .with_geoip(std::sync::Arc::new(sockrocket_core::china_geoip_db())),
@@ -3291,7 +3304,7 @@ impl AppState {
             ProxyMode::Rule => apply_proxy_mode(
                 outbound,
                 &ProxyMode::Rule,
-                &self.rules,
+                self.desktop_ruleset(),
                 &self.groups,
                 &self.nodes,
             ),
@@ -3567,6 +3580,7 @@ impl AppState {
             active_node: self.selected_node,
             subscriptions: self.subscriptions.clone(),
             rules: sockrocket_gui::desktop_rules::for_storage(&self.rules, &self.router_rules),
+            explicit_group_bindings: self.explicit_group_bindings,
             device_rule_groups: self.device_rule_groups.clone(),
             auto_connect: self.proxy_running,
             tun_was_enabled: self.tun_enabled,
@@ -3971,6 +3985,7 @@ impl AppState {
                 self.subscriptions = new_config.subscriptions.clone();
                 (self.rules, self.router_rules) =
                     sockrocket_gui::desktop_rules::split(new_config.rules.clone());
+                self.explicit_group_bindings = new_config.explicit_group_bindings;
                 self.device_rule_groups = new_config.device_rule_groups.clone();
                 self.dns = new_config.dns.clone();
                 self.ipv6_mode = new_config.ipv6_mode;

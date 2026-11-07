@@ -180,7 +180,7 @@ async fn async_main() -> Result<()> {
                         .iter()
                         .filter(|link| active_groups.contains(link.group.as_str()))
                         .map(|link| link.source.as_str())
-                        .filter(|source| source.contains(':') == ipv6),
+                        .filter(|source| !source.is_empty() && source.contains(':') == ipv6),
                 )
                 .collect();
             for source in sources {
@@ -1380,9 +1380,10 @@ fn build_outbound(
 fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
     match config.proxy_mode {
         ProxyMode::Rule => Some(Arc::new(
-            Router::new(sockrocket_core::router::rule_mode_with_devices(
+            Router::new(sockrocket_core::router::rule_mode_with_bindings(
                 &config.rules,
                 &config.device_rule_groups,
+                config.explicit_group_bindings,
             ))
             .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
         )),

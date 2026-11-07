@@ -22,6 +22,32 @@ pub(super) fn store_links(map: &mut Mapping, links: &[DeviceRuleGroup]) {
         );
     }
 }
+// Materialize legacy membership before an editor can add or rename a group.
+pub(super) fn migrate_bindings(map: &mut Mapping) -> Result<()> {
+    if map
+        .get(ykey("explicit_group_bindings"))
+        .and_then(Y::as_bool)
+        == Some(true)
+    {
+        return Ok(());
+    }
+    let mut bindings = links(map)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for rule in checked_rules(map)? {
+        let name = rule.group.trim();
+        if rule.is_global_destination() && !name.is_empty() && seen.insert(name.to_owned()) {
+            bindings.push(DeviceRuleGroup {
+                source: String::new(),
+                group: name.into(),
+                priority: 0,
+                target: String::new(),
+            });
+        }
+    }
+    store_links(map, &bindings);
+    map.insert(ykey("explicit_group_bindings"), Y::Bool(true));
+    Ok(())
+}
 pub(super) fn save_binding(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("配置读取失败");
@@ -32,7 +58,7 @@ pub(super) fn save_binding(post: &J) -> J {
     let Ok(source) = requested_rule_source(post, "") else {
         return err_msg("请填写有效的设备 IP 或网段");
     };
-    if source.is_empty() {
+    if source.is_empty() && post["all_devices"].as_bool() != Some(true) {
         return err_msg("请选择设备和规则组");
     }
     let Ok(mut bindings) = links(&map) else {

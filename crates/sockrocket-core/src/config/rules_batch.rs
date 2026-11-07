@@ -256,11 +256,23 @@ pub fn merge_batch_rules(
     incoming: Vec<RoutingRule>,
     conflict: BatchConflict,
 ) -> BatchMergeStats {
+    merge_rules(existing, incoming, conflict, false)
+}
+
+pub fn merge_rules(
+    existing: &mut Vec<RoutingRule>,
+    incoming: Vec<RoutingRule>,
+    conflict: BatchConflict,
+    within_group: bool,
+) -> BatchMergeStats {
     let mut stats = BatchMergeStats::default();
     // Insert newest-first among the batch so the first pasted line stays highest.
     for rule in incoming.into_iter().rev() {
         if let Some(pos) = existing.iter().position(|e| {
-            e.rule_type == rule.rule_type && e.pattern == rule.pattern && e.source == rule.source
+            (!within_group || e.group.trim() == rule.group.trim())
+                && e.rule_type == rule.rule_type
+                && e.pattern == rule.pattern
+                && e.source == rule.source
         }) {
             match conflict {
                 BatchConflict::Skip => stats.skipped += 1,

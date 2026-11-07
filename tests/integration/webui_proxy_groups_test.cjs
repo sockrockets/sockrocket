@@ -82,3 +82,13 @@ assert.equal(req[1].source,'2001:db8:1::/64');assert.equal(req[1].target,'group:
 el('device-picker').value='global';c.selectPolicyDevice();c.saveDevicePolicy();req=take('save_device_policy');
 assert.equal(req[1].source,'');assert.equal(req[1].target,'inherit');
 console.log('PASS: group selection, named router clients, device bindings, graph, manual CIDR and explicit global policy');
+
+el('device-picker').value='global';c.selectPolicyDevice();
+assert.equal(el('device-specific').hidden,true,'device naming is only available for a concrete device');
+el('device-available-groups').options.find(box=>box.value==='Music').checked=true;
+c.addDeviceGroups();req=take('save_device_binding');
+assert.equal(req[1].source,'');assert.equal(req[1].all_devices,true);assert.deepEqual([...req[1].groups],['Music']);
+c.SR_STATE.deviceBindings.push({source:'',group:'Music',target:'direct',priority:8});
+c.updateDevicePolicySelection();assert.equal(el('device-group-priority').value,'8');
+c.saveDeviceBinding(true);req=take('save_device_binding');
+assert.equal(req[1].all_devices,true);assert.equal(req[1].group,'Music');assert.equal(req[1].remove,true);

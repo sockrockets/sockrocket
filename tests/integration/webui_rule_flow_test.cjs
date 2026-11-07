@@ -235,3 +235,18 @@ function deviceConnections(html, source, hitsOnly=false) {
  assert.deepEqual(deviceConnections(diagram(),''),['全部直连']);
  console.log('PASS: only configured device wires are drawn; host, subnet and global hits use their owning source');
 }
+
+{
+ const f=fixture(),c=f.context,host='192.0.2.8';
+ const rules=[rule(0,{group:'Imported'}),rule(1,{group:'Legacy'}),rule(2,{group:'Unbound'})];
+ const bindings=[{source:'',group:'Legacy',target:'direct'}];
+ const refresh=()=>{c.srLoadRules();f.request('get_rules')[2]({ok:true,rules,global_rule_groups:bindings,device_rule_groups:[{source:host,group:'Imported',target:'reject'}]});};
+ refresh();
+ const graph=()=>f.element('rule-flow').innerHTML;
+ assert.deepEqual(deviceConnections(graph(),host),['Imported']);
+ assert.deepEqual(deviceConnections(graph(),''),['Legacy','内置国内 / 局域网','默认兜底']);
+ bindings.push({source:'',group:'Imported',target:'proxy',priority:10});refresh();
+ const globals=c.ruleFlowModel(rules,'rule',host).filter(s=>s.kind==='global_rule');
+ assert.deepEqual(Array.from(globals,s=>[s.title,s.targets[0]]),[['Imported','proxy'],['Legacy','direct']]);
+ assert.doesNotMatch(graph(),/<strong>Unbound<\/strong>/);
+}

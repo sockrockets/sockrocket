@@ -60,6 +60,10 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
         parsed.rules.len() <= MAX_RULE_LIST_RULES,
         "一次最多导入 4096 条规则"
     );
+    ensure!(
+        parsed.rules.iter().all(|r| r.is_global_destination()),
+        "规则组链接只支持目的规则；设备来源和默认出口请在绑定处配置"
+    );
     let text = parsed
         .rules
         .iter()

@@ -2,7 +2,7 @@
 //! nor logged; URL paths, queries and credentials are never echoed in results.
 use super::*;
 use sha2::{Digest, Sha256};
-use sockrocket_core::router::{RouteAction, Router, china_geoip_db, rule_mode_with_devices};
+use sockrocket_core::router::{RouteAction, Router, china_geoip_db, rule_mode_with_bindings};
 use std::net::IpAddr;
 
 pub(super) fn rules_revision(map: &Mapping) -> String {
@@ -161,7 +161,7 @@ pub(super) fn act_trace_route(post: &J) -> J {
                 return failure("route_trace_config", "设备规则组关联配置无效");
             }
         }
-        let router = Router::new(rule_mode_with_devices(&rules, &links))
+        let router = Router::new(rule_mode_with_bindings(&rules, &links, true))
             .with_geoip(std::sync::Arc::new(china_geoip_db()));
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()

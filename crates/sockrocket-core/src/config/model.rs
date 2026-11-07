@@ -71,6 +71,8 @@ pub struct AppConfig {
     pub rules: Vec<RoutingRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_rule_groups: Vec<DeviceRuleGroup>,
+    #[serde(default)]
+    pub explicit_group_bindings: bool,
     /// Whether the proxy was running when the app was last closed (auto-reconnect on next start)
     #[serde(default)]
     pub auto_connect: bool,
@@ -110,6 +112,7 @@ impl Default for AppConfig {
             subscriptions: Vec::new(),
             rules: Vec::new(),
             device_rule_groups: Vec::new(),
+            explicit_group_bindings: false,
             auto_connect: false,
             tun_was_enabled: false,
             tun_mtu: None,
@@ -538,7 +541,7 @@ pub fn validate_device_rule_groups(
     if links.is_empty() {
         return Ok(());
     }
-    if links.len() > 256 {
+    if links.iter().filter(|b| !b.source.is_empty()).count() > 256 {
         return Err("最多支持 256 个设备规则组关联");
     }
     let mut seen = std::collections::HashSet::new();
@@ -548,10 +551,7 @@ pub fn validate_device_rule_groups(
     }
     let mut total = 0;
     for link in links {
-        if link.source.is_empty()
-            || !seen.insert((&link.source, &link.group))
-            || link.group.trim().is_empty()
-        {
+        if !seen.insert((&link.source, &link.group)) || link.group.trim().is_empty() {
             return Err("设备或规则组缺失，或关联重复");
         }
         let target = link.target.as_str();
@@ -563,7 +563,9 @@ pub fn validate_device_rule_groups(
         {
             return Err("设备规则组关联引用了无效出口");
         }
-        total += counts.get(link.group.as_str()).copied().unwrap_or(0);
+        if !link.source.is_empty() {
+            total += counts.get(link.group.as_str()).copied().unwrap_or(0);
+        }
         if total > 65536 {
             return Err("设备关联的目的规则总数超过 65536");
         }

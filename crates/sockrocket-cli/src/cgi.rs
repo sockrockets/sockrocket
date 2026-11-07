@@ -318,8 +318,15 @@ fn load_conf() -> Result<Mapping> {
     let mut value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
     sockrocket_core::config::node_identity::migrate_references(&mut value)?;
     match value {
-        Y::Mapping(m) => Ok(m),
-        Y::Null => Ok(Mapping::new()),
+        Y::Mapping(mut m) => {
+            devices::migrate_bindings(&mut m)?;
+            Ok(m)
+        }
+        Y::Null => {
+            let mut m = Mapping::new();
+            devices::migrate_bindings(&mut m)?;
+            Ok(m)
+        }
         _ => bail!("config root must be a mapping"),
     }
 }
@@ -2460,7 +2467,7 @@ fn act_get_rules() -> J {
     let Ok(links) = devices::links(&map) else {
         return err_msg("设备规则组关联配置无效");
     };
-    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links, "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2494,9 +2501,14 @@ fn act_add_rule(post: &J) -> J {
         Ok(value) => value,
         Err(error) => return err_msg(&error),
     };
-    // Duplicate check: same type+pattern already present.
+    let group = post["group"].as_str().unwrap_or("").trim();
     let dup = seq.iter().any(|r| {
-        r.get(ykey("rule_type")).and_then(|v| v.as_str()) == Some(rule_type)
+        r.get(ykey("group"))
+            .and_then(Y::as_str)
+            .unwrap_or("")
+            .trim()
+            == group
+            && r.get(ykey("rule_type")).and_then(|v| v.as_str()) == Some(rule_type)
             && r.get(ykey("pattern")).and_then(|v| v.as_str()) == Some(pattern.as_str())
             && r.get(ykey("source")).and_then(Y::as_str).unwrap_or("") == source
     });
@@ -2598,6 +2610,7 @@ fn act_update_rule(post: &J) -> J {
     };
     if rules.iter().enumerate().any(|(i, r)| {
         i != index
+            && r.group.trim() == post["group"].as_str().unwrap_or(&old.group).trim()
             && rule_kind(&r.rule_type) == rule_kind(typ)
             && r.pattern == pattern
             && r.source == source
@@ -2881,6 +2894,9 @@ fn act_batch_add_rules(post: &J) -> J {
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
         if post.get("group_only").and_then(J::as_bool) == Some(true) {
+            if group.is_empty() || !source.is_empty() || !rule.is_global_destination() {
+                return err_msg("请选择具名规则组并导入目的规则；设备来源和默认出口请在绑定处配置");
+            }
             rule.group = group.to_string();
         }
         if post.get("source").is_some() {
@@ -2895,7 +2911,8 @@ fn act_batch_add_rules(post: &J) -> J {
             existing
                 .iter()
                 .find(|r| {
-                    rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
+                    r.group.trim() == rule.group.trim()
+                        && rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
                         && r.pattern == rule.pattern
                         && r.source == rule.source
                 })
@@ -2903,7 +2920,12 @@ fn act_batch_add_rules(post: &J) -> J {
         };
     }
     let n_in = parsed.rules.len();
-    let stats = sockrocket_core::merge_batch_rules(&mut existing, parsed.rules, conflict);
+    let stats = sockrocket_core::config::rules_batch::merge_rules(
+        &mut existing,
+        parsed.rules,
+        conflict,
+        true,
+    );
     save_routing_rules(&mut map, existing);
     match save_conf(&map) {
         Ok(()) => {
@@ -4933,6 +4955,44 @@ dns_direct_domains:
             .route("www.apple.com", 443),
             RouteAction::Proxy
         );
+    }
+
+    #[test]
+    fn imported_group_is_inactive_until_a_source_binds_it() {
+        let _env = TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain, group: Legacy, pattern: video.invalid, target: direct}"));
+        let winner = |source: &str| {
+            dispatch(
+                "trace_route",
+                &json!({"destination":"video.invalid","source":source,"resolve_dns":false}),
+            )["trace"]["action"]
+                .clone()
+        };
+        let bind = |source: &str, target: &str, remove: bool| {
+            let revision = act_get_rules()["revision"].clone();
+            dispatch(
+                "save_device_binding",
+                &json!({"revision":revision,"source":source,"all_devices":source.is_empty(),"group":"Imported","target":target,"priority":10,"remove":remove}),
+            )
+        };
+        assert_eq!(act_get_rules()["global_rule_groups"][0]["group"], "Legacy");
+        assert_eq!(
+            dispatch(
+                "batch_add_rules",
+                &json!({"text":"DOMAIN,video.invalid,REJECT","group_only":true,"group":"Imported"})
+            )["ok"],
+            true
+        );
+        assert_eq!(act_get_rules()["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(winner(""), "direct");
+        assert_eq!(bind("192.0.2.8", "reject", false)["ok"], true);
+        assert_eq!(winner("192.0.2.8"), "reject");
+        assert_eq!(winner("192.0.2.9"), "direct");
+        assert_eq!(bind("", "proxy", false)["ok"], true);
+        assert_eq!(winner("192.0.2.8"), "reject");
+        assert_eq!(winner("192.0.2.9"), "proxy");
+        assert_eq!(bind("", "", true)["ok"], true);
+        assert_eq!(winner("192.0.2.9"), "direct");
+        assert_eq!(winner("192.0.2.8"), "reject");
     }
 
     #[test]

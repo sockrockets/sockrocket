@@ -33,6 +33,14 @@ pub fn rule_mode_with_devices(
     rules: &[RoutingRule],
     links: &[crate::config::model::DeviceRuleGroup],
 ) -> RuleSet {
+    rule_mode_with_bindings(rules, links, false)
+}
+
+pub fn rule_mode_with_bindings(
+    rules: &[RoutingRule],
+    links: &[crate::config::model::DeviceRuleGroup],
+    explicit: bool,
+) -> RuleSet {
     let enabled: Vec<_> = rules
         .iter()
         .enumerate()
@@ -63,19 +71,31 @@ pub fn rule_mode_with_devices(
                 .unwrap_or(0),
         )
     });
+    let mut by_group = std::collections::HashMap::new();
+    for link in links {
+        if explicit || !link.source.is_empty() {
+            by_group
+                .entry(link.group.as_str())
+                .or_insert_with(Vec::new)
+                .push(link);
+        }
+    }
     let mut tiers = std::collections::BTreeMap::new();
     for (index, member) in &non_final {
-        for link in links
-            .iter()
-            .filter(|link| link.group == member.group.trim())
-        {
+        if !explicit || member.group.trim().is_empty() {
+            tiers
+                .entry((false, 0))
+                .or_insert_with(Vec::new)
+                .push((*index, (*member).clone()));
+        }
+        for link in by_group.get(member.group.trim()).into_iter().flatten() {
             let mut rule = (*member).clone();
             rule.source.clone_from(&link.source);
             if !link.target.is_empty() {
                 rule.target.clone_from(&link.target);
             }
             tiers
-                .entry(link.priority)
+                .entry((!link.source.is_empty(), link.priority))
                 .or_insert_with(Vec::new)
                 .push((*index, rule));
         }
@@ -86,7 +106,6 @@ pub fn rule_mode_with_devices(
             scoped.iter().map(|(i, r)| (*i, r)),
         ));
     }
-    set.extend(RuleSet::from_indexed_config(non_final));
 
     // Built-in China-direct without its catch-all. Placed after user
     // non-final rules so an explicit user `geoip:CN → proxy` (or a CN
