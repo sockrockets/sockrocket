@@ -76,7 +76,10 @@ pub fn preferred_merlin_cli_asset() -> Option<&'static str> {
 
 /// Merlin offline package name for a koolcenter platform tag.
 pub fn merlin_package_asset(platform: &str) -> Option<String> {
-    let p = platform.trim();
+    let p = match platform.trim() {
+        "arm386" => "arm",
+        other => other,
+    };
     match p {
         "arm" | "hnd" | "hnd_v8" | "qca" | "mtk" | "ipq32" | "ipq64" => {
             Some(format!("sockrocket-merlin-{p}.tar.gz"))
@@ -377,6 +380,10 @@ mod tests {
         assert_eq!(
             merlin_package_asset("hnd_v8").as_deref(),
             Some("sockrocket-merlin-hnd_v8.tar.gz")
+        );
+        assert_eq!(
+            merlin_package_asset("arm386\n"),
+            merlin_package_asset("arm")
         );
         assert!(merlin_package_asset("nope").is_none());
     }

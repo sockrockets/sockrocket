@@ -124,7 +124,7 @@ Plugin router cung cấp WebUI, proxy trong suốt, chuyển DNS và kiểm tra 
 *Ảnh đã ẩn thông tin. Số liệu là trạng thái lúc chụp, không phải trạng thái trực tiếp.*
 
 1. Nếu menu chưa có Software Center, tải bản Merlin hoặc bản mod chính hãng đúng model từ [fw.koolcenter.com](https://fw.koolcenter.com/) rồi flash. Merlin gốc không có Software Center.
-2. Chọn `sockrocket-merlin-<platform>.tar.gz` đúng nền tảng firmware và kiến trúc CPU; không chỉ đoán theo tên model.
+2. Tra tên model và kiến trúc firmware trong [bảng đối chiếu gói](docs/merlin.md#model--platform). Mỗi bộ gói có kèm tệp `merlin-models.md`.
 3. Làm theo [hướng dẫn Merlin](docs/merlin.md) để cấu hình JFFS / custom scripts và cài gói.
 4. Cấu hình subscription trên router; kiểm tra node trước khi bật chuyển DNS hoặc proxy trong suốt. Để một phần lưu lượng đi qua nhóm node, giữ chế độ Rule và đặt lối ra của quy tắc thành nhóm đó.
 5. Sao lưu cấu hình trước khi cập nhật và kiểm tra thao tác dừng / khôi phục mạng trước khi sử dụng lâu dài.
