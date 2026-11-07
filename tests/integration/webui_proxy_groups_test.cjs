@@ -53,7 +53,6 @@ assert.equal(el('device-picker').options.filter(o=>o.value.startsWith('192.0.2.8
 el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();
 assert.equal(el('device-target').value,'direct');
 assert.equal(el('device-group').value,'Emby');
-assert.deepEqual(el('global-rule-group').options.map(o=>o.value),['','Emby']);
 assert.match(el('global-rule-summary').textContent,/共 2 条，已启用 2 条/);
 assert.equal(el('device-group-target').value,'direct');
 assert.equal(el('device-unlink').hidden,false);

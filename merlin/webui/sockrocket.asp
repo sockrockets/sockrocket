@@ -506,7 +506,7 @@ body.bg {min-width:0!important}
           <div class="toolbar"><h4 id="sr-device-title">全局与设备分流策略</h4><div class="spacer"></div><button class="btn btn-sm" onclick="srLoadRules()">刷新设备</button></div>
           <fieldset id="sr-device-form" disabled style="border:0;padding:0;margin:0;min-width:0">
             <div class="toolbar">
-              <div class="fg"><label for="sr-global-rule-group">规则组内容</label><select id="sr-global-rule-group" onchange="selectGroupContents()"></select></div>
+              <div class="fg"><label for="sr-global-rule-group">规则组内容</label><input type="text" id="sr-global-rule-group" placeholder="输入已有分组名称" autocomplete="off" spellcheck="false" onfocus="this.select()" oninput="if(!event.isComposing)typeRuleGroup(this,false)" oncompositionend="typeRuleGroup(this,false)" onkeydown="if(event.key==='Enter' &amp;&amp; !event.isComposing){event.preventDefault();typeRuleGroup(this,true);}" disabled><small class="hint" id="sr-global-rule-group-hint" aria-live="polite"></small></div>
               <button type="button" id="sr-global-rule-view" class="btn btn-sm" onclick="viewGlobalRuleGroup()">查看组内规则</button>
             </div>
             <p class="hint" id="sr-global-rule-summary" aria-live="polite"></p>
@@ -553,7 +553,7 @@ body.bg {min-width:0!important}
           <div class="toolbar"><h3 id="sr-rule-workspace-title">分流规则编辑</h3><div class="spacer"></div><button class="btn btn-sm" onclick="exportRules()">导出</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
           <p class="hint" id="sr-rule-operation-state" role="status" aria-live="polite"></p>
           <div class="rule-workspace-controls">
-            <div class="fg"><label for="sr-rule-group-select">选择分组</label><select id="sr-rule-group-select" onchange="changeRuleGroup(this.value)" disabled><option value="">正在加载…</option></select></div>
+            <div class="fg"><label for="sr-rule-group-select">选择分组</label><input type="text" id="sr-rule-group-select" placeholder="输入已有分组名称" autocomplete="off" spellcheck="false" onfocus="this.select()" oninput="if(!event.isComposing)typeRuleGroup(this,false)" oncompositionend="typeRuleGroup(this,false)" onkeydown="if(event.key==='Enter' &amp;&amp; !event.isComposing){event.preventDefault();typeRuleGroup(this,true);}" disabled><small class="hint" id="sr-rule-group-select-hint" aria-live="polite"></small></div>
             <div class="fg"><label for="sr-rule-workspace-mode">编辑方式</label><select id="sr-rule-workspace-mode" onchange="changeRuleWorkspaceMode(this.value)" disabled><option value="list">规则列表</option><option value="bulk">批量编辑整个分组</option><option value="import">从链接追加规则</option></select></div>
             <div class="fg"><label for="sr-rule-group-outlet-select">分组代理出口</label><div id="sr-rule-group-outlet"></div></div>
           </div>
@@ -2073,24 +2073,11 @@ function deviceRecord() {
   return (SR_STATE.devices || []).find(function(row){return sameDeviceSource(row.source, deviceSource());});
 }
 function renderGlobalRuleGroups() {
-  var groups=new Map(),total=0,enabled=0;
-  (SR_STATE.ruleRows||[]).forEach(function(r){
-    var name=(r.group||'').trim();
-    groups.set(name,(groups.get(name)||0)+1);
-    total++;
-    if(r.enabled!==false)enabled++;
-  });
-  var picker=srElement('global-rule-group'),previous=picker.value;
-  picker.innerHTML=Array.from(groups,function(entry){return deviceOption(entry[0],(entry[0]||'未分组')+' · '+entry[1]+' 条');}).join('') || deviceOption('','暂无规则组');
-  if(groups.has(previous))picker.value=previous;
-  picker.disabled=!total;
-  srElement('global-rule-view').disabled=!total;
+  var rows=SR_STATE.ruleRows||[],total=rows.length,enabled=rows.filter(function(r){return r.enabled!==false;}).length;
   srElement('global-rule-summary').textContent=total?'共 '+total+' 条，已启用 '+enabled+' 条。新建或通过链接导入的组，关联来源后生效。':'可在规则编辑器中新建规则组或通过链接导入。';
 }
 function selectGroupContents() {
-  var picker=srElement('global-rule-group');
-  if(changeRuleGroup(picker.value))return true;
-  picker.value=RULE_SELECTED_GROUP||'';return false;
+  return typeRuleGroup(srElement('global-rule-group'),true);
 }
 function viewGlobalRuleGroup() {
   if(selectGroupContents())srElement('rule-workspace').scrollIntoView({behavior:'smooth',block:'start'});
@@ -2310,9 +2297,14 @@ function syncRuleWorkspace() {
   if(RULE_SELECTED_GROUP !== null && names.indexOf(RULE_SELECTED_GROUP)<0 && (RULE_ADD_BASELINE !== null || RULE_ROW_BASELINE !== null))names.push(RULE_SELECTED_GROUP);
   if(names.indexOf(RULE_SELECTED_GROUP)<0)RULE_SELECTED_GROUP=names.length?names[0]:null;
   var picker=srElement('rule-group-select'), members=ruleGroupMembers(RULE_SELECTED_GROUP), locked=ruleWorkspaceLocked();
-  picker.innerHTML=names.length?names.map(function(name){return '<option value="'+srEsc(name)+'">'+srEsc(name || '未分组')+' · '+ruleGroupMembers(name).length+' 条</option>';}).join(''):'<option value="">暂无分组，请新建</option>';
-  picker.value=RULE_SELECTED_GROUP === null?'':RULE_SELECTED_GROUP;picker.disabled=locked || !names.length;
-  srElement('global-rule-group').value=picker.value;
+  [picker,srElement('global-rule-group')].forEach(function(field){
+    if(field._shownGroup!==RULE_SELECTED_GROUP){
+      field.value=RULE_SELECTED_GROUP===null?'':RULE_SELECTED_GROUP||'未分组';
+      field._shownGroup=RULE_SELECTED_GROUP;
+    }
+    field.disabled=locked || !names.length;
+  });
+  srElement('global-rule-view').disabled=locked || !names.length;
   srElement('rule-workspace-mode').value=RULE_WORKSPACE_MODE;
   srElement('rule-workspace-mode').disabled=locked || RULE_SELECTED_GROUP === null;
   var editing=RULE_ADD_BASELINE !== null || RULE_ROW_BASELINE !== null;
@@ -2328,8 +2320,27 @@ function syncRuleWorkspace() {
   if(!locked){ruleTypeChanged();editRuleTypeChanged();}
   srElement('rule-import-fetch').disabled=locked || RULE_IMPORT_PENDING;
 }
+function typeRuleGroup(field,submit) {
+  var text=field.value.trim(), names=Array.from(new Set((SR_STATE.ruleRows||[]).map(function(r){return (r.group||'').trim();}).concat(RULE_LOCAL_GROUPS)));
+  var key=names.find(function(name){return name===text && !!name;});
+  if(key===undefined && (text==='未分组'||(!text&&submit)) && names.includes(''))key='';
+  if(key===undefined && text){
+    var matches=names.filter(function(name){return name.toLowerCase()===text.toLowerCase();});
+    if(matches.length===1)key=matches[0];
+  }
+  var hint=srElement(field===srElement('global-rule-group')?'global-rule-group-hint':'rule-group-select-hint');
+  if(key===undefined){
+    hint.textContent=text?'未匹配到分组，请输入完整组名。':'';
+    return false;
+  }
+  if(!submit && ruleWorkspaceDirty()){hint.textContent='按回车切换分组。';return false;}
+  hint.textContent='';
+  if(!changeRuleGroup(key)) {field.value=RULE_SELECTED_GROUP||'未分组';return false;}
+  return true;
+}
 function changeRuleGroup(key,scope) {
   if(ruleWorkspaceLocked() || !discardRuleDraft()) {srElement('rule-group-select').value=RULE_SELECTED_GROUP || '';return false;}
+  ['rule-group-select','global-rule-group'].forEach(function(id){srElement(id)._shownGroup=undefined;srElement(id+'-hint').textContent='';});
   resetRuleEditor();RULE_SELECTED_GROUP=key;srElement('rule-group').value=key;
   srElement('rule-search').value='';srElement('rule-filter-target').value='';srElement('rule-filter-state').value='';srElement('rule-filter-scope').value=scope||'';
   renderRules();return true;
@@ -3153,6 +3164,7 @@ function editRuleGroup(enc) {
     return (r.group || '').trim() === key;
   });
   if (!members.length || ruleWorkspaceLocked() || !discardRuleDraft()) return;
+  ['rule-group-select','global-rule-group'].forEach(function(id){srElement(id)._shownGroup=undefined;srElement(id+'-hint').textContent='';});
   resetRuleEditor();RULE_SELECTED_GROUP=key;RULE_WORKSPACE_MODE='bulk';srElement('rule-add-panel').hidden=false;
   srElement('rule-priority').value = '';
   RULE_EDIT_GROUP = key;
