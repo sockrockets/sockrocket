@@ -10,7 +10,7 @@ use tokio::{
 ///
 /// `UdpSocket::bind("[::]")` claims the IPv4 port on some kernels unless
 /// `IPV6_V6ONLY` is set before bind. The IPv4 listener already owns that port.
-fn bind_ipv6_udp(port: u16) -> Result<UdpSocket> {
+fn bind_ipv6_udp(port: u16) -> std::io::Result<UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
@@ -19,10 +19,10 @@ fn bind_ipv6_udp(port: u16) -> Result<UdpSocket> {
     socket.set_only_v6(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-    Ok(UdpSocket::from_std(std::net::UdpSocket::from(socket))?)
+    UdpSocket::from_std(std::net::UdpSocket::from(socket))
 }
 
-fn bind_ipv6_tcp(port: u16) -> Result<TcpListener> {
+fn bind_ipv6_tcp(port: u16) -> std::io::Result<TcpListener> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::STREAM,
@@ -32,7 +32,26 @@ fn bind_ipv6_tcp(port: u16) -> Result<TcpListener> {
     socket.set_nonblocking(true)?;
     socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
     socket.listen(128)?;
-    Ok(TcpListener::from_std(std::net::TcpListener::from(socket))?)
+    TcpListener::from_std(std::net::TcpListener::from(socket))
+}
+
+pub(super) struct Ipv6Listeners {
+    udp: UdpSocket,
+    tcp: TcpListener,
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Ipv6Listeners {
+    pub(super) fn bind(
+        port: u16,
+        open: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            udp: bind_ipv6_udp(port)?,
+            tcp: bind_ipv6_tcp(port)?,
+            open,
+        })
+    }
 }
 
 pub(super) async fn serve(
@@ -45,7 +64,14 @@ pub(super) async fn serve(
     let udp = UdpSocket::bind((bind, port)).await?;
     let actual = udp.local_addr()?.port();
     let tcp = TcpListener::bind((bind, actual)).await?;
-    serve_bound(udp, tcp, resolver, shutdown, ipv6_open).await
+    let ipv6 = ipv6_open.and_then(|open| match Ipv6Listeners::bind(actual, open) {
+        Ok(listeners) => Some(listeners),
+        Err(error) => {
+            tracing::warn!("IPv6 DNS listener unavailable: {error:#}");
+            None
+        }
+    });
+    serve_bound(udp, tcp, resolver, shutdown, ipv6).await
 }
 
 /// Run the same listener lifecycle with sockets already owned by the caller.
@@ -54,7 +80,7 @@ pub(super) async fn serve_bound(
     tcp: TcpListener,
     resolver: DnsResolver,
     shutdown: Arc<tokio::sync::Notify>,
-    ipv6_open: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ipv6: Option<Ipv6Listeners>,
 ) -> Result<()> {
     let address = udp.local_addr()?;
     let actual = address.port();
@@ -76,23 +102,16 @@ pub(super) async fn serve_bound(
         None,
     ));
     required.spawn(serve_tcp(tcp, resolver.clone(), tcp_stop_rx.clone(), None));
-    if let Some(open) = ipv6_open {
-        match (bind_ipv6_udp(actual), bind_ipv6_tcp(actual)) {
-            (Ok(v6_udp), Ok(v6_tcp)) => {
-                tracing::info!("DNS listener: udp+tcp://[::]:{actual} (LAN interception only)");
-                extra.spawn(serve_dns_socket(
-                    v6_udp,
-                    resolver.clone(),
-                    v6_udp_stop.clone(),
-                    budget.dns_queries,
-                    Some(open.clone()),
-                ));
-                extra.spawn(serve_tcp(v6_tcp, resolver, tcp_stop_rx, Some(open)));
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                tracing::warn!("IPv6 DNS listener unavailable: {error:#}");
-            }
-        }
+    if let Some(Ipv6Listeners { udp, tcp, open }) = ipv6 {
+        tracing::info!("DNS listener: udp+tcp://[::]:{actual} (LAN interception only)");
+        extra.spawn(serve_dns_socket(
+            udp,
+            resolver.clone(),
+            v6_udp_stop.clone(),
+            budget.dns_queries,
+            Some(open.clone()),
+        ));
+        extra.spawn(serve_tcp(tcp, resolver, tcp_stop_rx, Some(open)));
     }
     tracing::info!("DNS listener: udp+tcp://{bind}:{actual}");
     let mut failure = None;

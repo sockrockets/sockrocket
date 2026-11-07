@@ -2068,29 +2068,18 @@ mod tests {
 
     #[tokio::test]
     async fn serve_dns_udp_answers_queries_and_stops() {
-        let resolver = DnsResolver::with_config(china_split_dns_config());
+        let (upstream, _) = spawn_mock_dns(vec!["192.0.2.1".parse().unwrap()], vec![], false).await;
         let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (udp, tcp) = listener::bind_test_sockets().await.unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let server = tokio::spawn(listener::serve_bound(
+            udp,
+            tcp,
+            resolver_to(upstream),
+            shutdown.clone(),
+            None,
+        ));
 
-        // Bind an OS-assigned port to avoid collisions in CI.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let shutdown_clone = shutdown.clone();
-        let server = tokio::spawn(async move {
-            serve_dns_udp("127.0.0.1", port, resolver, shutdown_clone)
-                .await
-                .unwrap();
-        });
-        // Give the listener a moment to bind.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Send a well-formed A query for example.com. Offline, upstream
-        // resolution will fail or time out; either way the listener must send
-        // back a response with the same transaction ID (FORMERR/SERVFAIL is
-        // fine — the contract under test is the UDP plumbing, not upstream).
-        // Use tokio's socket: a blocking std socket here would stall the
-        // current-thread test runtime that also drives the listener.
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut query = Vec::new();
         query.extend_from_slice(&[0xAB, 0xCD]); // ID
@@ -2124,6 +2113,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .expect("listener must stop on shutdown")
+            .unwrap()
             .unwrap();
     }
 
@@ -2132,20 +2122,40 @@ mod tests {
         if std::net::UdpSocket::bind("[::1]:0").is_err() {
             return;
         }
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let resolver = DnsResolver::with_config(china_split_dns_config());
+        let (upstream, _) = spawn_mock_dns(vec!["192.0.2.1".parse().unwrap()], vec![], false).await;
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let shutdown_clone = shutdown.clone();
         let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let gate = open.clone();
-        let server = tokio::spawn(async move {
-            serve_dns_udp_and_ipv6("127.0.0.1", port, resolver, shutdown_clone, gate)
-                .await
-                .unwrap();
-        });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // All four sockets must own the same port before starting the test.
+        // IPv6 can have different port exclusions from IPv4 on Windows.
+        let mut sockets = None;
+        for _ in 0..64 {
+            let (udp, tcp) = listener::bind_test_sockets().await.unwrap();
+            let port = udp.local_addr().unwrap().port();
+            match listener::Ipv6Listeners::bind(port, open.clone()) {
+                Ok(v6) => {
+                    sockets = Some((udp, tcp, v6));
+                    break;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("could not bind IPv6 DNS listeners: {e}"),
+            }
+        }
+        let (udp, tcp, v6) = sockets.expect("could not reserve a dual-stack TCP/UDP port");
+        let port = udp.local_addr().unwrap().port();
+        let server = tokio::spawn(listener::serve_bound(
+            udp,
+            tcp,
+            resolver_to(upstream),
+            shutdown.clone(),
+            Some(v6),
+        ));
         let client = UdpSocket::bind("[::1]:0").await.unwrap();
         let query = [
             0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
@@ -2178,6 +2188,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .expect("listener must stop on shutdown")
+            .unwrap()
             .unwrap();
     }
 
