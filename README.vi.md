@@ -4,7 +4,7 @@
   <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket" width="320" />
 </p>
 <p align="center"><strong>Một lõi proxy Rust cho máy tính và router.</strong></p>
-<p align="center">Ứng dụng desktop native · CLI · Plugin AsusWRT-Merlin</p>
+<p align="center">Ứng dụng desktop native · CLI · Plugin Merlin nhỏ gọn, dùng ít RAM</p>
 <p align="center"><a href="README.md">English</a> · <strong>Tiếng Việt</strong> · <a href="README.zh.md">中文</a></p>
 <p align="center">
   <a href="https://sockrockets.github.io/sockrocket/">Website</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
@@ -115,7 +115,9 @@ Trước khi nâng cấp, thoát bản cũ và tiến trình nền chạy với 
 
 ## AsusWRT-Merlin
 
-**Gói nhỏ hơn từ v0.0.19:** Loại bỏ bản sao chương trình, giữ trang WebUI cần thiết cho Software Center và toàn bộ chức năng. So sánh đóng gói cùng tệp thực thi: ARM64 từ 12.67 xuống 6.43 MiB, ARMv7 từ 12.53 xuống 6.36 MiB, giảm khoảng 49%. Giảm dung lượng tải và giải nén tạm thời, không đổi chương trình hay hiệu năng. Dung lượng chương trình sau cài đặt và RAM không giảm một nửa; kích thước bản phát hành thực tế có thể khác.
+**Plugin Merlin nhỏ gọn, dùng ít RAM**
+
+Trong thử nghiệm đóng gói v0.0.19, gói cài đặt ngoại tuyến có dung lượng 6.36 MiB trên ARMv7 và 6.43 MiB trên ARM64, giảm khoảng 49% sau khi bỏ bản sao của tệp thực thi. Trong một thử nghiệm riêng trên RT-AX86U Pro với 153–172 phiên hoạt động, tiến trình proxy dùng 29–37 MiB bộ nhớ thường trú (RSS). Dung lượng gói tùy bản dựng và mức dùng RAM tùy tải. [Số liệu bộ nhớ trên router](docs/architecture/tls-failure-investigation-2026-11-06.md)
 
 Plugin router cung cấp WebUI, proxy trong suốt, chuyển DNS và kiểm tra dịch vụ cho các thiết bị LAN.
 

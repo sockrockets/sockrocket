@@ -1,6 +1,8 @@
 # Sockrocket — AsusWRT-Merlin plugin
 
-**Smaller packages in v0.0.19:** Merlin packages remove duplicate executables while retaining the required Software Center Web UI entry and all features. Local packaging comparisons using the same binaries reduced ARM64 from 12.67 MiB to 6.43 MiB and ARMv7 from 12.53 MiB to 6.36 MiB — about 49% smaller. This reduces downloads and extraction space without changing executable contents or runtime performance; installed executable size and runtime memory are not halved. These are comparison samples; actual release sizes vary.
+**Small packages and low memory use**
+
+In the v0.0.19 packaging test, the offline installer was 6.36 MiB for ARMv7 and 6.43 MiB for ARM64, about 49% smaller after removing a duplicate executable. In a separate RT-AX86U Pro test with 153–172 active sessions, the proxy process used 29–37 MiB of resident memory (RSS). Release size varies by build, and memory use varies with workload. [Router memory measurements](../docs/architecture/tls-failure-investigation-2026-11-06.md)
 
 Transparent proxy integration for **AsusWRT-Merlin** routers.
 

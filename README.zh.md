@@ -5,7 +5,7 @@
 </p>
 
 <p align="center"><strong>桌面到路由器，共用一个 Rust 代理内核。</strong></p>
-<p align="center">原生桌面客户端 · 命令行 · AsusWRT-Merlin 插件</p>
+<p align="center">桌面客户端 · CLI · 小安装包、低内存占用的梅林插件</p>
 <p align="center">
   <a href="README.md">English</a> · <a href="README.vi.md">Tiếng Việt</a> · <strong>中文</strong>
 </p>
@@ -118,7 +118,9 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 ## AsusWRT-Merlin
 
-**v0.0.19 小包优化：** Merlin 安装包移除重复程序，保留软件中心必需的网页入口和完整功能。同一二进制的本地打包对照：ARM64 从 12.67 MiB 降至 6.43 MiB，ARMv7 从 12.53 MiB 降至 6.36 MiB，约缩小 49%。减少下载量和解包临时占用，不改变程序内容或运行性能；安装后的程序大小和运行内存不会因此减半。数字为对照样本，实际发行包大小以下载文件为准。
+**梅林插件：小安装包，低内存占用**
+
+v0.0.19 本地打包对照中，移除重复程序后，ARMv7 离线包为 6.36 MiB，ARM64 为 6.43 MiB，下载体积约减半。另一次 RT-AX86U Pro 实测中，153–172 个活跃会话下，代理进程的常驻内存（RSS）为 29–37 MiB。发行包大小随构建而异，内存占用随负载变化。 [内存实测记录](docs/architecture/tls-failure-investigation-2026-11-06.md)
 
 路由器插件提供 WebUI、透明代理、DNS 接管和运行状态检查，让局域网设备共用代理内核。
 
