@@ -129,6 +129,10 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  assert.match(html,/客厅电视[\s\S]*?Emby[\s\S]*?代理[\s\S]*?Laptop[\s\S]*?Emby[\s\S]*?拒绝/);
  el('rule-flow-destination').value='video.invalid';c.traceRuleFlow();assert.equal(f.requests.length,0);
  assert.match(html,/全局规则路径/);
+ assert.equal((html.match(/class="flow-map-lane"/g)||[]).length,3,'two devices and the shared policy appear in one diagram');
+ assert.equal((html.match(/class="flow-map-edge entry"/g)||[]).length,3,'each source connects to its first check');
+ assert.equal((html.match(/class="flow-map-edge exit"/g)||[]).length,(html.match(/class="flow-map-step"/g)||[]).length,'each effective check connects to its own exits');
+ assert.doesNotMatch(html,/class="flow-stage"/,'overview does not append a second global-only diagram');
  c.chooseGlobalFlow();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'');
  c.chooseFlowHost(tv);assert.match(el('rule-flow').innerHTML,/设备关联组/);assert.match(el('rule-flow').innerHTML,/全局自定义规则/);
  c.traceRuleFlow();let first=f.request('trace_route');

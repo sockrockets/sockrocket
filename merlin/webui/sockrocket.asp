@@ -180,13 +180,23 @@
 #sockrocket-plugin .flow-lines text {fill:var(--text-muted);font:10px var(--sans)}
 #sockrocket-plugin .flow-lines path.branch {stroke-dasharray:4 4}
 #sockrocket-plugin .flow-box.inactive {opacity:.45}
-#sockrocket-plugin .flow-device-map {margin:12px 0 18px}
-#sockrocket-plugin .flow-device-map h4 {margin:0 0 8px}
-#sockrocket-plugin .flow-device-route {display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:12px;align-items:center;padding:9px 12px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;overflow-wrap:anywhere}
-#sockrocket-plugin .flow-device-route small {display:block;color:var(--text-muted)}
-#sockrocket-plugin .flow-device-branches {border-left:2px solid var(--border);padding-left:12px}
-#sockrocket-plugin .flow-device-branches>div {display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px}
-#sockrocket-plugin .flow-device-arrow {color:var(--text-muted)}
+#sockrocket-plugin .flow-device-map {margin:12px 0;--map-track:minmax(0,23fr) minmax(12px,4fr) minmax(0,41fr) minmax(12px,4fr) minmax(0,28fr)}
+#sockrocket-plugin .flow-map-head,#sockrocket-plugin .flow-map-step {display:grid;grid-template-columns:var(--map-track);align-items:center}
+#sockrocket-plugin .flow-map-head {color:var(--text-muted);font-size:11px;margin:10px 0 6px}
+#sockrocket-plugin .flow-map-head span:nth-child(2),#sockrocket-plugin .flow-map-stage {grid-column:3}
+#sockrocket-plugin .flow-map-head span:last-child,#sockrocket-plugin .flow-map-exit {grid-column:5}
+#sockrocket-plugin .flow-map-lane {padding:12px 0;border-top:1px solid var(--border)}
+#sockrocket-plugin .flow-map-step+.flow-map-step {margin-top:16px}
+#sockrocket-plugin .flow-map-node {position:relative;min-width:0;align-self:stretch;display:flex;flex-direction:column;justify-content:center;gap:3px;padding:7px 9px;background:var(--bg-sidebar);color:var(--text-primary);border:1px solid var(--border);border-radius:7px;text-align:left;font:inherit;font-size:12px;overflow-wrap:anywhere}
+#sockrocket-plugin button.flow-map-node {cursor:pointer}
+#sockrocket-plugin button.flow-map-node:hover {border-color:var(--accent)}
+#sockrocket-plugin .flow-map-node small {color:var(--text-muted);font-size:10px}
+#sockrocket-plugin .flow-map-source {grid-column:1;border-left:3px solid var(--accent)}
+#sockrocket-plugin .flow-map-step+.flow-map-step .flow-map-stage:before {content:"";position:absolute;bottom:100%;left:50%;height:16px;border-left:1px dashed var(--text-muted)}
+#sockrocket-plugin .flow-map-edge {position:relative;width:100%;height:0;border-top:1px solid var(--text-muted)}
+#sockrocket-plugin .flow-map-edge:after {content:"";position:absolute;right:0;top:-4px;border:3px solid transparent;border-right:0;border-left:5px solid var(--text-muted)}
+#sockrocket-plugin .flow-map-edge.entry {grid-column:2}
+#sockrocket-plugin .flow-map-edge.exit {grid-column:4}
 #sockrocket-plugin .flow-query {display:grid;grid-template-columns:minmax(160px,2fr) minmax(120px,1fr) 85px;gap:10px;margin:16px 0 10px}
 #sockrocket-plugin .flow-trace-result {margin-top:14px;border:1px solid var(--border);border-radius:9px;padding:14px;background:var(--bg-sidebar)}
 #sockrocket-plugin .flow-trace-result h4 {margin:0;font-size:15px}
@@ -2569,32 +2579,32 @@ function deviceBranchesHtml(rows,bindings) {
     if(item.source)scopes.add(flowHost(item.source)||item.source);
   });
   if(!scopes.size)return '';
-  function routeRow(stage) {
-    var exits=stage.targets.map(function(key){return RULE_TARGET_LABEL[key]||key;}).join(' / ');
-    return '<div><span>'+srEsc(stage.title)+'</span><span class="flow-device-arrow" aria-hidden="true">→</span><strong>'+srEsc(exits)+'</strong></div>';
+  function lane(source) {
+    var ip=flowHost(source),name=hosts.get(ip),label=name||source||'全部设备';
+    var sourceText='<strong>'+srEsc(label)+'</strong><small>'+srEsc(source?(name?ip:ip?'选择设备模拟':'来源网段'):'全局规则路径')+'</small>';
+    var sourceNode=source && !ip?'<div class="flow-map-node flow-map-source">'+sourceText+'</div>':
+      '<button type="button" class="flow-map-node flow-map-source" '+(ip?'data-ip="'+srEsc(ip)+'" onclick="chooseFlowHost(this.dataset.ip)"':'onclick="chooseGlobalFlow()"')+'>'+sourceText+'</button>';
+    var stages=ruleFlowModel(rows,'rule',source,ordered).filter(function(stage){return !stage.disabled;});
+    var steps=stages.map(function(stage,i){
+      var caption=stage.phaseLabel || (stage.kind==='builtin'?'内置规则':'默认出口');
+      var title='<strong>'+srEsc(stage.title)+'</strong><small>'+srEsc(caption)+'</small>';
+      var node=stage.indices?'<button class="flow-map-node flow-map-stage" type="button" data-index="'+Number(stage.indices[0])+'" onclick="openFlowMapGroup(this.dataset.index)">'+title+'</button>':'<div class="flow-map-node flow-map-stage">'+title+'</div>';
+      var exits=stage.targets.map(function(key){return '<span>'+srEsc(RULE_TARGET_LABEL[key]||key)+'</span>';}).join('');
+      return '<div class="flow-map-step">'+(i===0?sourceNode+'<i class="flow-map-edge entry" aria-hidden="true"></i>':'')+
+        node+'<i class="flow-map-edge exit" aria-hidden="true"></i><div class="flow-map-node flow-map-exit">'+exits+'</div></div>';
+    }).join('');
+    return '<section class="flow-map-lane" aria-label="'+srEsc(label)+'">'+steps+'</section>';
   }
-  function sharedStage(stage){return stage.kind==='global_rule'||stage.kind==='builtin';}
-  var global=ruleFlowModel(rows,'rule','',ordered).filter(function(stage){return !stage.disabled;});
-  var paths='<div class="flow-device-route"><div><button type="button" class="btn btn-sm" onclick="chooseGlobalFlow()">全部设备</button><small>全局规则路径</small></div><div class="flow-device-branches">'+global.map(routeRow).join('')+'</div></div>';
-  scopes.forEach(function(source){
-    var ip=flowHost(source),name=hosts.get(ip),label=srEsc(name||source);
-    var device=ip?'<button class="btn btn-sm" type="button" data-ip="'+srEsc(ip)+'" onclick="chooseFlowHost(this.dataset.ip)">'+label+'</button>':'<strong>'+label+'</strong>';
-    var sub=name?ip:ip?'选择设备模拟':'来源网段';
-    var inherits=false, branches='';
-    ruleFlowModel(rows,'rule',source,ordered).forEach(function(stage){
-      if(stage.disabled)return;
-      if(sharedStage(stage)){
-        if(!inherits)branches+='<div><span>未命中时继续匹配全局目的规则和内置直连</span></div>';
-        inherits=true;
-      }else{
-        branches+=routeRow(stage);
-      }
-    });
-    paths+='<div class="flow-device-route"><div>'+device+'<small>'+srEsc(sub)+'</small></div><div class="flow-device-branches">'+branches+'</div></div>';
-  });
-  var html='<section class="flow-device-map" aria-label="全局与设备的分流关系"><h4>分流路径</h4>'+paths+'</section>';
+  var html='<div class="flow-device-map" aria-label="全局与设备的分流路径"><div class="flow-map-head"><span>来源</span><span>按顺序检查，未命中向下</span><span>命中后的出口</span></div>'+
+    Array.from(scopes,lane).join('')+lane('')+'</div>';
   deviceMapCache={rows:rows,links:bindings,devices:SR_STATE.devices,compiled:SR_STATE.compiledTargets,nodes:SR_RULE_NODES,groups:SR_PROXY_GROUPS,html:html};
   return html;
+}
+function openFlowMapGroup(index) {
+  var rule=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(index);});
+  if(rule && changeRuleGroup((rule.group||'').trim(),rule.source?'device':'global')){
+    srElement('rule-workspace').scrollIntoView({behavior:'smooth',block:'start'});
+  }
 }
 function chooseGlobalFlow() {
   srElement('rule-flow-device').value='global';
@@ -2775,6 +2785,13 @@ function renderRuleFlow() {
   }
   var all=SR_STATE.ruleRows,enabled=all.filter(function(r){return r.enabled!==false;}).length;
   srElement('rule-flow-summary').textContent='与下方同一配置：共 '+all.length+' 条 · 启用 '+enabled+' 条 · 停用 '+(all.length-enabled)+' 条。图中不受列表搜索或分页影响。'+(rulePending?' 正在保存/应用并核对结果…':RULE_READ_PENDING?' 正在读取最新状态…':RULE_FLOW_ERROR?' 当前为上次快照，请刷新。':'');
+  if(!srElement('rule-flow-device').value && mode==='rule' && !t){
+    var overview=deviceBranchesHtml(all,SR_STATE.deviceBindings||[]);
+    if(overview){
+      host.innerHTML=overview+(RULE_FLOW_ERROR?'<p class="flow-warning">规则刷新失败，显示的是上次快照。</p>':'');
+      return;
+    }
+  }
   if(RULE_FLOW_SELECTED<0 && winner>=0)RULE_FLOW_SELECTED=winner;
   RULE_FLOW_SELECTED=Math.max(0,Math.min(RULE_FLOW_SELECTED,rows.length-1));
   var selected=rows[RULE_FLOW_SELECTED],targets=[],names=RULE_TARGET_LABEL,node=(SR_STATE.nodes||[])[st.active_node];
@@ -2796,10 +2813,8 @@ function renderRuleFlow() {
   }).join('');
   var outlets=targets.map(function(a){return '<div class="flow-box'+(t&&a===t.action?' selected':'')+'"><strong>'+srEsc(names[a]||a)+'</strong><small title="'+srEsc(descriptions[a]||'分组不可用')+'">'+srEsc(descriptions[a]||'分组不可用')+'</small></div>';}).join('');
   var actions=selected.rule?'<button type="button" class="btn btn-sm" onclick="inspectRule('+Number(selected.rule.index)+')">详情</button><button type="button" class="btn btn-accent btn-sm"'+(rulePending||RULE_READ_PENDING||RULE_FLOW_ERROR?' disabled':'')+' onclick="editRule('+Number(selected.rule.index)+')">编辑规则</button>':selected.indices?'<button type="button" class="btn btn-sm" onclick="showFlowRuleList(\''+selected.kind+'\','+RULE_FLOW_SELECTED+')">查看整个分组</button>':'';
-  var overview=!srElement('rule-flow-device').value && mode==='rule';
-  var branches=overview?deviceBranchesHtml(all,SR_STATE.deviceBindings||[]):'';
   var sourceTitle=RULE_FLOW_CLIENT?(flowDeviceChoices().get(RULE_FLOW_CLIENT)||RULE_FLOW_CLIENT):'全局规则';
-  host.innerHTML=branches+'<p class="hint">'+(t?'蓝线表示本次'+(t.definitive?'命中':'暂定匹配')+'路径；灰线仅表示规则检查顺序，停用项不参与分流。':'灰色连线仅表示配置关系；输入网站检查后高亮命中路径。')+'</p><div class="flow-columns" aria-hidden="true"><span>来源</span><span>按阶段依次匹配</span><span>命中后的出口</span></div><div class="flow-stage" style="height:'+h+'px"><svg class="flow-lines" viewBox="0 0 1000 '+h+'" preserveAspectRatio="none" aria-hidden="true">'+paths+'</svg><div class="flow-entry"><div class="flow-box"><strong>'+srEsc(sourceTitle)+'</strong><small>'+srEsc(RULE_TRACE?RULE_TRACE.destination+':'+RULE_TRACE.port:'输入网站后检查实际规则命中')+'</small></div></div><div class="flow-rules">'+boxes+'</div><div class="flow-exits">'+outlets+'</div></div><div class="flow-detail"><div><strong>'+srEsc(selected.title)+'</strong><p>'+srEsc((selected.phaseLabel?selected.phaseLabel+' · ':'')+selected.note)+'</p></div>'+actions+'</div>'+(RULE_FLOW_ERROR?'<p class="flow-warning">规则刷新失败，显示的是上次快照，请刷新后再检查。</p>':'')+flowTraceHtml(RULE_TRACE);
+  host.innerHTML='<p class="hint">'+(t?'蓝线表示本次'+(t.definitive?'命中':'暂定匹配')+'路径；灰线仅表示规则检查顺序，停用项不参与分流。':'灰色连线仅表示配置关系；输入网站检查后高亮命中路径。')+'</p><div class="flow-columns" aria-hidden="true"><span>来源</span><span>按阶段依次匹配</span><span>命中后的出口</span></div><div class="flow-stage" style="height:'+h+'px"><svg class="flow-lines" viewBox="0 0 1000 '+h+'" preserveAspectRatio="none" aria-hidden="true">'+paths+'</svg><div class="flow-entry"><div class="flow-box"><strong>'+srEsc(sourceTitle)+'</strong><small>'+srEsc(RULE_TRACE?RULE_TRACE.destination+':'+RULE_TRACE.port:'输入网站后检查实际规则命中')+'</small></div></div><div class="flow-rules">'+boxes+'</div><div class="flow-exits">'+outlets+'</div></div><div class="flow-detail"><div><strong>'+srEsc(selected.title)+'</strong><p>'+srEsc((selected.phaseLabel?selected.phaseLabel+' · ':'')+selected.note)+'</p></div>'+actions+'</div>'+(RULE_FLOW_ERROR?'<p class="flow-warning">规则刷新失败，显示的是上次快照，请刷新后再检查。</p>':'')+flowTraceHtml(RULE_TRACE);
 }
 
 function refreshRuleGroupList(rules) {
