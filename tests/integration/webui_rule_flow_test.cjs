@@ -195,3 +195,43 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  refresh('');assert.match(el('rule-flow').innerHTML,/<strong>TV<\/strong>/);
  console.log('PASS: device priority, matching exit and refreshed device and subnet names on one graph');
 }
+
+// Read the rendered wires and their endpoints independently of the flow model.
+function deviceConnections(html, source, hitsOnly=false) {
+ const sources=Array.from(html.matchAll(/data-source="([^"]*)" onclick="pickMapSource/g),m=>m[1]);
+ const groups=Array.from(html.matchAll(/class="map-node group[^"]*"[^>]*><strong>([^<]*)<\/strong>/g),m=>m[1]);
+ const index=sources.indexOf(source);
+ assert.ok(index>=0,'source is present on the shared canvas');
+ return Array.from(html.matchAll(/<path data-from="s(\d+)" data-to="g(\d+)" class="([^"]*)"/g))
+   .filter(m=>Number(m[1])===index && (!hitsOnly||m[3]==='selected'))
+   .map(m=>groups[Number(m[2])]).sort();
+}
+
+{
+ const f=fixture(),c=f.context,el=f.element, tv='192.0.2.8', network='192.0.2.0/24', other='198.51.100.9';
+ const rows=[rule(0,{group:'Media'}),rule(1,{group:'Work'}),rule(2,{group:'LAN'}),
+   rule(3,{source:tv,group:'Exception'}),rule(4,{source:tv,group:'TV default',rule_type:'final'}),
+   rule(5,{group:'Default',rule_type:'final'}),rule(6,{source:tv,group:'Off',enabled:false})];
+ c.SR_STATE.ruleRows=rows;
+ c.SR_STATE.deviceBindings=[{source:tv+'/32',group:'Media',target:'direct'},{source:network,group:'LAN',target:'reject'}];
+ c.SR_STATE.devices=[{source:other,alias:'Guest'}];
+ el('rule-flow-device').value='';c.renderRuleFlow();
+ const diagram=()=>el('rule-flow').innerHTML;
+ assert.deepEqual(deviceConnections(diagram(),tv),['Exception','Media','TV default']);
+ assert.deepEqual(deviceConnections(diagram(),network),['LAN']);
+ assert.deepEqual(deviceConnections(diagram(),other),[]);
+ assert.deepEqual(deviceConnections(diagram(),''),['Default','LAN','Media','Work','内置国内 / 局域网']);
+ c.chooseFlowHost(tv);c.SR_STATE.status.transparent_proxy=true;
+ for(const [index,owner,action] of [[1,'','proxy'],[2,network,'reject'],[0,tv,'direct'],[3,tv,'proxy'],[4,tv,'proxy']]){
+   const reply=result(rows[index],{source:tv});
+   reply.trace.steps[0].source=owner===tv?tv+'/32':owner||null;
+   reply.trace.action=action;c.RULE_TRACE=reply;c.renderRuleFlow();
+   assert.deepEqual(deviceConnections(diagram(),owner,true),[rows[index].group]);
+   assert.equal((diagram().match(/<path[^>]*class="selected"/g)||[]).length,2);
+   assert.deepEqual(deviceConnections(diagram(),tv),['Exception','Media','TV default']);
+ }
+ c.RULE_TRACE=null;c.RULE_SNAPSHOT_MODE='direct';c.renderRuleFlow();
+ assert.deepEqual(deviceConnections(diagram(),tv),[]);
+ assert.deepEqual(deviceConnections(diagram(),''),['全部直连']);
+ console.log('PASS: only configured device wires are drawn; host, subnet and global hits use their owning source');
+}

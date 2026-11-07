@@ -38,7 +38,7 @@ A rule group (the folder of rules on the Routing page) is not a node group. The 
 
 The desktop app edits and applies global rules. When it opens a shared configuration, it preserves router-specific rules and device group bindings for use on Merlin.
 
-The **流量去向** diagram shows device sources, shared rule groups, and exits on one canvas. Select a source and a group to configure their association. For an existing binding, select an exit and choose **保存该组出口**. Simulations highlight the matching path on the same diagram.
+The **流量去向** diagram shows device sources, shared rule groups, and exits on one canvas. Each device or subnet connects only to its own active rules, bound groups and configured fallback. Shared rules connect to **全部设备**. If a device simulation matches a subnet or shared rule, the highlighted path starts at the source that owns the match. Select a source and a group to configure their association. For an existing binding, select an exit and choose **保存此设备的绑定**. Simulations highlight the matching path on the same diagram.
 
 Under **全局与设备分流策略**, **全局规则组 · 所有设备共用** lists shared rules and opens the rule editor filtered to global entries. To configure a device, select a router client, a previously configured device, or a manual IP/network. The picker uses local DHCP leases and bridge neighbors. Names can be edited in the plugin. A discovered device's custom name is keyed by its MAC address, while routing uses its IP or subnet. Reserve a DHCP address if the policy should continue to apply to the same device.
 

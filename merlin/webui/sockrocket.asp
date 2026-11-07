@@ -491,7 +491,7 @@ body.bg {min-width:0!important}
         <div class="page-title">分流规则</div><p class="page-intro">在规则模式下，先检查设备专属规则和设备关联的规则组，再检查全局目的规则、国内直连及默认出口。</p>
         <section class="card" aria-labelledby="sr-rule-flow-title">
           <div class="rule-flow-head"><h3 id="sr-rule-flow-title">流量去向</h3><span class="flow-state" id="sr-rule-flow-state">等待状态</span><button type="button" class="btn btn-sm" id="sr-rule-flow-toggle" aria-expanded="true" aria-controls="sr-rule-flow" onclick="toggleRuleFlow()">收起概览</button></div>
-          <p class="hint">输入目标，由路由核心按保存的配置检查新连接：命中哪条规则、为什么命中、走哪个出口。不会修改规则或发起代理连接。</p>
+          <p class="hint">设备和网段只连接各自配置的规则。共用规则从「全部设备」连出。选择设备并输入目标，可查看实际命中的路径。</p>
           <p class="hint" id="sr-rule-flow-summary" role="status"></p>
           <div class="flow-query">
             <div class="fg"><label for="sr-rule-flow-destination">网站 / 目的 IP</label><input id="sr-rule-flow-destination" type="text" placeholder="例如 example.com，也可粘贴网址" autocomplete="off" spellcheck="false" oninput="invalidateRuleTrace()" onkeydown="if(event.key==='Enter')traceRuleFlow()"></div>
@@ -2072,11 +2072,6 @@ function deviceSource() {
 function deviceRecord() {
   return (SR_STATE.devices || []).find(function(row){return sameDeviceSource(row.source, deviceSource());});
 }
-function sameDeviceSource(a,b) {
-  if(a===b)return true;
-  var x=sourceNetwork(a), y=sourceNetwork(b);
-  return !!(x && y && x.width===y.width && x.prefix===y.prefix && sourceContains(a,b));
-}
 function renderGlobalRuleGroups() {
   var groups=new Map(),total=0,enabled=0;
   (SR_STATE.ruleRows||[]).forEach(function(r){
@@ -2512,6 +2507,11 @@ function flowHost(source) {
   var net=sourceNetwork(source);
   return net && net.prefix===net.width ? source.split('/')[0] : '';
 }
+function sameDeviceSource(a,b) {
+  if(a===b)return true;
+  var x=sourceNetwork(a), y=sourceNetwork(b);
+  return !!(x && y && x.width===y.width && x.prefix===y.prefix && sourceContains(a,b));
+}
 function flowSourceKey(source) {
   var net=sourceNetwork(source);
   return net?[net.width,net.prefix,net.value>>BigInt(net.width-net.prefix)].join('/'):'';
@@ -2654,21 +2654,26 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
     if(hit)e.hit=true;
   }
   var matched=winner>=0?activeStages[winner]:null;
+  var trace=matched && RULE_TRACE.trace;
+  var matchedStep=trace && trace.steps.find(function(step){return step.outcome==='matched';});
+  var matchedSource=flowSourceKey(matchedStep && matchedStep.source);
   // Keep source positions stable while laying groups out in the selected device's match order.
   var scopeOrder=sources.map(function(_,i){return i;});
   if(selected!==null)scopeOrder.sort(function(a,b){return Number(sources[b]===selected)-Number(sources[a]===selected);});
   scopeOrder.forEach(function(i){
     var scope=sources[i];
-    var stages=scope===selected && !FLOW_EDIT_NETWORK?activeStages:ruleFlowModel(all,mode,scope,ordered);
-    var linkedGroups=new Set(stages.filter(function(stage){return stage.kind==='device_link'&&!stage.disabled;}).map(groupKey));
+    // Draw only the policies owned by this source. Simulations still evaluate inherited stages.
+    var stages=ruleFlowModel(all,mode,scope,ordered,true);
+    var ownsMatch=!!matched && flowSourceKey(scope)===matchedSource;
     stages.forEach(function(stage){
       var key=groupKey(stage),g=groups.get(key);
       if(!g){g={index:groups.size,title:stage.title,ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
       g.phases.add(stage.phaseLabel||stage.title);
       if(scope===selected && stage.kind==='device_link')g.bindingPriority=stage.bindingPriority;
-      if(stage.disabled || (stage.kind==='global_rule'&&linkedGroups.has(key)&&stage!==matched))return;
+      if(stage.disabled)return;
       g.enabled=true;
-      var hit=!!matched && scope===selected && stage===matched;
+      var hit=ownsMatch && stage.kind===matched.kind &&
+        (stage.indices?stage.indices.includes(trace.matched_rule):!matched.indices);
       if(hit || (!matched && scope===selected && (FLOW_EDIT_GROUP===null||key==='group:'+FLOW_EDIT_GROUP)))g.selected=true;
       edge(true,i,g.index,scope,hit);
       stage.targets.forEach(function(action){
@@ -2682,7 +2687,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   var paths=Array.from(edges.values(),function(e){
     var x=e.left?220:670, end=e.left?330:780,mid=(x+end)/2;
     var y=center(e.a,e.left?sources.length:groups.size),dest=center(e.b,e.left?groups.size:exits.size);
-    var style=e.hit?'selected':selected===null?'':e.related?'related':'dim';
+    var style=e.hit?'selected':selected===null?'':e.related&&!matched?'related':'dim';
     return '<path data-from="'+(e.left?'s':'g')+e.a+'" data-to="'+(e.left?'g':'e')+e.b+'" class="'+style+'" d="M '+x+' '+y+' C '+mid+' '+y+', '+mid+' '+dest+', '+end+' '+dest+'"/>';
   }).join('');
   function box(kind,y,title,sub,cls,button){
@@ -2781,18 +2786,22 @@ function orderedFlowRules(rows) {
   });
 }
 function byBindingPriority(a,b) {return (b.priority||0)-(a.priority||0);}
-function ruleFlowModel(rows, mode, client, orderedRows) {
-  if(mode==='global'||mode==='direct')return [{kind:'mode',title:mode==='global'?'全局代理':'全部直连',note:'跳过全部分流规则',targets:[mode==='global'?'proxy':'direct']}];
+function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
+  var deviceConfig=configuredOnly && client;
+  if(mode==='global'||mode==='direct')return deviceConfig?[]:[{kind:'mode',title:mode==='global'?'全局代理':'全部直连',note:'跳过全部分流规则',targets:[mode==='global'?'proxy':'direct']}];
   var ordered=orderedRows||orderedFlowRules(rows), result=[];
   function group(kind,label,rules) {
     groupRulesForDisplay(rules).forEach(function(b){var members=b.indices.map(function(i){return rules[i];}),enabled=members.filter(function(r){return r.enabled!==false;}),first=Number(members[0].priority||0),last=Number(members[members.length-1].priority||0);
       result.push({kind:kind,bindingPriority:members[0].bindingPriority,title:b.name||'未分组',phaseLabel:label,note:'优先级 '+first+(first!==last?'～'+last:'')+' · 启用 '+enabled.length+'/'+members.length+(enabled.length?'':' · 已停用')+(kind.indexOf('device_')===0&&!client?' · 待指定设备':''),targets:(enabled.length?enabled:members).map(function(r){return r.target;}).filter(function(t,i,a){return a.indexOf(t)===i;}),count:members.length,enabledCount:enabled.length,disabled:!enabled.length,indices:members.map(function(r){return Number(r.index);}),rule:members.length===1?members[0]:null});
     });
   }
-  var devices=ordered.filter(function(r){return client&&r.source&&sourceContains(r.source,client);});
+  function applies(source) {
+    return client && source && (configuredOnly?sameDeviceSource(source,client):sourceContains(source,client));
+  }
+  var devices=ordered.filter(function(r){return applies(r.source);});
   group('device_rule','设备专属规则',devices.filter(function(r){return !isFinalRule(r);}));
   if(client) {
-    var activeLinks=(SR_STATE.deviceBindings||[]).filter(function(b){return sourceContains(b.source,client);})
+    var activeLinks=(SR_STATE.deviceBindings||[]).filter(function(b){return applies(b.source);})
       .sort(function(a,b){return byBindingPriority(a,b)||sourceNetwork(b.source).prefix-sourceNetwork(a.source).prefix;});
     var bestByGroup=new Map();
     activeLinks.forEach(function(b){if(!bestByGroup.has(b.group))bestByGroup.set(b.group,b);});
@@ -2805,14 +2814,16 @@ function ruleFlowModel(rows, mode, client, orderedRows) {
     linked.sort(function(a,b){return b.bindingPriority-a.bindingPriority;});
     group('device_link','设备关联组',linked);
   }
-  group('global_rule','全局自定义规则',ordered.filter(function(r){return !r.source&&!isFinalRule(r);}));
-  result.push({kind:'builtin',title:'内置国内 / 局域网',note:'核心内置国内域名、私有 IP 与 GeoIP 直连；独立于自定义规则，停用自定义 CN 规则不会关闭此层。',targets:['direct']});
+  if(!deviceConfig){
+    group('global_rule','全局自定义规则',ordered.filter(function(r){return !r.source&&!isFinalRule(r);}));
+    result.push({kind:'builtin',title:'内置国内 / 局域网',note:'核心内置国内域名、私有 IP 与 GeoIP 直连；独立于自定义规则，停用自定义 CN 规则不会关闭此层。',targets:['direct']});
+  }
   function reachableFinals(rules) {
     var first=rules.findIndex(function(r){return r.enabled!==false;});
     return first<0?rules:rules.slice(0,first+1);
   }
   var deviceFinals=reachableFinals(devices.filter(isFinalRule));group('device_final','设备兜底',deviceFinals);
-  if(client&&deviceFinals.some(function(r){return r.enabled!==false;}))return result;
+  if(deviceConfig || client&&deviceFinals.some(function(r){return r.enabled!==false;}))return result;
   var finals=reachableFinals(ordered.filter(function(r){return !r.source&&isFinalRule(r);}));group('global_final','全局兜底',finals);
   if(!finals.some(function(r){return r.enabled!==false;}))result.push({kind:'global_final',defaultFallback:true,title:'默认兜底',note:'没有启用的全局最终规则，未命中时代理',targets:['proxy']});
   return result;
