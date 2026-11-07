@@ -2431,6 +2431,15 @@ fn act_get_rules() -> J {
     {
         return err_msg("部分规则配置损坏，未返回不完整的规则列表，请检查诊断");
     }
+    // Keep editor snapshots unchanged. Index this separate list by saved rule
+    // number so the diagram uses the same accepted rules and actions as routing.
+    let compiled = sockrocket_core::router::RuleSet::from_config(&parsed);
+    let mut compiled_targets = vec![None; parsed.len()];
+    for entry in compiled.rules() {
+        if let Some(index) = entry.config_index {
+            compiled_targets[index] = Some(&entry.action);
+        }
+    }
     let rules: Vec<J> = parsed
         .into_iter()
         .enumerate()
@@ -2451,7 +2460,7 @@ fn act_get_rules() -> J {
     let Ok(links) = devices::links(&map) else {
         return err_msg("设备规则组关联配置无效");
     };
-    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links, "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -4940,6 +4949,7 @@ dns_direct_domains:
             )["trace"]["action"]
                 .clone()
         };
+        assert_eq!(act_get_rules()["compiled_targets"], json!(["direct"]));
         let original = revision();
         let bind = dispatch(
             "save_device_binding",

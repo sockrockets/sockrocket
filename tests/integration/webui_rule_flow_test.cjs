@@ -113,7 +113,7 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  const html=f.element('rule-flow').innerHTML;
  assert.match(html, /出口成员：Example B/);
  assert.match(html, /<div class="flow-box selected"><strong>Video<\/strong>/);
- assert.match(html, /height:380px/,'five exits fit their SVG stage');
+ assert.doesNotMatch(html, /<div class="flow-box"><strong>拒绝<\/strong>/,'an unused reject exit is not shown');
  assert.doesNotMatch(html, /\[object Object\]/);
  console.log('PASS: group trace highlights the exact exit and expands the diagram for additional groups');
 }
@@ -140,4 +140,27 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  el('rule-flow-client').value='2001:db8::7';c.invalidateRuleTrace();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'2001:db8::7');
  c.resetDeviceFlow();assert.match(el('rule-flow').innerHTML,/flow-device-map/);
  console.log('PASS: parallel device branches, explicit simulation source, per-device exits, stale replies and reset');
+}
+
+{
+ const f=fixture(), c=f.context, el=f.element, host='192.0.2.8';
+ const rows=[rule(0,{group:'Media',target:'DIRECT'}),rule(1,{group:'Unused',target:'reject'}),rule(2,{group:'Default',rule_type:'FINAL',target:'direct'})];
+ c.SR_STATE.ruleRows=rows;
+ c.SR_STATE.compiledTargets=['direct',null,'direct'];
+ c.SR_STATE.status.transparent_proxy=true;
+ c.SR_STATE.deviceBindings=[{group:'Media',source:'192.0.2.0/24',target:'reject'},{group:'Media',source:host+'/32',target:'proxy'}];
+ el('rule-flow-device').value='';c.renderRuleFlow();
+ const overview=el('rule-flow').innerHTML;assert.doesNotMatch(overview,/Unused/);
+ assert.match(overview,/全局规则路径[\s\S]*?Media[\s\S]*?直连/);
+ const netRoute=c.ruleFlowModel(rows,'rule','192.0.2.0/24').find(s=>s.kind==='device_link');
+ assert.deepEqual([...netRoute.targets],['reject'],'subnet summary does not inherit a narrower host override');
+ c.chooseFlowHost(host);
+ const route=c.ruleFlowModel(rows,'rule',host);assert.deepEqual([...route.find(s=>s.kind==='device_link').targets],['proxy']);
+ assert.deepEqual([...route.find(s=>s.kind==='global_rule').targets],['direct']);
+ const match=source=>({config_index:0,source,rule_type:'domain',outcome:'matched',checked:1});
+ for(const [source,action,kind] of [[host+'/32','proxy','device_link'],[null,'direct','global_rule']]){
+   const reply=result(rows[0],{source:host});reply.trace.steps=[match(source)];reply.trace.action=action;
+   c.RULE_TRACE=reply;c.RULE_FLOW_SELECTED=-1;c.renderRuleFlow();assert.equal(route[c.RULE_FLOW_SELECTED].kind,kind);
+ }
+ console.log('PASS: inherited and global outlets, overlapping sources and backend-selected phase');
 }

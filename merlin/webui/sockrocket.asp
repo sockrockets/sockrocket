@@ -2475,7 +2475,7 @@ function groupRulesForDisplay(rules) {
   });
   return buckets;
 }
-function isFinalRule(r) { return r.rule_type === 'match' || r.rule_type === 'final'; }
+function isFinalRule(r) { var kind=String(r.rule_type).toLowerCase(); return kind==='match'||kind==='final'; }
 function rulePhase(r) {return isFinalRule(r) ? (r.source ? 2 : 3) : (r.source ? 0 : 1);}
 function orderedRules(rules) {
   return rules.slice().sort(function(a,b) {
@@ -2507,7 +2507,7 @@ function sourceNetwork(text) {
 }
 function sourceContains(scope,client) {
   var net=sourceNetwork(scope), ip=sourceNetwork(client);
-  return !!(net&&ip&&net.width===ip.width&&(net.value>>BigInt(net.width-net.prefix))===(ip.value>>BigInt(net.width-net.prefix)));
+  return !!(net&&ip&&net.width===ip.width&&net.prefix<=ip.prefix&&(net.value>>BigInt(net.width-net.prefix))===(ip.value>>BigInt(net.width-net.prefix)));
 }
 // Hosts can be simulated; a configured subnet describes a branch, not a client IP.
 function flowHost(source) {
@@ -2557,51 +2557,44 @@ function chooseFlowHost(ip) {
   previewDeviceFlow();
   srElement('rule-flow-destination').focus();
 }
+// Status polling does not change saved rules. Reuse the overview until a
+// configuration, device inventory or exit catalog reload replaces its data.
+var deviceMapCache=null;
 function deviceBranchesHtml(rows,bindings) {
-  var scopes=new Map(),members=new Map(),hosts=flowDeviceChoices();
-  function branch(source){
-    var key=flowHost(source)||source;
-    if(!scopes.has(key))scopes.set(key,[]);
-    return scopes.get(key);
-  }
-  rows.forEach(function(row){
-    var group=(row.group||'').trim();
-    if(!row.source && !isFinalRule(row) && row.enabled!==false){
-      if(!members.has(group))members.set(group,new Set());
-      members.get(group).add(row.target);
-    }
-  });
-  function targetName(key){return RULE_TARGET_LABEL[key]||key;}
-  bindings.forEach(function(link){
-    var enabled=members.get(link.group);
-    var exits=enabled?(link.target?targetName(link.target):Array.from(enabled,targetName).join(' / ')):'无启用的目的规则';
-    branch(link.source).push([link.group,exits]);
-  });
-  var locals=new Map();
-  orderedRules(rows).forEach(function(row){
-    if(!row.source)return;
-    var key=flowHost(row.source)||row.source;
-    var title=isFinalRule(row)?'其余流量':(row.group||'未分组')+' · 专属规则';
-    if(!locals.has(key))locals.set(key,new Map());
-    var groups=locals.get(key);
-    if(!groups.has(title))groups.set(title,new Set());
-    if(row.enabled!==false)groups.get(title).add(row.target);
-  });
-  locals.forEach(function(groups,source){
-    groups.forEach(function(exits,title){branch(source).push([title,exits.size?Array.from(exits,targetName).join(' / '):'已停用']);});
+  var cache=deviceMapCache;
+  if(cache && cache.rows===rows && cache.links===bindings && cache.devices===SR_STATE.devices &&
+     cache.compiled===SR_STATE.compiledTargets && cache.nodes===SR_RULE_NODES && cache.groups===SR_PROXY_GROUPS)return cache.html;
+  var scopes=new Set(),hosts=flowDeviceChoices(),ordered=orderedFlowRules(rows);
+  bindings.concat(rows).forEach(function(item){
+    if(item.source)scopes.add(flowHost(item.source)||item.source);
   });
   if(!scopes.size)return '';
-  var paths='';
-  scopes.forEach(function(routes,source){
+  function routeRow(stage) {
+    var exits=stage.targets.map(function(key){return RULE_TARGET_LABEL[key]||key;}).join(' / ');
+    return '<div><span>'+srEsc(stage.title)+'</span><span class="flow-device-arrow" aria-hidden="true">→</span><strong>'+srEsc(exits)+'</strong></div>';
+  }
+  function sharedStage(stage){return stage.kind==='global_rule'||stage.kind==='builtin';}
+  var global=ruleFlowModel(rows,'rule','',ordered).filter(function(stage){return !stage.disabled;});
+  var paths='<div class="flow-device-route"><div><button type="button" class="btn btn-sm" onclick="chooseGlobalFlow()">全部设备</button><small>全局规则路径</small></div><div class="flow-device-branches">'+global.map(routeRow).join('')+'</div></div>';
+  scopes.forEach(function(source){
     var ip=flowHost(source),name=hosts.get(ip),label=srEsc(name||source);
     var device=ip?'<button class="btn btn-sm" type="button" data-ip="'+srEsc(ip)+'" onclick="chooseFlowHost(this.dataset.ip)">'+label+'</button>':'<strong>'+label+'</strong>';
     var sub=name?ip:ip?'选择设备模拟':'来源网段';
-    paths+='<div class="flow-device-route"><div>'+device+'<small>'+srEsc(sub)+'</small></div><div class="flow-device-branches">'+routes.map(function(route){
-      return '<div><span>'+srEsc(route[0])+'</span><span class="flow-device-arrow" aria-hidden="true">→</span><strong>'+srEsc(route[1])+'</strong></div>';
-    }).join('')+'</div></div>';
+    var inherits=false, branches='';
+    ruleFlowModel(rows,'rule',source,ordered).forEach(function(stage){
+      if(stage.disabled)return;
+      if(sharedStage(stage)){
+        if(!inherits)branches+='<div><span>未命中时继续匹配全局目的规则和内置直连</span></div>';
+        inherits=true;
+      }else{
+        branches+=routeRow(stage);
+      }
+    });
+    paths+='<div class="flow-device-route"><div>'+device+'<small>'+srEsc(sub)+'</small></div><div class="flow-device-branches">'+branches+'</div></div>';
   });
-  var shared='<div class="flow-device-route"><div><button type="button" class="btn btn-sm" onclick="chooseGlobalFlow()">全部设备</button><small>全局规则路径</small></div><div>全局目的规则 → 国内 / 局域网直连 → 默认出口</div></div>';
-  return '<section class="flow-device-map" aria-label="全局与设备的分流关系"><h4>分流路径</h4>'+shared+paths+'</section>';
+  var html='<section class="flow-device-map" aria-label="全局与设备的分流关系"><h4>分流路径</h4>'+paths+'</section>';
+  deviceMapCache={rows:rows,links:bindings,devices:SR_STATE.devices,compiled:SR_STATE.compiledTargets,nodes:SR_RULE_NODES,groups:SR_PROXY_GROUPS,html:html};
+  return html;
 }
 function chooseGlobalFlow() {
   srElement('rule-flow-device').value='global';
@@ -2669,9 +2662,16 @@ function traceRuleFlow() {
     if(e && e.error_code==='route_trace_stale')srLoadRules();
   },20000);
 }
-function ruleFlowModel(rows, mode, client) {
+function orderedFlowRules(rows) {
+  var sorted=orderedRules(rows),compiled=SR_STATE.compiledTargets;
+  if(!compiled)return sorted;
+  return sorted.filter(function(r){return r.enabled===false || compiled[r.index]!=null;}).map(function(r){
+    return r.enabled!==false && compiled[r.index]!==r.target ? Object.assign({},r,{target:compiled[r.index]}) : r;
+  });
+}
+function ruleFlowModel(rows, mode, client, orderedRows) {
   if(mode==='global'||mode==='direct')return [{kind:'mode',title:mode==='global'?'全局代理':'全部直连',note:'跳过全部分流规则',targets:[mode==='global'?'proxy':'direct']}];
-  var ordered=orderedRules(rows), result=[];
+  var ordered=orderedRows||orderedFlowRules(rows), result=[];
   function group(kind,label,rules) {
     groupRulesForDisplay(rules).forEach(function(b){var members=b.indices.map(function(i){return rules[i];}),enabled=members.filter(function(r){return r.enabled!==false;}),first=Number(members[0].priority||0),last=Number(members[members.length-1].priority||0);
       result.push({kind:kind,title:b.name||'未分组',phaseLabel:label,note:'优先级 '+first+(first!==last?'～'+last:'')+' · 启用 '+enabled.length+'/'+members.length+(enabled.length?'':' · 已停用')+(kind.indexOf('device_')===0&&!client?' · 待指定设备':''),targets:(enabled.length?enabled:members).map(function(r){return r.target;}).filter(function(t,i,a){return a.indexOf(t)===i;}),count:members.length,enabledCount:enabled.length,disabled:!enabled.length,indices:members.map(function(r){return Number(r.index);}),rule:members.length===1?members[0]:null});
@@ -2692,9 +2692,13 @@ function ruleFlowModel(rows, mode, client) {
   }
   group('global_rule','全局自定义规则',ordered.filter(function(r){return !r.source&&!isFinalRule(r);}));
   result.push({kind:'builtin',title:'内置国内 / 局域网',note:'核心内置国内域名、私有 IP 与 GeoIP 直连；独立于自定义规则，停用自定义 CN 规则不会关闭此层。',targets:['direct']});
-  var deviceFinals=devices.filter(isFinalRule);group('device_final','设备兜底',deviceFinals);
+  function reachableFinals(rules) {
+    var first=rules.findIndex(function(r){return r.enabled!==false;});
+    return first<0?rules:rules.slice(0,first+1);
+  }
+  var deviceFinals=reachableFinals(devices.filter(isFinalRule));group('device_final','设备兜底',deviceFinals);
   if(client&&deviceFinals.some(function(r){return r.enabled!==false;}))return result;
-  var finals=ordered.filter(function(r){return !r.source&&isFinalRule(r);});group('global_final','全局兜底',finals);
+  var finals=reachableFinals(ordered.filter(function(r){return !r.source&&isFinalRule(r);}));group('global_final','全局兜底',finals);
   if(!finals.some(function(r){return r.enabled!==false;}))result.push({kind:'global_final',defaultFallback:true,title:'默认兜底',note:'没有启用的全局最终规则，未命中时代理',targets:['proxy']});
   return result;
 }
@@ -2758,15 +2762,25 @@ function renderRuleFlow() {
   srElement('rule-flow-state').textContent=(!known?'状态未知':running?'服务运行中':'服务已停止')+' · '+(mode==='global'?'全局模式':mode==='direct'?'直连模式':'规则模式');
   if(!Array.isArray(SR_STATE.ruleRows)){host.innerHTML='<p class="hint">'+(RULE_FLOW_ERROR?'规则加载失败，请刷新后重试。':'正在加载规则…')+'</p>';return;}
   var rows=ruleFlowModel(SR_STATE.ruleRows,mode,RULE_FLOW_CLIENT),h=Math.max(224,rows.length*88-20),t=RULE_TRACE&&RULE_TRACE.trace,winner=-1;
-  if(t){var kind=mode!=='rule'?'mode':t.matched_builtin&&t.steps.some(function(s){return s.outcome==='matched'&&s.rule_type!=='final';})?'builtin':'global_final';winner=rows.findIndex(function(r){return t.matched_rule!=null?r.indices&&r.indices.indexOf(Number(t.matched_rule))>=0:r.kind===kind&&(kind!=='global_final'||r.defaultFallback);});}
+  if(t){
+    var matched=t.steps.find(function(step){return step.outcome==='matched';}),kind;
+    if(mode!=='rule')kind='mode';
+    else if(t.matched_rule!=null){
+      var original=SR_STATE.ruleRows.find(function(r){return Number(r.index)===Number(t.matched_rule);});
+      if(original)kind=matched && matched.source && !original.source?'device_link':flowRuleKind(original);
+    }else kind=t.matched_builtin && matched && matched.rule_type!=='final'?'builtin':'global_final';
+    winner=rows.findIndex(function(r){
+      return r.kind===kind && !r.disabled && (t.matched_rule!=null ? r.indices&&r.indices.includes(Number(t.matched_rule)) : kind!=='global_final'||r.defaultFallback);
+    });
+  }
   var all=SR_STATE.ruleRows,enabled=all.filter(function(r){return r.enabled!==false;}).length;
   srElement('rule-flow-summary').textContent='与下方同一配置：共 '+all.length+' 条 · 启用 '+enabled+' 条 · 停用 '+(all.length-enabled)+' 条。图中不受列表搜索或分页影响。'+(rulePending?' 正在保存/应用并核对结果…':RULE_READ_PENDING?' 正在读取最新状态…':RULE_FLOW_ERROR?' 当前为上次快照，请刷新。':'');
   if(RULE_FLOW_SELECTED<0 && winner>=0)RULE_FLOW_SELECTED=winner;
   RULE_FLOW_SELECTED=Math.max(0,Math.min(RULE_FLOW_SELECTED,rows.length-1));
-  var selected=rows[RULE_FLOW_SELECTED],targets=['proxy','direct','reject'],names=RULE_TARGET_LABEL,node=(SR_STATE.nodes||[])[st.active_node];
-  rows.forEach(function(r){r.targets.forEach(function(a){if(targets.indexOf(a)<0)targets.push(a);});});
+  var selected=rows[RULE_FLOW_SELECTED],targets=[],names=RULE_TARGET_LABEL,node=(SR_STATE.nodes||[])[st.active_node];
+  rows.forEach(function(r){if(!r.disabled)r.targets.forEach(function(a){if(targets.indexOf(a)<0)targets.push(a);});});
   var exitsHeight=targets.length*78-10;h=Math.max(h,exitsHeight);
-  var descriptions={proxy:RULE_TRACE?(RULE_TRACE.node_name||'尚未选择节点'):node?node.name:'当前所选节点',direct:'不经过代理节点',reject:'阻止连接'};
+  var descriptions={proxy:node?node.name:'当前所选节点',direct:'不经过代理节点',reject:'阻止连接'};
   (SR_RULE_NODES||[]).forEach(function(n){descriptions['node:'+n.id]=n.name;});
   (SR_PROXY_GROUPS||[]).forEach(function(g){descriptions['group:'+g.name]=(g.type==='fallback'?'按顺序 · 首选 ':'')+(g.selected_node||'当前成员不可用');});
   function curve(x1,y1,x2,y2,on,branch){var mid=(x1+x2)/2;return '<path class="'+(on?'selected ':'')+(branch&&!(on&&t&&t.definitive)?'branch':'')+'" d="M '+x1+' '+y1+' C '+mid+' '+y1+', '+mid+' '+y2+', '+x2+' '+y2+'"/>';}
@@ -2852,6 +2866,7 @@ function srLoadRules(after) {
     var rules = d.rules;
     SR_STATE.devices = d.devices || [];
     SR_STATE.deviceBindings = d.device_rule_groups || [];
+    SR_STATE.compiledTargets = Array.isArray(d.compiled_targets)?d.compiled_targets:null;
     SR_STATE.ruleRows = rules; RULE_FLOW_ERROR = false;RULE_READ_PENDING=false;
     RULE_SNAPSHOT_MODE=typeof d.proxy_mode==='string'?d.proxy_mode:(SR_STATE.status||{}).proxy_mode||'rule';
     var revision=d.revision||null, changed=RULE_RULE_REVISION!==revision;
