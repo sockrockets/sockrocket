@@ -622,18 +622,21 @@ fn parse_base64_lines(content: &str) -> Result<Vec<Node>> {
 
     let text = String::from_utf8(decoded).context("Invalid UTF-8 after Base64 decode")?;
 
-    if text.trim_start().starts_with("[Interface]") {
-        return super::wireguard::parse_profile(&text).map(|node| vec![node]);
+    let text = text.trim_start_matches('\u{feff}').trim();
+    if text.starts_with("[Interface]") {
+        return super::wireguard::parse_profile(text).map(|node| vec![node]);
     }
-    // The decoded content might be Clash YAML, sing-box JSON, or plain URI lines
-    if clash::is_clash_config(&text) {
-        return clash::parse_clash_config(&text);
+    // Decode only one envelope. Use the same JSON precedence as plain imports.
+    if clash::is_clash_config(text) {
+        return clash::parse_clash_config(text);
     }
-    if singbox::is_singbox_config(&text) {
-        return singbox::parse_singbox_config(&text);
+    if text.starts_with('{') && singbox::is_singbox_config(text) {
+        return singbox::parse_singbox_config(text);
     }
-
-    parse_plain_lines(&text)
+    if text.starts_with('{') && v2ray::is_v2ray_config(text) {
+        return v2ray::parse_v2ray_config(text);
+    }
+    parse_plain_lines(text)
 }
 
 /// Parse plain text where each line is a proxy URI
@@ -1036,6 +1039,22 @@ mod tests {
             assert_eq!(detect_format(&encoded), SubFormat::Base64Lines);
             let nodes = parse_subscription_content(&encoded, "auto").unwrap();
             assert_eq!(nodes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn encoded_subscription_accepts_the_same_single_node_as_plain_text() {
+        let json = r#"{"outbounds":[{"protocol":"shadowsocks","tag":"example","settings":{"servers":[{"address":"192.0.2.1","port":443,"method":"aes-256-gcm","password":"example"}]}}]}"#;
+        for plain in [json, "trojan://example@192.0.2.1:443#example"] {
+            let body = format!("\u{feff}{plain}\n");
+            let expected = parse_subscription_content(&body, "auto").unwrap();
+            assert_eq!(expected.len(), 1);
+            let encoded = general_purpose::STANDARD.encode(body);
+            for hint in ["auto", "base64", "v2ray"] {
+                let nodes = parse_subscription_content(&encoded, hint).unwrap();
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].name, expected[0].name);
+            }
         }
     }
 
