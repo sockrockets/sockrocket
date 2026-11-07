@@ -116,14 +116,14 @@ detect_tun_dev() {
     # LAN into it — silently breaking connectivity through someone else's
     # tunnel. If Sockrocket's own device is absent, report failure and let the caller
     # skip transparent proxying.
-    if ip link show sockrocket-tun >/dev/null 2>&1; then
+    if [ -d /sys/class/net/sockrocket-tun ] || ip link show sockrocket-tun >/dev/null 2>&1; then
         echo "sockrocket-tun"
         return 0
     fi
     # Fallback for older builds that used the kernel-assigned tun0 name, but
     # only when that device carries Sockrocket's gateway address — an OpenVPN device
     # would not.
-    if ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2"; then
+    if ip -4 addr show tun0 2>/dev/null | grep -Eq 'inet[[:space:]]+10[.]10[.]0[.]2([/[:space:]]|$)'; then
         echo "tun0"
         return 0
     fi
@@ -880,13 +880,13 @@ do_start() {
     done
     # Stage routing before exposing MARK rules to LAN packets. Repeated
     # firewall/WAN events must not accumulate identical policy rules.
-    if ! ip route replace default dev "$TUN_DEV" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; then
+    if ! ip route replace default dev "$TUN_DEV" table "$SOCKROCKET_RT_TABLE"; then
         flush_chains
         err "TUN route setup failed — LAN marking remains disabled"
         return 1
     fi
     if ! ip rule show 2>/dev/null | grep -Eq "fwmark ${TUN_MARK}(/0xffffffff)? .*lookup ${SOCKROCKET_RT_TABLE}([[:space:]]|$)"; then
-        if ! ip rule add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE" 2>/dev/null; then
+        if ! ip rule add fwmark "$TUN_MARK" table "$SOCKROCKET_RT_TABLE"; then
             flush_chains
             err "TUN policy rule setup failed — LAN marking remains disabled"
             return 1

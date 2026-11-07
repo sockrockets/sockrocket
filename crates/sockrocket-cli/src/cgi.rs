@@ -1985,12 +1985,7 @@ fn act_stats() -> J {
         }
     }
     let dns_active = dnsmasq_hijack_conf().exists();
-    let fw_active = run_cmd(
-        "iptables",
-        &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
-    )
-    .map(|out| out.contains("MARK"))
-    .unwrap_or(false);
+    let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
     let traffic_path = sockrocket_dir().join("traffic.yaml");
     let traffic_nodes: Vec<J> = sockrocket_core::TrafficLedger::read_file(&traffic_path)
         .unwrap_or_default()
@@ -2045,6 +2040,7 @@ fn act_stats() -> J {
         "pid": pid_val,
         "dns_active": dns_active,
         "fw_active": fw_active,
+        "fw_ipv6": fw_ipv6,
         "traffic": {
             "session_started": session_started,
             "nodes": traffic_nodes,
@@ -2067,23 +2063,103 @@ fn vm_rss_kb(pid: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn firewall_hooks(
+    command: impl Fn(&str, &[&str]) -> Option<String>,
+) -> (Option<bool>, Option<bool>) {
+    let mounted = |tool, chain: &str| {
+        command(tool, &["-t", "mangle", "-n", "-L", "PREROUTING"]).map(|listing| {
+            listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(chain))
+        })
+    };
+    (
+        mounted("iptables", "SOCKROCKET_MANGLE"),
+        mounted("ip6tables", "SOCKROCKET_IPV6_MANGLE"),
+    )
+}
+
+fn memory_usage(meminfo: &str) -> (Option<u64>, Option<u64>, &'static str) {
+    let kb = |key: &str| -> Option<u64> {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+    };
+    let total = kb("MemTotal:").filter(|v| *v > 0);
+    let estimate = || {
+        Some(
+            kb("MemFree:")?
+                .saturating_add(kb("Buffers:")?)
+                .saturating_add(kb("Cached:")?),
+        )
+    };
+    let (available, source) = match (total, kb("MemAvailable:")) {
+        (Some(_), Some(value)) => (Some(value), "measured"),
+        (Some(_), None) => match estimate() {
+            Some(value) => (Some(value), "estimated"),
+            None => (None, "unknown"),
+        },
+        _ => (None, "unknown"),
+    };
+    (
+        total,
+        total.zip(available).map(|(t, a)| t.saturating_sub(a)),
+        source,
+    )
+}
+
+fn wan_addresses(mut command: impl FnMut(&str, &[&str]) -> Option<String>) -> Vec<String> {
+    use std::net::IpAddr;
+    fn add(addresses: &mut Vec<IpAddr>, value: &str) {
+        if let Ok(ip) = value.trim().parse::<IpAddr>() {
+            if !ip.is_unspecified() && !ip.is_loopback() && !addresses.contains(&ip) {
+                addresses.push(ip);
+            }
+        }
+    }
+    let mut addresses = Vec::new();
+    // Local route lookups report the kernel-selected source, including PPP interfaces.
+    for (family, destination) in [("-4", "192.0.2.1"), ("-6", "2001:db8::1")] {
+        if let Some(route) = command("ip", &[family, "route", "get", destination]) {
+            if let Some(src) = route.split_whitespace().skip_while(|t| *t != "src").nth(1) {
+                add(&mut addresses, src);
+            }
+        }
+    }
+    let has_ipv4_route = addresses.iter().any(IpAddr::is_ipv4);
+    let mut nvram = |key: &str| {
+        command("nvram", &["get", key])
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if nvram("wans_mode") == "lb" {
+        for unit in [0, 1] {
+            if nvram(&format!("wan{unit}_state_t")) == "2" {
+                add(&mut addresses, &nvram(&format!("wan{unit}_ipaddr")));
+            }
+        }
+    } else if !has_ipv4_route {
+        let unit = if nvram("wan1_primary") == "1" { 1 } else { 0 };
+        let state = nvram(&format!("wan{unit}_state_t"));
+        if state.is_empty() || state == "2" {
+            add(&mut addresses, &nvram(&format!("wan{unit}_ipaddr")));
+        }
+    }
+    addresses.sort_by_key(IpAddr::is_ipv6);
+    addresses.iter().map(ToString::to_string).collect()
+}
+
 fn act_sysinfo() -> J {
     let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let kb_of = |key: &str| -> u64 {
-        meminfo
-            .lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    };
-    let mem_total = kb_of("MemTotal:");
-    let mem_avail = kb_of("MemAvailable:");
-    let mem_used = mem_total.saturating_sub(mem_avail);
+    let (mem_total, mem_used, mem_source) = memory_usage(&meminfo);
     let mem_pct = mem_used
-        .checked_mul(100)
-        .and_then(|v| v.checked_div(mem_total))
-        .unwrap_or(0);
+        .zip(mem_total)
+        .map(|(used, total)| ((used as u128 * 100 + total as u128 / 2) / total as u128) as u64);
     let load = fs::read_to_string("/proc/loadavg")
         .unwrap_or_default()
         .split_whitespace()
@@ -2096,9 +2172,7 @@ fn act_sysinfo() -> J {
         .next()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0) as u64;
-    let wan_ip = run_cmd("nvram", &["get", "wan0_ipaddr"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let wan_addresses = wan_addresses(run_cmd);
     // Per-process RSS so the UI can show Sockrocket's own footprint vs
     // system-wide MemAvailable pressure (often ~40–50% on Merlin even idle).
     let daemon_rss_kb = fs::read_to_string(pid_path())
@@ -2112,11 +2186,13 @@ fn act_sysinfo() -> J {
         "mem_total_kb": mem_total,
         "mem_used_kb": mem_used,
         "mem_pct": mem_pct,
+        "memory_source": mem_source,
         "daemon_rss_kb": daemon_rss_kb,
         "api_rss_kb": api_rss_kb,
         "load": load,
         "uptime": format!("{}h {}m", uptime_s / 3600, (uptime_s % 3600) / 60),
-        "wan_ip": wan_ip,
+        "wan_ip": wan_addresses.first().map(String::as_str).unwrap_or(""),
+        "wan_addresses": wan_addresses,
     })
 }
 
@@ -3561,8 +3637,11 @@ fn act_diagnose() -> J {
         "iptables",
         &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
     )
-    .map(|out| out.matches("MARK").count())
-    .unwrap_or(0);
+    .map(|out| {
+        out.lines()
+            .filter(|line| line.split_whitespace().next() == Some("MARK"))
+            .count()
+    });
     let dns_rules = if dnsmasq_hijack_conf().exists() { 1 } else { 0 };
     // .output(), NOT .status(): the diagnose endpoint runs inside the api
     // bridge whose stderr is sockrocket.log — an inherited stderr would spill probe
@@ -3576,18 +3655,7 @@ fn act_diagnose() -> J {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let fw_active = Command::new("iptables")
-        .args([
-            "-t",
-            "mangle",
-            "-C",
-            "PREROUTING",
-            "-j",
-            "SOCKROCKET_MANGLE",
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
     let errors: Vec<String> = tail_lines(&log_path(), 500)
         .lines()
         .filter(|l| {
@@ -3612,6 +3680,7 @@ fn act_diagnose() -> J {
         "dns_rules": dns_rules,
         "dnsmasq_running": dnsmasq_running,
         "fw_active": fw_active,
+        "fw_ipv6": fw_ipv6,
         "last_errors_base64": B64.encode(last_errors),
     })
 }
@@ -3619,6 +3688,66 @@ fn act_diagnose() -> J {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_memory_sources() {
+        let legacy = "MemTotal: 100000 kB\nMemFree: 10000 kB\nBuffers: 5000 kB\nCached: 15000 kB\n";
+        assert_eq!(
+            memory_usage(legacy),
+            (Some(100000), Some(70000), "estimated")
+        );
+        assert_eq!(
+            memory_usage(&format!("{legacy}MemAvailable: 0 kB")),
+            (Some(100000), Some(100000), "measured")
+        );
+        assert_eq!(
+            memory_usage("MemTotal: 128 kB"),
+            (Some(128), None, "unknown")
+        );
+    }
+
+    #[test]
+    fn monitor_wan_failover_and_load_balancing() {
+        let wan = |mode: &str| {
+            wan_addresses(|cmd, args| match (cmd, args) {
+                ("ip", ["-6", ..]) => Some("dev eth1 src 2001:db8::2".into()),
+                ("nvram", ["get", key]) => Some(
+                    match *key {
+                        "wans_mode" => mode,
+                        "wan1_primary" => "1",
+                        "wan0_state_t" | "wan1_state_t" => "2",
+                        "wan0_ipaddr" => "192.0.2.3",
+                        "wan1_ipaddr" => "192.0.2.4",
+                        _ => "",
+                    }
+                    .into(),
+                ),
+                _ => None,
+            })
+        };
+        assert_eq!(wan("fo"), ["192.0.2.4", "2001:db8::2"]);
+        assert_eq!(wan("lb"), ["192.0.2.3", "192.0.2.4", "2001:db8::2"]);
+        assert_eq!(
+            wan_addresses(|_, args| match args {
+                ["-6", ..] => Some("dev eth1 src 2001:db8::3".into()),
+                _ => None,
+            }),
+            ["2001:db8::3"]
+        );
+    }
+
+    #[test]
+    fn monitor_firewall_distinguishes_unavailable_from_unmounted() {
+        assert_eq!(
+            firewall_hooks(|cmd, _| (cmd == "iptables")
+                .then(|| "SOCKROCKET_MANGLE all -- anywhere anywhere".into())),
+            (Some(true), None)
+        );
+        assert_eq!(
+            firewall_hooks(|_, _| Some("Chain PREROUTING (policy ACCEPT)".into())),
+            (Some(false), Some(false))
+        );
+    }
 
     async fn parse_test_request(bytes: Vec<u8>) -> Option<ApiRequest> {
         use tokio::io::AsyncWriteExt;

@@ -1314,11 +1314,11 @@ function renderChrome() {
   renderNetworkControls();
   setProxyModeUi(st.proxy_mode || 'rule');
   if (SR_STATE.page === 'dns') renderRuleFlow();
-  srElement('wan-ip').textContent = si.wan_ip || '—';
+  srElement('wan-ip').textContent = (si.wan_addresses || []).join(' / ') || si.wan_ip || '—';
 
   // stat cards
-  srElement('st-mem').textContent = si.mem_pct != null ? si.mem_pct + '%' : '—';
-  srElement('st-mem-sub').textContent = si.mem_used_kb ? Math.round(si.mem_used_kb / 1024) + ' / ' + Math.round(si.mem_total_kb / 1024) + ' MB' : '';
+  srElement('st-mem').textContent = si.mem_pct != null ? (si.memory_source === 'estimated' ? '约 ' : '') + si.mem_pct + '%' : '—';
+  srElement('st-mem-sub').textContent = si.mem_used_kb != null ? Math.round(si.mem_used_kb / 1024) + ' / ' + Math.round(si.mem_total_kb / 1024) + ' MB' : '';
   srElement('st-load').textContent = si.load || '—';
   srElement('st-uptime').textContent = si.uptime ? '路由器运行 ' + si.uptime : '';
 }
@@ -1470,14 +1470,15 @@ function runDiagnostics() {
     done();
     if (d.ok === false) { srElement('diag-body').textContent = d.msg || '检查失败，请重试'; return; }
     function row(name, ok, detail) {
-      return '<div class="diag-row"><span class="d-name">' + name + '</span><span class="' + (ok ? 'check-ok' : 'check-bad') + '">' + (ok ? '✓ ' : '— ') + srEsc(detail) + '</span></div>';
+      return '<div class="diag-row"><span class="d-name">' + name + '</span><span class="' + (ok == null ? '' : ok ? 'check-ok' : 'check-bad') + '">' + (ok ? '✓ ' : '— ') + srEsc(detail) + '</span></div>';
     }
     var html = row('服务进程', d.running, d.running ? '运行中' : '已停止') +
       row('配置校验', d.config_valid, d.config_valid ? '通过' : '未通过') +
-      row('透明代理规则', d.iptables_rules > 0, Number(d.iptables_rules || 0) + ' 条标记规则') +
+      row('IPv4 标记规则', d.iptables_rules == null ? null : d.iptables_rules > 0, d.iptables_rules == null ? '无法检测规则数量' : Number(d.iptables_rules) + ' 条标记规则') +
       row('DNS 接管', d.dns_rules > 0, d.dns_rules > 0 ? '已启用' : '未发现接管规则') +
       row('dnsmasq', d.dnsmasq_running, d.dnsmasq_running ? '运行中' : '未运行') +
-      row('防火墙链', d.fw_active, d.fw_active ? '已挂载' : '未挂载') +
+      row('IPv4 透明代理链', d.fw_active, d.fw_active == null ? '无法检测' : d.fw_active ? '已挂载' : '未挂载') +
+      row('IPv6 透明代理链', d.fw_ipv6, d.fw_ipv6 == null ? '无法检测' : d.fw_ipv6 ? '已挂载' : '未挂载') +
       '<p class="hint">未启用的功能不一定表示故障，请结合网络设置判断。局域网设备联网需要在设备上确认。</p>';
     srElement('diag-body').innerHTML = html;
   }, function () { done(); srElement('diag-body').textContent = '检查请求失败，请确认路由器管理连接后重试。'; });

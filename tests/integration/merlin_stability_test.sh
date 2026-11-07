@@ -233,6 +233,7 @@ test_missing_tun_never_recovers() {
     echo fault > "$DEGRADED_FILE"
     wait_for_tun() { return 1; }
     if try_recover_lan_proxy; then exit 1; fi
+    recover_waiting || { echo 'missing TUN retry cooldown' >&2; exit 1; }
     check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'degrade marker retained'
     check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'DNS not installed without TUN'
 }
@@ -624,11 +625,12 @@ test_startup_failure_never_enables_dns() {
     want_proxy=true; want_dns=true
     wait_for_tun() { return 1; }
     if activate_startup_network; then exit 1; fi
-    check present "$([ -f "$DEGRADED_FILE" ] && echo present || echo absent)" 'startup failure records fail-open'
+    check 'startup TUN interface unavailable after 20s' "$(cat "$DEGRADED_FILE")" 'TUN timeout reason'
     check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'no fake-IP DNS without TUN'
     wait_for_tun() { return 0; }
     printf '#!/bin/sh\n[ "$1" != start ]\n' > "$SOCKROCKET_DIR/scripts/iptables.sh"
     if activate_startup_network; then exit 1; fi
+    check 'startup firewall/routing setup failed' "$(cat "$DEGRADED_FILE")" 'firewall failure reason'
     check absent "$([ -f "$SOCKROCKET_DNSMASQ_DIR/sockrocket.conf" ] && echo present || echo absent)" 'no fake-IP DNS after firewall failure'
 }
 
