@@ -172,31 +172,26 @@
 /* Configuration flow overview shares the firmware-integrated light palette. */
 #sockrocket-plugin .rule-flow-head {display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
 #sockrocket-plugin .rule-flow-head h3 {margin:0;flex:1}
-#sockrocket-plugin .flow-columns {display:grid;grid-template-columns:22% 44% 26%;gap:4%;margin:18px 0 10px;color:var(--text-muted);font-size:11px}
-#sockrocket-plugin .flow-stage {position:relative;display:grid;grid-template-columns:22% 44% 26%;gap:4%;min-width:0}
 #sockrocket-plugin .flow-lines {position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 #sockrocket-plugin .flow-lines path {fill:none;stroke:var(--border);stroke-width:1.5;vector-effect:non-scaling-stroke}
 #sockrocket-plugin .flow-lines path.selected {stroke:var(--accent);stroke-width:2}
-#sockrocket-plugin .flow-lines text {fill:var(--text-muted);font:10px var(--sans)}
 #sockrocket-plugin .flow-lines path.branch {stroke-dasharray:4 4}
-#sockrocket-plugin .flow-box.inactive {opacity:.45}
-#sockrocket-plugin .flow-device-map {margin:12px 0;--map-track:minmax(0,23fr) minmax(12px,4fr) minmax(0,41fr) minmax(12px,4fr) minmax(0,28fr)}
-#sockrocket-plugin .flow-map-head,#sockrocket-plugin .flow-map-step {display:grid;grid-template-columns:var(--map-track);align-items:center}
-#sockrocket-plugin .flow-map-head {color:var(--text-muted);font-size:11px;margin:10px 0 6px}
-#sockrocket-plugin .flow-map-head span:nth-child(2),#sockrocket-plugin .flow-map-stage {grid-column:3}
-#sockrocket-plugin .flow-map-head span:last-child,#sockrocket-plugin .flow-map-exit {grid-column:5}
-#sockrocket-plugin .flow-map-lane {padding:12px 0;border-top:1px solid var(--border)}
-#sockrocket-plugin .flow-map-step+.flow-map-step {margin-top:16px}
-#sockrocket-plugin .flow-map-node {position:relative;min-width:0;align-self:stretch;display:flex;flex-direction:column;justify-content:center;gap:3px;padding:7px 9px;background:var(--bg-sidebar);color:var(--text-primary);border:1px solid var(--border);border-radius:7px;text-align:left;font:inherit;font-size:12px;overflow-wrap:anywhere}
-#sockrocket-plugin button.flow-map-node {cursor:pointer}
-#sockrocket-plugin button.flow-map-node:hover {border-color:var(--accent)}
-#sockrocket-plugin .flow-map-node small {color:var(--text-muted);font-size:10px}
-#sockrocket-plugin .flow-map-source {grid-column:1;border-left:3px solid var(--accent)}
-#sockrocket-plugin .flow-map-step+.flow-map-step .flow-map-stage:before {content:"";position:absolute;bottom:100%;left:50%;height:16px;border-left:1px dashed var(--text-muted)}
-#sockrocket-plugin .flow-map-edge {position:relative;width:100%;height:0;border-top:1px solid var(--text-muted)}
-#sockrocket-plugin .flow-map-edge:after {content:"";position:absolute;right:0;top:-4px;border:3px solid transparent;border-right:0;border-left:5px solid var(--text-muted)}
-#sockrocket-plugin .flow-map-edge.entry {grid-column:2}
-#sockrocket-plugin .flow-map-edge.exit {grid-column:4}
+#sockrocket-plugin .routing-map {position:relative;isolation:isolate;margin:8px 0 14px}
+#sockrocket-plugin .routing-map .flow-lines {z-index:-1}
+#sockrocket-plugin .map-head {display:grid;grid-template-columns:22% 34% 22%;justify-content:space-between;color:var(--text-muted);font-size:11px;margin-top:14px}
+#sockrocket-plugin .map-node {position:absolute;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center;gap:2px;height:54px;min-width:0;padding:5px 8px;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);background:var(--bg-sidebar);font:inherit;font-size:12px;text-align:left}
+#sockrocket-plugin button.map-node {cursor:pointer}
+#sockrocket-plugin button.map-node:hover,#sockrocket-plugin .map-node.selected {border-color:var(--accent);background:var(--bg-hover)}
+#sockrocket-plugin .map-node strong,#sockrocket-plugin .map-node small {overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#sockrocket-plugin .map-node small {color:var(--text-muted);font-size:10px}
+#sockrocket-plugin .map-node.source {left:0;width:22%}
+#sockrocket-plugin .map-node.group {left:33%;width:34%}
+#sockrocket-plugin .map-node.outlet {left:78%;width:22%}
+#sockrocket-plugin .map-node.inactive {opacity:.55}
+#sockrocket-plugin .routing-map path.related {stroke:var(--accent);opacity:.7}
+#sockrocket-plugin .routing-map path.dim {opacity:.32}
+#sockrocket-plugin .flow-inspector {border-top:1px solid var(--border);padding-top:10px}
+#sockrocket-plugin .flow-inspector>summary {cursor:pointer;font-weight:600}
 #sockrocket-plugin .flow-query {display:grid;grid-template-columns:minmax(160px,2fr) minmax(120px,1fr) 85px;gap:10px;margin:16px 0 10px}
 #sockrocket-plugin .flow-trace-result {margin-top:14px;border:1px solid var(--border);border-radius:9px;padding:14px;background:var(--bg-sidebar)}
 #sockrocket-plugin .flow-trace-result h4 {margin:0;font-size:15px}
@@ -204,7 +199,6 @@
 #sockrocket-plugin .flow-checks li {padding:7px 4px;border-bottom:1px solid var(--border);font-size:11px;overflow-wrap:anywhere}
 #sockrocket-plugin .flow-checks .matched {color:var(--text-accent);font-weight:600}
 #sockrocket-plugin .flow-warning {color:var(--warning);font-size:11px;margin-top:8px;overflow-wrap:anywhere}
-#sockrocket-plugin .flow-entry,#sockrocket-plugin .flow-rules,#sockrocket-plugin .flow-exits {position:relative;display:flex;flex-direction:column;justify-content:center;gap:10px;min-width:0}
 #sockrocket-plugin .proxy-group-grid {grid-template-columns:repeat(2,minmax(0,1fr))}
 #sockrocket-plugin .pg-member-list {max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-sidebar)}
 #sockrocket-plugin .pg-member {display:flex;align-items:flex-start;gap:8px;margin:0;padding:7px 10px;border-bottom:1px solid var(--border);font-size:12px;line-height:1.4}
@@ -212,16 +206,6 @@
 #sockrocket-plugin .pg-member label {display:flex;align-items:flex-start;gap:8px;flex:1;min-width:0;margin:0;cursor:pointer}
 #sockrocket-plugin .pg-member input {margin-top:2px;flex:none}
 #sockrocket-plugin .pg-member-move {display:flex;gap:4px;flex:none}
-#sockrocket-plugin .flow-rules {gap:20px}
-#sockrocket-plugin .flow-box {display:flex;flex-direction:column;justify-content:center;gap:2px;min-width:0;height:68px;flex-shrink:0;padding:8px 10px;background:var(--bg-sidebar);border:1px solid var(--border);border-radius:9px;text-align:left;line-height:1.35}
-#sockrocket-plugin button.flow-box {width:100%;color:var(--text-primary)}
-#sockrocket-plugin button.flow-box:hover {background:var(--bg-hover);border-color:#a6c9eb}
-#sockrocket-plugin .flow-box.selected {border-color:var(--accent);background:var(--accent-dim)}
-#sockrocket-plugin .flow-box strong {font-size:12px;font-weight:600;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-#sockrocket-plugin .flow-box small {display:block;font-size:10px;color:var(--text-muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-#sockrocket-plugin .flow-box .flow-target {font-size:10px;color:var(--text-accent);margin-left:6px;font-weight:400}
-#sockrocket-plugin .flow-exits .flow-box {border-left:3px solid var(--border)}
-#sockrocket-plugin .flow-exits .flow-box.selected {border-left-color:var(--accent)}
 #sockrocket-plugin .flow-detail {display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:var(--bg-hover);border-radius:8px;padding:12px 14px;margin-top:16px;min-width:0}
 #sockrocket-plugin .flow-detail>div {flex:1;min-width:140px;overflow-wrap:anywhere}
 #sockrocket-plugin .flow-detail p {font-size:11px;color:var(--text-muted)}
@@ -234,14 +218,6 @@
  #sockrocket-plugin .proxy-group-grid {grid-template-columns:1fr}
  #sockrocket-plugin .flow-query {grid-template-columns:1fr}
  #sockrocket-plugin .rule-flow-head h3 {flex-basis:100%}
- #sockrocket-plugin .flow-columns,#sockrocket-plugin .flow-lines {display:none}
- #sockrocket-plugin .flow-stage {display:flex;flex-direction:column;gap:14px;height:auto!important;margin-top:16px}
- #sockrocket-plugin .flow-entry::before,#sockrocket-plugin .flow-rules::before,#sockrocket-plugin .flow-exits::before {font-size:11px;color:var(--text-muted)}
- #sockrocket-plugin .flow-entry::before {content:'入口'}
- #sockrocket-plugin .flow-rules::before {content:'↓ 匹配顺序 · 首条命中即结束'}
- #sockrocket-plugin .flow-exits::before {content:'↓ 处理方式'}
- #sockrocket-plugin .flow-box strong,#sockrocket-plugin .flow-box small {white-space:normal;overflow-wrap:anywhere}
- #sockrocket-plugin .flow-box {height:auto;min-height:68px}
 }
 
 body.bg {min-width:0!important}
@@ -519,16 +495,15 @@ body.bg {min-width:0!important}
           <p class="hint" id="sr-rule-flow-summary" role="status"></p>
           <div class="flow-query">
             <div class="fg"><label for="sr-rule-flow-destination">网站 / 目的 IP</label><input id="sr-rule-flow-destination" type="text" placeholder="例如 example.com，也可粘贴网址" autocomplete="off" spellcheck="false" oninput="invalidateRuleTrace()" onkeydown="if(event.key==='Enter')traceRuleFlow()"></div>
-            <div class="fg"><label for="sr-rule-flow-device">模拟设备</label><select id="sr-rule-flow-device" onchange="changeFlowDevice()"><option value="">全部设备 · 配置总览</option></select><div id="sr-rule-flow-manual" hidden><input id="sr-rule-flow-client" type="text" aria-label="手动输入设备 IP" placeholder="单个 IPv4 或 IPv6 地址" autocomplete="off" oninput="invalidateRuleTrace()" onkeydown="if(event.key==='Enter')traceRuleFlow()"></div></div>
+            <div class="fg"><label for="sr-rule-flow-device">模拟设备</label><select id="sr-rule-flow-device" onchange="changeFlowDevice();syncSimulatedSource()"><option value="">全部设备 · 配置总览</option></select><div id="sr-rule-flow-manual" hidden><input id="sr-rule-flow-client" onchange="syncSimulatedSource()" type="text" aria-label="手动输入设备 IP" placeholder="单个 IPv4 或 IPv6 地址" autocomplete="off" oninput="FLOW_EDIT_NETWORK='';FLOW_EDIT_GROUP=null;invalidateRuleTrace()" onkeydown="if(event.key==='Enter')traceRuleFlow()"></div></div>
             <div class="fg"><label for="sr-rule-flow-port">端口</label><input id="sr-rule-flow-port" type="number" min="1" max="65535" placeholder="自动" oninput="invalidateRuleTrace()" onkeydown="if(event.key==='Enter')traceRuleFlow()"></div>
           </div>
           <div class="toolbar"><button type="button" class="btn btn-accent btn-sm" id="sr-rule-flow-check" onclick="traceRuleFlow()">检查分流</button><button type="button" class="btn btn-sm" onclick="previewDeviceFlow()">只看配置流程</button><button type="button" class="btn btn-sm" onclick="resetDeviceFlow()">清除检查</button></div>
           <details><summary>DNS 与目的 IP</summary><div class="fg" style="margin-top:10px"><label for="sr-rule-flow-ip">真实目的 IP（选填，用于复现设备实际解析结果）</label><input id="sr-rule-flow-ip" type="text" autocomplete="off" placeholder="留空时按需解析" oninput="invalidateRuleTrace()"></div><label class="hint"><input id="sr-rule-flow-resolve" type="checkbox" checked onchange="invalidateRuleTrace()"> 遇到 IP / GeoIP 规则时查询 DNS</label></details>
-          <p class="hint" id="sr-rule-flow-query-state" role="status" aria-live="polite">尚未检查。图中展示匹配阶段，点选分组后，下方显示该组全部规则。</p>
+          <p class="hint" id="sr-rule-flow-query-state" role="status" aria-live="polite">点来源配置关联组和出口，点规则组查看规则；输入目的地址可高亮实际命中路径。</p>
           <div id="sr-rule-flow" aria-label="分流配置路径"><p class="hint">正在加载规则…</p></div>
-        </section>
-        <section class="card" aria-labelledby="sr-device-title">
-          <div class="toolbar"><h3 id="sr-device-title">全局与设备分流策略</h3><div class="spacer"></div><button class="btn btn-sm" onclick="srLoadRules()">刷新设备</button></div>
+          <details class="flow-inspector" id="sr-flow-inspector"><summary>配置来源与出口</summary>
+          <div class="toolbar"><h4 id="sr-device-title">全局与设备分流策略</h4><div class="spacer"></div><button class="btn btn-sm" onclick="srLoadRules()">刷新设备</button></div>
           <fieldset id="sr-device-form" disabled style="border:0;padding:0;margin:0;min-width:0">
             <div class="toolbar">
               <div class="fg"><label for="sr-global-rule-group">全局规则组 · 所有设备共用</label><select id="sr-global-rule-group"></select></div>
@@ -536,8 +511,8 @@ body.bg {min-width:0!important}
             </div>
             <p class="hint" id="sr-global-rule-summary" aria-live="polite"></p>
             <div class="form-grid">
-              <div class="fg"><label for="sr-device-picker">选择设备</label><select id="sr-device-picker" onchange="selectPolicyDevice()"><option value="">请选择设备</option></select></div>
-              <div class="fg" id="sr-device-manual" hidden><label for="sr-device-source">来源 IP / 网段</label><input id="sr-device-source" placeholder="例如 192.168.50.20" oninput="updateDevicePolicySelection()"></div>
+              <div class="fg"><label for="sr-device-picker">选择设备</label><select id="sr-device-picker" onchange="selectPolicyDevice();syncEditorToMap()"><option value="">请选择设备</option></select></div>
+              <div class="fg" id="sr-device-manual" hidden><label for="sr-device-source">来源 IP / 网段</label><input id="sr-device-source" placeholder="例如 192.168.50.20" oninput="updateDevicePolicySelection()" onchange="syncEditorToMap()"></div>
             </div>
             <div id="sr-device-settings" hidden>
               <div id="sr-device-specific">
@@ -549,7 +524,7 @@ body.bg {min-width:0!important}
                 </details>
                 <div id="sr-device-bound-editor" hidden>
                   <div class="form-grid">
-                    <div class="fg"><label for="sr-device-group">已关联的规则组</label><select id="sr-device-group" onchange="renderDeviceBinding()"></select></div>
+                    <div class="fg"><label for="sr-device-group">已关联的规则组</label><select id="sr-device-group" onchange="FLOW_EDIT_GROUP=this.value;renderDeviceBinding();renderRuleFlow()"></select></div>
                     <div class="fg"><label for="sr-device-group-target">命中该组时</label><select id="sr-device-group-target"></select></div>
                   </div>
                   <p id="sr-device-group-state" class="hint" aria-live="polite"></p>
@@ -561,6 +536,7 @@ body.bg {min-width:0!important}
             </div>
           </fieldset>
           <p class="hint">设备策略按来源 IP 匹配，建议在路由器中为设备保留 DHCP 地址。</p>
+          </details>
         </section>
         <section class="card" aria-labelledby="sr-rule-presets-title">
           <h3 id="sr-rule-presets-title">常用规则预设</h3>
@@ -2550,6 +2526,7 @@ function syncFlowDevicePicker() {
   picker.value=before || '';
 }
 function changeFlowDevice() {
+  FLOW_EDIT_NETWORK='';FLOW_EDIT_GROUP=null;
   var value=srElement('rule-flow-device').value;
   var manual=value==='manual',field=srElement('rule-flow-client');
   srElement('rule-flow-manual').hidden=!manual;
@@ -2567,44 +2544,135 @@ function chooseFlowHost(ip) {
   previewDeviceFlow();
   srElement('rule-flow-destination').focus();
 }
-// Status polling does not change saved rules. Reuse the overview until a
-// configuration, device inventory or exit catalog reload replaces its data.
-var deviceMapCache=null;
-function deviceBranchesHtml(rows,bindings) {
-  var cache=deviceMapCache;
-  if(cache && cache.rows===rows && cache.links===bindings && cache.devices===SR_STATE.devices &&
-     cache.compiled===SR_STATE.compiledTargets && cache.nodes===SR_RULE_NODES && cache.groups===SR_PROXY_GROUPS)return cache.html;
-  var scopes=new Set(),hosts=flowDeviceChoices(),ordered=orderedFlowRules(rows);
-  bindings.concat(rows).forEach(function(item){
-    if(item.source)scopes.add(flowHost(item.source)||item.source);
-  });
-  if(!scopes.size)return '';
-  function lane(source) {
-    var ip=flowHost(source),name=hosts.get(ip),label=name||source||'全部设备';
-    var sourceText='<strong>'+srEsc(label)+'</strong><small>'+srEsc(source?(name?ip:ip?'选择设备模拟':'来源网段'):'全局规则路径')+'</small>';
-    var sourceNode=source && !ip?'<div class="flow-map-node flow-map-source">'+sourceText+'</div>':
-      '<button type="button" class="flow-map-node flow-map-source" '+(ip?'data-ip="'+srEsc(ip)+'" onclick="chooseFlowHost(this.dataset.ip)"':'onclick="chooseGlobalFlow()"')+'>'+sourceText+'</button>';
-    var stages=ruleFlowModel(rows,'rule',source,ordered).filter(function(stage){return !stage.disabled;});
-    var steps=stages.map(function(stage,i){
-      var caption=stage.phaseLabel || (stage.kind==='builtin'?'内置规则':'默认出口');
-      var title='<strong>'+srEsc(stage.title)+'</strong><small>'+srEsc(caption)+'</small>';
-      var node=stage.indices?'<button class="flow-map-node flow-map-stage" type="button" data-index="'+Number(stage.indices[0])+'" onclick="openFlowMapGroup(this.dataset.index)">'+title+'</button>':'<div class="flow-map-node flow-map-stage">'+title+'</div>';
-      var exits=stage.targets.map(function(key){return '<span>'+srEsc(RULE_TARGET_LABEL[key]||key)+'</span>';}).join('');
-      return '<div class="flow-map-step">'+(i===0?sourceNode+'<i class="flow-map-edge entry" aria-hidden="true"></i>':'')+
-        node+'<i class="flow-map-edge exit" aria-hidden="true"></i><div class="flow-map-node flow-map-exit">'+exits+'</div></div>';
-    }).join('');
-    return '<section class="flow-map-lane" aria-label="'+srEsc(label)+'">'+steps+'</section>';
-  }
-  var html='<div class="flow-device-map" aria-label="全局与设备的分流路径"><div class="flow-map-head"><span>来源</span><span>按顺序检查，未命中向下</span><span>命中后的出口</span></div>'+
-    Array.from(scopes,lane).join('')+lane('')+'</div>';
-  deviceMapCache={rows:rows,links:bindings,devices:SR_STATE.devices,compiled:SR_STATE.compiledTargets,nodes:SR_RULE_NODES,groups:SR_PROXY_GROUPS,html:html};
-  return html;
+var FLOW_EDIT_NETWORK='',FLOW_EDIT_GROUP=null;
+function setFlowEditorSource(source) {
+  var picker=srElement('device-picker');
+  var option=source && Array.from(picker.options).find(function(o){return sameDeviceSource(o.value,source);});
+  picker.value=source?(option?option.value:'manual'):'global';
+  selectPolicyDevice();
+  if(picker.value==='manual'){srElement('device-source').value=source;updateDevicePolicySelection();}
 }
-function openFlowMapGroup(index) {
+function syncSimulatedSource() {
+  var value=srElement('rule-flow-device').value, source=srElement('rule-flow-client').value.trim();
+  if(value==='global'||sourceNetwork(source))setFlowEditorSource(value==='global'?'':source);
+  else {srElement('device-picker').value='';selectPolicyDevice();}
+}
+function pickMapSource(source) {
+  if(source && !flowHost(source)){
+    srElement('rule-flow-device').value='manual';changeFlowDevice();
+    FLOW_EDIT_NETWORK=source;renderRuleFlow();
+    srElement('rule-flow-query-state').textContent='正在配置此网段。模拟时请输入网段内的设备 IP。';
+  }else if(source)chooseFlowHost(flowHost(source));else chooseGlobalFlow();
+  setFlowEditorSource(source);
+  srElement('flow-inspector').open=true;
+}
+function syncEditorToMap() {
+  var value=srElement('device-picker').value,source=deviceSource();
+  if(value==='global')chooseGlobalFlow();
+  else if(flowHost(source))chooseFlowHost(flowHost(source));
+  else if(sourceNetwork(source))pickMapSource(source);
+  else resetDeviceFlow();
+}
+function openMapGroup(index) {
   var rule=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(index);});
-  if(rule && changeRuleGroup((rule.group||'').trim(),rule.source?'device':'global')){
+  if(!rule)return;
+  var name=(rule.group||'').trim(), source=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT;
+  FLOW_EDIT_GROUP=null;
+  if(source && name && (SR_STATE.ruleRows||[]).some(function(r){return !r.source && !isFinalRule(r) && (r.group||'').trim()===name;})){
+    setFlowEditorSource(source);
+    srElement('flow-inspector').open=true;
+    var bound=(SR_STATE.deviceBindings||[]).some(function(link){return sameDeviceSource(source,link.source)&&link.group===name;});
+    if(bound){
+      FLOW_EDIT_GROUP=name;
+      srElement('device-group').value=name;renderDeviceBinding();
+      srElement('device-group-target').focus();
+    }else{
+      var boxes=srElement('device-available-groups').querySelectorAll('input');
+      Array.from(boxes).forEach(function(box){if(box.value===name)box.checked=true;});
+      srElement('device-add-groups').open=true;updateDeviceAddCount();
+      srElement('device-add-selected').focus();
+    }
+    renderRuleFlow();
+  }else if(changeRuleGroup(name,rule.source?'device':'global')){
     srElement('rule-workspace').scrollIntoView({behavior:'smooth',block:'start'});
   }
+}
+function pickMapExit(target) {
+  if(ruleWorkspaceLocked() || FLOW_EDIT_GROUP===null || srElement('device-group').value!==FLOW_EDIT_GROUP)return;
+  var select=srElement('device-group-target');
+  if(!Array.from(select.options).some(function(o){return o.value===target;}))return;
+  select.value=target;srElement('flow-inspector').open=true;srElement('device-link').focus();
+}
+
+// Connections represent possible routes. Per-source membership on each edge
+// distinguishes two devices using the same group with different exits.
+var sharedMapCache;
+function sharedFlowGraph(all,mode,activeStages,winner) {
+  var choice=srElement('rule-flow-device').value;
+  var selected=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT||(choice==='global'?'':null);
+  // Router status polls reuse the topology until a snapshot or selection changes.
+  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.compiledTargets,SR_STATE.nodes,(SR_STATE.status||{}).active_node,SR_PROXY_GROUPS,SR_RULE_NODES];
+  if(sharedMapCache && inputs.every(function(value,i){return sharedMapCache.inputs[i]===value;}))return sharedMapCache.html;
+  var hosts=flowDeviceChoices(), scopes=new Set(['']), groups=new Map(), exits=new Map(), edges=new Map();
+  var ordered=orderedFlowRules(all);
+  (SR_STATE.deviceBindings||[]).concat(all).forEach(function(r){if(r.source)scopes.add(flowHost(r.source)||r.source);});
+  if(selected!==null)scopes.add(selected);
+  var sources=Array.from(scopes), original=new Map(all.map(function(r){return [Number(r.index),r];}));
+  function groupKey(stage){
+    return stage.indices?'group:'+String(original.get(stage.indices[0]).group||'').trim():'stage:'+stage.kind;
+  }
+  function edge(left,a,b,scope,hit){
+    var id=[left,a,b].join('/'),e=edges.get(id);
+    if(!e){e={left:left,a:a,b:b,related:false,hit:false};edges.set(id,e);}
+    if(scope===selected)e.related=true;
+    if(hit)e.hit=true;
+  }
+  var matched=winner>=0?activeStages[winner]:null;
+  sources.forEach(function(scope,i){
+    var stages=scope===selected && !FLOW_EDIT_NETWORK?activeStages:ruleFlowModel(all,mode,scope,ordered);
+    var linkedGroups=new Set(stages.filter(function(stage){return stage.kind==='device_link'&&!stage.disabled;}).map(groupKey));
+    stages.forEach(function(stage){
+      var key=groupKey(stage),g=groups.get(key);
+      if(!g){g={index:groups.size,title:stage.title,ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
+      g.phases.add(stage.phaseLabel||stage.title);
+      if(stage.disabled || (stage.kind==='global_rule'&&linkedGroups.has(key)&&stage!==matched))return;
+      g.enabled=true;
+      var hit=!!matched && scope===selected && stage===matched;
+      if(hit || (!matched && scope===selected && (FLOW_EDIT_GROUP===null||key==='group:'+FLOW_EDIT_GROUP)))g.selected=true;
+      edge(true,i,g.index,scope,hit);
+      stage.targets.forEach(function(action){
+        if(!exits.has(action))exits.set(action,exits.size);
+        edge(false,g.index,exits.get(action),scope,hit && RULE_TRACE.trace.action===action);
+      });
+    });
+  });
+  var height=Math.max(sources.length,groups.size,exits.size)*68;
+  function center(index,count){return (height-(count-1)*68)/2+index*68;}
+  var paths=Array.from(edges.values(),function(e){
+    var x=e.left?220:670, end=e.left?330:780,mid=(x+end)/2;
+    var y=center(e.a,e.left?sources.length:groups.size),dest=center(e.b,e.left?groups.size:exits.size);
+    var style=e.hit?'selected':selected===null?'':e.related?'related':'dim';
+    return '<path data-from="'+(e.left?'s':'g')+e.a+'" data-to="'+(e.left?'g':'e')+e.b+'" class="'+style+'" d="M '+x+' '+y+' C '+mid+' '+y+', '+mid+' '+dest+', '+end+' '+dest+'"/>';
+  }).join('');
+  function box(kind,y,title,sub,cls,button){
+    var tag=button?'button':'div';
+    return '<'+tag+(button?' type="button" '+button:'')+' class="map-node '+kind+cls+'" style="top:'+(y-27)+'px" title="'+srEsc(title+(sub?' · '+sub:''))+'"><strong>'+srEsc(title)+'</strong><small>'+srEsc(sub)+'</small></'+tag+'>';
+  }
+  var nodes=sources.map(function(scope,i){
+    return box('source',center(i,sources.length),hosts.get(scope)||scope||'全部设备',scope?(hosts.get(scope)?scope:'配置此来源'):'全局规则',scope===selected?' selected':'','data-source="'+srEsc(scope)+'" onclick="pickMapSource(this.dataset.source)"');
+  }).join('');
+  groups.forEach(function(g){
+    nodes+=box('group',center(g.index,groups.size),g.title,g.enabled?Array.from(g.phases).join(' / '):'已停用',g.selected?' selected':g.enabled?'':' inactive',g.ruleIndex==null?'':'data-index="'+g.ruleIndex+'" onclick="openMapGroup(this.dataset.index)"');
+  });
+  exits.forEach(function(i,action){
+    var sub='';
+    if(action==='proxy'){var node=(SR_STATE.nodes||[])[(SR_STATE.status||{}).active_node];sub=node?node.name:'当前所选节点';}
+    else if(action.indexOf('group:')===0){var g=(SR_PROXY_GROUPS||[]).find(function(g){return g.name===action.slice(6);});sub=g&&g.selected_node||'';}
+    nodes+=box('outlet',center(i,exits.size),RULE_TARGET_LABEL[action]||action,sub,matched && RULE_TRACE.trace.action===action?' selected':'',FLOW_EDIT_GROUP===null?'':'data-target="'+srEsc(action)+'" onclick="pickMapExit(this.dataset.target)"');
+  });
+  var html='<div class="map-head"><span>来源</span><span>规则组 / 策略</span><span>出口</span></div><div class="routing-map" aria-label="设备与全局规则共享分流图" style="height:'+height+'px"><svg class="flow-lines" aria-hidden="true" viewBox="0 0 1000 '+height+'" preserveAspectRatio="none">'+paths+'</svg>'+nodes+'</div>';
+  sharedMapCache={inputs:inputs,html:html};
+  return html;
 }
 function chooseGlobalFlow() {
   srElement('rule-flow-device').value='global';
@@ -2624,14 +2692,15 @@ function invalidateRuleTrace(message) {
 function previewDeviceFlow() {
   var text=srElement('rule-flow-client').value.trim();
   if(text && (!sourceNetwork(text) || text.indexOf('/')>=0)) {srShowMsg('设备来源请填写单个 IPv4 或 IPv6 地址。','err');return;}
-  invalidateRuleTrace('配置流程概览。选择阶段可查看全部相关规则；输入网站后可检查具体命中。');
+  invalidateRuleTrace('已显示此来源可用的路径，输入目的地址可检查具体命中。');
   RULE_FLOW_SELECTED=0;renderRuleFlow();
 }
 function resetDeviceFlow() {
+  FLOW_EDIT_NETWORK='';FLOW_EDIT_GROUP=null;
   srElement('rule-flow-device').value='';srElement('rule-flow-manual').hidden=true;
   ['rule-flow-client','rule-flow-destination','rule-flow-port','rule-flow-ip'].forEach(function(id){srElement(id).value='';});
   srElement('rule-flow-resolve').checked=true;RULE_FLOW_SELECTED=0;
-  invalidateRuleTrace('尚未检查。图中展示匹配阶段，点选分组后，下方显示该组全部规则。');
+  invalidateRuleTrace('点来源配置关联组和出口，点规则组查看规则；输入目的地址可高亮实际命中路径。');
 }
 function traceRuleFlow() {
   if(RULE_TRACE_PENDING)return;
@@ -2770,8 +2839,8 @@ function renderRuleFlow() {
     RULE_TRACE=null;RULE_TRACE_GENERATION++;srElement('rule-flow-query-state').textContent='服务、分流模式或出口已变化，请重新检查。';
   }
   srElement('rule-flow-state').textContent=(!known?'状态未知':running?'服务运行中':'服务已停止')+' · '+(mode==='global'?'全局模式':mode==='direct'?'直连模式':'规则模式');
-  if(!Array.isArray(SR_STATE.ruleRows)){host.innerHTML='<p class="hint">'+(RULE_FLOW_ERROR?'规则加载失败，请刷新后重试。':'正在加载规则…')+'</p>';return;}
-  var rows=ruleFlowModel(SR_STATE.ruleRows,mode,RULE_FLOW_CLIENT),h=Math.max(224,rows.length*88-20),t=RULE_TRACE&&RULE_TRACE.trace,winner=-1;
+  if(!Array.isArray(SR_STATE.ruleRows)){host._flowHtml=null;host.innerHTML='<p class="hint">'+(RULE_FLOW_ERROR?'规则加载失败，请刷新后重试。':'正在加载规则…')+'</p>';return;}
+  var rows=ruleFlowModel(SR_STATE.ruleRows,mode,RULE_FLOW_CLIENT),t=RULE_TRACE&&RULE_TRACE.trace,winner=-1;
   if(t){
     var matched=t.steps.find(function(step){return step.outcome==='matched';}),kind;
     if(mode!=='rule')kind='mode';
@@ -2785,36 +2854,12 @@ function renderRuleFlow() {
   }
   var all=SR_STATE.ruleRows,enabled=all.filter(function(r){return r.enabled!==false;}).length;
   srElement('rule-flow-summary').textContent='与下方同一配置：共 '+all.length+' 条 · 启用 '+enabled+' 条 · 停用 '+(all.length-enabled)+' 条。图中不受列表搜索或分页影响。'+(rulePending?' 正在保存/应用并核对结果…':RULE_READ_PENDING?' 正在读取最新状态…':RULE_FLOW_ERROR?' 当前为上次快照，请刷新。':'');
-  if(!srElement('rule-flow-device').value && mode==='rule' && !t){
-    var overview=deviceBranchesHtml(all,SR_STATE.deviceBindings||[]);
-    if(overview){
-      host.innerHTML=overview+(RULE_FLOW_ERROR?'<p class="flow-warning">规则刷新失败，显示的是上次快照。</p>':'');
-      return;
-    }
-  }
   if(RULE_FLOW_SELECTED<0 && winner>=0)RULE_FLOW_SELECTED=winner;
   RULE_FLOW_SELECTED=Math.max(0,Math.min(RULE_FLOW_SELECTED,rows.length-1));
-  var selected=rows[RULE_FLOW_SELECTED],targets=[],names=RULE_TARGET_LABEL,node=(SR_STATE.nodes||[])[st.active_node];
-  rows.forEach(function(r){if(!r.disabled)r.targets.forEach(function(a){if(targets.indexOf(a)<0)targets.push(a);});});
-  var exitsHeight=targets.length*78-10;h=Math.max(h,exitsHeight);
-  var descriptions={proxy:node?node.name:'当前所选节点',direct:'不经过代理节点',reject:'阻止连接'};
-  (SR_RULE_NODES||[]).forEach(function(n){descriptions['node:'+n.id]=n.name;});
-  (SR_PROXY_GROUPS||[]).forEach(function(g){descriptions['group:'+g.name]=(g.type==='fallback'?'按顺序 · 首选 ':'')+(g.selected_node||'当前成员不可用');});
-  function curve(x1,y1,x2,y2,on,branch){var mid=(x1+x2)/2;return '<path class="'+(on?'selected ':'')+(branch&&!(on&&t&&t.definitive)?'branch':'')+'" d="M '+x1+' '+y1+' C '+mid+' '+y1+', '+mid+' '+y2+', '+x2+' '+y2+'"/>';}
-  var paths='',startY=(h-(rows.length*88-20))/2;
-  paths+=curve(220,h/2,260,startY+(t&&winner>=0?winner:0)*88+34,!!t&&winner>=0,true);
-  rows.forEach(function(r,i){var y=startY+i*88+34;
-    if(i<rows.length-1)paths+='<path d="M 480 '+(y+34)+' L 480 '+(y+54)+'"/><text x="500" y="'+(y+48)+'">'+(r.disabled?'已停用 ↓':t&&t.definitive?(i<winner?'未命中 ↓':'未执行'):'未命中时 ↓')+'</text>';
-    if(!r.disabled)r.targets.forEach(function(target){var j=targets.indexOf(target);if(j>=0&&(!t||i===winner&&target===t.action))paths+=curve(700,y,740,(h-exitsHeight)/2+j*78+34,!!t&&i===winner&&target===t.action,true);});
-  });
-  var boxes=rows.map(function(r,i){var hit=!!t&&i===winner,after=!!t&&winner>=0&&i>winner;
-    var note=hit?'本次'+(t.definitive?'命中':'暂定命中')+(t.matched_rule!=null?' · 配置 #'+(Number(t.matched_rule)+1):''):after?(t.definitive?'前面已经命中 · 不再执行':'此前暂定匹配 · 结果待验证'):r.note;
-    return '<button type="button" id="sr-rule-flow-step-'+i+'" class="flow-box'+(hit||(!t&&i===RULE_FLOW_SELECTED)?' selected':'')+(after||r.disabled?' inactive':'')+'" title="'+srEsc(note)+'" aria-pressed="'+(i===RULE_FLOW_SELECTED)+'" onclick="selectRuleFlow('+i+')"><strong>'+srEsc(r.title)+'</strong><small>'+srEsc((r.phaseLabel?r.phaseLabel+' · ':'')+note)+'</small><small class="flow-target">'+r.targets.map(function(a){return srEsc(names[a]||a);}).join(' / ')+'</small></button>';
-  }).join('');
-  var outlets=targets.map(function(a){return '<div class="flow-box'+(t&&a===t.action?' selected':'')+'"><strong>'+srEsc(names[a]||a)+'</strong><small title="'+srEsc(descriptions[a]||'分组不可用')+'">'+srEsc(descriptions[a]||'分组不可用')+'</small></div>';}).join('');
-  var actions=selected.rule?'<button type="button" class="btn btn-sm" onclick="inspectRule('+Number(selected.rule.index)+')">详情</button><button type="button" class="btn btn-accent btn-sm"'+(rulePending||RULE_READ_PENDING||RULE_FLOW_ERROR?' disabled':'')+' onclick="editRule('+Number(selected.rule.index)+')">编辑规则</button>':selected.indices?'<button type="button" class="btn btn-sm" onclick="showFlowRuleList(\''+selected.kind+'\','+RULE_FLOW_SELECTED+')">查看整个分组</button>':'';
-  var sourceTitle=RULE_FLOW_CLIENT?(flowDeviceChoices().get(RULE_FLOW_CLIENT)||RULE_FLOW_CLIENT):'全局规则';
-  host.innerHTML='<p class="hint">'+(t?'蓝线表示本次'+(t.definitive?'命中':'暂定匹配')+'路径；灰线仅表示规则检查顺序，停用项不参与分流。':'灰色连线仅表示配置关系；输入网站检查后高亮命中路径。')+'</p><div class="flow-columns" aria-hidden="true"><span>来源</span><span>按阶段依次匹配</span><span>命中后的出口</span></div><div class="flow-stage" style="height:'+h+'px"><svg class="flow-lines" viewBox="0 0 1000 '+h+'" preserveAspectRatio="none" aria-hidden="true">'+paths+'</svg><div class="flow-entry"><div class="flow-box"><strong>'+srEsc(sourceTitle)+'</strong><small>'+srEsc(RULE_TRACE?RULE_TRACE.destination+':'+RULE_TRACE.port:'输入网站后检查实际规则命中')+'</small></div></div><div class="flow-rules">'+boxes+'</div><div class="flow-exits">'+outlets+'</div></div><div class="flow-detail"><div><strong>'+srEsc(selected.title)+'</strong><p>'+srEsc((selected.phaseLabel?selected.phaseLabel+' · ':'')+selected.note)+'</p></div>'+actions+'</div>'+(RULE_FLOW_ERROR?'<p class="flow-warning">规则刷新失败，显示的是上次快照，请刷新后再检查。</p>':'')+flowTraceHtml(RULE_TRACE);
+  var html=sharedFlowGraph(all,mode,rows,winner)+flowTraceHtml(RULE_TRACE);
+  if(RULE_FLOW_ERROR)html+='<p class="flow-warning">规则刷新失败，显示的是上次快照。</p>';
+  if(host._flowHtml!==html){host.innerHTML=html;host._flowHtml=html;}
+
 }
 
 function refreshRuleGroupList(rules) {

@@ -67,13 +67,12 @@ assert.match(grouped.element('rule-group-outlet').innerHTML,/节点 · Example B
 g.SR_STATE.status.transparent_proxy=true;g.SR_STATE.status.cn_ipset_direct=false;
 g.RULE_TRACE=result(g.SR_STATE.ruleRows[3]);g.RULE_FLOW_SELECTED=-1;g.renderRuleFlow();assert.equal(g.RULE_FLOW_SELECTED,3,'highlight the exact matching group segment, not the first global group');
 let graph=grouped.element('rule-flow').innerHTML;
-let highlighted=Array.from(graph.matchAll(/<path class="selected[^"]*" d="([^"]+)"/g),m=>m[1]);
+let highlighted=Array.from(graph.matchAll(/<path[^>]* class="selected[^"]*" d="([^"]+)"/g),m=>m[1]);
 assert.equal(highlighted.length,2,'only source-to-winner and winner-to-outlet form the highlighted route');
-assert.match(highlighted[0],/260 298$/,'source connects directly to the winning group, not the first group');
-assert.match(highlighted[1],/^M 700 298 /,'only the winning group connects to the chosen outlet');
-assert.doesNotMatch(graph,/<path[^>]*d="M 700 122 /,'disabled groups have no outbound connection');
+assert.match(graph,/<path data-from="s0" data-to="g0" class="selected"/,'the matched Local rule highlights the shared Local node');
+assert.doesNotMatch(graph,/<path data-from="g1"/,'disabled group has no outlet');
 g.selectRuleFlow(0);
-assert.deepEqual(Array.from(grouped.element('rule-flow').innerHTML.matchAll(/<path class="selected[^"]*" d="([^"]+)"/g),m=>m[1]),highlighted,'inspecting another group cannot change the actual highlighted route');
+assert.deepEqual(Array.from(grouped.element('rule-flow').innerHTML.matchAll(/<path[^>]* class="selected[^"]*" d="([^"]+)"/g),m=>m[1]),highlighted,'inspecting another group cannot change the actual highlighted route');
 g.SR_STATE.status={...g.SR_STATE.status,active_node:0,node_count:1};g.renderRuleFlow();
 assert.notEqual(g.RULE_TRACE,null,'normal status polling must preserve a valid trace on the default node');
 g.srLoadRules();const oldRead=grouped.request('get_rules');g.srLoadRules();
@@ -91,16 +90,18 @@ assert.deepEqual(Array.from(mixedGroup.targets),['proxy'],'a partially disabled 
 assert.deepEqual(Array.from(mixedGroup.indices),[0,1],'disabled members remain available for diagram/list correspondence');
 m.SR_STATE.ruleRows[0].enabled=false;mixedGroup=m.ruleFlowModel(m.SR_STATE.ruleRows,'rule','')[0];
 assert.equal(mixedGroup.disabled,true);m.renderRuleFlow();
-assert.doesNotMatch(mixed.element('rule-flow').innerHTML,/<path[^>]*d="M 700 34 /,'fully disabled groups must have no outbound route');
+assert.doesNotMatch(mixed.element('rule-flow').innerHTML,/<path data-from="g0"/,'fully disabled groups must have no outbound route');
 console.log('PASS: partially disabled groups expose only effective outlets; fully disabled groups have no route');
 
 {
  const f=fixture(),c=f.context;
  c.SR_STATE.ruleRows=[rule(0,{group:'Phone',source:'192.0.2.10'}),rule(1,{group:'Laptop',source:'192.0.2.11'}),rule(2,{group:'Shared'}),rule(3,{group:'Fallback',rule_type:'final'})];
  c.renderRuleFlow();
- const fromSource=Array.from(f.element('rule-flow').innerHTML.matchAll(/<path class="branch" d="M 220 /g));
- assert.equal(fromSource.length,1,'ordered rules enter through the first stage only');
- console.log('PASS: source connects only to the first rule stage');
+ const data=f.element('rule-flow').innerHTML;
+ assert.equal((data.match(/class="map-node source/g)||[]).length,3,'two devices and all devices share one source column');
+ assert.equal((data.match(/class="routing-map"/g)||[]).length,1);
+ assert.equal((data.match(/<strong>Shared<\/strong>/g)||[]).length,1);
+
 }
 
 {
@@ -112,7 +113,7 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  f.request('trace_route')[2](result(c.SR_STATE.ruleRows[0],{proxy_group:'Video',node_name:'Example B'}));
  const html=f.element('rule-flow').innerHTML;
  assert.match(html, /出口成员：Example B/);
- assert.match(html, /<div class="flow-box selected"><strong>Video<\/strong>/);
+ assert.match(html, /class="map-node outlet selected"[^>]*><strong>Video<\/strong>/);
  assert.doesNotMatch(html, /<div class="flow-box"><strong>拒绝<\/strong>/,'an unused reject exit is not shown');
  assert.doesNotMatch(html, /\[object Object\]/);
  console.log('PASS: group trace highlights the exact exit and expands the diagram for additional groups');
@@ -126,23 +127,23 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  c.SR_STATE.deviceBindings=[{source:tv+'/32',group:'Emby',target:'proxy'},{source:laptop+'/32',group:'Emby',target:'reject'}];
  el('rule-flow-device').value='';c.syncFlowDevicePicker();c.renderRuleFlow();
  const html=el('rule-flow').innerHTML;
- assert.match(html,/客厅电视[\s\S]*?Emby[\s\S]*?代理[\s\S]*?Laptop[\s\S]*?Emby[\s\S]*?拒绝/);
+ assert.match(html,/客厅电视/);assert.match(html,/Laptop/);
+ for(const label of ['Emby','直连','代理','拒绝']){
+   assert.equal(html.split('<strong>'+label+'</strong>').length-1,1,label+' is drawn exactly once');
+ }
  el('rule-flow-destination').value='video.invalid';c.traceRuleFlow();assert.equal(f.requests.length,0);
- assert.match(html,/全局规则路径/);
- assert.equal((html.match(/class="flow-map-lane"/g)||[]).length,3,'two devices and the shared policy appear in one diagram');
- assert.equal((html.match(/class="flow-map-edge entry"/g)||[]).length,3,'each source connects to its first check');
- assert.equal((html.match(/class="flow-map-edge exit"/g)||[]).length,(html.match(/class="flow-map-step"/g)||[]).length,'each effective check connects to its own exits');
- assert.doesNotMatch(html,/class="flow-stage"/,'overview does not append a second global-only diagram');
+ assert.equal((html.match(/class="routing-map"/g)||[]).length,1);
+ assert.equal((html.match(/class="map-node source/g)||[]).length,3);
  c.chooseGlobalFlow();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'');
  c.chooseFlowHost(tv);assert.match(el('rule-flow').innerHTML,/设备关联组/);assert.match(el('rule-flow').innerHTML,/全局自定义规则/);
  c.traceRuleFlow();let first=f.request('trace_route');
- assert.equal(first[1].source,tv);assert.doesNotMatch(el('rule-flow').innerHTML,/flow-device-map/);
+ assert.equal(first[1].source,tv);assert.match(el('rule-flow').innerHTML,/Laptop/,'selecting the TV keeps the other device visible');
  c.chooseFlowHost(laptop);first[2](result(c.SR_STATE.ruleRows[0],{source:tv}));assert.equal(c.RULE_TRACE,null);
  c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,laptop);
  el('rule-flow-device').value='global';c.changeFlowDevice();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'');
  el('rule-flow-device').value='manual';c.changeFlowDevice();c.traceRuleFlow();assert.equal(f.requests.length,0);
  el('rule-flow-client').value='2001:db8::7';c.invalidateRuleTrace();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'2001:db8::7');
- c.resetDeviceFlow();assert.match(el('rule-flow').innerHTML,/flow-device-map/);
+ c.resetDeviceFlow();assert.match(el('rule-flow').innerHTML,/routing-map/);
  console.log('PASS: parallel device branches, explicit simulation source, per-device exits, stale replies and reset');
 }
 
@@ -155,7 +156,7 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  c.SR_STATE.deviceBindings=[{group:'Media',source:'192.0.2.0/24',target:'reject'},{group:'Media',source:host+'/32',target:'proxy'}];
  el('rule-flow-device').value='';c.renderRuleFlow();
  const overview=el('rule-flow').innerHTML;assert.doesNotMatch(overview,/Unused/);
- assert.match(overview,/全局规则路径[\s\S]*?Media[\s\S]*?直连/);
+ assert.match(overview,/全局规则[\s\S]*?Media[\s\S]*?直连/);
  const netRoute=c.ruleFlowModel(rows,'rule','192.0.2.0/24').find(s=>s.kind==='device_link');
  assert.deepEqual([...netRoute.targets],['reject'],'subnet summary does not inherit a narrower host override');
  c.chooseFlowHost(host);
