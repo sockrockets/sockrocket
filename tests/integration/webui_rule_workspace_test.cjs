@@ -11,6 +11,12 @@ c.SR_STATE.ruleRows=rows;c.RULE_RULE_REVISION='v1';c.renderRules();
 assert.equal(c.RULE_SELECTED_GROUP,'Services');assert.match(element('rule-count').textContent,/本组共 4 条/);
 for(const i of [0,2,3,4])assert.match(element('rule-list').innerHTML,new RegExp('editRule\\('+i+'\\)'));
 assert.doesNotMatch(element('rule-list').innerHTML,/other.invalid/);
+assert.equal(c.changeRuleGroup('Services','global'),true);
+assert.doesNotMatch(element('rule-list').innerHTML,/editRule\(3\)/,'a mixed group can show only the rules shared by all devices');
+assert.match(element('rule-list').innerHTML,/editRule\(0\)/);
+assert.equal(c.changeRuleGroup('Services'),true);
+assert.match(element('rule-list').innerHTML,/editRule\(3\)/,'normal group navigation restores all sources');
+
 element('rule-search').value='192.0.2.0';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 1 条/);assert.match(element('rule-group-summary').textContent,/共 4 条/);
 c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_MEMBERS.length,4);assert.equal(element('rule-list-panel').hidden,true);
 assert.match(element('rule-batch').value,/DOMAIN-SUFFIX,example.invalid,PROXY/);assert.match(element('rule-batch').value,/SOURCE,192.0.2.4,DST-PORT,443,DIRECT/);assert.match(element('rule-batch').value,/MATCH,PROXY/);

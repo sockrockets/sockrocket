@@ -128,7 +128,10 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  const html=el('rule-flow').innerHTML;
  assert.match(html,/客厅电视[\s\S]*?Emby[\s\S]*?代理[\s\S]*?Laptop[\s\S]*?Emby[\s\S]*?拒绝/);
  el('rule-flow-destination').value='video.invalid';c.traceRuleFlow();assert.equal(f.requests.length,0);
- c.chooseFlowHost(tv);c.traceRuleFlow();let first=f.request('trace_route');
+ assert.match(html,/全局规则路径/);
+ c.chooseGlobalFlow();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'');
+ c.chooseFlowHost(tv);assert.match(el('rule-flow').innerHTML,/设备关联组/);assert.match(el('rule-flow').innerHTML,/全局自定义规则/);
+ c.traceRuleFlow();let first=f.request('trace_route');
  assert.equal(first[1].source,tv);assert.doesNotMatch(el('rule-flow').innerHTML,/flow-device-map/);
  c.chooseFlowHost(laptop);first[2](result(c.SR_STATE.ruleRows[0],{source:tv}));assert.equal(c.RULE_TRACE,null);
  c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,laptop);
