@@ -41,6 +41,13 @@ pub(super) fn save_binding(post: &J) -> J {
     let Ok(rules) = checked_rules(&map) else {
         return err_msg("规则配置无效");
     };
+    let priority = match post.get("priority") {
+        None => None,
+        Some(value) => match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
+            Some(n) => Some(n),
+            None => return err_msg("关联优先级须为 0 至 65535 的整数"),
+        },
+    };
     // Adding several groups is one configuration write and one service apply.
     // Existing bindings retain their per-device exits, including on retry.
     if let Some(names) = post.get("groups") {
@@ -68,6 +75,7 @@ pub(super) fn save_binding(post: &J) -> J {
                 bindings.push(DeviceRuleGroup {
                     source: source.clone(),
                     group: group.into(),
+                    priority: priority.unwrap_or_default(),
                     target: String::new(),
                 });
             }
@@ -104,12 +112,19 @@ pub(super) fn save_binding(post: &J) -> J {
         (Some(i), true) => {
             bindings.remove(i);
         }
-        (Some(i), false) if bindings[i].target != target => {
+        (Some(i), false)
+            if bindings[i].target != target
+                || priority.is_some_and(|p| p != bindings[i].priority) =>
+        {
+            if let Some(p) = priority {
+                bindings[i].priority = p;
+            }
             bindings[i].target = target.to_owned();
         }
         (None, false) => bindings.push(DeviceRuleGroup {
             source,
             group: group.to_owned(),
+            priority: priority.unwrap_or_default(),
             target: target.to_owned(),
         }),
         _ => return json!({"ok":true,"msg":"设备关联已是所选状态"}),

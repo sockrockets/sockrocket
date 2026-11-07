@@ -169,3 +169,29 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  }
  console.log('PASS: inherited and global outlets, overlapping sources and backend-selected phase');
 }
+
+{
+ const f=fixture(), c=f.context, el=f.element, host='192.0.2.8', subnet='192.0.2.0/24';
+ const rows=[rule(0,{group:'Media',priority:100,target:'direct'}),rule(1,{group:'Japan',target:'proxy'})];
+ const links=[{source:host,group:'Media'},{source:host,group:'Japan',priority:20,target:'reject'},{source:subnet,group:'Japan',target:'direct'}];
+ const refresh=(alias)=>{
+   c.srLoadRules();f.request('get_rules')[2]({ok:true,revision:'revision',rules:rows,device_rule_groups:links,
+     devices:[{source:host+'/32',alias,host:'TV'},{source:subnet,alias:'影音网段'}]});
+ };
+ refresh('旧名称');c.chooseFlowHost(host);
+ refresh('客厅屏幕');
+ assert.equal(el('rule-flow-device').value,host);
+ assert.match(el('rule-flow').innerHTML,/<strong>客厅屏幕<\/strong>/);
+ assert.doesNotMatch(el('rule-flow').innerHTML,/旧名称/);
+ assert.match(el('rule-flow').innerHTML,/<strong>影音网段<\/strong>/);
+ assert.match(el('rule-flow-device').innerHTML,/客厅屏幕/);
+ const stages=c.ruleFlowModel(rows,'rule',host).filter(s=>s.kind==='device_link');
+ assert.deepEqual(Array.from(stages,s=>s.title),['Japan','Media']);
+ assert.match(el('rule-flow').innerHTML,/<strong>Japan<\/strong><small>关联优先级 20/);
+ c.SR_STATE.status.transparent_proxy=true;
+ const reply=result(rows[1],{source:host});reply.trace.action='reject';reply.trace.steps[0].source=host;
+ c.RULE_TRACE=reply;c.RULE_FLOW_SELECTED=-1;c.renderRuleFlow();
+ assert.match(el('rule-flow').innerHTML,/class="map-node outlet selected"[^>]*><strong>拒绝/);
+ refresh('');assert.match(el('rule-flow').innerHTML,/<strong>TV<\/strong>/);
+ console.log('PASS: device priority, matching exit and refreshed device and subnet names on one graph');
+}

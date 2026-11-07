@@ -4936,6 +4936,57 @@ dns_direct_domains:
     }
 
     #[test]
+    fn device_binding_priority_changes_the_winner_only_for_that_source() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Media, pattern: tv.invalid, target: direct, priority: 100}\n  - {rule_type: domain, group: Japan, pattern: tv.invalid, target: proxy}",
+        ));
+        let save = |source: &str, changes: J| {
+            let mut body = changes;
+            body["source"] = json!(source);
+            body["revision"] = json!(route_trace::rules_revision(&load_conf().unwrap()));
+            dispatch("save_device_binding", &body)
+        };
+        let tv = "192.0.2.8";
+        let laptop = "192.0.2.9";
+        for src in [tv, laptop] {
+            assert_eq!(save(src, json!({"groups":["Media","Japan"]}))["ok"], true);
+        }
+        let winner = |source: &str| {
+            let trace = dispatch(
+                "trace_route",
+                &json!({"source":source,"destination":"tv.invalid","resolve_dns":false}),
+            );
+            (
+                trace["trace"]["matched_rule"].clone(),
+                trace["trace"]["action"].clone(),
+            )
+        };
+        assert_eq!(winner(tv), (json!(0), json!("direct")));
+        assert_eq!(
+            save(tv, json!({"group":"Japan","priority":20,"target":"reject"}))["ok"],
+            true
+        );
+        assert_eq!(winner(tv), (json!(1), json!("reject")));
+        assert_eq!(winner(laptop), (json!(0), json!("direct")));
+        assert_eq!(winner(""), (json!(0), json!("direct")));
+        // Older clients can update the outlet without resetting the saved priority.
+        assert_eq!(save(tv, json!({"group":"Japan","target":""}))["ok"], true);
+        assert_eq!(winner(tv), (json!(1), json!("proxy")));
+        for invalid in [json!(-1), json!(65536), json!(1.5)] {
+            assert_eq!(
+                save(tv, json!({"group":"Japan","target":"","priority":invalid}))["ok"],
+                false
+            );
+        }
+        assert_eq!(
+            save(tv, json!({"group":"Japan","target":"","priority":0}))["ok"],
+            true
+        );
+        assert_eq!(winner(tv), (json!(0), json!("direct")));
+    }
+
+    #[test]
     fn device_bindings_follow_edits_and_aliases_are_independent_of_routing() {
         let _env = TestEnv::new(&SAMPLE.replace(
             "rules: []",

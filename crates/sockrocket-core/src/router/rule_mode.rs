@@ -63,7 +63,7 @@ pub fn rule_mode_with_devices(
                 .unwrap_or(0),
         )
     });
-    let mut scoped = Vec::new();
+    let mut tiers = std::collections::BTreeMap::new();
     for (index, member) in &non_final {
         for link in links
             .iter()
@@ -74,12 +74,18 @@ pub fn rule_mode_with_devices(
             if !link.target.is_empty() {
                 rule.target.clone_from(&link.target);
             }
-            scoped.push((*index, rule));
+            tiers
+                .entry(link.priority)
+                .or_insert_with(Vec::new)
+                .push((*index, rule));
         }
     }
-    set.extend(RuleSet::from_indexed_config(
-        scoped.iter().map(|(i, r)| (*i, r)),
-    ));
+    // Each tier retains the normal member priority, config index and prefix tie-break.
+    for scoped in tiers.values().rev() {
+        set.extend(RuleSet::from_indexed_config(
+            scoped.iter().map(|(i, r)| (*i, r)),
+        ));
+    }
     set.extend(RuleSet::from_indexed_config(non_final));
 
     // Built-in China-direct without its catch-all. Placed after user
@@ -289,6 +295,7 @@ mod device_tests {
         let binding = |source: &str, target: &str| DeviceRuleGroup {
             source: normalize_rule_source(source).unwrap(),
             group: "Media".into(),
+            priority: 0,
             target: target.into(),
         };
         let links = [

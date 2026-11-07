@@ -522,6 +522,9 @@ pub struct DeviceRuleGroup {
     #[serde(deserialize_with = "deserialize_rule_source")]
     pub source: String,
     pub group: String,
+    /// Higher binding priority is evaluated first within the linked-group stage.
+    #[serde(default)]
+    pub priority: u16,
     /// Empty means use each member's own action.
     #[serde(default)]
     pub target: String,

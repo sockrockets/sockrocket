@@ -520,15 +520,17 @@ body.bg {min-width:0!important}
                 <details><summary>自定义设备名称</summary><div class="toolbar"><input id="sr-device-alias" aria-label="自定义设备名称" maxlength="48" placeholder="例如 客厅电视"><button class="btn btn-sm" onclick="saveDeviceAlias()">保存名称</button></div></details>
                 <details id="sr-device-add-groups"><summary>添加规则组（可多选）</summary>
                   <div class="pg-member-list" id="sr-device-available-groups" onchange="updateDeviceAddCount()"></div>
-                  <div class="toolbar"><button type="button" id="sr-device-add-selected" class="btn btn-accent btn-sm" disabled onclick="addDeviceGroups()">关联所选组</button></div>
+                  <div class="toolbar"><div class="fg"><label for="sr-device-add-priority">新关联优先级（数字越大越先匹配）</label><input id="sr-device-add-priority" type="number" min="0" max="65535" step="1" value="0"></div><button type="button" id="sr-device-add-selected" class="btn btn-accent btn-sm" disabled onclick="addDeviceGroups()">关联所选组</button></div>
                 </details>
                 <div id="sr-device-bound-editor" hidden>
                   <div class="form-grid">
                     <div class="fg"><label for="sr-device-group">已关联的规则组</label><select id="sr-device-group" onchange="FLOW_EDIT_GROUP=this.value;renderDeviceBinding();renderRuleFlow()"></select></div>
+                    <div class="fg"><label for="sr-device-group-priority">此设备的关联优先级</label><input id="sr-device-group-priority" type="number" min="0" max="65535" step="1" value="0"></div>
                     <div class="fg"><label for="sr-device-group-target">命中该组时</label><select id="sr-device-group-target"></select></div>
                   </div>
+                  <p class="hint">多个组同时命中时，关联优先级高的先匹配。同级沿用规则优先级和原有顺序。</p>
                   <p id="sr-device-group-state" class="hint" aria-live="polite"></p>
-                  <div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-device-link" onclick="saveDeviceBinding(false)">保存该组出口</button><button class="btn btn-sm" id="sr-device-unlink" onclick="saveDeviceBinding(true)">解除该组关联</button></div>
+                  <div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-device-link" onclick="saveDeviceBinding(false)">保存此设备的绑定</button><button class="btn btn-sm" id="sr-device-unlink" onclick="saveDeviceBinding(true)">解除该组关联</button></div>
                 </div>
               </div>
               <div class="toolbar" style="margin-top:14px"><div class="fg"><label for="sr-device-target">其余流量的默认出口</label><select id="sr-device-target"></select></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存默认出口</button></div>
@@ -2102,9 +2104,8 @@ function renderDevicePolicies() {
   var picker=srElement('device-picker'), previous=picker.value, known=new Map(), networks=new Set();
   function addSource(source,label) {
     if(!source || known.has(source))return;
-    var net=sourceNetwork(source);
-    if(!net)return;
-    var key=[net.width,net.prefix,net.value>>BigInt(net.width-net.prefix)].join('/');
+    var key=flowSourceKey(source);
+    if(!key)return;
     if(networks.has(key))return;
     networks.add(key);
     known.set(source,label);
@@ -2114,7 +2115,8 @@ function renderDevicePolicies() {
   picker.innerHTML=deviceOption('','请选择设备')+
     Array.from(known,function(entry){return deviceOption(entry[0],entry[1]+' · '+entry[0].replace(entry[0].indexOf(':')<0?/\/32$/:/\/128$/,''));}).join('')+
     deviceOption('manual','手动输入 IP / 网段')+deviceOption('global','所有设备的全局默认出口');
-  picker.value=known.has(previous) || previous==='manual' || previous==='global' ? previous : '';
+  picker.value=previous==='manual'||previous==='global'?previous:
+    (Array.from(known.keys()).find(function(source){return sameDeviceSource(source,previous);})||'');
   selectPolicyDevice();
 }
 function selectPolicyDevice() {
@@ -2136,12 +2138,13 @@ function updateDevicePolicySelection() {
   var current=policy?policy.target:'inherit';
   if(!Array.from(exit.options).some(function(o){return o.value===current;}))exit.innerHTML+=deviceOption(current,'已失效 · '+current);
   exit.value=current;
-  var bindings=(SR_STATE.deviceBindings||[]).filter(function(b){return sameDeviceSource(source,b.source);});
+  var bindings=(SR_STATE.deviceBindings||[]).filter(function(b){return sameDeviceSource(source,b.source);}).sort(byBindingPriority);
   var details=srElement('device-policy-list');
   details.textContent=global?'全局默认出口在国内直连之后匹配。':
-    (bindings.length?'已关联：'+bindings.map(function(b){return b.group;}).join('、')+'。':'尚未关联规则组。')+
+    (bindings.length?'此来源已关联 '+bindings.length+' 个组。':'尚未关联规则组。')+
     ' 匹配顺序：设备专属规则 → 关联组 → 全局目的规则 → 国内直连 → 默认出口。';
   if(global)return;
+  srElement('device-add-priority').value='0';
   var network=sourceNetwork(source);
   srElement('device-trace').hidden=network.prefix!==network.width;
   var record=deviceRecord();
@@ -2158,7 +2161,7 @@ function updateDevicePolicySelection() {
   updateDeviceAddCount();
   srElement('device-bound-editor').hidden=!bindings.length;
   var group=srElement('device-group'),previous=group.value;
-  group.innerHTML=bindings.map(function(b){return deviceOption(b.group,b.group);}).join('');
+  group.innerHTML=bindings.map(function(b){return deviceOption(b.group,b.group+' · 优先级 '+(b.priority||0));}).join('');
   group.value=bound.has(previous)?previous:(bindings.length?bindings[0].group:'');
   if(bindings.length)renderDeviceBinding();
 }
@@ -2170,11 +2173,18 @@ function updateDeviceAddCount() {
   button.disabled=!count;
   button.textContent=count?'关联所选 '+count+' 个组':'关联所选组';
 }
+function readBindingPriority(id) {
+  var field=srElement(id), value=String(field.value).trim(), priority=Number(value);
+  if(value && Number.isInteger(priority) && priority>=0 && priority<=65535)return priority;
+  srShowMsg('关联优先级须为 0 至 65535 的整数。','err');
+  field.focus();return null;
+}
 function addDeviceGroups() {
   var groups=selectedDeviceGroups(),source=deviceSource();
   if(!sourceNetwork(source) || !groups.length || ruleWorkspaceLocked())return;
+  var priority=readBindingPriority('device-add-priority');if(priority===null)return;
   if(confirm('为此设备添加 '+groups.length+' 个规则组？新关联将沿用各组规则的出口。')){
-    ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,groups:groups},toastResp);
+    ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,groups:groups,priority:priority},toastResp);
   }
 }
 function renderDeviceBinding() {
@@ -2184,9 +2194,10 @@ function renderDeviceBinding() {
   target.innerHTML=deviceOption('','沿用组内各条规则的出口')+Object.keys(RULE_TARGET_LABEL).map(function(key){return deviceOption(key,RULE_TARGET_LABEL[key]);}).join('');
   if(bind && bind.target && !Object.prototype.hasOwnProperty.call(RULE_TARGET_LABEL,bind.target))target.innerHTML+=deviceOption(bind.target,'已失效 · '+bind.target);
   target.value=bind?bind.target:'';
+  srElement('device-group-priority').value=String(bind && bind.priority || 0);
   var members=(SR_STATE.ruleRows||[]).filter(function(r){return !r.source && (r.group||'').trim()===group && !isFinalRule(r);});
   srElement('device-link').disabled=!group || !members.length;
-  srElement('device-link').textContent='保存该组出口';
+  srElement('device-link').textContent='保存此设备的绑定';
   srElement('device-unlink').hidden=!bind;
   srElement('device-group-state').textContent=group?'组内已启用 '+members.filter(function(r){return r.enabled!==false;}).length+' 条全局目的规则。新增、修改或停用规则会同步到此设备。':'请先在下方规则编辑器中创建包含目的规则的分组。';
 }
@@ -2199,8 +2210,9 @@ function saveDeviceBinding(remove) {
   var picker=srElement('device-picker').value,source=deviceSource(),group=srElement('device-group').value;
   if(ruleWorkspaceLocked() || !picker || picker==='global' || !sourceNetwork(source) || !group)return;
   var target=srElement('device-group-target').value;
-  var ask=remove?'解除 '+source+' 与「'+group+'」的关联？':'将「'+group+'」用于 '+source+'，命中后'+(RULE_TARGET_LABEL[target]?'使用「'+RULE_TARGET_LABEL[target]+'」':'沿用各条规则的出口')+'？';
-  if(confirm(ask))ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,group:group,target:target,remove:remove},toastResp);
+  var priority=remove?undefined:readBindingPriority('device-group-priority');if(priority===null)return;
+  var ask=remove?'解除 '+source+' 与「'+group+'」的关联？':'将「'+group+'」用于 '+source+'，优先级 '+priority+'，命中后'+(RULE_TARGET_LABEL[target]?'使用「'+RULE_TARGET_LABEL[target]+'」':'沿用各条规则的出口')+'？';
+  if(confirm(ask))ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,group:group,target:target,priority:priority,remove:remove},toastResp);
 }
 function saveDeviceAlias() {
   var source=deviceSource(),record=deviceRecord();
@@ -2500,17 +2512,21 @@ function flowHost(source) {
   var net=sourceNetwork(source);
   return net && net.prefix===net.width ? source.split('/')[0] : '';
 }
+function flowSourceKey(source) {
+  var net=sourceNetwork(source);
+  return net?[net.width,net.prefix,net.value>>BigInt(net.width-net.prefix)].join('/'):'';
+}
 function flowDeviceChoices() {
-  var hosts=new Map();
-  (SR_STATE.devices||[]).forEach(function(d){
-    var ip=flowHost(d.source);
-    if(ip)hosts.set(ip,d.alias || d.host || '');
-  });
-  (SR_STATE.deviceBindings||[]).concat(SR_STATE.ruleRows||[]).forEach(function(r){
-    if(!r.source)return;
-    var ip=flowHost(r.source);
-    if(ip && !hosts.has(ip))hosts.set(ip,'');
-  });
+  var hosts=new Map(),keys=new Set();
+  function add(source,name){
+    var ip=flowHost(source);
+    if(!ip)return;
+    var key=flowSourceKey(ip);
+    if(keys.has(key))return;
+    keys.add(key);hosts.set(ip,name);
+  }
+  (SR_STATE.devices||[]).forEach(function(d){add(d.source,d.alias||d.host||'');});
+  (SR_STATE.deviceBindings||[]).concat(SR_STATE.ruleRows||[]).forEach(function(r){if(r.source)add(r.source,'');});
   return hosts;
 }
 function syncFlowDevicePicker() {
@@ -2521,6 +2537,8 @@ function syncFlowDevicePicker() {
   });
   picker.innerHTML=options+'<option value="manual">手动输入设备 IP</option><option value="global">仅模拟全局规则</option>';
   if(before && before!=='manual' && before!=='global' && !hosts.has(before)){
+    var equivalent=Array.from(hosts.keys()).find(function(ip){return sameDeviceSource(ip,before);});
+    if(equivalent){picker.value=equivalent;return;}
     picker.value='';changeFlowDevice();return;
   }
   picker.value=before || '';
@@ -2538,7 +2556,10 @@ function changeFlowDevice() {
 function chooseFlowHost(ip) {
   var picker=srElement('rule-flow-device');
   picker.value=ip;
-  if(picker.value!==ip)picker.value='manual';
+  if(picker.value!==ip){
+    var option=Array.from(picker.options).find(function(o){return sameDeviceSource(o.value,ip);});
+    picker.value=option?option.value:'manual';
+  }
   changeFlowDevice();
   if(picker.value==='manual')srElement('rule-flow-client').value=ip;
   previewDeviceFlow();
@@ -2613,11 +2634,16 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   // Router status polls reuse the topology until a snapshot or selection changes.
   var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.compiledTargets,SR_STATE.nodes,(SR_STATE.status||{}).active_node,SR_PROXY_GROUPS,SR_RULE_NODES];
   if(sharedMapCache && inputs.every(function(value,i){return sharedMapCache.inputs[i]===value;}))return sharedMapCache.html;
-  var hosts=flowDeviceChoices(), scopes=new Set(['']), groups=new Map(), exits=new Map(), edges=new Map();
+  var names=new Map(),scopes=new Map([['','']]),groups=new Map(),exits=new Map(),edges=new Map();
+  (SR_STATE.devices||[]).forEach(function(d){
+    var key=flowSourceKey(d.source);
+    names.set(key,d.alias||d.host||'');
+    if(d.alias)scopes.set(key,flowHost(d.source)||d.source);
+  });
   var ordered=orderedFlowRules(all);
-  (SR_STATE.deviceBindings||[]).concat(all).forEach(function(r){if(r.source)scopes.add(flowHost(r.source)||r.source);});
-  if(selected!==null)scopes.add(selected);
-  var sources=Array.from(scopes), original=new Map(all.map(function(r){return [Number(r.index),r];}));
+  (SR_STATE.deviceBindings||[]).concat(all).forEach(function(r){if(r.source)scopes.set(flowSourceKey(r.source),flowHost(r.source)||r.source);});
+  if(selected!==null)scopes.set(flowSourceKey(selected),selected);
+  var sources=Array.from(scopes.values()), original=new Map(all.map(function(r){return [Number(r.index),r];}));
   function groupKey(stage){
     return stage.indices?'group:'+String(original.get(stage.indices[0]).group||'').trim():'stage:'+stage.kind;
   }
@@ -2628,13 +2654,18 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
     if(hit)e.hit=true;
   }
   var matched=winner>=0?activeStages[winner]:null;
-  sources.forEach(function(scope,i){
+  // Keep source positions stable while laying groups out in the selected device's match order.
+  var scopeOrder=sources.map(function(_,i){return i;});
+  if(selected!==null)scopeOrder.sort(function(a,b){return Number(sources[b]===selected)-Number(sources[a]===selected);});
+  scopeOrder.forEach(function(i){
+    var scope=sources[i];
     var stages=scope===selected && !FLOW_EDIT_NETWORK?activeStages:ruleFlowModel(all,mode,scope,ordered);
     var linkedGroups=new Set(stages.filter(function(stage){return stage.kind==='device_link'&&!stage.disabled;}).map(groupKey));
     stages.forEach(function(stage){
       var key=groupKey(stage),g=groups.get(key);
       if(!g){g={index:groups.size,title:stage.title,ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
       g.phases.add(stage.phaseLabel||stage.title);
+      if(scope===selected && stage.kind==='device_link')g.bindingPriority=stage.bindingPriority;
       if(stage.disabled || (stage.kind==='global_rule'&&linkedGroups.has(key)&&stage!==matched))return;
       g.enabled=true;
       var hit=!!matched && scope===selected && stage===matched;
@@ -2659,10 +2690,11 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
     return '<'+tag+(button?' type="button" '+button:'')+' class="map-node '+kind+cls+'" style="top:'+(y-27)+'px" title="'+srEsc(title+(sub?' · '+sub:''))+'"><strong>'+srEsc(title)+'</strong><small>'+srEsc(sub)+'</small></'+tag+'>';
   }
   var nodes=sources.map(function(scope,i){
-    return box('source',center(i,sources.length),hosts.get(scope)||scope||'全部设备',scope?(hosts.get(scope)?scope:'配置此来源'):'全局规则',scope===selected?' selected':'','data-source="'+srEsc(scope)+'" onclick="pickMapSource(this.dataset.source)"');
+    var name=names.get(flowSourceKey(scope));
+    return box('source',center(i,sources.length),name||scope||'全部设备',scope?(name?scope:'配置此来源'):'全局规则',scope===selected?' selected':'','data-source="'+srEsc(scope)+'" onclick="pickMapSource(this.dataset.source)"');
   }).join('');
   groups.forEach(function(g){
-    nodes+=box('group',center(g.index,groups.size),g.title,g.enabled?Array.from(g.phases).join(' / '):'已停用',g.selected?' selected':g.enabled?'':' inactive',g.ruleIndex==null?'':'data-index="'+g.ruleIndex+'" onclick="openMapGroup(this.dataset.index)"');
+    nodes+=box('group',center(g.index,groups.size),g.title,g.enabled?(g.bindingPriority!=null?'关联优先级 '+g.bindingPriority+' · ':'')+Array.from(g.phases).join(' / '):'已停用',g.selected?' selected':g.enabled?'':' inactive',g.ruleIndex==null?'':'data-index="'+g.ruleIndex+'" onclick="openMapGroup(this.dataset.index)"');
   });
   exits.forEach(function(i,action){
     var sub='';
@@ -2748,25 +2780,29 @@ function orderedFlowRules(rows) {
     return r.enabled!==false && compiled[r.index]!==r.target ? Object.assign({},r,{target:compiled[r.index]}) : r;
   });
 }
+function byBindingPriority(a,b) {return (b.priority||0)-(a.priority||0);}
 function ruleFlowModel(rows, mode, client, orderedRows) {
   if(mode==='global'||mode==='direct')return [{kind:'mode',title:mode==='global'?'全局代理':'全部直连',note:'跳过全部分流规则',targets:[mode==='global'?'proxy':'direct']}];
   var ordered=orderedRows||orderedFlowRules(rows), result=[];
   function group(kind,label,rules) {
     groupRulesForDisplay(rules).forEach(function(b){var members=b.indices.map(function(i){return rules[i];}),enabled=members.filter(function(r){return r.enabled!==false;}),first=Number(members[0].priority||0),last=Number(members[members.length-1].priority||0);
-      result.push({kind:kind,title:b.name||'未分组',phaseLabel:label,note:'优先级 '+first+(first!==last?'～'+last:'')+' · 启用 '+enabled.length+'/'+members.length+(enabled.length?'':' · 已停用')+(kind.indexOf('device_')===0&&!client?' · 待指定设备':''),targets:(enabled.length?enabled:members).map(function(r){return r.target;}).filter(function(t,i,a){return a.indexOf(t)===i;}),count:members.length,enabledCount:enabled.length,disabled:!enabled.length,indices:members.map(function(r){return Number(r.index);}),rule:members.length===1?members[0]:null});
+      result.push({kind:kind,bindingPriority:members[0].bindingPriority,title:b.name||'未分组',phaseLabel:label,note:'优先级 '+first+(first!==last?'～'+last:'')+' · 启用 '+enabled.length+'/'+members.length+(enabled.length?'':' · 已停用')+(kind.indexOf('device_')===0&&!client?' · 待指定设备':''),targets:(enabled.length?enabled:members).map(function(r){return r.target;}).filter(function(t,i,a){return a.indexOf(t)===i;}),count:members.length,enabledCount:enabled.length,disabled:!enabled.length,indices:members.map(function(r){return Number(r.index);}),rule:members.length===1?members[0]:null});
     });
   }
   var devices=ordered.filter(function(r){return client&&r.source&&sourceContains(r.source,client);});
   group('device_rule','设备专属规则',devices.filter(function(r){return !isFinalRule(r);}));
   if(client) {
     var activeLinks=(SR_STATE.deviceBindings||[]).filter(function(b){return sourceContains(b.source,client);})
-      .sort(function(a,b){return sourceNetwork(b.source).prefix-sourceNetwork(a.source).prefix;});
+      .sort(function(a,b){return byBindingPriority(a,b)||sourceNetwork(b.source).prefix-sourceNetwork(a.source).prefix;});
+    var bestByGroup=new Map();
+    activeLinks.forEach(function(b){if(!bestByGroup.has(b.group))bestByGroup.set(b.group,b);});
     var linked=[];
     ordered.forEach(function(r){
       if(r.source || isFinalRule(r))return;
-      var link=activeLinks.find(function(b){return b.group===(r.group||'').trim();});
-      if(link)linked.push(Object.assign({},r,{source:link.source,target:link.target||r.target}));
+      var link=bestByGroup.get((r.group||'').trim());
+      if(link)linked.push(Object.assign({},r,{source:link.source,target:link.target||r.target,bindingPriority:link.priority||0}));
     });
+    linked.sort(function(a,b){return b.bindingPriority-a.bindingPriority;});
     group('device_link','设备关联组',linked);
   }
   group('global_rule','全局自定义规则',ordered.filter(function(r){return !r.source&&!isFinalRule(r);}));
@@ -2895,13 +2931,14 @@ function ruleApi(action, data, cb, errCb) {
   if (rulePending||RULE_READ_PENDING||RULE_FLOW_ERROR) { srShowMsg('请等待规则保存、应用及刷新完成；读取失败时请先刷新。','err'); return; }
   rulePending = true;
   RULE_LOAD_GENERATION++;
-  invalidateRuleTrace('规则正在更新，完成后请重新检查。');
-  srElement('rule-operation-state').textContent='正在保存并应用规则，完成后将核对最新状态；请勿重复点击。';
+  var renaming=action==='save_device_alias';
+  if(!renaming)invalidateRuleTrace('规则正在更新，完成后请重新检查。');
+  srElement('rule-operation-state').textContent=renaming?'正在保存设备名称…':'正在保存并应用规则，完成后将核对最新状态；请勿重复点击。';
   renderRuleBusy();
   function reconcile(d,failed) {
     srLoadRules(function(fresh){
       rulePending=false;renderRuleBusy();
-      var message=failed?'请求未完成，已尝试读取保存结果；应用状态未确认，请结合诊断检查，勿重复提交。':d.ok===false?(d.msg||d.error_message||'规则更新失败；已重新读取保存状态。'):d.saved&&d.applied===false?'规则已保存；代理当前停止，下次启动后生效。':'规则已保存并完成状态核对。';
+      var message=failed?'请求未完成，已尝试读取保存结果；应用状态未确认，请结合诊断检查，勿重复提交。':d.ok===false?(d.msg||d.error_message||'规则更新失败；已重新读取保存状态。'):d.saved&&d.applied===false?'规则已保存；代理当前停止，下次启动后生效。':renaming?'设备名称已保存。':'规则已保存并完成状态核对。';
       if(!fresh)message+=' 最新状态读取失败，当前为上次快照，请先刷新。';
       srElement('rule-operation-state').textContent=message;
       if(fresh&&!RULE_TRACE&&!RULE_TRACE_PENDING)srElement('rule-flow-query-state').textContent='已核对保存的配置，输入网站可重新检查规则判定。';
