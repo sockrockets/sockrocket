@@ -169,6 +169,29 @@
 #sockrocket-plugin dialog dd {overflow-wrap:anywhere}
 #sockrocket-plugin .dialog-actions {display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:24px}
 
+/* Keep the routing editor's frequent actions prominent and its row tools quieter. */
+#sockrocket-plugin #sr-page-dns .toolbar > h3 {margin:0}
+#sockrocket-plugin #sr-page-dns .card > h3 {margin-bottom:8px}
+#sockrocket-plugin #sr-rule-workspace > .toolbar:first-child {margin-bottom:4px}
+#sockrocket-plugin #sr-rule-workspace :is(.rule-actions,.rule-workspace-actions,.toolbar:first-child) > .btn:not(.btn-accent) {background:transparent;border-color:transparent}
+#sockrocket-plugin #sr-rule-workspace :is(.rule-actions,.rule-workspace-actions,.toolbar:first-child) > .btn:not(.btn-accent):hover:not(:disabled) {background:var(--bg-hover)}
+#sockrocket-plugin #sr-rule-workspace #sr-rule-import {border-color:var(--border)}
+#sockrocket-plugin #sr-rule-list-panel {padding-top:10px}
+#sockrocket-plugin #sr-rule-filter-panel > summary {width:fit-content;cursor:pointer;color:var(--text-secondary)}
+#sockrocket-plugin #sr-rule-workspace .rule-phase {padding:6px 8px;border:0;border-radius:5px;background:var(--bg-hover);margin-top:8px}
+#sockrocket-plugin #sr-rule-workspace .rule-row {align-items:center;padding:10px 4px}
+#sockrocket-plugin #sr-rule-workspace .rule-main {display:flex;flex-wrap:wrap;align-items:center;gap:3px 6px}
+#sockrocket-plugin #sr-rule-workspace .rule-pattern {order:-1;width:100%;font-weight:600}
+#sockrocket-plugin #sr-rule-workspace .rule-meta {margin:0}
+#sockrocket-plugin #sr-rule-workspace .rule-actions {gap:2px}
+@media(min-width:701px) {
+  #sockrocket-plugin #sr-rule-workspace .rule-filters {grid-template-columns:minmax(140px,2fr) repeat(3,minmax(76px,1fr))}
+}
+@media(max-width:700px) {
+  #sockrocket-plugin #sr-rule-workspace .rule-filters {grid-template-columns:repeat(3,minmax(0,1fr))}
+  #sockrocket-plugin #sr-rule-workspace .rule-row {gap:4px}
+}
+
 /* Configuration flow overview shares the firmware-integrated light palette. */
 #sockrocket-plugin .rule-flow-head {display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
 #sockrocket-plugin .rule-flow-head h3 {margin:0;flex:1}
