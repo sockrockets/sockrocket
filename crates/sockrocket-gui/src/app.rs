@@ -156,6 +156,8 @@ pub struct AppState {
 
     // Rules management
     pub(crate) rules: Vec<RoutingRule>,
+    router_rules: Vec<(usize, RoutingRule)>,
+    device_rule_groups: Vec<sockrocket_core::config::model::DeviceRuleGroup>,
     pub(crate) rule_group_input: Entity<InputState>,
     pub(crate) rule_pattern_input: Entity<InputState>,
     pub(crate) rule_priority_input: Entity<InputState>,
@@ -690,6 +692,7 @@ impl AppState {
             }
         });
 
+        let (rules, router_rules) = sockrocket_gui::desktop_rules::split(persisted.rules);
         let mut state = Self {
             active_view: ActiveView::Home,
             proxy_running: false,
@@ -751,7 +754,9 @@ impl AppState {
             tun_starting: false,
             tun_status: "Disabled".to_string(),
             tun_stop_tx: None,
-            rules: persisted.rules.clone(),
+            rules,
+            router_rules,
+            device_rule_groups: persisted.device_rule_groups.clone(),
             rule_group_input,
             rule_pattern_input,
             rule_priority_input,
@@ -1258,10 +1263,16 @@ impl AppState {
         if group_idx >= self.groups.len() {
             return;
         }
+        let target = format!("group:{}", self.groups[group_idx].name);
         if self
             .rules
             .iter()
-            .any(|r| r.target == format!("group:{}", self.groups[group_idx].name))
+            .chain(self.router_rules.iter().map(|(_, r)| r))
+            .any(|r| r.target == target)
+            || self
+                .device_rule_groups
+                .iter()
+                .any(|link| link.target == target)
         {
             self.proxy_status =
                 "Group is referenced by routing rules; update those rules first".into();
@@ -1299,9 +1310,19 @@ impl AppState {
         {
             let previous = format!("group:{}", g.name);
             g.name = new_name.clone();
-            for rule in &mut self.rules {
-                if rule.target == previous {
-                    rule.target = format!("group:{new_name}");
+            for target in self
+                .rules
+                .iter_mut()
+                .chain(self.router_rules.iter_mut().map(|(_, r)| r))
+                .map(|r| &mut r.target)
+                .chain(
+                    self.device_rule_groups
+                        .iter_mut()
+                        .map(|link| &mut link.target),
+                )
+            {
+                if *target == previous {
+                    *target = format!("group:{new_name}");
                 }
             }
             self.apply_outbound_hot_swap(cx);
@@ -3545,7 +3566,8 @@ impl AppState {
             nodes: self.nodes.clone(),
             active_node: self.selected_node,
             subscriptions: self.subscriptions.clone(),
-            rules: self.rules.clone(),
+            rules: sockrocket_gui::desktop_rules::for_storage(&self.rules, &self.router_rules),
+            device_rule_groups: self.device_rule_groups.clone(),
             auto_connect: self.proxy_running,
             tun_was_enabled: self.tun_enabled,
             health_check: self.health_check.clone(),
@@ -3947,7 +3969,9 @@ impl AppState {
                 // filter/sort cache (keyed on this counter).
                 self.nodes_generation = self.nodes_generation.wrapping_add(1);
                 self.subscriptions = new_config.subscriptions.clone();
-                self.rules = new_config.rules.clone();
+                (self.rules, self.router_rules) =
+                    sockrocket_gui::desktop_rules::split(new_config.rules.clone());
+                self.device_rule_groups = new_config.device_rule_groups.clone();
                 self.dns = new_config.dns.clone();
                 self.ipv6_mode = new_config.ipv6_mode;
                 self.tun_mtu = new_config.tun_mtu;
@@ -4626,6 +4650,11 @@ impl AppState {
         // Multi-line paste, or Clash `TYPE,pattern,TARGET` — unified parser.
         if line_count > 1 || lines_look_clash_typed(&batch_text) {
             let parsed = parse_batch_rules_in_group(&batch_text, &target, &group);
+            if parsed.rules.iter().any(|rule| !rule.source.is_empty()) {
+                self.rules_status = "按设备匹配的规则请在梅林路由器中编辑".into();
+                cx.notify();
+                return;
+            }
             if parsed.rules.is_empty() {
                 let msg = parsed
                     .errors
@@ -4717,7 +4746,17 @@ impl AppState {
         self.finish_rule_mutation(&format!("✓ 已添加 {shown}"), window, cx);
     }
 
+    fn prune_device_rule_groups(&mut self) {
+        self.device_rule_groups.retain(|link| {
+            self.rules
+                .iter()
+                .chain(self.router_rules.iter().map(|(_, r)| r))
+                .any(|rule| rule.group.trim() == link.group)
+        });
+    }
+
     fn finish_rule_mutation(&mut self, msg: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        self.prune_device_rule_groups();
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             format!(
                 "{}{}",
@@ -5003,6 +5042,11 @@ impl AppState {
         let text = self.rule_batch_input.read(cx).value().to_string();
         let target = self.rule_target_sel.clone();
         let parsed = parse_batch_rules_in_group(&text, &target, &group);
+        if parsed.rules.iter().any(|rule| !rule.source.is_empty()) {
+            self.rules_status = "按设备匹配的规则请在梅林路由器中编辑".into();
+            cx.notify();
+            return;
+        }
         if let Some(error) = parsed.errors.first() {
             self.rules_status =
                 format!("✗ 第 {} 行：{}；未保存任何更改", error.line, error.message);
@@ -5065,6 +5109,7 @@ impl AppState {
             self.editing_rule_index = Some(edit - 1);
         }
         self.rules.remove(index);
+        self.prune_device_rule_groups();
         self.rules_status = sockrocket_gui::i18n::t("rules.status.removed").to_string();
         if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             self.rules_status
@@ -5226,6 +5271,7 @@ impl AppState {
             },
         ];
         self.rules = china_rules;
+        self.prune_device_rule_groups();
         normalize_rule_priorities(&mut self.rules);
         self.rules_status = if self.proxy_running && self.proxy_mode == ProxyMode::Rule {
             "✓ China Direct preset loaded. Restarting Rule mode to apply changes.".to_string()
@@ -5241,6 +5287,7 @@ impl AppState {
 
     pub(crate) fn clear_rules(&mut self, cx: &mut Context<Self>) {
         self.rules.clear();
+        self.prune_device_rule_groups();
         self.adding_rule_group = None;
         self.editing_rule_index = None;
         self.rules_status = sockrocket_gui::i18n::t("rules.status.cleared").to_string();
@@ -5402,6 +5449,7 @@ impl AppState {
                 r.group.trim() != g
             }
         });
+        self.prune_device_rule_groups();
         let removed = before - self.rules.len();
         if self
             .editing_group

@@ -34,6 +34,14 @@ The rule-group exit rewrites rules that were already going through a proxy, a no
 
 A rule group (the folder of rules on the Routing page) is not a node group. The folder organizes rules. The node group is an exit.
 
+## Device policies in Merlin
+
+The desktop app edits and applies global rules. When it opens a shared configuration, it preserves router-specific rules and device group bindings for use on Merlin.
+
+Under **设备分流策略**, select a router client, a previously configured device, or a manual IP/network. The picker uses local DHCP leases and bridge neighbors. Names can be edited in the plugin. A discovered device's custom name is keyed by its MAC address, while routing uses its IP or subnet. Reserve a DHCP address if the policy should continue to apply to the same device.
+
+Choose a rule group and keep its original actions or set an exit for this device. The link follows the group's enabled, global destination rules as you edit them. Explicit device destination rules take precedence, followed by linked groups, shared destination rules, domestic direct routing and the device/global fallback. Removing a link restores normal matching. Changing a device name does not restart the proxy.
+
 ## Import a rule list into a Merlin rule group
 
 Select the rule group and choose **从链接添加**. Paste an HTTP(S) URL to a raw UTF-8 rule list, choose the import exit, then select **读取规则**. Review the editable text and choose **预览并应用**, followed by **确认应用**.

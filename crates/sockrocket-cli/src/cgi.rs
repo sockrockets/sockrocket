@@ -16,6 +16,7 @@
 //! Paths default to the router layout under `/jffs/addons/sockrocket` and can be
 //! overridden with `SOCKROCKET_DIR` (used by unit tests and local debugging).
 
+mod devices;
 mod http;
 mod network_settings;
 mod proxy_groups;
@@ -330,8 +331,15 @@ fn save_conf(map: &Mapping) -> Result<()> {
             .unwrap_or(Y::Sequence(vec![])),
     )
     .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
-    sockrocket_core::config::group::validate_targets(&groups, &load_routing_rules(map))
+    let rules = load_routing_rules(map);
+    sockrocket_core::config::group::validate_targets(&groups, &rules)
         .map_err(anyhow::Error::msg)?;
+    sockrocket_core::config::model::validate_device_rule_groups(
+        &devices::links(map)?,
+        &rules,
+        &groups,
+    )
+    .map_err(anyhow::Error::msg)?;
     let text = serde_yaml::to_string(&Y::Mapping(map.clone()))?;
     storage::atomic_write(&text)
 }
@@ -538,6 +546,8 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "proxy_groups" => proxy_groups::get(),
         "save_proxy_group" => proxy_groups::save(post),
         "delete_proxy_group" => proxy_groups::delete(post),
+        "save_device_binding" => devices::save_binding(post),
+        "save_device_alias" => devices::save_alias(post),
         "save_device_policy" => proxy_groups::device(post),
         "network_settings" => network_settings::get(),
         "save_network_settings" => network_settings::save(post),
@@ -2352,7 +2362,15 @@ fn load_routing_rules(map: &Mapping) -> Vec<sockrocket_core::RoutingRule> {
         .unwrap_or_default()
 }
 
+fn prune_device_links(map: &mut Mapping, rules: &[sockrocket_core::RoutingRule]) {
+    if let Ok(mut links) = devices::links(map) {
+        links.retain(|b| rules.iter().any(|r| r.group.trim() == b.group));
+        devices::store_links(map, &links);
+    }
+}
+
 fn save_routing_rules(map: &mut Mapping, rules: Vec<sockrocket_core::RoutingRule>) {
+    prune_device_links(map, &rules);
     let seq: Vec<Y> = rules.into_iter().map(routing_rule_to_yaml).collect();
     map.insert(ykey("rules"), Y::Sequence(seq));
 }
@@ -2430,7 +2448,10 @@ fn act_get_rules() -> J {
             })
         })
         .collect();
-    json!({"ok": true, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    let Ok(links) = devices::links(&map) else {
+        return err_msg("设备规则组关联配置无效");
+    };
+    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links, "rules": rules, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2632,6 +2653,8 @@ fn act_del_rule(post: &J) -> J {
     }
     seq.remove(index);
     map.insert(ykey("rules"), Y::Sequence(seq));
+    let remaining = load_routing_rules(&map);
+    prune_device_links(&mut map, &remaining);
     match save_conf(&map) {
         Ok(()) => {
             if is_running()
@@ -3220,6 +3243,16 @@ fn act_replace_rule_group(post: &J) -> J {
         Ok(n) => n,
         Err(e) => return err_msg(&e),
     };
+    if old_group != new_group
+        && let Ok(mut links) = devices::links(&map)
+    {
+        for b in &mut links {
+            if b.group == old_group {
+                b.group.clone_from(&new_group);
+            }
+        }
+        devices::store_links(&mut map, &links);
+    }
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
         Ok(()) => {
@@ -4891,6 +4924,64 @@ dns_direct_domains:
             .route("www.apple.com", 443),
             RouteAction::Proxy
         );
+    }
+
+    #[test]
+    fn device_bindings_follow_edits_and_aliases_are_independent_of_routing() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Video, pattern: tv.invalid, target: direct}",
+        ));
+        let revision = || route_trace::rules_revision(&load_conf().unwrap());
+        let trace = |ip: &str, host: &str| {
+            dispatch(
+                "trace_route",
+                &json!({"source":ip,"destination":host,"resolve_dns":false}),
+            )["trace"]["action"]
+                .clone()
+        };
+        let original = revision();
+        let bind = dispatch(
+            "save_device_binding",
+            &json!({"revision":original,"source":"192.0.2.8","group":"Video","target":"reject"}),
+        );
+        assert_eq!(bind["ok"], true, "{bind}");
+        assert_eq!(load_routing_rules(&load_conf().unwrap()).len(), 1);
+        assert_eq!(trace("192.0.2.8", "tv.invalid"), "reject");
+        assert_eq!(trace("192.0.2.9", "tv.invalid"), "direct");
+        let stale = dispatch(
+            "save_device_binding",
+            &json!({"revision":original,"source":"192.0.2.8","group":"Video","target":"","remove":true}),
+        );
+        assert_eq!(stale["ok"], false);
+        let added = dispatch(
+            "batch_add_rules",
+            &json!({"group":"Video","text":"DOMAIN,new.invalid,DIRECT","target":"proxy"}),
+        );
+        assert_eq!(added["ok"], true, "{added}");
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "reject");
+        let saved_config = fs::read(conf_path()).unwrap();
+        let alias = json!({"source":"192.0.2.8","key":"mac:02:00:00:00:00:01","name":"客厅电视","previous":""});
+        assert_eq!(dispatch("save_device_alias", &alias)["ok"], true);
+        assert_eq!(
+            dispatch("save_device_alias", &alias)["ok"],
+            false,
+            "stale rename must not overwrite"
+        );
+        assert_eq!(fs::read(conf_path()).unwrap(), saved_config);
+        assert!(
+            act_get_rules()["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["alias"] == "客厅电视")
+        );
+        let removed = dispatch(
+            "save_device_binding",
+            &json!({"revision":revision(),"source":"192.0.2.8","group":"Video","target":"","remove":true}),
+        );
+        assert_eq!(removed["ok"], true);
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
     }
 
     #[test]

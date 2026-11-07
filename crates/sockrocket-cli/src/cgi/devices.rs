@@ -1,0 +1,243 @@
+//! Merlin LAN inventory and live links from a device to named routing rules.
+use super::*;
+use serde::{Deserialize, Serialize};
+use sockrocket_core::config::model::DeviceRuleGroup;
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
+
+pub(super) fn links(map: &Mapping) -> Result<Vec<DeviceRuleGroup>> {
+    Ok(serde_yaml::from_value(
+        map.get(ykey("device_rule_groups"))
+            .cloned()
+            .unwrap_or(Y::Sequence(vec![])),
+    )?)
+}
+pub(super) fn store_links(map: &mut Mapping, links: &[DeviceRuleGroup]) {
+    if links.is_empty() {
+        map.remove(ykey("device_rule_groups"));
+    } else {
+        map.insert(
+            ykey("device_rule_groups"),
+            serde_yaml::to_value(links).unwrap(),
+        );
+    }
+}
+pub(super) fn save_binding(post: &J) -> J {
+    let Ok(mut map) = load_conf() else {
+        return err_msg("配置读取失败");
+    };
+    if !proxy_groups::check_revision(&map, post) {
+        return err_msg("规则已变化，请刷新后重试");
+    }
+    let Ok(source) = requested_rule_source(post, "") else {
+        return err_msg("请填写有效的设备 IP 或网段");
+    };
+    let group = post["group"].as_str().unwrap_or("").trim();
+    if source.is_empty() || group.is_empty() {
+        return err_msg("请选择设备和规则组");
+    }
+    let Ok(mut bindings) = links(&map) else {
+        return err_msg("设备关联配置无效");
+    };
+    let Ok(rules) = checked_rules(&map) else {
+        return err_msg("规则配置无效");
+    };
+    let remove = post["remove"].as_bool() == Some(true);
+    let Some(target) = post["target"].as_str() else {
+        return err_msg("请选择规则组出口");
+    };
+    if !remove {
+        if !target.is_empty() && !proxy_groups::valid_target(target) {
+            return err_msg("请选择有效出口");
+        }
+        if !rules
+            .iter()
+            .any(|r| r.is_global_destination() && r.group.trim() == group)
+        {
+            return err_msg("这个组没有可关联的全局目的规则");
+        }
+    }
+    let position = bindings
+        .iter()
+        .position(|b| b.source == source && b.group == group);
+    match (position, remove) {
+        (Some(i), true) => {
+            bindings.remove(i);
+        }
+        (Some(i), false) if bindings[i].target != target => {
+            bindings[i].target = target.to_owned();
+        }
+        (None, false) => bindings.push(DeviceRuleGroup {
+            source,
+            group: group.to_owned(),
+            target: target.to_owned(),
+        }),
+        _ => return json!({"ok":true,"msg":"设备关联已是所选状态"}),
+    }
+    store_links(&mut map, &bindings);
+    proxy_groups::applied(&map)
+}
+fn checked_rules(map: &Mapping) -> Result<Vec<sockrocket_core::RoutingRule>> {
+    Ok(serde_yaml::from_value(
+        map.get(ykey("rules"))
+            .cloned()
+            .unwrap_or(Y::Sequence(vec![])),
+    )?)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Alias {
+    name: String,
+    source: String,
+}
+type Aliases = BTreeMap<String, Alias>;
+fn aliases() -> Result<Aliases> {
+    match fs::read(sockrocket_dir().join("device-aliases.json")) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Aliases::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+fn mac(value: &str) -> Option<String> {
+    let parts: Vec<_> = value.split(':').collect();
+    (parts.len() == 6
+        && parts
+            .iter()
+            .all(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        && value != "00:00:00:00:00:00")
+        .then(|| value.to_ascii_lowercase())
+}
+#[derive(Default)]
+struct Client {
+    mac: String,
+    host: String,
+}
+fn clients(leases: &str, arp: &str) -> BTreeMap<Ipv4Addr, Client> {
+    let mut rows = BTreeMap::new();
+    for line in leases.lines().take(2048) {
+        let fields: Vec<_> = line.split_whitespace().take(4).collect();
+        if let [_, hw, addr, host] = fields.as_slice()
+            && let (Ok(ip), Some(mac)) = (addr.parse::<Ipv4Addr>(), mac(hw))
+        {
+            rows.insert(
+                ip,
+                Client {
+                    mac,
+                    host: if *host == "*" {
+                        String::new()
+                    } else {
+                        host.chars().take(128).collect()
+                    },
+                },
+            );
+        }
+    }
+    for line in arp.lines().take(2048) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if let [addr, _, flags, hw, _, iface] = fields.as_slice()
+            && iface.starts_with("br")
+            && u32::from_str_radix(flags.trim_start_matches("0x"), 16).is_ok_and(|f| f & 2 != 0)
+            && let (Ok(ip), Some(mac)) = (addr.parse::<Ipv4Addr>(), mac(hw))
+        {
+            let row = rows.entry(ip).or_default();
+            if row.mac != mac {
+                *row = Client {
+                    mac,
+                    host: String::new(),
+                };
+            }
+        }
+    }
+    rows
+}
+pub(super) fn catalog() -> Vec<J> {
+    let aliases = aliases().unwrap_or_default();
+    let leases = fs::read_to_string("/var/lib/misc/dnsmasq.leases").unwrap_or_default();
+    let arp = fs::read_to_string("/proc/net/arp").unwrap_or_default();
+    let mut rows = BTreeMap::new();
+    let mut visible = std::collections::HashSet::new();
+    for (ip, c) in clients(&leases, &arp) {
+        let source = format!("{ip}/32");
+        let key = format!("mac:{}", c.mac);
+        let alias = aliases.get(&key).or_else(|| aliases.get(&source));
+        rows.insert(source.clone(),json!({"source":source,"key":key,"host":c.host,"alias":alias.map(|a|a.name.as_str()).unwrap_or(""),"alias_key":if aliases.contains_key(&key)||alias.is_none(){&key}else{&source}}));
+        visible.insert(key);
+    }
+    for (key, alias) in aliases {
+        if !visible.contains(&key) {
+            rows.entry(alias.source.clone()).or_insert_with(
+                || json!({"source":alias.source,"key":key,"alias_key":key,"alias":alias.name}),
+            );
+        }
+    }
+    rows.into_values().collect()
+}
+pub(super) fn save_alias(post: &J) -> J {
+    let Ok(source) = requested_rule_source(post, "") else {
+        return err_msg("无效设备来源");
+    };
+    let key = post["key"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .unwrap_or(&source);
+    if source.is_empty()
+        || !(key == source
+            || key
+                .strip_prefix("mac:")
+                .and_then(mac)
+                .is_some_and(|m| key == format!("mac:{m}")))
+    {
+        return err_msg("无效设备标识");
+    }
+    let Some(name) = post["name"].as_str().map(str::trim) else {
+        return err_msg("无效名称");
+    };
+    if name.chars().count() > 48 || name.chars().any(char::is_control) {
+        return err_msg("设备名称最多 48 个字符，不能包含控制字符");
+    }
+    let Ok(mut aliases) = aliases() else {
+        return err_msg("读取设备名称失败");
+    };
+    if post["previous"].as_str() != Some(aliases.get(key).map_or("", |a| a.name.as_str())) {
+        return err_msg("名称已变化，请刷新后重试");
+    }
+    if name.is_empty() {
+        aliases.remove(key);
+    } else {
+        aliases.insert(
+            key.into(),
+            Alias {
+                name: name.into(),
+                source,
+            },
+        );
+    }
+    let path = sockrocket_dir().join("device-aliases.json");
+    let saved = serde_json::to_string(&aliases)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| {
+            sockrocket_core::config::storage::atomic_write_private(&path, &text, false)
+        });
+    if saved.is_err() {
+        return err_msg("设备名称保存失败");
+    }
+    json!({"ok":true,"msg":"设备名称已保存"})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn combines_dhcp_and_lan_neighbors_without_reusing_a_stale_hostname() {
+        let rows = clients(
+            "1 10:00:00:00:00:01 192.0.2.1 TV *\n1 10:00:00:00:00:02 192.0.2.2 Old *",
+            "192.0.2.2 0x1 0x2 10:00:00:00:00:03 * br0\n192.0.2.3 0x1 0x2 10:00:00:00:00:04 * eth0\n192.0.2.4 0x1 0x12 10:00:00:00:00:04 * br1\n192.0.2.5 0x1 0x10 10:00:00:00:00:05 * br0",
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains_key(&Ipv4Addr::new(192, 0, 2, 4)));
+        assert!(!rows.contains_key(&Ipv4Addr::new(192, 0, 2, 5)));
+        assert_eq!(rows[&Ipv4Addr::new(192, 0, 2, 1)].host, "TV");
+        assert_eq!(rows[&Ipv4Addr::new(192, 0, 2, 2)].host, "");
+        assert_eq!(rows[&Ipv4Addr::new(192, 0, 2, 2)].mac, "10:00:00:00:00:03");
+    }
+}

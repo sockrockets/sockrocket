@@ -71,10 +71,10 @@ pub(super) fn valid_target(target: &str) -> bool {
             load_conf().is_ok_and(|map| groups(&map).iter().any(|g| g.name == name))
         })
 }
-fn check_revision(map: &Mapping, post: &J) -> bool {
+pub(super) fn check_revision(map: &Mapping, post: &J) -> bool {
     post.get("revision").and_then(J::as_str) == Some(route_trace::rules_revision(map).as_str())
 }
-fn applied(map: &Mapping) -> J {
+pub(super) fn applied(map: &Mapping) -> J {
     if save_conf(map).is_err() {
         return err_msg("保存失败：检查分组引用与存储状态，原配置未覆盖");
     }
@@ -156,6 +156,15 @@ pub(super) fn save(post: &J) -> J {
     } else {
         gs.push(group.clone());
     }
+    let Ok(mut links) = devices::links(&map) else {
+        return err_msg("设备关联配置无效");
+    };
+    for link in &mut links {
+        if !old.is_empty() && link.target == format!("group:{old}") {
+            link.target = format!("group:{}", group.name);
+        }
+    }
+    devices::store_links(&mut map, &links);
     // A rename rewrites all references, including disabled/device rules.
     let mut rules = load_routing_rules(&map);
     if !old.is_empty() {
@@ -180,9 +189,11 @@ pub(super) fn delete(post: &J) -> J {
         return err_msg("配置已变化，请刷新后重试");
     }
     let name = post.get("name").and_then(J::as_str).unwrap_or("");
-    if load_routing_rules(&map)
-        .iter()
-        .any(|r| r.target == format!("group:{name}"))
+    if devices::links(&map)
+        .is_ok_and(|links| links.iter().any(|b| b.target == format!("group:{name}")))
+        || load_routing_rules(&map)
+            .iter()
+            .any(|r| r.target == format!("group:{name}"))
     {
         return err_msg("仍有规则或设备策略引用此分组，请先调整出口");
     }

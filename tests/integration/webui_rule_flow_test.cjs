@@ -7,7 +7,7 @@ function fixture() {
   const context=vm.createContext({confirm:()=>true,toastResp(){},SR_PROXY_GROUPS:[],setProxyGroupTargets(){},renderDevicePolicies(){},srElement:element,srApi:(...args)=>requests.push(args),srEsc:v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),srShowMsg(){},inspectRule:i=>inspected.push(i),editRule:i=>edited.push(i),SR_PAGE_LOADED:{},SR_STATE:{statusKnown:true,status:{running:true,proxy_mode:'rule',active_node:0},nodes:[{name:'Example node'}],ruleRows:[]}});
   vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')), context);
   context.inspectRule=i=>inspected.push(i);context.editRule=i=>edited.push(i);
-  context.RULE_RULE_REVISION='revision';
+  context.RULE_RULE_REVISION='revision';element('rule-flow-device').value='global';
   const request=action=>{const at=requests.findIndex(r=>r[0]===action);assert.ok(at>=0,action);return requests.splice(at,1)[0];};
   return {context,element,request,requests,inspected,edited};
 }
@@ -22,7 +22,7 @@ assert.equal(stages.at(-1).kind,'device_final');
 assert.ok(stages.some(stage=>stage.kind==='global_rule'));
 assert.ok(stages.some(stage=>stage.kind==='builtin'));
 assert.ok(!stages.some(stage=>stage.kind==='global_final'));
-assert.ok(c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','').some(r=>r.kind==='device_final'));
+assert.ok(!c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','').some(r=>r.kind==='device_final'),'global simulation skips device stages');
 f.element('rule-flow-destination').value='example.com';c.traceRuleFlow();
 let req=f.request('trace_route');assert.equal(req[1].expected_revision,'revision');assert.equal(req[1].port,undefined);
 req[2](result(c.SR_STATE.ruleRows[9]));c.flowMatchedRule(true);
@@ -116,4 +116,25 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  assert.match(html, /height:380px/,'five exits fit their SVG stage');
  assert.doesNotMatch(html, /\[object Object\]/);
  console.log('PASS: group trace highlights the exact exit and expands the diagram for additional groups');
+}
+
+{
+ const f=fixture(), c=f.context, el=f.element;
+ const tv='192.0.2.8', laptop='192.0.2.9';
+ c.SR_STATE.devices=[{source:tv+'/32',alias:'客厅电视'},{source:laptop+'/32',host:'Laptop'}];
+ c.SR_STATE.ruleRows=[rule(0,{group:'Emby',target:'direct'})];
+ c.SR_STATE.deviceBindings=[{source:tv+'/32',group:'Emby',target:'proxy'},{source:laptop+'/32',group:'Emby',target:'reject'}];
+ el('rule-flow-device').value='';c.syncFlowDevicePicker();c.renderRuleFlow();
+ const html=el('rule-flow').innerHTML;
+ assert.match(html,/客厅电视[\s\S]*?Emby[\s\S]*?代理[\s\S]*?Laptop[\s\S]*?Emby[\s\S]*?拒绝/);
+ el('rule-flow-destination').value='video.invalid';c.traceRuleFlow();assert.equal(f.requests.length,0);
+ c.chooseFlowHost(tv);c.traceRuleFlow();let first=f.request('trace_route');
+ assert.equal(first[1].source,tv);assert.doesNotMatch(el('rule-flow').innerHTML,/flow-device-map/);
+ c.chooseFlowHost(laptop);first[2](result(c.SR_STATE.ruleRows[0],{source:tv}));assert.equal(c.RULE_TRACE,null);
+ c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,laptop);
+ el('rule-flow-device').value='global';c.changeFlowDevice();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'');
+ el('rule-flow-device').value='manual';c.changeFlowDevice();c.traceRuleFlow();assert.equal(f.requests.length,0);
+ el('rule-flow-client').value='2001:db8::7';c.invalidateRuleTrace();c.traceRuleFlow();assert.equal(f.request('trace_route')[1].source,'2001:db8::7');
+ c.resetDeviceFlow();assert.match(el('rule-flow').innerHTML,/flow-device-map/);
+ console.log('PASS: parallel device branches, explicit simulation source, per-device exits, stale replies and reset');
 }

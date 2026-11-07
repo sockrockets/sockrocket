@@ -148,7 +148,7 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    // Validated IPv4 source networks needing userspace policy before CN bypass.
+    // Source networks with active device policy must reach the router before CN bypass.
     if let Some(index) = args.iter().position(|arg| {
         matches!(
             arg.as_str(),
@@ -161,6 +161,12 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
         let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
         if config.proxy_mode == ProxyMode::Rule {
+            let active_groups: std::collections::HashSet<_> = config
+                .rules
+                .iter()
+                .filter(|rule| rule.enabled && rule.is_global_destination())
+                .map(|rule| rule.group.trim())
+                .collect();
             let sources: std::collections::BTreeSet<_> = config
                 .rules
                 .iter()
@@ -168,6 +174,14 @@ async fn async_main() -> Result<()> {
                     rule.enabled && !rule.source.is_empty() && rule.source.contains(':') == ipv6
                 })
                 .map(|rule| rule.source.as_str())
+                .chain(
+                    config
+                        .device_rule_groups
+                        .iter()
+                        .filter(|link| active_groups.contains(link.group.as_str()))
+                        .map(|link| link.source.as_str())
+                        .filter(|source| source.contains(':') == ipv6),
+                )
                 .collect();
             for source in sources {
                 println!("{source}");
@@ -1366,8 +1380,11 @@ fn build_outbound(
 fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
     match config.proxy_mode {
         ProxyMode::Rule => Some(Arc::new(
-            Router::new(sockrocket_core::rule_mode_ruleset(&config.rules))
-                .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
+            Router::new(sockrocket_core::router::rule_mode_with_devices(
+                &config.rules,
+                &config.device_rule_groups,
+            ))
+            .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
         )),
         ProxyMode::Global | ProxyMode::Direct => None,
     }

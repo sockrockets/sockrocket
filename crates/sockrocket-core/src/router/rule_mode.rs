@@ -26,6 +26,13 @@ fn is_catch_all(rule_type: &str) -> bool {
 /// China-direct. A device catch-all replaces the global fallback for its
 /// source and does not hide earlier destination rules.
 pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
+    rule_mode_with_devices(rules, &[])
+}
+
+pub fn rule_mode_with_devices(
+    rules: &[RoutingRule],
+    links: &[crate::config::model::DeviceRuleGroup],
+) -> RuleSet {
     let enabled: Vec<_> = rules
         .iter()
         .enumerate()
@@ -45,6 +52,34 @@ pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
         .partition(|(_, r)| !is_catch_all(&r.rule_type));
 
     let mut set = RuleSet::from_indexed_config(device_rules);
+    // Explicit device exceptions precede linked groups. Keep the original index
+    // for trace/edit and resolve overlapping prefixes most-specific first on ties.
+    let mut links: Vec<_> = links.iter().collect();
+    links.sort_by_key(|link| {
+        std::cmp::Reverse(
+            link.source
+                .split_once('/')
+                .and_then(|(_, p)| p.parse::<u8>().ok())
+                .unwrap_or(0),
+        )
+    });
+    let mut scoped = Vec::new();
+    for (index, member) in &non_final {
+        for link in links
+            .iter()
+            .filter(|link| link.group == member.group.trim())
+        {
+            let mut rule = (*member).clone();
+            rule.source.clone_from(&link.source);
+            if !link.target.is_empty() {
+                rule.target.clone_from(&link.target);
+            }
+            scoped.push((*index, rule));
+        }
+    }
+    set.extend(RuleSet::from_indexed_config(
+        scoped.iter().map(|(i, r)| (*i, r)),
+    ));
     set.extend(RuleSet::from_indexed_config(non_final));
 
     // Built-in China-direct without its catch-all. Placed after user
@@ -237,6 +272,62 @@ mod device_tests {
             enabled: true,
         }
     }
+    #[tokio::test]
+    async fn linked_groups_respect_member_state_scope_and_explicit_exceptions() {
+        use crate::config::model::DeviceRuleGroup;
+        let mut rules = vec![
+            rule("", "domain", "video.invalid", "direct", 0),
+            rule("", "domain", "off.invalid", "direct", 0),
+            rule("", "final", "*", "proxy", 0),
+            rule("192.0.2.7", "domain", "override.invalid", "reject", 0),
+            rule("", "domain", "override.invalid", "direct", 100),
+        ];
+        for rule in &mut rules {
+            rule.group = "Media".into();
+        }
+        rules[1].enabled = false;
+        let binding = |source: &str, target: &str| DeviceRuleGroup {
+            source: normalize_rule_source(source).unwrap(),
+            group: "Media".into(),
+            target: target.into(),
+        };
+        let links = [
+            binding("192.0.2.0/24", "reject"),
+            binding("192.0.2.7", "group:Japan"),
+        ];
+        let router = Router::new(rule_mode_with_devices(&rules, &links));
+        for (src, dest, want) in [
+            ("192.0.2.8", "video.invalid", RouteAction::Reject),
+            (
+                "192.0.2.7",
+                "video.invalid",
+                RouteAction::Group("Japan".into()),
+            ),
+            ("192.0.2.7", "override.invalid", RouteAction::Reject),
+            ("192.0.2.7", "off.invalid", RouteAction::Proxy),
+            ("192.0.2.7", "other.invalid", RouteAction::Proxy),
+            ("198.51.100.1", "video.invalid", RouteAction::Direct),
+        ] {
+            with_client_source(Some(src.parse().unwrap()), async {
+                assert_eq!(router.route(dest, 443), want);
+            })
+            .await;
+        }
+        rules[0].target = "reject".into();
+        let router = Router::new(rule_mode_with_devices(&rules, &[binding("192.0.2.7", "")]));
+        let trace = router
+            .trace_route(
+                "video.invalid",
+                443,
+                Some("192.0.2.7".parse().unwrap()),
+                None,
+                false,
+            )
+            .await;
+        assert_eq!(trace.action, RouteAction::Reject);
+        assert_eq!(trace.matched_rule, Some(0));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn same_destination_is_isolated_between_concurrent_devices_and_global_fallback() {
         let router = Arc::new(Router::new(rule_mode_ruleset(&[

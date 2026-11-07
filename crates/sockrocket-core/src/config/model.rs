@@ -69,6 +69,8 @@ pub struct AppConfig {
     pub subscriptions: Vec<Subscription>,
     /// Routing rules
     pub rules: Vec<RoutingRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_rule_groups: Vec<DeviceRuleGroup>,
     /// Whether the proxy was running when the app was last closed (auto-reconnect on next start)
     #[serde(default)]
     pub auto_connect: bool,
@@ -107,6 +109,7 @@ impl Default for AppConfig {
             active_node: None,
             subscriptions: Vec::new(),
             rules: Vec::new(),
+            device_rule_groups: Vec::new(),
             auto_connect: false,
             tun_was_enabled: false,
             tun_mtu: None,
@@ -133,6 +136,8 @@ impl AppConfig {
             cfg.proxy_mode = ProxyMode::Rule;
         }
         super::group::validate_targets(&cfg.groups, &cfg.rules)
+            .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
+        validate_device_rule_groups(&cfg.device_rule_groups, &cfg.rules, &cfg.groups)
             .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
         Ok(cfg)
     }
@@ -511,6 +516,58 @@ fn default_format() -> String {
     "auto".to_string()
 }
 
+/// A device uses the current global destination members of this rule group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceRuleGroup {
+    #[serde(deserialize_with = "deserialize_rule_source")]
+    pub source: String,
+    pub group: String,
+    /// Empty means use each member's own action.
+    #[serde(default)]
+    pub target: String,
+}
+
+pub fn validate_device_rule_groups(
+    links: &[DeviceRuleGroup],
+    rules: &[RoutingRule],
+    exits: &[ProxyGroupConfig],
+) -> Result<(), &'static str> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    if links.len() > 256 {
+        return Err("最多支持 256 个设备规则组关联");
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut counts = std::collections::HashMap::new();
+    for rule in rules.iter().filter(|r| r.is_global_destination()) {
+        *counts.entry(rule.group.trim()).or_insert(0usize) += 1;
+    }
+    let mut total = 0;
+    for link in links {
+        if link.source.is_empty()
+            || !seen.insert((&link.source, &link.group))
+            || link.group.trim().is_empty()
+        {
+            return Err("设备或规则组缺失，或关联重复");
+        }
+        let target = link.target.as_str();
+        if !matches!(target, "" | "direct" | "proxy" | "reject")
+            && super::group::node_target_id(target).is_none()
+            && !target
+                .strip_prefix("group:")
+                .is_some_and(|name| exits.iter().any(|g| g.name == name))
+        {
+            return Err("设备规则组关联引用了无效出口");
+        }
+        total += counts.get(link.group.as_str()).copied().unwrap_or(0);
+        if total > 65536 {
+            return Err("设备关联的目的规则总数超过 65536");
+        }
+    }
+    Ok(())
+}
+
 /// Routing rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
@@ -525,7 +582,7 @@ pub struct RoutingRule {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Display group (e.g. "跨境", "国内直连"). Empty = ungrouped.
-    /// Group is UI-only; source scope and priority determine matching order.
+    /// Merlin devices can link to the global destination rules in this group.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
     /// Rule type: "domain", "domain-suffix", "domain-keyword", "ip-cidr",
@@ -542,6 +599,14 @@ pub struct RoutingRule {
     /// priority keep their list order (stable). Default `0`.
     #[serde(default)]
     pub priority: i32,
+}
+
+impl RoutingRule {
+    pub fn is_global_destination(&self) -> bool {
+        self.source.is_empty()
+            && !self.rule_type.eq_ignore_ascii_case("match")
+            && !self.rule_type.eq_ignore_ascii_case("final")
+    }
 }
 
 fn deserialize_rule_source<'de, D: serde::Deserializer<'de>>(
