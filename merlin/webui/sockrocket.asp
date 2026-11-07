@@ -42,6 +42,8 @@
 #sockrocket-plugin #sr-titlebar {display:flex;align-items:center;flex-wrap:wrap;gap:14px;margin-bottom:20px;min-width:0}
 #sockrocket-plugin .logo {display:flex;align-items:center;gap:8px;font-size:24px;font-weight:650;letter-spacing:-.5px}
 #sockrocket-plugin .logo svg {color:var(--accent);flex-shrink:0}
+#sockrocket-plugin .project-links {display:flex;flex-wrap:wrap;gap:6px 16px;min-width:0}
+#sockrocket-plugin .project-links a {color:var(--text-accent);font-weight:600;text-decoration:underline;overflow-wrap:anywhere}
 #sockrocket-plugin .spacer {flex:1}
 #sockrocket-plugin .service-pill {font-size:12px;color:var(--text-muted);background:#e4e8ed;padding:4px 13px;border-radius:7px;white-space:nowrap}
 #sockrocket-plugin .service-pill.success {color:var(--success);background:#e4f5ee}
@@ -313,6 +315,10 @@ body.bg {min-width:0!important}
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 13.5 C7 9 8.6 5.2 12 3 C15.4 5.2 17 9 17 13.5"/><path d="M5.5 15.5 C8.5 14.4 15.5 14.4 18.5 15.5"/><path d="M10 17.5 L10 19.5"/><path d="M14 17.5 L14 21.5"/></svg>
       Sockrocket
     </div><span class="service-pill" id="sr-service-pill">等待状态</span>
+    <nav class="project-links" aria-label="项目链接">
+      <a href="https://t.me/sockrocket" target="_blank" rel="noopener noreferrer">Telegram</a>
+      <a href="https://sockrockets.github.io/sockrocket/" target="_blank" rel="noopener noreferrer">官网</a>
+    </nav>
     <div class="spacer"></div>
     <a class="btn" id="sr-exit-btn" href="/Module_Softcenter.asp#/" target="_top" title="返回软件中心">退出</a>
     <button type="button" class="node-badge" id="sr-node-badge" onclick="srShowPage('nodes')" title="查看当前节点">

@@ -1,11 +1,13 @@
-# Sockrocket
+# Sockrocket 梅林路由器插件
 
 <p align="center">
   <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket" width="320" />
 </p>
 
-<p align="center"><strong>桌面到路由器，共用一个 Rust 代理内核。</strong></p>
-<p align="center">原生桌面客户端 · 命令行 · AsusWRT-Merlin 插件</p>
+## 开源 Rust · 小安装包 · 低内存占用
+
+离线安装包实测约 6.4 MiB。RT-AX86U Pro 在 153–172 个活跃会话下，代理进程常驻内存实测为 29–37 MiB。装在路由器上，全家设备共用节点、规则和 DNS。
+
 <p align="center">
   <a href="README.md">English</a> · <a href="README.vi.md">Tiếng Việt</a> · <strong>中文</strong>
 </p>
@@ -18,11 +20,21 @@
   <a href="https://github.com/sockrockets/sockrocket/issues">反馈问题</a>
 </p>
 
-Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户端中。桌面端采用 macOS 系统设置风格的分组界面；CLI 和 Merlin 插件复用同一套协议与路由能力。
+## 按路由器型号下载安装包
 
-> **配图说明**：桌面配图为依据项目 Figma 方向整理的设计示意，使用虚构数据，部分布局与交互以实际版本为准。Merlin 部分为实际管理界面的脱敏截图，节点、地址、SSID 与凭据在导出前已隐藏。
+在表中查找机身完整型号和硬件修订版，下载对应文件，再进入软件中心离线安装。表中列出打包目标，固件用户空间决定架构。
 
-![概览设计预览：连接状态、流量和系统代理设置](docs/images/readme/overview.png)
+| 路由器型号 | 固件架构 | 离线安装包 |
+| --- | --- | --- |
+| RT-AC68U、RT-AC68U V4、RT-AC66U B1、RT-AC1900、RT-AC1900P、RT-AC87U、Netgear R6300 V2、RT-AC88U、RT-AC3100、RT-AC3200、RT-AC5300 | ARMv7 软浮点 | [sockrocket-merlin-arm.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz) |
+| RT-BE92U、RT-BE82U、RT-BE58 Go、GS7 Pro、GS7 Pro Max、TUF-BE3600、TUF-BE3600 V2、TUF-AX5400 V2、ZenWiFi ET8、ZenWiFi XD6、ZenWiFi XT9、TUF-AX3000、TUF-AX3000 V2、TUF-AX5400、RT-AX58U、RT-AX58U V2、RAX70、RT-AX1800、RAX50、RT-AX82U、RT-AX82U V2、ZenWiFi XT8、ZenWiFi XT8 V2、ZenWiFi XD4、ZenWiFi XD4 Plus、RT-AX56U、RT-AX56U V2、RT-AX57、RT-AX55 | ARMv7 硬浮点 | [sockrocket-merlin-hnd.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz) |
+| RT-AC86U、GT-AC2900、GT-AC5300、RT-AX88U、RT-AX88U PRO、RAX80、GT-AX11000、GT-AX11000 PRO、RT-AX92U、RT-AX68U、RT-AX86U、RT-AX86U PRO、RT-AX86S、GT-AXE11000、GT-AXE16000、GT-AX6000、ZenWiFi Pro XT12、RT-BE88U、RT-BE7200、RT-BE86U、RT-BE96U、GT-BE96、GT-BE98、GT-BE98 Pro、GT-BE19000AI | AArch64 | [sockrocket-merlin-hnd_v8.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz) |
+| RT-AX89X | ARMv7 硬浮点 | [sockrocket-merlin-qca.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz) |
+| GS7、GS7 Air、GS-BE7200X、TX-AX6000、ZenWiFi BT8P、RT-AX57 Go、TUF-AX4200Q、TUF-AX4200、TUF-AX6000、RT-AX59U | AArch64 | [sockrocket-merlin-mtk.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz) |
+| ZenWiFi BD4 | ARMv7 硬浮点 | [sockrocket-merlin-ipq32.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz) |
+| TUF-BE6500 | AArch64 | [sockrocket-merlin-ipq64.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz) |
+
+![Merlin 实际管理界面：已隐藏节点、地址、SSID 与凭据](docs/images/readme/merlin.jpg)
 
 ## 主要能力
 
@@ -118,13 +130,12 @@ Sockrocket 将节点、订阅、分流规则和流量接管放在同一个客户
 
 ## AsusWRT-Merlin
 
-**v0.0.19 小包优化：** Merlin 安装包移除重复程序，保留软件中心必需的网页入口和完整功能。同一二进制的本地打包对照：ARM64 从 12.67 MiB 降至 6.43 MiB，ARMv7 从 12.53 MiB 降至 6.36 MiB，约缩小 49%。减少下载量和解包临时占用，不改变程序内容或运行性能；安装后的程序大小和运行内存不会因此减半。数字为对照样本，实际发行包大小以下载文件为准。
+**梅林插件：小安装包，低内存占用**
+
+v0.0.19 本地打包对照中，移除重复程序后，ARMv7 离线包为 6.36 MiB，ARM64 为 6.43 MiB，下载体积约减半。另一次 RT-AX86U Pro 实测中，153–172 个活跃会话下，代理进程的常驻内存（RSS）为 29–37 MiB。发行包大小随构建而异，内存占用随负载变化。 [内存实测记录](docs/architecture/tls-failure-investigation-2026-11-06.md)
 
 路由器插件提供 WebUI、透明代理、DNS 接管和运行状态检查，让局域网设备共用代理内核。
 
-![Merlin 实际管理界面：已隐藏节点、地址、SSID 与凭据](docs/images/readme/merlin.jpg)
-
-*实际界面脱敏截图；运行指标为截图时的状态，不代表实时状态。*
 
 1. 菜单里还没有软件中心时，先到 [fw.koolcenter.com](https://fw.koolcenter.com/) 按机型下载梅林改版或官改固件并刷入。原版 Merlin 没有软件中心。
 2. 在[型号与安装包对照表](docs/merlin-models.md)按完整型号和固件架构查找文件名。打包产物附带同一份 `merlin-models.md`。

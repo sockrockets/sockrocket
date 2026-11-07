@@ -1,10 +1,12 @@
-# Sockrocket
+# Sockrocket for AsusWRT-Merlin routers
 
 <p align="center">
   <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket" width="320" />
 </p>
-<p align="center"><strong>One Rust proxy engine, from desktop to router.</strong></p>
-<p align="center">Native desktop client · CLI · AsusWRT-Merlin plugin</p>
+## Open-source Rust · Small download · Low memory use
+
+Sample offline installers weighed about 6.4 MiB. On an RT-AX86U Pro with 153–172 active sessions, the proxy used 29–37 MiB of resident memory. Install on the router to share nodes, rules and DNS across your home.
+
 <p align="center"><strong>English</strong> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.zh.md">中文</a></p>
 <p align="center">
   <a href="https://sockrockets.github.io/sockrocket/">Website</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
@@ -15,11 +17,21 @@
   <a href="https://github.com/sockrockets/sockrocket/issues">Report a bug</a>
 </p>
 
-Sockrocket brings nodes, subscriptions, routing rules and traffic capture into one client. Its desktop interface follows the grouped layout of macOS System Settings; the CLI and Merlin plugin share the same Rust protocol engine.
+## Download for your router
 
-> **About the images:** desktop illustrations follow the project's Figma direction and use synthetic data; released layouts may differ. The Merlin image is a sanitized capture of the actual management interface, with nodes, addresses, SSIDs and credentials hidden before export.
+Match the full model and hardware revision, download the linked package, then install it in Software Center. These are packaging targets. The architecture refers to the firmware userspace.
 
-![Overview design preview: connection status, traffic and system proxy controls](docs/images/readme/overview.png)
+| Router models | Firmware architecture | Offline installer |
+| --- | --- | --- |
+| RT-AC68U, RT-AC68U V4, RT-AC66U B1, RT-AC1900, RT-AC1900P, RT-AC87U, Netgear R6300 V2, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300 | ARMv7 soft-float | [sockrocket-merlin-arm.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz) |
+| RT-BE92U, RT-BE82U, RT-BE58 Go, GS7 Pro, GS7 Pro Max, TUF-BE3600, TUF-BE3600 V2, TUF-AX5400 V2, ZenWiFi ET8, ZenWiFi XD6, ZenWiFi XT9, TUF-AX3000, TUF-AX3000 V2, TUF-AX5400, RT-AX58U, RT-AX58U V2, RAX70, RT-AX1800, RAX50, RT-AX82U, RT-AX82U V2, ZenWiFi XT8, ZenWiFi XT8 V2, ZenWiFi XD4, ZenWiFi XD4 Plus, RT-AX56U, RT-AX56U V2, RT-AX57, RT-AX55 | ARMv7 hard-float | [sockrocket-merlin-hnd.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz) |
+| RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U PRO, RAX80, GT-AX11000, GT-AX11000 PRO, RT-AX92U, RT-AX68U, RT-AX86U, RT-AX86U PRO, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12, RT-BE88U, RT-BE7200, RT-BE86U, RT-BE96U, GT-BE96, GT-BE98, GT-BE98 Pro, GT-BE19000AI | AArch64 | [sockrocket-merlin-hnd_v8.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz) |
+| RT-AX89X | ARMv7 hard-float | [sockrocket-merlin-qca.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz) |
+| GS7, GS7 Air, GS-BE7200X, TX-AX6000, ZenWiFi BT8P, RT-AX57 Go, TUF-AX4200Q, TUF-AX4200, TUF-AX6000, RT-AX59U | AArch64 | [sockrocket-merlin-mtk.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz) |
+| ZenWiFi BD4 | ARMv7 hard-float | [sockrocket-merlin-ipq32.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz) |
+| TUF-BE6500 | AArch64 | [sockrocket-merlin-ipq64.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz) |
+
+![Actual Merlin management interface with nodes, addresses, SSIDs and credentials hidden](docs/images/readme/merlin.jpg)
 
 ## What it does
 
@@ -115,13 +127,12 @@ Before upgrading, quit the old client and its elevated background instance. Runn
 
 ## AsusWRT-Merlin
 
-**Smaller packages in v0.0.19:** Merlin packages remove duplicate executables while retaining the required Software Center Web UI entry and all features. Local packaging comparisons using the same binaries reduced ARM64 from 12.67 MiB to 6.43 MiB and ARMv7 from 12.53 MiB to 6.36 MiB — about 49% smaller. This reduces downloads and extraction space without changing executable contents or runtime performance; installed executable size and runtime memory are not halved. These are comparison samples; actual release sizes vary.
+**Small Merlin packages and low memory use**
+
+In the v0.0.19 packaging test, the offline installer was 6.36 MiB for ARMv7 and 6.43 MiB for ARM64, about 49% smaller after removing a duplicate executable. In a separate RT-AX86U Pro test with 153–172 active sessions, the proxy process used 29–37 MiB of resident memory (RSS). Release size varies by build, and memory use varies with workload. [Router memory measurements](docs/architecture/tls-failure-investigation-2026-11-06.md)
 
 The router plugin includes a WebUI, transparent proxy, DNS capture and service checks, sharing the engine across LAN devices.
 
-![Actual Merlin management interface with nodes, addresses, SSIDs and credentials hidden](docs/images/readme/merlin.jpg)
-
-*Sanitized interface capture. Runtime metrics reflect the capture time, not live status.*
 
 1. If the menu has no Software Center, download a Merlin or official-mod build for your model from [fw.koolcenter.com](https://fw.koolcenter.com/) and flash it. Upstream Merlin does not include Software Center.
 2. Find your exact model and firmware architecture in the [model-to-package table](docs/merlin.md#model--platform). Each release also includes `merlin-models.md`.

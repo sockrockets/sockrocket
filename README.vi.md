@@ -1,10 +1,12 @@
-# Sockrocket
+# Sockrocket cho router AsusWRT-Merlin
 
 <p align="center">
   <img src="crates/sockrocket-gui/assets/logo-banner.svg" alt="Sockrocket" width="320" />
 </p>
-<p align="center"><strong>Một lõi proxy Rust cho máy tính và router.</strong></p>
-<p align="center">Ứng dụng desktop native · CLI · Plugin AsusWRT-Merlin</p>
+## Rust mã nguồn mở · Gói cài nhỏ · Dùng ít RAM
+
+Gói cài đặt ngoại tuyến trong thử nghiệm có dung lượng khoảng 6.4 MiB. Trên RT-AX86U Pro với 153–172 phiên hoạt động, tiến trình proxy dùng 29–37 MiB bộ nhớ thường trú. Cài trên router để cả nhà dùng chung node, quy tắc và DNS.
+
 <p align="center"><a href="README.md">English</a> · <strong>Tiếng Việt</strong> · <a href="README.zh.md">中文</a></p>
 <p align="center">
   <a href="https://sockrockets.github.io/sockrocket/">Website</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
@@ -15,11 +17,21 @@
   <a href="https://github.com/sockrockets/sockrocket/issues">Báo lỗi</a>
 </p>
 
-Sockrocket quản lý node, subscription, quy tắc định tuyến và chế độ chuyển lưu lượng trong cùng một ứng dụng. Giao diện desktop theo phong cách nhóm cài đặt của macOS; CLI và plugin Merlin dùng chung lõi giao thức Rust.
+## Tải gói theo model router
 
-> **Về hình ảnh:** hình desktop theo định hướng Figma và dùng dữ liệu giả; giao diện phát hành có thể khác. Hình Merlin được chụp từ giao diện quản lý thực tế sau khi ẩn node, địa chỉ, SSID và thông tin xác thực trước khi xuất.
+Tra đúng tên model và phiên bản phần cứng, tải gói tương ứng rồi cài trong Software Center. Bảng liệt kê các mục tiêu đóng gói theo kiến trúc không gian người dùng của firmware.
 
-![Thiết kế tổng quan: trạng thái kết nối, lưu lượng và proxy hệ thống](docs/images/readme/overview.png)
+| Model router | Kiến trúc firmware | Gói cài ngoại tuyến |
+| --- | --- | --- |
+| RT-AC68U, RT-AC68U V4, RT-AC66U B1, RT-AC1900, RT-AC1900P, RT-AC87U, Netgear R6300 V2, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300 | ARMv7 soft-float | [sockrocket-merlin-arm.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz) |
+| RT-BE92U, RT-BE82U, RT-BE58 Go, GS7 Pro, GS7 Pro Max, TUF-BE3600, TUF-BE3600 V2, TUF-AX5400 V2, ZenWiFi ET8, ZenWiFi XD6, ZenWiFi XT9, TUF-AX3000, TUF-AX3000 V2, TUF-AX5400, RT-AX58U, RT-AX58U V2, RAX70, RT-AX1800, RAX50, RT-AX82U, RT-AX82U V2, ZenWiFi XT8, ZenWiFi XT8 V2, ZenWiFi XD4, ZenWiFi XD4 Plus, RT-AX56U, RT-AX56U V2, RT-AX57, RT-AX55 | ARMv7 hard-float | [sockrocket-merlin-hnd.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz) |
+| RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U PRO, RAX80, GT-AX11000, GT-AX11000 PRO, RT-AX92U, RT-AX68U, RT-AX86U, RT-AX86U PRO, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12, RT-BE88U, RT-BE7200, RT-BE86U, RT-BE96U, GT-BE96, GT-BE98, GT-BE98 Pro, GT-BE19000AI | AArch64 | [sockrocket-merlin-hnd_v8.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz) |
+| RT-AX89X | ARMv7 hard-float | [sockrocket-merlin-qca.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz) |
+| GS7, GS7 Air, GS-BE7200X, TX-AX6000, ZenWiFi BT8P, RT-AX57 Go, TUF-AX4200Q, TUF-AX4200, TUF-AX6000, RT-AX59U | AArch64 | [sockrocket-merlin-mtk.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz) |
+| ZenWiFi BD4 | ARMv7 hard-float | [sockrocket-merlin-ipq32.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz) |
+| TUF-BE6500 | AArch64 | [sockrocket-merlin-ipq64.tar.gz](https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz) |
+
+![Giao diện quản lý Merlin thực tế, đã ẩn node, địa chỉ, SSID và thông tin xác thực](docs/images/readme/merlin.jpg)
 
 ## Tính năng
 
@@ -115,13 +127,12 @@ Trước khi nâng cấp, thoát bản cũ và tiến trình nền chạy với 
 
 ## AsusWRT-Merlin
 
-**Gói nhỏ hơn từ v0.0.19:** Loại bỏ bản sao chương trình, giữ trang WebUI cần thiết cho Software Center và toàn bộ chức năng. So sánh đóng gói cùng tệp thực thi: ARM64 từ 12.67 xuống 6.43 MiB, ARMv7 từ 12.53 xuống 6.36 MiB, giảm khoảng 49%. Giảm dung lượng tải và giải nén tạm thời, không đổi chương trình hay hiệu năng. Dung lượng chương trình sau cài đặt và RAM không giảm một nửa; kích thước bản phát hành thực tế có thể khác.
+**Plugin Merlin nhỏ gọn, dùng ít RAM**
+
+Trong thử nghiệm đóng gói v0.0.19, gói cài đặt ngoại tuyến có dung lượng 6.36 MiB trên ARMv7 và 6.43 MiB trên ARM64, giảm khoảng 49% sau khi bỏ bản sao của tệp thực thi. Trong một thử nghiệm riêng trên RT-AX86U Pro với 153–172 phiên hoạt động, tiến trình proxy dùng 29–37 MiB bộ nhớ thường trú (RSS). Dung lượng gói tùy bản dựng và mức dùng RAM tùy tải. [Số liệu bộ nhớ trên router](docs/architecture/tls-failure-investigation-2026-11-06.md)
 
 Plugin router cung cấp WebUI, proxy trong suốt, chuyển DNS và kiểm tra dịch vụ cho các thiết bị LAN.
 
-![Giao diện quản lý Merlin thực tế, đã ẩn node, địa chỉ, SSID và thông tin xác thực](docs/images/readme/merlin.jpg)
-
-*Ảnh đã ẩn thông tin. Số liệu là trạng thái lúc chụp, không phải trạng thái trực tiếp.*
 
 1. Nếu menu chưa có Software Center, tải bản Merlin hoặc bản mod chính hãng đúng model từ [fw.koolcenter.com](https://fw.koolcenter.com/) rồi flash. Merlin gốc không có Software Center.
 2. Tra tên model và kiến trúc firmware trong [bảng đối chiếu gói](docs/merlin.md#model--platform). Mỗi bộ gói có kèm tệp `merlin-models.md`.

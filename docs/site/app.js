@@ -21,13 +21,14 @@ Object.assign(translations.en, {
  wireguardDetail:'No additional OS interface; UDP payloads must fit the tunnel MTU.',
  protocolLimits:'Compatibility: VLESS Vision supports TLS 1.3 / REALITY over TCP and XUDP (standard flow excludes UDP/443). gRPC / XHTTP remain unsupported and fail explicitly. WireGuard does not yet support multiple peers, IP fragmentation or profile scripts.',
  protocolGuide:'Protocol and transport guide →',
- heroLabel:'AsusWRT-Merlin · Open-source Rust engine',
- heroTitle:'One router.<br>The whole home.',
- heroDescription:'Install the same engine on Merlin. Computers, phones and tablets on the LAN share nodes, rules and DNS. The desktop client is still there.',
+ heroLabel:'Router plugin for AsusWRT-Merlin',
+ heroTitle:'Open-source Rust<br>Small download<br>Low memory use',
+ heroDescription:'Sample Merlin installers were about 6.4 MiB, and the proxy used 29–37 MiB of RAM in an RT-AX86U Pro test. Install once to share nodes, rules and DNS across your home.',
  heroDownload:'Download the router plugin',
  heroGuide:'Read the install guide',
  heroPlatforms:'Match the firmware platform · hnd_v8 / hnd / arm / qca / mtk',
- heroWindow:'The desktop client uses the same engine.',
+ heroWindow:'Merlin router interface',
+ routerImageNote:'Router screenshot with network details hidden',
  merlinNote:'The package must match the firmware platform and CPU. Compatibility stays the default, and it does not require ISP IPv6.',
  merlinFirmware:'No Software Center yet? Download a firmware that includes it, then flash →',
  pkgHndV8:'hnd_v8 · AX86U, AX88U, GT-AX6000',
@@ -101,13 +102,14 @@ Object.assign(translations.vi, {
  wireguardDetail:'Không tạo thêm giao diện mạng hệ thống; gói UDP phải nằm trong MTU của đường hầm.',
  protocolLimits:'Giới hạn: VLESS Vision hỗ trợ TLS 1.3 / REALITY qua TCP và XUDP (flow tiêu chuẩn chặn UDP/443). gRPC / XHTTP chưa được triển khai và sẽ bị từ chối rõ ràng. WireGuard chưa hỗ trợ nhiều peer, phân mảnh IP hoặc script cấu hình.',
  protocolGuide:'Hướng dẫn giao thức và transport →',
- heroLabel:'AsusWRT-Merlin · Lõi Rust mã nguồn mở',
- heroTitle:'Một router.<br>Cả nhà cùng dùng.',
- heroDescription:'Cài cùng một lõi trên Merlin. Máy tính, điện thoại và máy tính bảng trong LAN dùng chung node, quy tắc và DNS. Ứng dụng desktop vẫn có.',
+ heroLabel:'Plugin cho router AsusWRT-Merlin',
+ heroTitle:'Rust mã nguồn mở<br>Gói cài nhỏ<br>Dùng ít RAM',
+ heroDescription:'Gói cài đặt thử nghiệm khoảng 6.4 MiB. Trên RT-AX86U Pro, tiến trình proxy dùng 29–37 MiB RAM trong thử nghiệm. Cài một lần để cả nhà dùng chung node, quy tắc và DNS.',
  heroDownload:'Tải plugin cho router',
  heroGuide:'Đọc hướng dẫn cài đặt',
  heroPlatforms:'Chọn đúng nền tảng firmware · hnd_v8 / hnd / arm / qca / mtk',
- heroWindow:'Ứng dụng desktop dùng cùng một lõi.',
+ heroWindow:'Giao diện quản lý router Merlin',
+ routerImageNote:'Ảnh chụp trên router đã ẩn thông tin mạng',
  merlinNote:'Gói phải khớp nền tảng firmware và CPU. Mặc định giữ tương thích IPv4, không yêu cầu ISP có IPv6.',
  merlinFirmware:'Chưa có Software Center? Tải firmware có sẵn nó, rồi flash →',
  pkgHndV8:'hnd_v8 · AX86U, AX88U, GT-AX6000',
@@ -176,7 +178,7 @@ function setLanguage(value) {
  locale = Object.hasOwn(translations,value) ? value : 'zh';
  elements.forEach(el => { el.innerHTML = translations[locale][el.dataset.t] ?? translations.zh[el.dataset.t]; });
  document.documentElement.lang = {zh:'zh-CN',en:'en',vi:'vi'}[locale];
- document.title = {zh:'Sockrocket · 一台路由器，整屋一起走',en:'Sockrocket · One router, the whole home',vi:'Sockrocket · Một router, cả nhà cùng dùng'}[locale];
+ document.title = 'Sockrocket · ' + document.querySelector('[data-t="heroTitle"]').innerHTML.split('<br>').join(' · ');
  document.querySelector('meta[name="description"]').content = document.querySelector('[data-t="heroDescription"]').textContent;
  document.getElementById('language').value = locale;
  try { localStorage.setItem('sockrocket-language',locale); } catch {}

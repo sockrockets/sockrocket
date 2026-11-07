@@ -26,10 +26,12 @@ h3{font-size:19px;line-height:1.4;font-weight:620}
 .nav-tools{display:flex;align-items:center;gap:18px}
 .nav select{border:0;border-radius:6px;color:#555e6c;background:transparent;padding:6px;font-size:13px}
 .github{display:flex}
-.hero{display:grid;grid-template-columns:.85fr 1.25fr;gap:40px;align-items:center;padding-block:88px 68px;min-height:635px}
+.hero{display:grid;grid-template-columns:1.05fr 1.05fr;gap:40px;align-items:center;padding-block:88px 68px;min-height:635px}
 .eyebrow{font-size:12px;font-weight:650;letter-spacing:.1em;color:var(--blue);margin-bottom:20px;display:flex;align-items:center;gap:9px}
 .dot{width:7px;height:7px;border-radius:50%;background:#36ac7a;display:inline-block;flex-shrink:0}
-.hero h1{font-size:clamp(48px,5.9vw,76px);font-weight:650;line-height:1.12}
+.hero-copy{container-type:inline-size;min-width:0}
+.hero h1{font-size:clamp(48px,17cqi,96px);font-weight:800;line-height:1.08}
+html:not(:lang(zh)) .hero h1{font-size:clamp(34px,12.4cqi,82px)}
 .hero-description{margin-top:25px;font-size:17px;color:var(--muted);max-width:390px}
 .actions{display:flex;align-items:center;gap:22px;margin-top:30px;flex-wrap:wrap}
 .button{display:inline-flex;align-items:center;justify-content:center;gap:20px;padding:15px 21px;border-radius:10px;font-size:14px;font-weight:600;transition:transform .2s,background .2s}
@@ -174,7 +176,7 @@ section[id]{scroll-margin-top:25px}
 }
 @media(max-width:1000px){.wrap{width:calc(100% - 44px)}
 .hero{gap:20px;padding-block:65px}
-.hero h1{font-size:57px}
+
 .hero-description{font-size:15px}
 .float-note{left:12px;padding:10px 13px}
 .protocols{gap:20px}
@@ -198,7 +200,7 @@ section[id]{scroll-margin-top:25px}
 .nav-tools{gap:10px}
 .nav select{font-size:12px}
 .hero{grid-template-columns:1fr;padding-block:45px 35px;gap:35px}
-.hero h1{font-size:61px}
+
 .hero-description{max-width:480px}
 .hero-visual{padding-bottom:33px}
 .visual-caption{margin-inline:5px}
@@ -267,7 +269,7 @@ footer>div{gap:16px;font-size:11px}
 
 
 @media(max-width:720px){.community h2{font-size:24px}
-.hero h1{font-size:clamp(45px,13vw,61px)}
+
 }
 
 /* Protocol capabilities describe source changes separately from release downloads. */
