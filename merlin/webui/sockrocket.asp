@@ -3355,7 +3355,11 @@ function srCheckUpdate() {
     if (d.available) {
       pendingUpdateAsset = d.asset_url || null;
       btn.style.display = pendingUpdateAsset ? '' : 'none';
-      srShowMsg(d.msg || '有可用更新', 'ok');
+      if (pendingUpdateAsset) srShowMsg(d.msg || '有可用更新', 'ok');
+      else {
+        st.textContent = '发现新版 v' + d.latest + '，但未找到适配当前机型的软件包。可查看发布记录。';
+        srShowMsg(st.textContent, 'info');
+      }
     } else {
       srShowMsg(d.msg || '已是最新版本', 'ok');
     }
@@ -3365,20 +3369,37 @@ function srCheckUpdate() {
   }, 70000);
 }
 var srUpdatePollTimer = null;
+var srUpdateJobId = null;
+var srUpdateLaunchDeadline = 0;
 function srPollUpdate() {
   if (srUpdatePollTimer) clearTimeout(srUpdatePollTimer);
+  var expected = srUpdateJobId;
   srApi('update_status', null, function (d) {
+    if (expected !== srUpdateJobId) return;
     var st = srElement('update-status'), status = d.status || 'idle';
+    if (expected && expected !== d.job_id) {
+      if (Date.now() < srUpdateLaunchDeadline) {
+        st.textContent = '正在确认本次更新任务…';
+        srUpdatePollTimer = setTimeout(srPollUpdate, 1000);
+      } else {
+        st.textContent = '无法确认本次更新任务，请刷新页面查看当前状态。';
+        srUpdateJobId = null;
+      }
+      return;
+    }
     if (d.active) {
-      var labels = {queued:'等待开始',preparing:'准备备份',stopping:'停止服务',replacing:'安装文件',integration:'更新系统集成','api-restart':'启动管理接口','service-start':'启动代理','health-check':'检查服务'};
+      srUpdateJobId = d.job_id || null;
+      var labels = {checking:'核对版本和机型',downloading:'下载软件包',verifying:'校验软件包',queued:'等待开始',preparing:'准备备份',stopping:'停止服务',replacing:'安装文件',integration:'更新系统集成','api-restart':'启动管理接口','service-start':'启动代理','health-check':'检查服务'};
       st.textContent = '更新进行中：' + (labels[d.stage || status] || '处理中');
       srUpdatePollTimer = setTimeout(srPollUpdate, 2000);
       return;
     }
-    if (status.indexOf('success:') === 0) st.textContent = '更新成功，健康检查通过。';
+    srUpdateJobId = null;
+    if (status === 'up-to-date') st.textContent = '已是最新版本。';
+    else if (status.indexOf('success:') === 0) st.textContent = '更新成功，健康检查通过。';
     else if (status.indexOf('rolled-back:') === 0) st.textContent = '更新未通过检查，已恢复旧版并通过健康检查。';
     else if (status.indexOf('rollback-failed:') === 0) st.textContent = '恢复未通过检查，备份已保留，请检查诊断日志。';
-    else if (status.indexOf('failed:') === 0) st.textContent = '更新失败：' + status;
+    else if (status.indexOf('failed:') === 0) st.textContent = '更新失败：' + status.slice(7).trim();
     else st.textContent = '当前没有更新任务。';
     refreshStatus();
   }, function () {
@@ -3389,12 +3410,18 @@ function srPollUpdate() {
 function srApplyUpdate() {
   var st = srElement('update-status');
   if (!confirm('下载并安装最新完整插件？\n\n订阅、节点和规则会保留。服务将重启，网络连接可能短暂中断。')) return;
-  st.textContent = '正在下载并安装，可能需要一分钟…';
+  if (srUpdateJobId) return;
+  var random = new Uint8Array(16);
+  window.crypto.getRandomValues(random);
+  srUpdateJobId = Array.prototype.map.call(random, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  srUpdateLaunchDeadline = Date.now() + 30000;
+  st.textContent = '正在启动更新任务…';
   srElement('btn-apply-update').style.display = 'none';
-  srApi('apply_update', null, function (d) {
+  srApi('apply_update', {request_id:srUpdateJobId}, function (d) {
     toastResp(d);
     st.textContent = d.msg || '';
-    if (d.ok !== false) srPollUpdate();
+    if (d.ok !== false) { srUpdateJobId = d.job_id || null; srPollUpdate(); }
+    else srUpdateJobId = null;
   }, function () {
     st.textContent = '请求中断，正在查询实际更新结果…';
     srPollUpdate();

@@ -575,7 +575,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "delete_rule_group" => act_delete_rule_group(post),
         "replace_rule_group" => act_replace_rule_group(post),
         "check_update" => act_check_update(),
-        "apply_update" => act_apply_update(),
+        "apply_update" => act_apply_update(post),
         "update_status" => act_update_status(),
         "diagnose" => act_diagnose(),
         _ => json!({"error": "Unknown action"}),
@@ -3479,23 +3479,104 @@ fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<
     Ok(())
 }
 
+fn save_update_status(status: &str) -> Result<()> {
+    sockrocket_core::config::storage::atomic_write_private(
+        &sockrocket_dir().join("update-status"),
+        status,
+        false,
+    )
+}
+
+fn update_lock() -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sockrocket_dir().join(".update-worker-lock"))
+}
+
 fn act_update_status() -> J {
     let root = sockrocket_dir();
     let mut active = root.join(".update-transaction").is_dir();
-    let status = fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
+    let job_id = fs::read_to_string(root.join("update-job-id")).unwrap_or_default();
+    let mut status =
+        fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
     active |= status.trim() == "queued";
+    if !job_id.is_empty()
+        && matches!(
+            status.trim(),
+            "checking" | "downloading" | "verifying" | "queued" | "preparing"
+        )
+        && !root.join(".update-transaction").is_dir()
+    {
+        // The detached worker keeps the launch lock on stdin until the installer exits.
+        // On reboot or worker exit the kernel releases it.
+        if update_lock().is_ok_and(|lock| lock.try_lock_shared().is_ok()) {
+            active = false;
+            status = "failed: 更新进程已中断".into();
+        } else {
+            active = true;
+        }
+    }
     if status.starts_with("rollback-failed:") {
         active = false;
     }
     let stage = fs::read_to_string(root.join(".update-transaction/stage")).unwrap_or_default();
-    json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim()})
+    json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim(),"job_id":job_id.trim()})
 }
 
-fn act_apply_update() -> J {
-    let Some(asset) = merlin_update_asset() else {
-        return err_msg("Unknown Merlin platform; reinstall the matching offline package first");
-    };
-    let result = (|| -> anyhow::Result<J> {
+fn act_apply_update(post: &J) -> J {
+    let id = post
+        .get("request_id")
+        .and_then(J::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err_msg("Invalid update request ID");
+    }
+    let launch = (|| -> Result<J> {
+        let root = sockrocket_dir();
+        let id_path = root.join("update-job-id");
+        if fs::read_to_string(&id_path).ok().as_deref() == Some(&id) {
+            return Ok(json!({"ok":true,"job_id":id}));
+        }
+        let lock = update_lock()?;
+        lock.try_lock()
+            .map_err(|_| anyhow::anyhow!("已有软件更新任务正在运行"))?;
+        anyhow::ensure!(
+            !root.join(".update-transaction").exists(),
+            "已有更新事务正在运行"
+        );
+        save_update_status("checking")?;
+        sockrocket_core::config::storage::atomic_write_private(&id_path, &id, false)?;
+        let child = Command::new(std::env::current_exe()?)
+            .arg("--merlin-update-worker")
+            .env("SOCKROCKET_DIR", &root)
+            .stdin(lock)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => {
+                save_update_status("failed: 无法启动更新进程")?;
+                return Err(e.into());
+            }
+        }
+        Ok(json!({"ok":true,"job_id":id,"msg":"更新任务已启动"}))
+    })();
+    launch.unwrap_or_else(|e| err_msg(&e.to_string()))
+}
+
+pub fn merlin_update_worker() -> Result<()> {
+    let result = (|| -> Result<()> {
+        let asset =
+            merlin_update_asset().ok_or_else(|| anyhow::anyhow!("无法识别当前机型的软件包"))?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -3504,7 +3585,7 @@ fn act_apply_update() -> J {
             Some(&asset),
         ))?;
         if check.availability != sockrocket_core::UpdateAvailability::Available {
-            return Ok(json!({"ok":true,"msg":"Already up to date"}));
+            return save_update_status("up-to-date");
         }
         let url = check
             .asset_url
@@ -3518,6 +3599,7 @@ fn act_apply_update() -> J {
         fs::create_dir(&work)?;
         let prepare = (|| -> anyhow::Result<()> {
             let archive = work.join("package.tar.gz");
+            save_update_status("downloading")?;
             rt.block_on(sockrocket_core::download_file_with_proxy_fallback(
                 &url,
                 &archive,
@@ -3527,6 +3609,7 @@ fn act_apply_update() -> J {
                     None
                 },
             ))?;
+            save_update_status("verifying")?;
             let listing = Command::new("tar").arg("-tzvf").arg(&archive).output()?;
             anyhow::ensure!(listing.status.success(), "Invalid package archive");
             for line in String::from_utf8_lossy(&listing.stdout).lines() {
@@ -3598,34 +3681,58 @@ fn act_apply_update() -> J {
                 "{}",
                 String::from_utf8_lossy(&space.stderr).trim()
             );
-            fs::write(sockrocket_dir().join("update-status"), "queued\n")?;
-            Command::new("sh")
+            save_update_status("queued")?;
+            // Replace the old binary before installation so unlinking it frees flash.
+            // Only the supervising shell retains the lock on stdin. The installer
+            // and any services that it starts must not inherit that descriptor.
+            let mut install = Command::new("sh");
+            install
                 .arg("-c")
-                .arg(r#"sleep 2; exec sh "$1" "$2" "$3""#)
-                .arg("sockrocket-update")
+                .arg(
+                    r#"
+                sh "$1" "$2" "$3" </dev/null
+                rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    case "$(cat "$SOCKROCKET_DIR/update-status")" in
+                        failed:*|rolled-back:*|rollback-failed:*) ;;
+                        *) echo 'failed: 安装未完成' > "$SOCKROCKET_DIR/update-status" ;;
+                    esac
+                fi
+                exit "$rc"
+            "#,
+                )
+                .arg("merlin-update")
                 .arg(work.join("worker.sh"))
                 .arg(&pkg)
                 .arg(&work)
-                .env("SOCKROCKET_DIR", sockrocket_dir())
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
-            Ok(())
+                .env("SOCKROCKET_DIR", sockrocket_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                Err(install.exec().into())
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::ensure!(install.status()?.success(), "安装未完成");
+                Ok(())
+            }
         })();
         if let Err(e) = prepare {
-            let _ = fs::write(
-                sockrocket_dir().join("update-status"),
-                "failed: preparation\n",
-            );
             let _ = fs::remove_dir_all(&work);
             return Err(e);
         }
-        Ok(
-            json!({"ok":true,"msg":"完整插件更新已启动；稍后刷新页面查看版本。失败时自动恢复旧版。"}),
-        )
+        Ok(())
     })();
-    result.unwrap_or_else(|e| err_msg(&format!("Plugin update failed: {e:#}")))
+    if let Err(ref error) = result {
+        let status = fs::read_to_string(sockrocket_dir().join("update-status")).unwrap_or_default();
+        if !status.starts_with("rolled-back:")
+            && !status.starts_with("rollback-failed:")
+            && !status.starts_with("failed:")
+        {
+            save_update_status(&format!("failed: {error}"))?;
+        }
+    }
+    result
 }
 
 fn act_diagnose() -> J {
@@ -4085,6 +4192,33 @@ mod tests {
             false
         );
         assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), before);
+    }
+
+    #[test]
+    fn update_status_tracks_each_preinstall_phase_and_worker_exit() {
+        let env = TestEnv::new(SAMPLE);
+        let id = "00112233445566778899aabbccddeeff";
+        let lock = update_lock().unwrap();
+        lock.try_lock().unwrap();
+        fs::write(env.dir.join("update-job-id"), id).unwrap();
+        for phase in ["checking", "downloading", "verifying", "queued"] {
+            save_update_status(phase).unwrap();
+            let status = act_update_status();
+            assert_eq!(status["active"], true);
+            assert_eq!(status["job_id"], id);
+            assert_eq!(status["status"], phase);
+        }
+        assert_eq!(act_apply_update(&json!({"request_id":id}))["job_id"], id);
+        assert_eq!(act_apply_update(&json!({}))["ok"], false);
+        drop(lock);
+        let interrupted = act_update_status();
+        assert_eq!(interrupted["active"], false);
+        assert!(
+            interrupted["status"]
+                .as_str()
+                .unwrap()
+                .starts_with("failed:")
+        );
     }
 
     #[test]

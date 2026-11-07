@@ -119,6 +119,7 @@ async fn merlin_web_release(
     client: &reqwest::Client,
     releases: &str,
     asset: &str,
+    current: &str,
 ) -> Result<GhRelease> {
     let page = client
         .head(format!("{releases}/latest"))
@@ -139,6 +140,13 @@ async fn merlin_web_release(
                 .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
         "Invalid GitHub release version"
     );
+    if !compare_versions(current, version).is_lt() {
+        return Ok(GhRelease {
+            tag_name: tag.to_owned(),
+            html_url: html_url.to_owned(),
+            assets: Vec::new(),
+        });
+    }
     let url = format!("{releases}/download/{tag}/{asset}");
     let package = client
         .head(&url)
@@ -178,6 +186,7 @@ async fn latest_release(
     api: &str,
     releases: &str,
     prefer_asset: Option<&str>,
+    current: &str,
 ) -> Result<GhRelease> {
     let response = client
         .get(api)
@@ -197,7 +206,7 @@ async fn latest_release(
             .as_deref()
             == Some(*name)
     }) {
-        merlin_web_release(client, releases, asset)
+        merlin_web_release(client, releases, asset, current)
             .await
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -234,6 +243,7 @@ pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Resu
         RELEASES_LATEST,
         "https://github.com/sockrockets/sockrocket/releases",
         prefer_asset,
+        current,
     )
     .await?;
 
@@ -350,11 +360,25 @@ mod tests {
     async fn limited_api_resolves_pinned_merlin_package() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let asset = "sockrocket-merlin-hnd.tar.gz";
-        for status in ["403 Forbidden", "429 Too Many Requests"] {
+        for (status, current, asset_reply) in [
+            (
+                "403 Forbidden",
+                "1.0.0",
+                Some("200 OK\r\nContent-Length: 12345"),
+            ),
+            (
+                "429 Too Many Requests",
+                "1.0.0",
+                Some("200 OK\r\nContent-Length: 12345"),
+            ),
+            ("403 Forbidden", "1.0.0", Some("404 Not Found")),
+            ("403 Forbidden", "1.2.3", None),
+            ("429 Too Many Requests", "1.2.4", None),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let root = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
-                for (expected, reply) in [
+                let mut requests = vec![
                     (
                         "GET /api".to_owned(),
                         format!("{status}\r\nContent-Length: 0"),
@@ -364,11 +388,11 @@ mod tests {
                         "302 Found\r\nLocation: /tag/v1.2.3".into(),
                     ),
                     ("HEAD /tag/v1.2.3".into(), "200 OK".into()),
-                    (
-                        format!("HEAD /download/v1.2.3/{asset}"),
-                        "200 OK\r\nContent-Length: 12345".into(),
-                    ),
-                ] {
+                ];
+                if let Some(reply) = asset_reply {
+                    requests.push((format!("HEAD /download/v1.2.3/{asset}"), reply.into()));
+                }
+                for (expected, reply) in requests {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut lines = BufReader::new(&mut stream).lines();
                     assert_eq!(
@@ -389,10 +413,16 @@ mod tests {
                 .timeout(std::time::Duration::from_secs(3))
                 .build()
                 .unwrap();
-            let release = latest_release(&client, &format!("{root}/api"), &root, Some(asset))
-                .await
-                .unwrap();
+            let release =
+                latest_release(&client, &format!("{root}/api"), &root, Some(asset), current)
+                    .await
+                    .unwrap();
             assert_eq!(release.tag_name, "v1.2.3");
+            if !asset_reply.is_some_and(|reply| reply.starts_with("200")) {
+                assert!(release.assets.is_empty());
+                server.await.unwrap();
+                continue;
+            }
             assert_eq!(release.assets[0].size, Some(12345));
             assert_eq!(
                 release.assets[0].browser_download_url,

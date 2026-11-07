@@ -29,6 +29,9 @@ fn main() -> Result<()> {
     // UI backend), or explicitly as `sockrocket-cli cgi`. Synchronous, no tokio
     // runtime — the router CPU pays for one process spawn per call and
     // nothing more.
+    if env::args().nth(1).as_deref() == Some("--merlin-update-worker") {
+        return cgi::merlin_update_worker();
+    }
     if env::args().nth(1).as_deref() == Some("--subscription-worker") {
         return cgi::subscription_worker(
             &env::args()

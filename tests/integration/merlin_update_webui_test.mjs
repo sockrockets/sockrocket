@@ -26,3 +26,35 @@ const reconnect = poll({}, true);
 assert.match(reconnect.text, /等待管理接口恢复/);
 assert.equal(reconnect.timers.length, 1);
 console.log('PASS: terminal update states, active polling and API reconnect');
+
+for (const [status, label] of [['checking','核对版本'],['downloading','下载软件包'],['verifying','校验软件包']]) {
+  const result = poll({active:true,status,job_id:'current'});
+  assert.ok(result.text.includes(label));
+  assert.equal(result.timers.length, 1);
+}
+const elements = new Map();
+const checkContext = vm.createContext({
+  srElement: name => {
+    if (!elements.has(name)) elements.set(name, {style:{}});
+    return elements.get(name);
+  },
+  srApi: (_action,_data,ok) => ok({available:true,latest:'1.2.3',asset_url:null,html_url:'release-page'}),
+  srShowMsg: () => {},
+});
+new vm.Script(page.slice(page.indexOf('var pendingUpdateAsset'), page.indexOf('var srUpdatePollTimer')) + '\nsrCheckUpdate();').runInContext(checkContext);
+assert.match(elements.get('update-status').textContent, /1\.2\.3.*未找到适配当前机型的软件包/);
+assert.equal(elements.get('btn-apply-update').style.display, 'none');
+assert.equal(elements.get('btn-update-link').href, 'release-page');
+console.log('PASS: preinstall progress and missing platform package');
+{
+  const element = {textContent: ''};
+  const timers = [];
+  const ctx = vm.createContext({
+    srElement: () => element, clearTimeout: () => {}, setTimeout: cb => timers.push(cb),
+    srApi: (_action, _data, ok) => ok({active:false,status:'success: old update',job_id:'old'}),
+  });
+  new vm.Script(source + "\nsrUpdateJobId = 'current'; srUpdateLaunchDeadline = Date.now() + 30000; srPollUpdate();").runInContext(ctx);
+  assert.match(element.textContent, /确认本次更新任务/);
+  assert.equal(timers.length, 1);
+}
+console.log('PASS: stale success cannot complete a newly submitted update');
