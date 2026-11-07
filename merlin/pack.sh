@@ -18,7 +18,7 @@
 #     Expects release binaries already built at:
 #       target/aarch64-unknown-linux-musl/release/sockrocket-cli
 #       target/armv7-unknown-linux-musleabihf/release/sockrocket-cli
-#       target/armv7-unknown-linux-musleabi/release/sockrocket-cli   (optional; falls back to hf)
+#       target/armv7-unknown-linux-musleabi/release/sockrocket-cli
 #
 #   OUT_DIR=dist/merlin ./merlin/pack.sh
 
@@ -41,9 +41,11 @@ if [ ! -x "$ARMV7HF_BIN" ]; then
   exit 1
 fi
 if [ ! -x "$ARMV7SF_BIN" ]; then
-  echo "armv7 softfloat binary missing; reusing hardfloat for platform 'arm'" >&2
-  ARMV7SF_BIN="$ARMV7HF_BIN"
+  echo "missing armv7 softfloat binary: $ARMV7SF_BIN" >&2
+  exit 1
 fi
+
+python3 "$ROOT/tools/verify-merlin-targets.py" "$AARCH64_BIN" "$ARMV7HF_BIN" "$ARMV7SF_BIN"
 
 pack_one() {
   local platform="$1"
@@ -62,7 +64,11 @@ pack_one() {
 
   cp "$ROOT/merlin/install.sh" "$ROOT/merlin/uninstall.sh" \
      "$ROOT/merlin/config.yaml.template" "$ROOT/merlin/version" "$pkg/"
-  printf '%s\n' "$platform" > "$pkg/.valid"
+  cp "$ROOT/docs/merlin-models.md" "$pkg/"
+  local marker="$platform"
+  # Legacy Koolshare checks this firmware tag before running install.sh.
+  if [ "$platform" = arm ]; then marker=arm386; fi
+  printf '%s\n' "$marker" > "$pkg/.valid"
 
   cp "$ROOT/merlin/scripts/update.sh" "$ROOT/merlin/scripts/sockrocket.sh" "$ROOT/merlin/scripts/iptables.sh" \
      "$ROOT/merlin/scripts/dnsmasq-postconf.sh" \
@@ -105,22 +111,21 @@ pack_one hnd   "$ARMV7HF_BIN"
 pack_one qca   "$ARMV7HF_BIN"
 pack_one ipq32 "$ARMV7HF_BIN"
 
-# legacy arm (prefer softfloat when available)
+# Legacy BCM470x firmware uses the soft-float ABI.
 pack_one arm "$ARMV7SF_BIN"
 
 # Standalone binaries for --online / manual replace
 cp "$AARCH64_BIN" "$OUT_DIR/sockrocket-cli-linux-aarch64"
 cp "$ARMV7HF_BIN" "$OUT_DIR/sockrocket-cli-linux-armv7"
-if [ "$ARMV7SF_BIN" != "$ARMV7HF_BIN" ]; then
-  cp "$ARMV7SF_BIN" "$OUT_DIR/sockrocket-cli-linux-armv7sf"
-fi
+cp "$ARMV7SF_BIN" "$OUT_DIR/sockrocket-cli-linux-armv7sf"
+cp "$ROOT/docs/merlin-models.md" "$OUT_DIR/"
 
 (
   cd "$OUT_DIR"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum sockrocket-merlin-*.tar.gz sockrocket-cli-linux-* > SHA256SUMS-merlin.txt
+    sha256sum sockrocket-merlin-*.tar.gz sockrocket-cli-linux-* merlin-models.md > SHA256SUMS-merlin.txt
   else
-    shasum -a 256 sockrocket-merlin-*.tar.gz sockrocket-cli-linux-* > SHA256SUMS-merlin.txt
+    shasum -a 256 sockrocket-merlin-*.tar.gz sockrocket-cli-linux-* merlin-models.md > SHA256SUMS-merlin.txt
   fi
   cat SHA256SUMS-merlin.txt
 )

@@ -124,7 +124,7 @@ The router plugin includes a WebUI, transparent proxy, DNS capture and service c
 *Sanitized interface capture. Runtime metrics reflect the capture time, not live status.*
 
 1. If the menu has no Software Center, download a Merlin or official-mod build for your model from [fw.koolcenter.com](https://fw.koolcenter.com/) and flash it. Upstream Merlin does not include Software Center.
-2. Choose `sockrocket-merlin-<platform>.tar.gz` for the firmware platform and CPU architecture; do not guess from the model name alone.
+2. Find your exact model and firmware architecture in the [model-to-package table](docs/merlin.md#model--platform). Each release also includes `merlin-models.md`.
 3. Follow the [Merlin guide](docs/merlin.md) to configure JFFS / custom scripts and install the package.
 4. Configure subscriptions locally on the router. Verify the node before enabling DNS capture or transparent proxy. To send some traffic through a node group, stay in Rule mode and set that rule's exit to the group.
 5. Back up configuration before updates and verify manual stop / network recovery before relying on the setup.

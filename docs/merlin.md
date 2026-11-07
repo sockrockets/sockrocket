@@ -36,18 +36,20 @@ uname -m
 | Platform | Package | CPU binary | SoC family |
 |----------|---------|------------|------------|
 | `arm` | `sockrocket-merlin-arm.tar.gz` | armv7 softfloat | BCM4708 / BCM4709 |
-| `hnd` | `sockrocket-merlin-hnd.tar.gz` | armv7 hardfloat | BCM6750 / BCM6755 (`axhnd.675x`) |
+| `hnd` | `sockrocket-merlin-hnd.tar.gz` | armv7 hardfloat | BCM675x / BCM676x with 32-bit userspace |
 | `hnd_v8` | `sockrocket-merlin-hnd_v8.tar.gz` | aarch64 | BCM4906 / BCM4908 / BCM4912 / BCM4916 |
 | `qca` | `sockrocket-merlin-qca.tar.gz` | armv7 hardfloat | Qualcomm IPQ807x |
 | `mtk` | `sockrocket-merlin-mtk.tar.gz` | aarch64 | MediaTek Filogic / MT798x |
 | `ipq32` | `sockrocket-merlin-ipq32.tar.gz` | armv7 hardfloat | Qualcomm IPQ53xx **32-bit** userspace |
 | `ipq64` | `sockrocket-merlin-ipq64.tar.gz` | aarch64 | Qualcomm IPQ53xx **64-bit** userspace |
 
-**vs fancyss:** koolshare’s `fancyss_hnd` covers both BCM490x (ARMv8) and BCM675x (ARMv7) in one tree. Sockrocket **splits** them into `hnd_v8` (aarch64) and `hnd` (armv7hf) so the binary matches the CPU. Picking the wrong one is the most common install failure.
+The legacy ARM installer accepts `arm384` or `arm386` in `.valid`. The current packer writes `arm386`; the original v0.0.19 release wrote `arm`. The Broadcom HND installer recognizes the substring `hnd` for both HND packages, so choose the ABI for the firmware from the model table.
 
 ---
 
 ## Model → platform
+
+[完整中文型号与安装包对照](merlin-models.md) · The same guide ships with the packages.
 
 Co-branded / limited editions (Gundam, Call of Duty, Haiyan, …) use the **same** platform as the base SKU. When a model exists as both 梅林改 and 官改, the Sockrocket package tag is the same; only the firmware/software-center build differs.
 
@@ -113,6 +115,8 @@ Research sources (2026-11-04): [fancyss 3.0 model and architecture table](https:
 | TUF-AX5400 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
 | RT-AX58U | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
 | RT-AX58U_V2 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| RAX70 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
+| RT-AX1800 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
 | RAX50 | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
 | RT-AX82U | BCM6750 | `sockrocket-merlin-hnd.tar.gz` |
 | RT-AX82U_V2 | BCM6755 | `sockrocket-merlin-hnd.tar.gz` |
@@ -135,6 +139,7 @@ For koolshare Merlin **384/386** (and similar) on classic AC series — not stoc
 | RT-AC66U_B1 | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
 | RT-AC1900 / RT-AC1900P | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
 | RT-AC87U | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
+| Netgear R6300 V2 | BCM4708 | `sockrocket-merlin-arm.tar.gz` |
 | RT-AC88U | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
 | RT-AC3100 | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
 | RT-AC3200 | BCM4709 | `sockrocket-merlin-arm.tar.gz` |
@@ -144,12 +149,13 @@ For koolshare Merlin **384/386** (and similar) on classic AC series — not stoc
 
 | Model | Typical SoC | Sockrocket installation package |
 |-------|-------------|---------------------------------|
-| RT-AX89X / RT-AC89X | IPQ8074 | `sockrocket-merlin-qca.tar.gz` |
+| RT-AX89X | IPQ8074 | `sockrocket-merlin-qca.tar.gz` |
 
 ### `mtk` — MediaTek Filogic / MT798x (aarch64)
 
 | Model | Typical SoC | Sockrocket installation package |
 |-------|-------------|---------------------------------|
+| TUF-AX4200Q | MT7986A | `sockrocket-merlin-mtk.tar.gz` |
 | TUF-AX4200 | MT7986 | `sockrocket-merlin-mtk.tar.gz` |
 | TUF-AX6000 | MT7986 | `sockrocket-merlin-mtk.tar.gz` |
 | RT-AX59U | MT7986 | `sockrocket-merlin-mtk.tar.gz` |
@@ -161,12 +167,12 @@ Newer Filogic SKUs: if softcenter rejects the offline package, check which `.val
 
 | Platform | Use when |
 |----------|----------|
-| `ipq32` | `uname -m` is `armv7l` on an IPQ53xx board |
-| `ipq64` | `uname -m` is `aarch64` on an IPQ53xx board |
+| `ipq32` | 32-bit ARM userspace on an IPQ53xx board |
+| `ipq64` | 64-bit AArch64 userspace on an IPQ53xx board |
 
 ZenWiFi BD4 (IPQ5322, 32-bit firmware): **`sockrocket-merlin-ipq32.tar.gz`**. TUF-BE6500 (IPQ5322, 64-bit firmware): **`sockrocket-merlin-ipq64.tar.gz`**.
 
-Prefer `uname -m` over the marketing model name — the same chassis can ship 32-bit or 64-bit userspace depending on the firmware port.
+Match the exact model, hardware revision and firmware userspace. A 64-bit kernel can run 32-bit userspace.
 
 ---
 

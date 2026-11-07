@@ -25,7 +25,7 @@ Preset coverage is a curated starting point, not a complete service endpoint lis
 
 ## Platforms (koolcenter)
 
-Packages are named `sockrocket-merlin-<platform>.tar.gz` with a matching `.valid` tag:
+Packages are named `sockrocket-merlin-<platform>.tar.gz` with a Software Center `.valid` tag. The legacy `arm` package uses `arm386` for the Koolshare 384/386 installer.
 
 Each package contains one executable at `bin/sockrocket-cli` and a Web UI
 source at `webui/sockrocket.asp` plus `webs/Module_sockrocket.asp` for Software Center preflight. The bundled installer publishes the Web UI
@@ -38,14 +38,14 @@ regular files and directories because the online updater rejects archive links.
 | Platform | CPU binary | SoC family |
 |----------|------------|------------|
 | `arm` | armv7 softfloat | BCM4708/4709 |
-| `hnd` | armv7 hardfloat | BCM675x |
+| `hnd` | armv7 hardfloat | BCM675x / BCM676x |
 | `hnd_v8` | aarch64 | BCM490x / BCM491x |
 | `qca` | armv7 hardfloat | IPQ807x |
 | `mtk` | aarch64 | MT798x |
 | `ipq32` | armv7 hardfloat | IPQ53xx 32-bit userspace |
 | `ipq64` | aarch64 | IPQ53xx 64-bit userspace |
 
-Unlike fancyss’s single `fancyss_hnd` tree, Sockrocket uses **`hnd_v8` for BCM490x** and **`hnd` for BCM675x**.
+Broadcom models use `hnd_v8` for 64-bit firmware and `hnd` for 32-bit HND firmware.
 
 | Platform | Example models |
 |----------|----------------|
@@ -56,6 +56,8 @@ Unlike fancyss’s single `fancyss_hnd` tree, Sockrocket uses **`hnd_v8` for BCM
 | `mtk` | TUF-AX4200 / 6000, RT-AX59U, GS7 / GS7 Air / GS-BE7200X, RT-AX57 Go, TX-AX6000, ZenWiFi BT8P |
 
 ZenWiFi BD4 uses `sockrocket-merlin-ipq32.tar.gz`; TUF-BE6500 uses `sockrocket-merlin-ipq64.tar.gz`.
+
+Every archive and the release assets include [the model-to-package guide](../docs/merlin-models.md). Packaging requires all three ABI-correct executables.
 
 Full model tables, including RT-BE88U / BE7200, other Wi-Fi 7 models, GS7 Pro / GS7 Pro Max, and firmware-platform checks: [docs/merlin.md](../docs/merlin.md).
 
