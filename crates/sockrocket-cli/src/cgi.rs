@@ -2115,19 +2115,21 @@ fn memory_usage(meminfo: &str) -> (Option<u64>, Option<u64>, &'static str) {
 fn wan_addresses(mut command: impl FnMut(&str, &[&str]) -> Option<String>) -> Vec<String> {
     use std::net::IpAddr;
     fn add(addresses: &mut Vec<IpAddr>, value: &str) {
-        if let Ok(ip) = value.trim().parse::<IpAddr>() {
-            if !ip.is_unspecified() && !ip.is_loopback() && !addresses.contains(&ip) {
-                addresses.push(ip);
-            }
+        if let Ok(ip) = value.trim().parse::<IpAddr>()
+            && !ip.is_unspecified()
+            && !ip.is_loopback()
+            && !addresses.contains(&ip)
+        {
+            addresses.push(ip);
         }
     }
     let mut addresses = Vec::new();
     // Local route lookups report the kernel-selected source, including PPP interfaces.
     for (family, destination) in [("-4", "192.0.2.1"), ("-6", "2001:db8::1")] {
-        if let Some(route) = command("ip", &[family, "route", "get", destination]) {
-            if let Some(src) = route.split_whitespace().skip_while(|t| *t != "src").nth(1) {
-                add(&mut addresses, src);
-            }
+        if let Some(route) = command("ip", &[family, "route", "get", destination])
+            && let Some(src) = route.split_whitespace().skip_while(|t| *t != "src").nth(1)
+        {
+            add(&mut addresses, src);
         }
     }
     let has_ipv4_route = addresses.iter().any(IpAddr::is_ipv4);
