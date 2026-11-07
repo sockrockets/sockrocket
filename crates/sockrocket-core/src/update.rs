@@ -114,6 +114,107 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+/// The public release page remains usable when GitHub limits REST requests.
+async fn merlin_web_release(
+    client: &reqwest::Client,
+    releases: &str,
+    asset: &str,
+) -> Result<GhRelease> {
+    let page = client
+        .head(format!("{releases}/latest"))
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
+    let html_url = page.url().as_str();
+    let tag = html_url
+        .strip_prefix(&format!("{releases}/tag/"))
+        .context("GitHub did not identify the latest release")?;
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    anyhow::ensure!(
+        version.split('.').count() == 3
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "Invalid GitHub release version"
+    );
+    let url = format!("{releases}/download/{tag}/{asset}");
+    let package = client
+        .head(&url)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("Cannot check release package")?;
+    let assets = if package.status() == reqwest::StatusCode::NOT_FOUND {
+        Vec::new()
+    } else {
+        anyhow::ensure!(
+            package.status().is_success(),
+            "Release package returned HTTP {}",
+            package.status()
+        );
+        let size = package
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
+            .filter(|size| *size > 0)
+            .context("Release package size unavailable")?;
+        vec![GhAsset {
+            name: asset.into(),
+            browser_download_url: url,
+            size: Some(size),
+        }]
+    };
+    Ok(GhRelease {
+        tag_name: tag.to_owned(),
+        html_url: html_url.to_owned(),
+        assets,
+    })
+}
+
+async fn latest_release(
+    client: &reqwest::Client,
+    api: &str,
+    releases: &str,
+    prefer_asset: Option<&str>,
+) -> Result<GhRelease> {
+    let response = client
+        .get(api)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .context("Failed to contact GitHub Releases")?;
+
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) && let Some(asset) = prefer_asset.filter(|name| {
+        name.strip_prefix("sockrocket-merlin-")
+            .and_then(|s| s.strip_suffix(".tar.gz"))
+            .and_then(merlin_package_asset)
+            .as_deref()
+            == Some(*name)
+    }) {
+        merlin_web_release(client, releases, asset)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "GitHub API returned HTTP {status}; official release lookup failed: {error}"
+                )
+            })
+    } else {
+        if !status.is_success() {
+            bail!("GitHub Releases returned HTTP {status}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse GitHub release JSON")
+    }
+}
+
 /// Query GitHub for the latest release and compare to `current` (e.g. `0.1.0`).
 ///
 /// `prefer_asset` is an exact asset file name to resolve a direct download URL.
@@ -128,22 +229,13 @@ pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Resu
         .build()
         .context("Failed to create HTTP client")?;
 
-    let response = client
-        .get(RELEASES_LATEST)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .context("Failed to contact GitHub Releases")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        bail!("GitHub Releases returned HTTP {status}");
-    }
-
-    let release: GhRelease = response
-        .json()
-        .await
-        .context("Failed to parse GitHub release JSON")?;
+    let release = latest_release(
+        &client,
+        RELEASES_LATEST,
+        "https://github.com/sockrockets/sockrocket/releases",
+        prefer_asset,
+    )
+    .await?;
 
     let latest = release
         .tag_name
@@ -253,6 +345,62 @@ async fn download_bytes(url: &str, socks: Option<std::net::SocketAddr>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn limited_api_resolves_pinned_merlin_package() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let asset = "sockrocket-merlin-hnd.tar.gz";
+        for status in ["403 Forbidden", "429 Too Many Requests"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let root = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for (expected, reply) in [
+                    (
+                        "GET /api".to_owned(),
+                        format!("{status}\r\nContent-Length: 0"),
+                    ),
+                    (
+                        "HEAD /latest".into(),
+                        "302 Found\r\nLocation: /tag/v1.2.3".into(),
+                    ),
+                    ("HEAD /tag/v1.2.3".into(), "200 OK".into()),
+                    (
+                        format!("HEAD /download/v1.2.3/{asset}"),
+                        "200 OK\r\nContent-Length: 12345".into(),
+                    ),
+                ] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut lines = BufReader::new(&mut stream).lines();
+                    assert_eq!(
+                        lines.next_line().await.unwrap().unwrap(),
+                        format!("{expected} HTTP/1.1")
+                    );
+                    while !lines.next_line().await.unwrap().unwrap().is_empty() {}
+                    stream
+                        .write_all(
+                            format!("HTTP/1.1 {reply}\r\nConnection: close\r\n\r\n").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let release = latest_release(&client, &format!("{root}/api"), &root, Some(asset))
+                .await
+                .unwrap();
+            assert_eq!(release.tag_name, "v1.2.3");
+            assert_eq!(release.assets[0].size, Some(12345));
+            assert_eq!(
+                release.assets[0].browser_download_url,
+                format!("{root}/download/v1.2.3/{asset}")
+            );
+            server.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn successful_download_does_not_use_fallback() {

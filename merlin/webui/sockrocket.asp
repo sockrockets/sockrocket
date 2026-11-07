@@ -3362,7 +3362,7 @@ function srCheckUpdate() {
   }, function () {
     st.textContent = '更新检查失败，请检查网络后重试';
     srShowMsg('更新检查失败', 'err');
-  }, 30000);
+  }, 70000);
 }
 var srUpdatePollTimer = null;
 function srPollUpdate() {
