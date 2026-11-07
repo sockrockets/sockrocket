@@ -83,24 +83,24 @@
           <li>WebUI → <strong>系统管理 → 固件升级</strong>，上传这个文件，等路由器自己重启。中途不要断电。</li>
           <li>重启后菜单里会出现软件中心。再到<strong>系统设置</strong>打开 JFFS 和自定义脚本，然后按下面的平台安装 Sockrocket。</li>
         </ol>
-        <p>官改和梅林改版使用同一个平台包。平台看 CPU，不看刷的是哪一条固件线。</p>
+        <p>请按完整型号、硬件修订版和所装固件的用户空间架构选包。</p>
         <h2 id="requirements">准备</h2>
         <ul>
           <li>Asus 路由器，固件为 <strong>AsusWRT-Merlin</strong>（建议 388.x+，含软件中心）。</li>
           <li>开启 <strong>JFFS</strong> 与自定义脚本（系统管理 → 系统设置）。</li>
-          <li>SSH 上执行 <code>uname -m</code>：<code>armv7l</code> 或 <code>aarch64</code>，用来对照下表。</li>
+          <li><code>uname -m</code> 显示内核架构。核对下表中的型号和固件架构，尤其注意 ARMv7 软浮点与硬浮点的区别。</li>
         </ul>
         <h2 id="packages">按平台选包</h2>
         <div class="doc-table"><table>
-          <thead><tr><th>平台</th><th>软件包</th><th>常见机型 / SoC</th></tr></thead>
+          <thead><tr><th>平台</th><th>固件架构</th><th>软件包</th><th>机型</th></tr></thead>
           <tbody>
-            <tr><td><code>hnd_v8</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz">sockrocket-merlin-hnd_v8.tar.gz</a></td><td>RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U PRO, RAX80, GT-AX11000, GT-AX11000 PRO, RT-AX92U, RT-AX68U, RT-AX86U, RT-AX86U PRO, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12, RT-BE88U, RT-BE7200, RT-BE86U, RT-BE96U, GT-BE96, GT-BE98, GT-BE98 Pro, GT-BE19000AI</td></tr>
-            <tr><td><code>hnd</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz">sockrocket-merlin-hnd.tar.gz</a></td><td>RT-BE92U, RT-BE82U, RT-BE58 Go, GS7 Pro, GS7 Pro Max, TUF-BE3600, TUF-BE3600 V2, TUF-AX5400 V2, ZenWiFi ET8, ZenWiFi XD6, ZenWiFi XT9, TUF-AX3000, TUF-AX3000 V2, TUF-AX5400, RT-AX58U, RT-AX58U V2, RAX70, RT-AX1800, RAX50, RT-AX82U, RT-AX82U V2, ZenWiFi XT8, ZenWiFi XT8 V2, ZenWiFi XD4, ZenWiFi XD4 Plus, RT-AX56U, RT-AX56U V2, RT-AX57, RT-AX55</td></tr>
-            <tr><td><code>arm</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz">sockrocket-merlin-arm.tar.gz</a></td><td>RT-AC68U, RT-AC68U V4, RT-AC66U B1, RT-AC1900, RT-AC1900P, RT-AC87U, Netgear R6300 V2, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300</td></tr>
-            <tr><td><code>qca</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz">sockrocket-merlin-qca.tar.gz</a></td><td>RT-AX89X</td></tr>
-            <tr><td><code>mtk</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz">sockrocket-merlin-mtk.tar.gz</a></td><td>GS7, GS7 Air, GS-BE7200X, TX-AX6000, ZenWiFi BT8P, RT-AX57 Go, TUF-AX4200Q, TUF-AX4200, TUF-AX6000, RT-AX59U</td></tr>
-            <tr><td><code>ipq32</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz">sockrocket-merlin-ipq32.tar.gz</a></td><td>ZenWiFi BD4</td></tr>
-            <tr><td><code>ipq64</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz">sockrocket-merlin-ipq64.tar.gz</a></td><td>TUF-BE6500</td></tr>
+            <tr><td><code>hnd_v8</code></td><td>AArch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz">sockrocket-merlin-hnd_v8.tar.gz</a></td><td>RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U PRO, RAX80, GT-AX11000, GT-AX11000 PRO, RT-AX92U, RT-AX68U, RT-AX86U, RT-AX86U PRO, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12, RT-BE88U, RT-BE7200, RT-BE86U, RT-BE96U, GT-BE96, GT-BE98, GT-BE98 Pro, GT-BE19000AI</td></tr>
+            <tr><td><code>hnd</code></td><td>ARMv7 · hard-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz">sockrocket-merlin-hnd.tar.gz</a></td><td>RT-BE92U, RT-BE82U, RT-BE58 Go, GS7 Pro, GS7 Pro Max, TUF-BE3600, TUF-BE3600 V2, TUF-AX5400 V2, ZenWiFi ET8, ZenWiFi XD6, ZenWiFi XT9, TUF-AX3000, TUF-AX3000 V2, TUF-AX5400, RT-AX58U, RT-AX58U V2, RAX70, RT-AX1800, RAX50, RT-AX82U, RT-AX82U V2, ZenWiFi XT8, ZenWiFi XT8 V2, ZenWiFi XD4, ZenWiFi XD4 Plus, RT-AX56U, RT-AX56U V2, RT-AX57, RT-AX55</td></tr>
+            <tr><td><code>arm</code></td><td>ARMv7 · soft-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz">sockrocket-merlin-arm.tar.gz</a></td><td>RT-AC68U, RT-AC68U V4, RT-AC66U B1, RT-AC1900, RT-AC1900P, RT-AC87U, Netgear R6300 V2, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300</td></tr>
+            <tr><td><code>qca</code></td><td>ARMv7 · hard-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz">sockrocket-merlin-qca.tar.gz</a></td><td>RT-AX89X</td></tr>
+            <tr><td><code>mtk</code></td><td>AArch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz">sockrocket-merlin-mtk.tar.gz</a></td><td>GS7, GS7 Air, GS-BE7200X, TX-AX6000, ZenWiFi BT8P, RT-AX57 Go, TUF-AX4200Q, TUF-AX4200, TUF-AX6000, RT-AX59U</td></tr>
+            <tr><td><code>ipq32</code></td><td>ARMv7 · hard-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz">sockrocket-merlin-ipq32.tar.gz</a></td><td>ZenWiFi BD4</td></tr>
+            <tr><td><code>ipq64</code></td><td>AArch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz">sockrocket-merlin-ipq64.tar.gz</a></td><td>TUF-BE6500</td></tr>
           </tbody>
         </table></div>
         <div class="doc-callout"><strong>和 fancyss 的差异</strong>fancyss 的 <code>hnd</code> 可能同时覆盖 ARMv7 与 ARMv8。Sockrocket 拆成 <code>hnd</code> 与 <code>hnd_v8</code>，必须和 CPU 一致，否则会出现 Exec format error。</div>
@@ -147,24 +147,24 @@
           <li>WebUI → <strong>Administration → Firmware Upgrade</strong>. Upload the file and wait for the router to reboot. Do not power it off.</li>
           <li>Software Center appears after reboot. Enable JFFS and custom scripts under System, then install the Sockrocket package for your platform below.</li>
         </ol>
-        <p>Official-mod and Merlin builds use the same platform package. The platform follows the CPU, not which firmware line you flashed.</p>
+        <p>Match the exact model, hardware revision and firmware userspace ABI.</p>
         <h2 id="en-requirements">Requirements</h2>
         <ul>
           <li>Asus router on <strong>AsusWRT-Merlin</strong> (388.x+ recommended) with Software Center.</li>
           <li><strong>JFFS</strong> and custom scripts enabled.</li>
-          <li>Run <code>uname -m</code> (<code>armv7l</code> or <code>aarch64</code>) and match the table below.</li>
+          <li>Use the model and firmware ABI below. <code>uname -m</code> reports the kernel architecture and cannot distinguish ARMv7 float ABIs.</li>
         </ul>
         <h2 id="en-packages">Pick a package</h2>
         <div class="doc-table"><table>
-          <thead><tr><th>Platform</th><th>Package</th><th>Typical models / SoC</th></tr></thead>
+          <thead><tr><th>Platform</th><th>Firmware ABI</th><th>Package</th><th>Models</th></tr></thead>
           <tbody>
-            <tr><td><code>hnd_v8</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz">sockrocket-merlin-hnd_v8.tar.gz</a></td><td>RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U PRO, RAX80, GT-AX11000, GT-AX11000 PRO, RT-AX92U, RT-AX68U, RT-AX86U, RT-AX86U PRO, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12, RT-BE88U, RT-BE7200, RT-BE86U, RT-BE96U, GT-BE96, GT-BE98, GT-BE98 Pro, GT-BE19000AI</td></tr>
-            <tr><td><code>hnd</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz">sockrocket-merlin-hnd.tar.gz</a></td><td>RT-BE92U, RT-BE82U, RT-BE58 Go, GS7 Pro, GS7 Pro Max, TUF-BE3600, TUF-BE3600 V2, TUF-AX5400 V2, ZenWiFi ET8, ZenWiFi XD6, ZenWiFi XT9, TUF-AX3000, TUF-AX3000 V2, TUF-AX5400, RT-AX58U, RT-AX58U V2, RAX70, RT-AX1800, RAX50, RT-AX82U, RT-AX82U V2, ZenWiFi XT8, ZenWiFi XT8 V2, ZenWiFi XD4, ZenWiFi XD4 Plus, RT-AX56U, RT-AX56U V2, RT-AX57, RT-AX55</td></tr>
-            <tr><td><code>arm</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz">sockrocket-merlin-arm.tar.gz</a></td><td>RT-AC68U, RT-AC68U V4, RT-AC66U B1, RT-AC1900, RT-AC1900P, RT-AC87U, Netgear R6300 V2, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300</td></tr>
-            <tr><td><code>qca</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz">sockrocket-merlin-qca.tar.gz</a></td><td>RT-AX89X</td></tr>
-            <tr><td><code>mtk</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz">sockrocket-merlin-mtk.tar.gz</a></td><td>GS7, GS7 Air, GS-BE7200X, TX-AX6000, ZenWiFi BT8P, RT-AX57 Go, TUF-AX4200Q, TUF-AX4200, TUF-AX6000, RT-AX59U</td></tr>
-            <tr><td><code>ipq32</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz">sockrocket-merlin-ipq32.tar.gz</a></td><td>ZenWiFi BD4</td></tr>
-            <tr><td><code>ipq64</code></td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz">sockrocket-merlin-ipq64.tar.gz</a></td><td>TUF-BE6500</td></tr>
+            <tr><td><code>hnd_v8</code></td><td>AArch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd_v8.tar.gz">sockrocket-merlin-hnd_v8.tar.gz</a></td><td>RT-AC86U, GT-AC2900, GT-AC5300, RT-AX88U, RT-AX88U PRO, RAX80, GT-AX11000, GT-AX11000 PRO, RT-AX92U, RT-AX68U, RT-AX86U, RT-AX86U PRO, RT-AX86S, GT-AXE11000, GT-AXE16000, GT-AX6000, ZenWiFi Pro XT12, RT-BE88U, RT-BE7200, RT-BE86U, RT-BE96U, GT-BE96, GT-BE98, GT-BE98 Pro, GT-BE19000AI</td></tr>
+            <tr><td><code>hnd</code></td><td>ARMv7 · hard-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-hnd.tar.gz">sockrocket-merlin-hnd.tar.gz</a></td><td>RT-BE92U, RT-BE82U, RT-BE58 Go, GS7 Pro, GS7 Pro Max, TUF-BE3600, TUF-BE3600 V2, TUF-AX5400 V2, ZenWiFi ET8, ZenWiFi XD6, ZenWiFi XT9, TUF-AX3000, TUF-AX3000 V2, TUF-AX5400, RT-AX58U, RT-AX58U V2, RAX70, RT-AX1800, RAX50, RT-AX82U, RT-AX82U V2, ZenWiFi XT8, ZenWiFi XT8 V2, ZenWiFi XD4, ZenWiFi XD4 Plus, RT-AX56U, RT-AX56U V2, RT-AX57, RT-AX55</td></tr>
+            <tr><td><code>arm</code></td><td>ARMv7 · soft-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-arm.tar.gz">sockrocket-merlin-arm.tar.gz</a></td><td>RT-AC68U, RT-AC68U V4, RT-AC66U B1, RT-AC1900, RT-AC1900P, RT-AC87U, Netgear R6300 V2, RT-AC88U, RT-AC3100, RT-AC3200, RT-AC5300</td></tr>
+            <tr><td><code>qca</code></td><td>ARMv7 · hard-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-qca.tar.gz">sockrocket-merlin-qca.tar.gz</a></td><td>RT-AX89X</td></tr>
+            <tr><td><code>mtk</code></td><td>AArch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-mtk.tar.gz">sockrocket-merlin-mtk.tar.gz</a></td><td>GS7, GS7 Air, GS-BE7200X, TX-AX6000, ZenWiFi BT8P, RT-AX57 Go, TUF-AX4200Q, TUF-AX4200, TUF-AX6000, RT-AX59U</td></tr>
+            <tr><td><code>ipq32</code></td><td>ARMv7 · hard-float</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq32.tar.gz">sockrocket-merlin-ipq32.tar.gz</a></td><td>ZenWiFi BD4</td></tr>
+            <tr><td><code>ipq64</code></td><td>AArch64</td><td><a href="https://github.com/sockrockets/sockrocket/releases/latest/download/sockrocket-merlin-ipq64.tar.gz">sockrocket-merlin-ipq64.tar.gz</a></td><td>TUF-BE6500</td></tr>
           </tbody>
         </table></div>
         <div class="doc-callout"><strong>Unlike fancyss</strong>Sockrocket splits <code>hnd</code> and <code>hnd_v8</code>. The wrong one fails with Exec format error.</div>

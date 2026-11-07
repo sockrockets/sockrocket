@@ -51,29 +51,34 @@ class PackageTest(unittest.TestCase):
             self.assertEqual(len(list(out.glob('*.tar.gz'))), len(platforms))
             guide = (ROOT / 'docs/merlin-models.md').read_bytes()
             self.assertEqual((out / 'merlin-models.md').read_bytes(), guide)
-            rows = re.findall(r'^\| ([^|]+) \| [^|]+ \| `(\w+)` \| `(sockrocket-merlin-(\w+)\.tar\.gz)` \|$',
+            rows = re.findall(r'^\| ([^|]+) \| ([^|]+) \| `(\w+)` \| `(sockrocket-merlin-(\w+)\.tar\.gz)` \|$',
                               guide.decode(), re.MULTILINE)
-            self.assertEqual({name for _, _, name, _ in rows}, {p.name for p in out.glob('*.tar.gz')})
+            self.assertEqual({name for _, _, _, name, _ in rows}, {p.name for p in out.glob('*.tar.gz')})
             # Representative firmware families, including similar AC/AX model names.
             reference_models = {'arm': 'RT-AC88U', 'hnd': 'RT-AX58U', 'hnd_v8': 'RT-AX88U',
                                 'qca': 'RT-AX89X', 'mtk': 'TX-AX6000',
                                 'ipq32': 'ZenWiFi BD4', 'ipq64': 'TUF-BE6500'}
             known_models = set()
-            for models, _, _, platform in rows:
+            for models, _, _, _, platform in rows:
                 names = models.split('、')
                 self.assertIn(reference_models[platform], names)
                 self.assertTrue(known_models.isdisjoint(names))
                 known_models.update(names)
-            markers = {platform: marker for _, marker, _, platform in rows}
+            markers = {platform: marker for _, _, marker, _, platform in rows}
             homepage = (ROOT / 'docs/site/index.html').read_text()
             install_guide = (ROOT / 'docs/site/docs/merlin.html').read_text()
-            for models, _, name, platform in rows:
+            for models, firmware_abi, _, name, platform in rows:
+                expected_abi = {'armv7sf': 'ARMv7 软浮点', 'armv7': 'ARMv7 硬浮点',
+                                'aarch64': 'AArch64'}[platforms[platform]]
+                self.assertEqual(firmware_abi, expected_abi)
+                site_abi = expected_abi.replace(' 软浮点', ' · soft-float').replace(' 硬浮点', ' · hard-float')
                 # Check the actual download link in each rendered table row.
                 expected_models = models.replace('、', ', ')
                 for page in (homepage, install_guide):
                     page_rows = re.findall(r'<tr><td><code>' + platform + r'</code>.*?</tr>', page)
-                    self.assertTrue(page_rows, platform)
+                    self.assertEqual(len(page_rows), 1 if page == homepage else 2, platform)
                     for row in page_rows:
+                        self.assertIn('<td>' + site_abi + '</td>', row)
                         self.assertIn('>' + expected_models + '</td>', row)
                         self.assertIn('/download/' + name + '"', row)
             for platform, arch in platforms.items():
