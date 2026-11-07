@@ -53,8 +53,8 @@ assert.equal(el('device-picker').options.filter(o=>o.value.startsWith('192.0.2.8
 el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();
 assert.equal(el('device-target').value,'direct');
 assert.equal(el('device-group').value,'Emby');
-assert.deepEqual(el('global-rule-group').options.map(o=>o.value),['Emby']);
-assert.match(el('global-rule-summary').textContent,/共 1 条，已启用 1 条/);
+assert.deepEqual(el('global-rule-group').options.map(o=>o.value),['','Emby']);
+assert.match(el('global-rule-summary').textContent,/共 2 条，已启用 2 条/);
 assert.equal(el('device-group-target').value,'direct');
 assert.equal(el('device-unlink').hidden,false);
 for(const name of ['Music','Work'])c.SR_STATE.ruleRows.push({index:c.SR_STATE.ruleRows.length,rule_type:'domain',source:'',group:name,enabled:true,pattern:name+'.invalid',target:'proxy'});

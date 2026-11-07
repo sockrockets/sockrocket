@@ -17,6 +17,10 @@ assert.match(element('rule-list').innerHTML,/editRule\(0\)/);
 assert.equal(c.changeRuleGroup('Services'),true);
 assert.match(element('rule-list').innerHTML,/editRule\(3\)/,'normal group navigation restores all sources');
 
+vm.runInContext(source.slice(source.indexOf('function selectGroupContents()'),source.indexOf('function renderDevicePolicies()')),c);
+element('rule-search').value='no-match';element('global-rule-group').value='Services';
+c.selectGroupContents();assert.match(element('rule-count').textContent,/当前显示 4 条/);
+element('rule-search').value='SERVICES';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 4 条/);
 element('rule-search').value='192.0.2.0';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 1 条/);assert.match(element('rule-group-summary').textContent,/共 4 条/);
 c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_MEMBERS.length,4);assert.equal(element('rule-list-panel').hidden,true);
 assert.match(element('rule-batch').value,/DOMAIN-SUFFIX,example.invalid,PROXY/);assert.match(element('rule-batch').value,/SOURCE,192.0.2.4,DST-PORT,443,DIRECT/);assert.match(element('rule-batch').value,/MATCH,PROXY/);
