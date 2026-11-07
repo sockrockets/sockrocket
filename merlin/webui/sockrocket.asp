@@ -528,12 +528,18 @@ body.bg {min-width:0!important}
               <div id="sr-device-specific">
                 <div class="toolbar"><button type="button" class="btn btn-sm" id="sr-device-trace" onclick="inspectDeviceTraffic()">检查这台设备的分流</button></div>
                 <details><summary>自定义设备名称</summary><div class="toolbar"><input id="sr-device-alias" aria-label="自定义设备名称" maxlength="48" placeholder="例如 客厅电视"><button class="btn btn-sm" onclick="saveDeviceAlias()">保存名称</button></div></details>
-                <div class="form-grid">
-                  <div class="fg"><label for="sr-device-group">关联规则组</label><select id="sr-device-group" onchange="renderDeviceBinding()"></select></div>
-                  <div class="fg"><label for="sr-device-group-target">命中该组时</label><select id="sr-device-group-target"></select></div>
+                <details id="sr-device-add-groups"><summary>添加规则组（可多选）</summary>
+                  <div class="pg-member-list" id="sr-device-available-groups" onchange="updateDeviceAddCount()"></div>
+                  <div class="toolbar"><button type="button" id="sr-device-add-selected" class="btn btn-accent btn-sm" disabled onclick="addDeviceGroups()">关联所选组</button></div>
+                </details>
+                <div id="sr-device-bound-editor" hidden>
+                  <div class="form-grid">
+                    <div class="fg"><label for="sr-device-group">已关联的规则组</label><select id="sr-device-group" onchange="renderDeviceBinding()"></select></div>
+                    <div class="fg"><label for="sr-device-group-target">命中该组时</label><select id="sr-device-group-target"></select></div>
+                  </div>
+                  <p id="sr-device-group-state" class="hint" aria-live="polite"></p>
+                  <div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-device-link" onclick="saveDeviceBinding(false)">保存该组出口</button><button class="btn btn-sm" id="sr-device-unlink" onclick="saveDeviceBinding(true)">解除该组关联</button></div>
                 </div>
-                <p id="sr-device-group-state" class="hint" aria-live="polite"></p>
-                <div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-device-link" onclick="saveDeviceBinding(false)">关联规则组</button><button class="btn btn-sm" id="sr-device-unlink" onclick="saveDeviceBinding(true)" hidden>解除关联</button></div>
               </div>
               <div class="toolbar" style="margin-top:14px"><div class="fg"><label for="sr-device-target">其余流量的默认出口</label><select id="sr-device-target"></select></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存默认出口</button></div>
               <p class="hint" id="sr-device-policy-list" aria-live="polite"></p>
@@ -2127,15 +2133,36 @@ function updateDevicePolicySelection() {
   srElement('device-trace').hidden=network.prefix!==network.width;
   var record=deviceRecord();
   srElement('device-alias').value=record && record.alias || '';
-  var groups=new Map();
-  rows.forEach(function(r){var name=(r.group||'').trim();if(!r.source && name && !isFinalRule(r))groups.set(name,true);});
-  bindings.forEach(function(b){groups.set(b.group,true);});
+  var bound=new Set(bindings.map(function(b){return b.group;})), available=new Set();
+  rows.forEach(function(r){
+    var name=(r.group||'').trim();
+    if(!r.source && name && !isFinalRule(r) && !bound.has(name))available.add(name);
+  });
+  srElement('device-available-groups').innerHTML=Array.from(available,function(name){
+    return '<label class="pg-member"><input type="checkbox" value="'+srEsc(name)+'"><span>'+srEsc(name)+'</span></label>';
+  }).join('') || '<p class="hint">没有可添加的规则组</p>';
+  srElement('device-add-groups').open=!bindings.length;
+  updateDeviceAddCount();
+  srElement('device-bound-editor').hidden=!bindings.length;
   var group=srElement('device-group'),previous=group.value;
-  group.innerHTML=Array.from(groups.keys(),function(name){
-    return deviceOption(name,name+(bindings.some(function(b){return b.group===name;})?' · 已关联':''));
-  }).join('') || deviceOption('','暂无可关联的规则组');
-  group.value=groups.has(previous)?previous:bindings.length?bindings[0].group:(groups.keys().next().value || '');
-  renderDeviceBinding();
+  group.innerHTML=bindings.map(function(b){return deviceOption(b.group,b.group);}).join('');
+  group.value=bound.has(previous)?previous:(bindings.length?bindings[0].group:'');
+  if(bindings.length)renderDeviceBinding();
+}
+function selectedDeviceGroups() {
+  return Array.from(srElement('device-available-groups').querySelectorAll('input:checked'),function(box){return box.value;});
+}
+function updateDeviceAddCount() {
+  var count=selectedDeviceGroups().length, button=srElement('device-add-selected');
+  button.disabled=!count;
+  button.textContent=count?'关联所选 '+count+' 个组':'关联所选组';
+}
+function addDeviceGroups() {
+  var groups=selectedDeviceGroups(),source=deviceSource();
+  if(!sourceNetwork(source) || !groups.length || ruleWorkspaceLocked())return;
+  if(confirm('为此设备添加 '+groups.length+' 个规则组？新关联将沿用各组规则的出口。')){
+    ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,groups:groups},toastResp);
+  }
 }
 function renderDeviceBinding() {
   var group=srElement('device-group').value;
@@ -2146,7 +2173,7 @@ function renderDeviceBinding() {
   target.value=bind?bind.target:'';
   var members=(SR_STATE.ruleRows||[]).filter(function(r){return !r.source && (r.group||'').trim()===group && !isFinalRule(r);});
   srElement('device-link').disabled=!group || !members.length;
-  srElement('device-link').textContent=bind?'保存关联出口':'关联规则组';
+  srElement('device-link').textContent='保存该组出口';
   srElement('device-unlink').hidden=!bind;
   srElement('device-group-state').textContent=group?'组内已启用 '+members.filter(function(r){return r.enabled!==false;}).length+' 条全局目的规则。新增、修改或停用规则会同步到此设备。':'请先在下方规则编辑器中创建包含目的规则的分组。';
 }

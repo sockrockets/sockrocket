@@ -4960,6 +4960,43 @@ dns_direct_domains:
         );
         assert_eq!(added["ok"], true, "{added}");
         assert_eq!(trace("192.0.2.8", "new.invalid"), "reject");
+        for (group, host) in [("Music", "music.invalid"), ("Work", "work.invalid")] {
+            let added = dispatch(
+                "batch_add_rules",
+                &json!({"group":group,"text":format!("DOMAIN,{host},DIRECT"),"target":"proxy"}),
+            );
+            assert_eq!(added["ok"], true, "{added}");
+        }
+        let add_groups = |groups: &[&str]| {
+            dispatch(
+                "save_device_binding",
+                &json!({"revision":revision(),"source":"192.0.2.8","groups":groups}),
+            )
+        };
+        assert_eq!(add_groups(&["Music", "Missing"])["ok"], false);
+        assert_eq!(
+            act_get_rules()["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(add_groups(&["Music", "Work", "Video", "Music"])["ok"], true);
+        assert_eq!(
+            act_get_rules()["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let changed = dispatch(
+            "save_device_binding",
+            &json!({"revision":revision(),"source":"192.0.2.8","group":"Music","target":"proxy"}),
+        );
+        assert_eq!(changed["ok"], true);
+        assert_eq!(trace("192.0.2.8", "tv.invalid"), "reject");
+        assert_eq!(trace("192.0.2.8", "music.invalid"), "proxy");
+        assert_eq!(trace("192.0.2.8", "work.invalid"), "direct");
         let saved_config = fs::read(conf_path()).unwrap();
         let alias = json!({"source":"192.0.2.8","key":"mac:02:00:00:00:00:01","name":"客厅电视","previous":""});
         assert_eq!(dispatch("save_device_alias", &alias)["ok"], true);
@@ -4982,6 +5019,14 @@ dns_direct_domains:
         );
         assert_eq!(removed["ok"], true);
         assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
+        assert_eq!(
+            act_get_rules()["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(trace("192.0.2.8", "music.invalid"), "proxy");
     }
 
     #[test]

@@ -39,6 +39,7 @@ c.loadProxyGroups();const old=take('proxy_groups');c.loadProxyGroups();take('pro
 // Load the real source/CIDR, phase and locking helpers used by the device editor.
 vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')),c);
 c.RULE_RULE_REVISION='r1';
+el('device-available-groups').querySelectorAll=()=>el('device-available-groups').options.filter(box=>box.checked);
 c.ruleApi=(...args)=>requests.push(args);
 c.SR_STATE.devices=[{source:'192.0.2.8/32',key:'mac:00:11:22:33:44:55',alias_key:'mac:00:11:22:33:44:55',alias:'电视',host:'living-room'}];
 c.SR_STATE.ruleRows=[
@@ -54,6 +55,15 @@ assert.equal(el('device-target').value,'direct');
 assert.equal(el('device-group').value,'Emby');
 assert.equal(el('device-group-target').value,'direct');
 assert.equal(el('device-unlink').hidden,false);
+for(const name of ['Music','Work'])c.SR_STATE.ruleRows.push({index:c.SR_STATE.ruleRows.length,rule_type:'domain',source:'',group:name,enabled:true,pattern:name+'.invalid',target:'proxy'});
+c.updateDevicePolicySelection();
+const choices=el('device-available-groups').options;
+assert.deepEqual(choices.map(row=>row.value),['Music','Work']);
+choices.forEach(box=>box.checked=true);c.updateDeviceAddCount();
+assert.equal(el('device-add-selected').disabled,false);
+c.addDeviceGroups();const batch=take('save_device_binding')[1];
+assert.deepEqual([...batch.groups],['Music','Work']);assert.equal(batch.source,'192.0.2.8/32');
+assert.equal(requests.length,0,'adding multiple groups sends a single request');
 const stages=c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','192.0.2.8');
 assert.deepEqual([...stages.find(s=>s.kind==='device_link').targets],['direct']);
 el('device-group-target').value='group:Video';c.saveDeviceBinding(false);req=take('save_device_binding');

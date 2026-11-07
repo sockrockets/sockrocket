@@ -32,8 +32,7 @@ pub(super) fn save_binding(post: &J) -> J {
     let Ok(source) = requested_rule_source(post, "") else {
         return err_msg("请填写有效的设备 IP 或网段");
     };
-    let group = post["group"].as_str().unwrap_or("").trim();
-    if source.is_empty() || group.is_empty() {
+    if source.is_empty() {
         return err_msg("请选择设备和规则组");
     }
     let Ok(mut bindings) = links(&map) else {
@@ -42,6 +41,47 @@ pub(super) fn save_binding(post: &J) -> J {
     let Ok(rules) = checked_rules(&map) else {
         return err_msg("规则配置无效");
     };
+    // Adding several groups is one configuration write and one service apply.
+    // Existing bindings retain their per-device exits, including on retry.
+    if let Some(names) = post.get("groups") {
+        let Some(names) = names.as_array().filter(|v| !v.is_empty() && v.len() <= 256) else {
+            return err_msg("请选择 1 至 256 个规则组");
+        };
+        let eligible: std::collections::HashSet<_> = rules
+            .iter()
+            .filter(|r| r.is_global_destination())
+            .map(|r| r.group.trim())
+            .collect();
+        let before = bindings.len();
+        for name in names {
+            let Some(group) = name
+                .as_str()
+                .map(str::trim)
+                .filter(|g| !g.is_empty() && eligible.contains(g))
+            else {
+                return err_msg("所选组中有无效规则组，请刷新后重试");
+            };
+            if !bindings
+                .iter()
+                .any(|b| b.source == source && b.group == group)
+            {
+                bindings.push(DeviceRuleGroup {
+                    source: source.clone(),
+                    group: group.into(),
+                    target: String::new(),
+                });
+            }
+        }
+        if bindings.len() == before {
+            return json!({"ok":true,"msg":"所选组均已关联"});
+        }
+        store_links(&mut map, &bindings);
+        return proxy_groups::applied(&map);
+    }
+    let group = post["group"].as_str().unwrap_or("").trim();
+    if group.is_empty() {
+        return err_msg("请选择规则组");
+    }
     let remove = post["remove"].as_bool() == Some(true);
     let Some(target) = post["target"].as_str() else {
         return err_msg("请选择规则组出口");

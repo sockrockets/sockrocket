@@ -40,7 +40,7 @@ The desktop app edits and applies global rules. When it opens a shared configura
 
 Under **设备分流策略**, select a router client, a previously configured device, or a manual IP/network. The picker uses local DHCP leases and bridge neighbors. Names can be edited in the plugin. A discovered device's custom name is keyed by its MAC address, while routing uses its IP or subnet. Reserve a DHCP address if the policy should continue to apply to the same device.
 
-Choose a rule group and keep its original actions or set an exit for this device. The link follows the group's enabled, global destination rules as you edit them. Explicit device destination rules take precedence, followed by linked groups, shared destination rules, domestic direct routing and the device/global fallback. Removing a link restores normal matching. Changing a device name does not restart the proxy.
+Open **添加规则组（可多选）**, select one or more groups, and apply them together. Each new group initially uses its own rule actions. Select a group under **已关联的规则组** to change its exit for this device or remove its link independently. The link follows the group's enabled, global destination rules as you edit them. Explicit device destination rules take precedence, followed by linked groups, shared destination rules, domestic direct routing and the device/global fallback. Removing a link restores normal matching. Changing a device name does not restart the proxy.
 
 ## Import a rule list into a Merlin rule group
 
