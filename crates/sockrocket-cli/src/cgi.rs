@@ -464,6 +464,7 @@ fn read_only_action(action: &str) -> bool {
             | "sysinfo"
             | "get_direct_domains"
             | "get_rules"
+            | "fetch_rule_list"
             | "trace_route"
             | "proxy_groups"
             | "network_settings"
@@ -542,6 +543,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "save_network_settings" => network_settings::save(post),
         "dns_test" => network_settings::test(post),
         "get_rules" => act_get_rules(),
+        "fetch_rule_list" => act_fetch_rule_list(post),
         "add_rule_preset" => rule_presets::add(post),
         "trace_route" => route_trace::act_trace_route(post),
         "add_rule" => act_add_rule(post),
@@ -2731,6 +2733,35 @@ fn act_move_rule(post: &J) -> J {
     }
 }
 
+/// Read a remote list for preview without changing saved configuration.
+fn act_fetch_rule_list(post: &J) -> J {
+    let url = post.get("url").and_then(J::as_str).unwrap_or("").trim();
+    let target = post.get("target").and_then(J::as_str).unwrap_or("proxy");
+    let group = post.get("group").and_then(J::as_str).unwrap_or("").trim();
+    if !proxy_groups::valid_target(target) {
+        return err_msg("请选择有效的规则出口");
+    }
+    let result = (|| -> Result<_> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(sockrocket_core::config::rule_list::fetch_rule_list(
+            url,
+            target,
+            group,
+            if is_running() {
+                local_socks_addr()
+            } else {
+                None
+            },
+        ))
+    })();
+    match result {
+        Ok(preview) => json!({"ok":true,"text":preview.text,"count":preview.count}),
+        Err(error) => err_msg(&format!("{error:#}")),
+    }
+}
+
 /// Batch paste / import: multiline text → many rules (same parser as desktop GUI).
 fn act_batch_add_rules(post: &J) -> J {
     let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -2817,6 +2848,9 @@ fn act_batch_add_rules(post: &J) -> J {
     };
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
+        if post.get("group_only").and_then(J::as_bool) == Some(true) {
+            rule.group = group.to_string();
+        }
         if post.get("source").is_some() {
             if !rule.source.is_empty() && rule.source != source {
                 return err_msg("每行 SOURCE 与所选来源不一致；未保存任何更改");
@@ -4856,6 +4890,75 @@ dns_direct_domains:
             )))
             .route("www.apple.com", 443),
             RouteAction::Proxy
+        );
+    }
+
+    #[test]
+    fn rule_link_preview_is_read_only_and_import_stays_in_selected_group() {
+        use std::io::Write;
+        let _env = TestEnv::new(SAMPLE);
+        assert!(read_only_action("fetch_rule_list"));
+        let before = fs::read(conf_path()).unwrap();
+        for url in ["file:///etc/passwd", "https://"] {
+            assert_eq!(
+                dispatch("fetch_rule_list", &json!({"url":url}))["ok"],
+                false
+            );
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = "# > test\nDOMAIN,example.invalid\n# @group Foreign\nDOMAIN,example.invalid\nGEOIP,CN,DIRECT";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let target = format!("node:{}", "a".repeat(64));
+        let preview = dispatch(
+            "fetch_rule_list",
+            &json!({"url":format!("http://{address}/rules.list"),"target":target,"group":"Emby"}),
+        );
+        server.join().unwrap();
+        assert_eq!(preview["ok"], true, "{preview}");
+        assert_eq!(preview["count"], 3);
+        assert_eq!(
+            fs::read(conf_path()).unwrap(),
+            before,
+            "reading must not save or restart"
+        );
+        let text = format!("# @group Foreign\n{}", preview["text"].as_str().unwrap());
+        let added = dispatch(
+            "batch_add_rules",
+            &json!({"group":"Emby","text":text,"target":target,"group_only":true,"replace":false}),
+        );
+        assert_eq!(added["ok"], true, "{added}");
+        let rows = act_get_rules()["rules"].as_array().unwrap().clone();
+        assert_eq!(rows.len(), 2, "duplicates are skipped");
+        assert!(rows.iter().all(|r| r["group"] == "Emby"));
+        assert_eq!(rows[0]["target"], target);
+        assert_eq!(rows[1]["target"], "direct");
+        let saved = fs::read(conf_path()).unwrap();
+        assert_eq!(
+            dispatch(
+                "batch_add_rules",
+                &json!({"group":"Emby","text":text,"target":target,"group_only":true,"replace":false})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            fs::read(conf_path()).unwrap(),
+            saved,
+            "repeated import must preserve existing rules"
         );
     }
 

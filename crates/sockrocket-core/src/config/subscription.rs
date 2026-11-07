@@ -303,7 +303,7 @@ async fn fetch_valid_subscription(
     Ok((content, nodes))
 }
 
-fn subscription_client(
+pub(super) fn subscription_client(
     socks: Option<SocketAddr>,
     explicit_routes: bool,
 ) -> Result<reqwest::Client> {

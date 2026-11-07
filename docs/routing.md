@@ -34,6 +34,16 @@ The rule-group exit rewrites rules that were already going through a proxy, a no
 
 A rule group (the folder of rules on the Routing page) is not a node group. The folder organizes rules. The node group is an exit.
 
+## Import a rule list into a Merlin rule group
+
+Select the rule group and choose **从链接添加**. Paste an HTTP(S) URL to a raw UTF-8 rule list, choose the import exit, then select **读取规则**. Review the editable text and choose **预览并应用**, followed by **确认应用**.
+
+Lines such as `DOMAIN,example.com` inherit the selected global node, pinned node or node group. Explicit actions such as `DIRECT` and `REJECT` are preserved. The importer uses the existing bulk-text formats, including domain, domain suffix, IP/CIDR, GEOIP and SOURCE rules; it ignores blank lines and `#` comments and normalizes international domain names. If you change the exit after reading, read the list again or edit its explicit actions before applying.
+
+This appends rules to the selected rule group. It preserves existing rules and skips duplicates with the same type, match and source, including duplicates already in another group. Group directives in the downloaded list cannot redirect the import to another group. An invalid line rejects the entire list and identifies its line number; reading or a failed download does not save configuration.
+
+Imports are one-time copies, not automatically refreshed subscriptions. Each list is limited to 256 KiB and 4,096 rules, with a 30-second download timeout. Update the Merlin plugin's backend and WebUI together to use this feature.
+
 ## Example
 
 ```text

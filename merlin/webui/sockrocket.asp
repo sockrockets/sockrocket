@@ -525,15 +525,20 @@ body.bg {min-width:0!important}
           <p class="hint" id="sr-rule-operation-state" role="status" aria-live="polite"></p>
           <div class="rule-workspace-controls">
             <div class="fg"><label for="sr-rule-group-select">选择分组</label><select id="sr-rule-group-select" onchange="changeRuleGroup(this.value)" disabled><option value="">正在加载…</option></select></div>
-            <div class="fg"><label for="sr-rule-workspace-mode">编辑方式</label><select id="sr-rule-workspace-mode" onchange="changeRuleWorkspaceMode(this.value)" disabled><option value="list">规则列表</option><option value="bulk">批量编辑整个分组</option></select></div>
+            <div class="fg"><label for="sr-rule-workspace-mode">编辑方式</label><select id="sr-rule-workspace-mode" onchange="changeRuleWorkspaceMode(this.value)" disabled><option value="list">规则列表</option><option value="bulk">批量编辑整个分组</option><option value="import">从链接追加规则</option></select></div>
             <div class="fg"><label for="sr-rule-group-outlet-select">分组代理出口</label><div id="sr-rule-group-outlet"></div></div>
           </div>
           <p class="hint" id="sr-rule-group-summary" aria-live="polite"></p>
-          <div class="toolbar rule-workspace-actions"><button class="btn btn-sm" id="sr-rule-group-new" onclick="openRuleGroupCreator()">新建分组</button><button class="btn btn-sm" id="sr-rule-group-enable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),true)">启用该组</button><button class="btn btn-sm" id="sr-rule-group-disable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),false)">停用该组</button><button class="btn btn-danger btn-sm" id="sr-rule-group-delete" onclick="deleteRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP))">删除该组</button><div class="spacer"></div><button class="btn btn-accent btn-sm" id="sr-rule-add" onclick="startRuleAddition()">添加规则</button></div>
+          <div class="toolbar rule-workspace-actions"><button class="btn btn-sm" id="sr-rule-group-new" onclick="openRuleGroupCreator()">新建分组</button><button class="btn btn-sm" id="sr-rule-group-enable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),true)">启用该组</button><button class="btn btn-sm" id="sr-rule-group-disable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),false)">停用该组</button><button class="btn btn-danger btn-sm" id="sr-rule-group-delete" onclick="deleteRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP))">删除该组</button><div class="spacer"></div><button class="btn btn-sm" id="sr-rule-import" onclick="startRuleImport()">从链接添加</button><button class="btn btn-accent btn-sm" id="sr-rule-add" onclick="startRuleAddition()">添加规则</button></div>
           <div id="sr-rule-group-creator" class="rule-inline-editor" hidden><div class="fg"><label for="sr-rule-new-group-name">新分组名称</label><input id="sr-rule-new-group-name" type="text" placeholder="例如：常用服务" onkeydown="if(event.key==='Enter')createRuleGroup()"></div><p class="hint">添加第一条规则后保存分组，同一组可以包含多种类型的规则。</p><div class="toolbar"><button class="btn btn-accent btn-sm" onclick="createRuleGroup()">创建分组</button><button class="btn btn-sm" onclick="srElement('rule-group-creator').hidden=true">取消</button></div></div>
           <datalist id="sr-rule-group-list"></datalist><input type="hidden" id="sr-rule-group"><input type="hidden" id="sr-rule-entry-mode" value="single">
           <div id="sr-rule-add-panel" class="rule-inline-editor" hidden>
             <div class="toolbar"><h3 id="sr-rule-editor-state">添加规则</h3><button class="btn btn-sm" id="sr-rule-edit-cancel" onclick="cancelRuleEditor()">取消编辑</button></div>
+            <div id="sr-rule-import-panel" hidden>
+              <div class="fg"><label for="sr-rule-import-url">规则列表链接</label><input type="url" id="sr-rule-import-url" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="https://example.com/rules.list"></div>
+              <div class="toolbar" style="margin-top:8px"><button class="btn btn-sm" id="sr-rule-import-fetch" onclick="fetchRuleList()">读取规则</button><span class="hint" id="sr-rule-import-state" role="status" aria-live="polite"></span></div>
+              <p class="hint">读取后可修改并预览，再追加到当前组。未指定出口的规则使用下方所选出口；注释和空行忽略，重复规则跳过。仅导入本次内容，不自动更新。</p>
+            </div>
           <div class="form-grid adaptive-form" id="sr-rule-default-fields">
             <div class="fg"><label for="sr-rule-type">类型</label>
               <select id="sr-rule-type" onchange="ruleTypeChanged()">
@@ -570,7 +575,7 @@ body.bg {min-width:0!important}
             </div>
           </div>
           <div id="sr-rule-bulk-wrap">
-            <textarea id="sr-rule-batch" rows="5" spellcheck="false" placeholder="DOMAIN-SUFFIX,example.invalid,PROXY&#10;GEOIP,CN,DIRECT&#10;MATCH,PROXY"></textarea>
+            <textarea id="sr-rule-batch" aria-label="待导入或批量编辑的规则" rows="5" spellcheck="false" placeholder="DOMAIN-SUFFIX,example.invalid,PROXY&#10;GEOIP,CN,DIRECT&#10;MATCH,PROXY"></textarea>
             <div class="toolbar" style="margin-top:8px">
               <div class="spacer"></div>
               <span class="hint">域名、网段、地区可每行一个值；混合规则使用 TYPE,内容,ACTION。</span>
@@ -2105,15 +2110,17 @@ function ruleTypeChanged() {
   }
   // Keep the fallback action editable even when editing a mixed-type group.
   srElement('rule-default-fields').hidden = false;
-  ['type','source','priority','dup'].forEach(function(field){srElement('rule-'+field).parentElement.hidden = RULE_EDIT_GROUP !== null;});
+  ['type','source','priority','dup'].forEach(function(field){srElement('rule-'+field).parentElement.hidden = RULE_EDIT_GROUP !== null || (RULE_IMPORT_MODE && (field==='type' || field==='dup'));});
   srElement('rule-target').parentElement.hidden = false;
-  srElement('rule-target-label').textContent = RULE_EDIT_GROUP !== null ? '默认处理（未填写 ACTION 时使用）' : '处理方式';
+  srElement('rule-target-label').textContent = RULE_IMPORT_MODE ? '导入出口（默认代理、指定节点或节点组）' : RULE_EDIT_GROUP !== null ? '默认处理（未填写 ACTION 时使用）' : '处理方式';
   srElement('rule-source').disabled = RULE_EDIT_GROUP !== null;
+  if(RULE_IMPORT_MODE && hint)hint.textContent='下方是待追加的规则。每行已写明出口；如需更换导入出口，请选择后重新读取链接，或直接修改各行。';
   var dup = srElement('rule-dup');
   if (dup && dup.parentElement) dup.parentElement.style.display = bulk ? '' : 'none';
 }
 var RULE_SELECTED_GROUP = null, RULE_LOCAL_GROUPS = [], RULE_WORKSPACE_MODE = 'list';
 var RULE_ADD_BASELINE = null, RULE_ROW_BASELINE = null;
+var RULE_IMPORT_MODE = false, RULE_IMPORT_PENDING = false, RULE_IMPORT_GENERATION = 0;
 function ruleGroupMembers(key) {
   return (SR_STATE.ruleRows || []).filter(function(r){return (r.group || '').trim() === key;});
 }
@@ -2143,12 +2150,14 @@ function syncRuleWorkspace() {
   ['enable','disable','delete'].forEach(function(action){srElement('rule-group-'+action).disabled=locked || editing || !members.length;});
   srElement('rule-group-new').disabled=locked;
   srElement('rule-add').disabled=locked || RULE_SELECTED_GROUP === null;
+  srElement('rule-import').disabled=locked || RULE_SELECTED_GROUP === null;
   var types=[];members.forEach(function(r){var label=RULE_TYPE_LABEL[r.rule_type] || r.rule_type;if(types.indexOf(label)<0)types.push(label);});
   srElement('rule-group-summary').textContent=RULE_SELECTED_GROUP === null?'先新建一个分组，再添加规则。':(RULE_SELECTED_GROUP || '未分组')+' · 共 '+members.length+' 条 · 已启用 '+members.filter(function(r){return r.enabled!==false;}).length+' 条'+(types.length?' · '+types.join(' / '):' · 添加第一条规则后保存');
   srElement('rule-group-outlet').innerHTML=groupOutletSelect(encodeURIComponent(RULE_SELECTED_GROUP || '').replace(/'/g,'%27'),members);
-  srElement('rule-list-panel').hidden=RULE_WORKSPACE_MODE==='bulk';
+  srElement('rule-list-panel').hidden=RULE_WORKSPACE_MODE!=='list';
   ['rule-add-panel','rule-edit-panel'].forEach(function(id){var el=srElement(id);if(el.querySelectorAll)Array.prototype.forEach.call(el.querySelectorAll('input,select,textarea,button'),function(input){input.disabled=locked;});});
   if(!locked){ruleTypeChanged();editRuleTypeChanged();}
+  srElement('rule-import-fetch').disabled=locked || RULE_IMPORT_PENDING;
 }
 function changeRuleGroup(key) {
   if(ruleWorkspaceLocked() || !discardRuleDraft()) {srElement('rule-group-select').value=RULE_SELECTED_GROUP || '';return false;}
@@ -2160,7 +2169,8 @@ function changeRuleWorkspaceMode(mode) {
   if(ruleWorkspaceLocked())return;
   if(!discardRuleDraft()){srElement('rule-workspace-mode').value=RULE_WORKSPACE_MODE;return;}
   resetRuleEditor();
-  if(mode==='bulk') {
+  if(mode==='import')startRuleImport();
+  else if(mode==='bulk') {
     if(ruleGroupMembers(RULE_SELECTED_GROUP).length)editRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP));
     else {startRuleAddition();RULE_WORKSPACE_MODE='bulk';srElement('rule-entry-mode').value='bulk';ruleTypeChanged();RULE_ADD_BASELINE=ruleEditorSnapshot();}
   }
@@ -2188,6 +2198,34 @@ function startRuleAddition() {
   var proxy=ruleGroupMembers(RULE_SELECTED_GROUP).filter(function(r){return proxyLikeTarget(r.target);});
   srElement('rule-target').value=proxy.length?proxy[0].target:'proxy';
   ruleTypeChanged();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);srElement('rule-type').focus();
+}
+function startRuleImport() {
+  if(ruleWorkspaceLocked() || RULE_SELECTED_GROUP === null || !discardRuleDraft())return;
+  resetRuleEditor();startRuleAddition();
+  RULE_IMPORT_MODE=true;RULE_WORKSPACE_MODE='import';
+  srElement('rule-entry-mode').value='bulk';srElement('rule-dup').value='skip';
+  srElement('rule-import-panel').hidden=false;
+  srElement('rule-editor-state').textContent='从链接追加到「'+(RULE_SELECTED_GROUP || '未分组')+'」';
+  ruleTypeChanged();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);srElement('rule-import-url').focus();
+}
+function fetchRuleList() {
+  if(!RULE_IMPORT_MODE || ruleWorkspaceLocked() || RULE_IMPORT_PENDING)return;
+  var url=srElement('rule-import-url').value.trim();
+  try {var parsed=new URL(url);if(!/^https?:$/.test(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || /\s/.test(url))throw new Error();}
+  catch(e){srShowMsg('请填写有效的 HTTP 或 HTTPS 规则列表链接。','err');return;}
+  if(srElement('rule-batch').value.trim() && !confirm('重新读取会替换下方待导入内容，已保存的规则保持不变。继续？'))return;
+  var generation=++RULE_IMPORT_GENERATION,draft=ruleEditorSnapshot();
+  RULE_IMPORT_PENDING=true;srElement('rule-import-fetch').disabled=true;
+  srElement('rule-import-state').textContent='正在读取规则链接…';
+  function finish(d) {
+    if(generation!==RULE_IMPORT_GENERATION || !RULE_IMPORT_MODE)return;
+    RULE_IMPORT_PENDING=false;srElement('rule-import-fetch').disabled=ruleWorkspaceLocked();
+    if(draft!==ruleEditorSnapshot()) {srElement('rule-import-state').textContent='读取期间内容或出口已变化，未覆盖草稿；请重新读取。';return;}
+    if(!d || d.ok===false || typeof d.text!=='string' || !d.text.trim()) {srElement('rule-import-state').textContent=d&&(d.msg||d.error_message)||'读取失败，请检查链接后重试；现有规则未改变。';return;}
+    srElement('rule-batch').value=d.text;
+    srElement('rule-import-state').textContent='已读取 '+Number(d.count||0)+' 条待导入规则，请检查后预览并添加。';
+  }
+  srApi('fetch_rule_list',{url:url,target:srElement('rule-target').value,group:RULE_SELECTED_GROUP},finish,finish,40000);
 }
 function cancelRuleRowEditor() {if(discardRuleDraft()){resetRuleEditor();renderRules(false);}}
 
@@ -2635,6 +2673,8 @@ function saveRuleEdit() {
 function cancelRuleEditor() {if(discardRuleDraft()){resetRuleEditor();renderRules(false);}}
 function resetRuleEditor() {
   RULE_EDIT_GROUP=null;RULE_EDIT_MEMBERS=null;RULE_EDIT_ROW=null;RULE_ADD_BASELINE=null;RULE_ROW_BASELINE=null;RULE_WORKSPACE_MODE='list';
+  RULE_IMPORT_MODE=false;RULE_IMPORT_PENDING=false;RULE_IMPORT_GENERATION++;
+  srElement('rule-import-panel').hidden=true;srElement('rule-import-url').value='';srElement('rule-import-state').textContent='';
   srElement('rule-add-panel').hidden=true;srElement('rule-edit-panel').hidden=true;
   srElement('rule-priority').value='0';srElement('rule-source').value='';srElement('rule-type').value='domain-suffix';
   srElement('rule-entry-mode').value='single';srElement('rule-entry-mode').disabled=false;
@@ -2642,7 +2682,7 @@ function resetRuleEditor() {
 }
 var rulePreviewSnapshot = null;
 
-function ruleEditorSnapshot() { return JSON.stringify(['rule-source','rule-entry-mode','rule-group','rule-type','rule-target','rule-dup','rule-priority','rule-batch','rule-pattern'].map(function(id) { return srElement(id).value; }).concat([RULE_EDIT_GROUP])); }
+function ruleEditorSnapshot() { return JSON.stringify(['rule-source','rule-entry-mode','rule-group','rule-type','rule-target','rule-dup','rule-priority','rule-batch','rule-pattern','rule-import-url'].map(function(id) { return srElement(id).value; }).concat([RULE_EDIT_GROUP,RULE_IMPORT_MODE])); }
 function readRulePriority(id) {
   var text=String(srElement(id).value).trim(); if (!text) return null;
   if (!/^-?\d+$/.test(text)) return false;
@@ -2657,10 +2697,11 @@ function previewRuleChanges() {
   rulePreviewSnapshot = ruleEditorSnapshot();
   srElement('rule-preview-title').textContent = RULE_EDIT_GROUP !== null ? '确认替换整个分组' : '确认添加规则';
   srElement('rule-preview-text').textContent = text || 'MATCH,' + srElement('rule-target').value.toUpperCase();
-  srElement('rule-preview-summary').textContent = '分组：' + (srElement('rule-group').value.trim() || '未分组') + (RULE_EDIT_GROUP !== null ? '。这会替换整个分组，并将其集中到首次出现的位置；未修改规则的启用状态和优先级会保留。' : '。类型：' + (RULE_TYPE_LABEL[srElement('rule-type').value] || '混合') + '；默认处理：' + (RULE_TARGET_LABEL[srElement('rule-target').value] || srElement('rule-target').value) + '。现有规则按所选重复处理方式保留或替换。');
+  srElement('rule-preview-summary').textContent = '分组：' + (srElement('rule-group').value.trim() || '未分组') + (RULE_EDIT_GROUP !== null ? '。这会替换整个分组，并将其集中到首次出现的位置；未修改规则的启用状态和优先级会保留。' : '。类型：' + (RULE_IMPORT_MODE ? '链接规则，以每行类型与出口为准' : RULE_TYPE_LABEL[srElement('rule-type').value] || '混合') + '；默认处理：' + (RULE_TARGET_LABEL[srElement('rule-target').value] || srElement('rule-target').value) + (RULE_IMPORT_MODE ? '。' : '。现有规则按所选重复处理方式保留或替换。'));
   srElement('rule-preview-summary').textContent += ' 优先级：'+(readRulePriority('rule-priority') === null ? (RULE_EDIT_GROUP !== null ? '保留原值，新规则沿用分组优先级' : '保留原值，新规则为 0') : readRulePriority('rule-priority'))+'（数字越大越先匹配）。';
   srElement('rule-preview-summary').textContent += ' 来源：'+(RULE_EDIT_GROUP !== null ? '保留每行 SOURCE 或原分组来源' : srElement('rule-source').value.trim() || '全局 / 每行 SOURCE')+'。';
   if (RULE_EDIT_GROUP !== null) srElement('rule-preview-summary').textContent += ' 未填写 ACTION 的行默认处理：'+(RULE_TARGET_LABEL[srElement('rule-target').value] || srElement('rule-target').value)+'。';
+  if(RULE_IMPORT_MODE)srElement('rule-preview-summary').textContent+=' 本次追加到当前组；同类型、匹配内容和来源的已有规则跳过，不替换现有规则。';
   srElement('rule-preview-dialog').showModal();
 }
 function applyRulePreview() {
@@ -2736,7 +2777,7 @@ function addRule() {
   if (srElement('rule-entry-mode').value === 'bulk') {
     var text = srElement('rule-batch').value, batchDraft=ruleEditorSnapshot();
     if (!text.trim()) { srShowMsg('请先粘贴至少一条规则', 'err'); return; }
-    ruleApi('batch_add_rules', withPriority({ text: text, target: g, group: grp, rule_type: t, replace: replace }), function (d) {
+    ruleApi('batch_add_rules', withPriority({ text: text, target: g, group: grp, rule_type: t, replace: RULE_IMPORT_MODE ? false : replace, group_only: RULE_IMPORT_MODE }), function (d) {
       toastResp(d);
       if (d.ok !== false) {
         if (ruleEditorSnapshot() === batchDraft) {resetRuleEditor();renderRules(false);}

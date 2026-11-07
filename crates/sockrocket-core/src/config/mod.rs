@@ -7,6 +7,7 @@ pub mod group;
 pub mod model;
 pub mod node_identity;
 pub mod rule_groups;
+pub mod rule_list;
 pub mod rule_scenes;
 pub mod rules_batch;
 pub mod singbox;
