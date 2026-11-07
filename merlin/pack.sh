@@ -52,7 +52,7 @@ pack_one() {
   work="$(mktemp -d)"
   local pkg="$work/sockrocket"
 
-  mkdir -p "$pkg/bin" "$pkg/webui" "$pkg/scripts" "$pkg/res"
+  mkdir -p "$pkg/bin" "$pkg/webui" "$pkg/scripts" "$pkg/webs" "$pkg/res"
 
   # Both the bundled installer and online updater use this canonical path.
   # Do not duplicate the binary under an architecture suffix or add links:
@@ -70,7 +70,9 @@ pack_one() {
      "$ROOT/merlin/scripts/sockrocket_status.sh" \
      "$pkg/scripts/"
   cp "$ROOT/merlin/webui/sockrocket.asp" "$pkg/webui/sockrocket.asp"
-  # install.sh publishes this source to koolshare/webs/Module_sockrocket.asp.
+  # Software Center checks webs/ before invoking install.sh. Keep a regular
+  # copy: the online updater rejects archive links, including hard links.
+  cp "$ROOT/merlin/webui/sockrocket.asp" "$pkg/webs/Module_sockrocket.asp"
   if [ -f "$ROOT/merlin/res/icon-sockrocket.png" ]; then
     cp "$ROOT/merlin/res/icon-sockrocket.png" "$pkg/res/icon-sockrocket.png"
   fi

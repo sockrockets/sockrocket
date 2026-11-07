@@ -255,24 +255,26 @@ impl Drop for WireInflightGuard {
 /// stampeding the proxy node with dials.
 const PROXY_DNS_POOL_SIZE: usize = 4;
 
-/// A small pool of independently-locked proxy-DNS connection slots.
-/// A FIFO permit queue waits for any free slot, rather than an arbitrarily
-/// selected busy connection. Slots remain independently locked for I/O.
 struct PooledDnsStream {
     stream: BoxProxyStream,
     outbound: SharedOutbound,
     server: DnsServer,
 }
 struct ProxyConnPool {
-    slots: Vec<Mutex<Option<PooledDnsStream>>>,
-    cursor: std::sync::atomic::AtomicUsize,
+    idle: std::sync::Mutex<std::collections::VecDeque<Option<PooledDnsStream>>>,
     available: tokio::sync::Semaphore,
 }
 
-// Field order matters: unlock the slot before returning its permit.
 struct ProxyConnGuard<'a> {
-    slot: tokio::sync::MutexGuard<'a, Option<PooledDnsStream>>,
+    pool: &'a ProxyConnPool,
+    slot: Option<PooledDnsStream>,
     _permit: tokio::sync::SemaphorePermit<'a>,
+}
+impl Drop for ProxyConnGuard<'_> {
+    fn drop(&mut self) {
+        // Publish the slot before dropping the permit and waking a waiter.
+        self.pool.idle.lock().unwrap().push_back(self.slot.take());
+    }
 }
 impl std::ops::Deref for ProxyConnGuard<'_> {
     type Target = Option<PooledDnsStream>;
@@ -290,31 +292,28 @@ impl ProxyConnPool {
     fn new(size: usize) -> Self {
         assert!(size > 0);
         Self {
-            slots: (0..size).map(|_| Mutex::new(None)).collect(),
-            cursor: std::sync::atomic::AtomicUsize::new(0),
+            idle: std::sync::Mutex::new((0..size).map(|_| None).collect()),
             available: tokio::sync::Semaphore::new(size),
         }
     }
 
     async fn acquire(&self) -> ProxyConnGuard<'_> {
-        use std::sync::atomic::Ordering;
         let permit = self
             .available
             .acquire()
             .await
             .expect("pool is never closed");
-        let n = self.slots.len();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
-        for i in 0..n {
-            let idx = (start + i) % n;
-            if let Ok(slot) = self.slots[idx].try_lock() {
-                return ProxyConnGuard {
-                    slot,
-                    _permit: permit,
-                };
-            }
+        let slot = self
+            .idle
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("permit has a queued slot");
+        ProxyConnGuard {
+            pool: self,
+            slot,
+            _permit: permit,
         }
-        unreachable!("a pool permit reserves one unlocked slot")
     }
 }
 

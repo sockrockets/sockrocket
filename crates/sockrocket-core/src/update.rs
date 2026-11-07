@@ -189,38 +189,179 @@ pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Resu
 
 /// Download `url` to `dest` (overwrites).
 pub async fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
-    let client = reqwest::Client::builder()
+    download_file_with_proxy_fallback(url, dest, None).await
+}
+
+/// Retry failed network downloads through the caller's local SOCKS listener.
+/// The proxy resolves hostnames; TLS validation remains enabled.
+pub async fn download_file_with_proxy_fallback(
+    url: &str,
+    dest: &std::path::Path,
+    socks: Option<std::net::SocketAddr>,
+) -> Result<()> {
+    let bytes = match download_bytes(url, None).await {
+        Ok(bytes) => bytes,
+        Err(direct) => match socks {
+            Some(addr) => download_bytes(url, Some(addr)).await.map_err(|proxy| {
+                anyhow::anyhow!("Direct download failed: {direct:#}; SOCKS retry failed: {proxy:#}")
+            })?,
+            None => return Err(direct),
+        },
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create download directory")?;
+    }
+    std::fs::write(dest, &bytes).context("Failed to write downloaded package")?;
+    Ok(())
+}
+
+async fn download_bytes(url: &str, socks: Option<std::net::SocketAddr>) -> Result<bytes::Bytes> {
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(300))
         .user_agent(format!(
             "Sockrocket/{} (+https://github.com/sockrockets/sockrocket)",
             env!("CARGO_PKG_VERSION")
-        ))
-        .build()
-        .context("Failed to create HTTP client")?;
+        ));
+    if let Some(addr) = socks {
+        builder = builder.no_proxy().proxy(
+            reqwest::Proxy::all(format!("socks5h://{addr}"))
+                .context("Failed to configure update proxy")?,
+        );
+    }
+    let client = builder.build().context("Failed to create HTTP client")?;
 
     let response = client
         .get(url)
         .send()
         .await
+        .map_err(|error| error.without_url())
         .context("Download request failed")?;
     if !response.status().is_success() {
         bail!("Download returned HTTP {}", response.status());
     }
-    let bytes = response
+    response
         .bytes()
         .await
-        .context("Failed to read download body")?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(dest, &bytes).with_context(|| format!("Failed to write {}", dest.display()))?;
-    Ok(())
+        .map_err(|error| error.without_url())
+        .context("Failed to read download body")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn successful_download_does_not_use_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let direct = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/package", direct.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = direct.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() < 8192);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\npackage",
+                )
+                .await
+                .unwrap();
+        });
+        let path = std::env::temp_dir().join(format!("sockrocket-update-{}", uuid::Uuid::new_v4()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_file_with_proxy_fallback(&url, &path, Some(proxy.local_addr().unwrap())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"package");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), proxy.accept())
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_download_retries_socks_with_remote_dns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 2];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; greeting[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..4], &[5, 1, 0, 3]);
+            let mut hostname = vec![0; header[4] as usize];
+            stream.read_exact(&mut hostname).await.unwrap();
+            assert_eq!(hostname, b"sockrocket-update-test.invalid");
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+                assert!(request.len() < 8192);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\npackage",
+                )
+                .await
+                .unwrap();
+        });
+        let path = std::env::temp_dir().join(format!("sockrocket-update-{}", uuid::Uuid::new_v4()));
+        tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            download_file_with_proxy_fallback(
+                "http://sockrocket-update-test.invalid/package",
+                &path,
+                Some(addr),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"package");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_download_preserves_existing_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let path = std::env::temp_dir().join(format!("sockrocket-update-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"existing").unwrap();
+        let error = download_file_with_proxy_fallback(
+            &format!("http://{addr}/package?token=private-test-value"),
+            &path,
+            Some(addr),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("SOCKS retry failed"));
+        assert!(!format!("{error:#}").contains("private-test-value"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn compare_versions_basic() {

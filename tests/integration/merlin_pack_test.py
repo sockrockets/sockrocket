@@ -45,7 +45,12 @@ class PackageTest(unittest.TestCase):
                         [n for n in files if n.startswith('sockrocket/bin/')],
                         ['sockrocket/bin/sockrocket-cli'],
                     )
-                    self.assertFalse(any(n.startswith('sockrocket/webs/') for n in files))
+                    # Software Center discovers the plugin page before install.sh runs.
+                    self.assertIn('sockrocket/webs/Module_sockrocket.asp', files)
+                    self.assertEqual(
+                        archive.extractfile('sockrocket/webs/Module_sockrocket.asp').read(),
+                        archive.extractfile('sockrocket/webui/sockrocket.asp').read(),
+                    )
                     self.assertFalse(any('/._' in n for n in files))
                     binary = files['sockrocket/bin/sockrocket-cli']
                     self.assertTrue(binary.mode & 0o111)
