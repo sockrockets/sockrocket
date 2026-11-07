@@ -114,6 +114,9 @@ pub struct RuleEntry {
 pub struct RuleSet {
     rules: Vec<RuleEntry>,
     default_action: RouteAction,
+    device_scopes: Vec<(IpAddr, u8)>,
+    global_destinations: std::ops::Range<usize>,
+    global_final_start: Option<usize>,
 }
 
 impl RuleSet {
@@ -121,6 +124,9 @@ impl RuleSet {
         Self {
             rules: Vec::new(),
             default_action: RouteAction::Proxy,
+            device_scopes: Vec::new(),
+            global_destinations: 0..0,
+            global_final_start: None,
         }
     }
 
@@ -219,6 +225,43 @@ impl RuleSet {
         set
     }
 
+    pub(crate) fn isolate_devices<'a>(
+        &mut self,
+        global_destinations: std::ops::Range<usize>,
+        sources: impl Iterator<Item = &'a str>,
+    ) {
+        self.global_destinations = global_destinations;
+        self.global_final_start = Some(self.rules.len());
+        self.device_scopes = sources
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| parse_cidr(&normalize_rule_source(s).ok()?))
+            .collect();
+        self.device_scopes.sort_unstable();
+        self.device_scopes.dedup();
+    }
+
+    fn has_device_scope(&self, source: Option<IpAddr>) -> bool {
+        source.is_some()
+            && self
+                .device_scopes
+                .iter()
+                .any(|scope| source_matches(Some(*scope), source))
+    }
+
+    fn entries_for(&self, source: Option<IpAddr>) -> impl Iterator<Item = &RuleEntry> {
+        let (skip, end) = if self.has_device_scope(source) {
+            (
+                self.global_destinations.clone(),
+                self.global_final_start.unwrap_or(self.rules.len()),
+            )
+        } else {
+            (0..0, self.rules.len())
+        };
+        self.rules[..skip.start]
+            .iter()
+            .chain(&self.rules[skip.end..end])
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
         self.rules.extend(other.rules);
     }
@@ -279,10 +322,12 @@ impl Router {
     /// Whether the current client has any enabled device-specific policy.
     pub fn has_client_rules(&self) -> bool {
         let source = crate::proxy::routing::client_source();
-        self.rules
-            .rules
-            .iter()
-            .any(|entry| entry.source.is_some() && source_matches(entry.source, source))
+        self.rules.has_device_scope(source)
+            || self
+                .rules
+                .rules
+                .iter()
+                .any(|entry| entry.source.is_some() && source_matches(entry.source, source))
     }
 
     /// Evaluate routing rules for a given destination.
@@ -317,8 +362,9 @@ impl Router {
             .ok()
             .or(crate::proxy::routing::tun_destination().0);
 
-        for entry in &self.rules.rules {
-            if !source_matches(entry.source, crate::proxy::routing::client_source()) {
+        let source = crate::proxy::routing::client_source();
+        for entry in self.rules.entries_for(source) {
+            if !source_matches(entry.source, source) {
                 continue;
             }
             if self.rule_matches(&entry.rule, &host_lower, ip, port) {
@@ -348,8 +394,9 @@ impl Router {
     /// evaluation is pure string matching.
     pub fn route_domain_only(&self, host: &str) -> Option<RouteAction> {
         let host_lower = host.to_lowercase();
-        for entry in &self.rules.rules {
-            if !source_matches(entry.source, crate::proxy::routing::client_source()) {
+        let source = crate::proxy::routing::client_source();
+        for entry in self.rules.entries_for(source) {
+            if !source_matches(entry.source, source) {
                 continue;
             }
             let matched = match &entry.rule {
@@ -403,8 +450,9 @@ impl Router {
             .or(crate::proxy::routing::tun_destination().0);
         let mut dns_attempted = ip.is_some();
 
-        for entry in &self.rules.rules {
-            if !source_matches(entry.source, crate::proxy::routing::client_source()) {
+        let source = crate::proxy::routing::client_source();
+        for entry in self.rules.entries_for(source) {
+            if !source_matches(entry.source, source) {
                 continue;
             }
             // Lazily resolve the first time evaluation reaches an IP-based

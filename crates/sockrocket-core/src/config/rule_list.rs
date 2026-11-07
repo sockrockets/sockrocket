@@ -14,6 +14,7 @@ pub const RULE_LIST_TIMEOUT_SECS: u64 = 30;
 pub struct RuleListPreview {
     pub text: String,
     pub count: usize,
+    pub skipped: std::collections::BTreeMap<&'static str, usize>,
 }
 
 pub fn validate_rule_list_url(input: &str) -> Result<()> {
@@ -47,13 +48,38 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
             <= MAX_RULE_LIST_RULES,
         "一次最多导入 4096 条规则"
     );
-    let parsed = parse_batch_rules_in_group(text, target, group);
+    // Keep original line numbers for errors, and keep omissions visible in the
+    // editable preview even for clients that only display its text.
+    let mut skipped = std::collections::BTreeMap::new();
+    let mut preview_input = String::with_capacity(text.len());
+    for line in text.lines() {
+        let unsupported = line.split_once(',').and_then(|(kind, _)| {
+            ["IP-ASN", "PROCESS-NAME"]
+                .into_iter()
+                .find(|name| kind.trim().eq_ignore_ascii_case(name))
+        });
+        if let Some(kind) = unsupported {
+            *skipped.entry(kind).or_insert(0) += 1;
+        } else {
+            preview_input.push_str(line);
+        }
+        preview_input.push('\n');
+    }
+    let parsed = parse_batch_rules_in_group(&preview_input, target, group);
     if let Some(error) = parsed.errors.first() {
         anyhow::bail!(
             "第 {} 行无法解析：{}；未导入任何规则",
             error.line,
             error.message
         );
+    }
+    let omissions = skipped
+        .iter()
+        .map(|(kind, count)| format!("{kind} × {count}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    if parsed.rules.is_empty() && !skipped.is_empty() {
+        anyhow::bail!("没有可导入的规则；当前不支持 {omissions}");
     }
     ensure!(!parsed.rules.is_empty(), "链接中没有可导入的规则");
     ensure!(
@@ -77,6 +103,7 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
     Ok(RuleListPreview {
         text,
         count: parsed.rules.len(),
+        skipped,
     })
 }
 
@@ -161,6 +188,26 @@ mod tests {
     }
 
     #[test]
+    fn clash_ipv6_lists_preview_supported_rules_and_report_omissions() {
+        let preview = preview_rule_list("DOMAIN,example.test\nIP-CIDR6,2001:db8::/32,no-resolve\nIP-ASN,64496\nPROCESS-NAME,example", "proxy", "Messaging").unwrap();
+        assert_eq!(preview.count, 2);
+        assert_eq!(preview.text.lines().count(), preview.count);
+        assert_eq!(preview.skipped["IP-ASN"], 1);
+        assert_eq!(preview.skipped["PROCESS-NAME"], 1);
+        let round_trip = parse_batch_rules_in_group(&preview.text, "proxy", "Messaging");
+        assert!(round_trip.errors.is_empty());
+        assert_eq!(round_trip.rules[1].rule_type, "ip-cidr");
+        assert_eq!(round_trip.rules[1].pattern, "2001:db8::/32");
+        assert!(
+            preview_rule_list("IP-ASN,64496\nIP-CIDR6,192.0.2.0/24", "proxy", "Messaging")
+                .unwrap_err()
+                .to_string()
+                .contains("第 2 行")
+        );
+        assert!(preview_rule_list("PROCESS-NAME,example", "proxy", "Messaging").is_err());
+    }
+
+    #[test]
     fn invalid_empty_and_oversized_lists_are_atomic() {
         for text in [
             "# comment\n",
@@ -216,6 +263,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(preview.count, 2);
+        assert_eq!(preview.text.lines().count(), preview.count);
         assert!(preview.text.contains("group:Japan"));
         for response in [
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),

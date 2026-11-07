@@ -2880,7 +2880,9 @@ fn act_fetch_rule_list(post: &J) -> J {
         ))
     })();
     match result {
-        Ok(preview) => json!({"ok":true,"text":preview.text,"count":preview.count}),
+        Ok(preview) => {
+            json!({"ok":true,"text":preview.text,"count":preview.count,"skipped":preview.skipped})
+        }
         Err(error) => err_msg(&format!("{error:#}")),
     }
 }
@@ -4066,6 +4068,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn saving_fallback_requires_an_explicit_scope() {
+        let env = TestEnv::new(SAMPLE);
+        let revision = route_trace::rules_revision(&load_conf().unwrap());
+        let before = fs::read(env.dir.join("config.yaml")).unwrap();
+        for post in [
+            json!({"target":"reject","revision":revision}),
+            json!({"source":"","all_devices":false,"target":"reject","revision":revision}),
+        ] {
+            assert_eq!(dispatch("save_device_policy", &post)["ok"], false);
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        assert_eq!(
+            dispatch(
+                "save_device_policy",
+                &json!({"source":"","all_devices":true,
+            "target":"reject","revision":revision})
+            )["ok"],
+            true
+        );
     }
 
     #[test]
@@ -5441,7 +5465,7 @@ dns_direct_domains:
             &json!({"revision":revision(),"source":"192.0.2.8","group":"Video","target":"","remove":true}),
         );
         assert_eq!(removed["ok"], true);
-        assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "proxy");
         assert_eq!(
             act_get_rules()["device_rule_groups"]
                 .as_array()
@@ -5450,6 +5474,14 @@ dns_direct_domains:
             2
         );
         assert_eq!(trace("192.0.2.8", "music.invalid"), "proxy");
+        for group in ["Music", "Work"] {
+            let removed = dispatch(
+                "save_device_binding",
+                &json!({"revision":revision(),"source":"192.0.2.8","group":group,"target":"","remove":true}),
+            );
+            assert_eq!(removed["ok"], true);
+        }
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
     }
 
     #[test]

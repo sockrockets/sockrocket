@@ -19,7 +19,7 @@ assert.equal(c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','')[0].count,12,'all rul
 c.SR_STATE.ruleRows.push(rule(12,{rule_type:'final',source:'192.0.2.8',target:'direct'}));
 let stages=c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','192.0.2.8');
 assert.equal(stages.at(-1).kind,'device_final');
-assert.ok(stages.some(stage=>stage.kind==='global_rule'));
+assert.ok(!stages.some(stage=>stage.kind==='global_rule'));
 assert.ok(stages.some(stage=>stage.kind==='builtin'));
 assert.ok(!stages.some(stage=>stage.kind==='global_final'));
 assert.ok(!c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','').some(r=>r.kind==='device_final'),'global simulation skips device stages');
@@ -161,12 +161,11 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  assert.deepEqual([...netRoute.targets],['reject'],'subnet summary does not inherit a narrower host override');
  c.chooseFlowHost(host);
  const route=c.ruleFlowModel(rows,'rule',host);assert.deepEqual([...route.find(s=>s.kind==='device_link').targets],['proxy']);
- assert.deepEqual([...route.find(s=>s.kind==='global_rule').targets],['direct']);
+ assert.ok(!route.some(s=>s.kind==='global_rule'));
+ assert.deepEqual([...c.ruleFlowModel(rows,'rule','198.51.100.7').find(s=>s.kind==='global_rule').targets],['direct']);
  const match=source=>({config_index:0,source,rule_type:'domain',outcome:'matched',checked:1});
- for(const [source,action,kind] of [[host+'/32','proxy','device_link'],[null,'direct','global_rule']]){
-   const reply=result(rows[0],{source:host});reply.trace.steps=[match(source)];reply.trace.action=action;
-   c.RULE_TRACE=reply;c.RULE_FLOW_SELECTED=-1;c.renderRuleFlow();assert.equal(route[c.RULE_FLOW_SELECTED].kind,kind);
- }
+ const reply=result(rows[0],{source:host});reply.trace.steps=[match(host+'/32')];reply.trace.action='proxy';
+ c.RULE_TRACE=reply;c.RULE_FLOW_SELECTED=-1;c.renderRuleFlow();assert.equal(route[c.RULE_FLOW_SELECTED].kind,'device_link');
  console.log('PASS: inherited and global outlets, overlapping sources and backend-selected phase');
 }
 
@@ -218,12 +217,13 @@ function deviceConnections(html, source, hitsOnly=false) {
  el('rule-flow-device').value='';c.renderRuleFlow();
  const diagram=()=>el('rule-flow').innerHTML;
  assert.deepEqual(deviceConnections(diagram(),tv),['Exception','Media','TV default']);
- assert.deepEqual(deviceConnections(diagram(),network),['LAN']);
+ assert.deepEqual(deviceConnections(diagram(),network),['LAN','设备默认出口']);
  assert.deepEqual(deviceConnections(diagram(),other),[]);
  assert.deepEqual(deviceConnections(diagram(),''),['Default','LAN','Media','Work','内置国内 / 局域网']);
  c.chooseFlowHost(tv);c.SR_STATE.status.transparent_proxy=true;
  for(const [index,owner,action] of [[1,'','proxy'],[2,network,'reject'],[0,tv,'direct'],[3,tv,'proxy'],[4,tv,'proxy']]){
-   const reply=result(rows[index],{source:tv});
+   const reply=result(rows[index],{source:owner?tv:other});
+   c.chooseFlowHost(owner?tv:other);
    reply.trace.steps[0].source=owner===tv?tv+'/32':owner||null;
    reply.trace.action=action;c.RULE_TRACE=reply;c.renderRuleFlow();
    assert.deepEqual(deviceConnections(diagram(),owner,true),[rows[index].group]);
@@ -243,10 +243,11 @@ function deviceConnections(html, source, hitsOnly=false) {
  const refresh=()=>{c.srLoadRules();f.request('get_rules')[2]({ok:true,rules,global_rule_groups:bindings,device_rule_groups:[{source:host,group:'Imported',target:'reject'}]});};
  refresh();
  const graph=()=>f.element('rule-flow').innerHTML;
- assert.deepEqual(deviceConnections(graph(),host),['Imported']);
- assert.deepEqual(deviceConnections(graph(),''),['Legacy','内置国内 / 局域网','默认兜底']);
+ assert.deepEqual(deviceConnections(graph(),host),['Imported','设备默认出口']);
+ assert.deepEqual(deviceConnections(graph(),''),['Legacy','全局兜底','内置国内 / 局域网']);
  bindings.push({source:'',group:'Imported',target:'proxy',priority:10});refresh();
- const globals=c.ruleFlowModel(rules,'rule',host).filter(s=>s.kind==='global_rule');
+ assert.equal(c.ruleFlowModel(rules,'rule',host).some(s=>s.kind==='global_rule'),false);
+ const globals=c.ruleFlowModel(rules,'rule','198.51.100.9').filter(s=>s.kind==='global_rule');
  assert.deepEqual(Array.from(globals,s=>[s.title,s.targets[0]]),[['Imported','proxy'],['Legacy','direct']]);
  assert.doesNotMatch(graph(),/<strong>Unbound<\/strong>/);
 }

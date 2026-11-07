@@ -3,11 +3,10 @@
 //!
 //! Order when custom rules exist:
 //! 1. Device destination rules (source match required).
-//! 2. Global destination rules.
+//! 2. Global destination rules, only for sources without a device assignment.
 //! 3. Built-in China-direct (including known domestic TUN destinations).
-//! 4. Device final rules (source match required). They replace only the global
-//!    fallback for that source.
-//! 5. Global final rules, or a built-in MatchAll → Proxy fallback.
+//! 4. Assigned sources use a matching device final, or default to proxy.
+//!    Unassigned sources use the global final, or default to proxy.
 //!
 //! Priorities descend within each phase; ties keep configuration order.
 
@@ -24,7 +23,7 @@ fn is_catch_all(rule_type: &str) -> bool {
 /// are enabled the built-in China-direct ruleset is used so rule mode still
 /// behaves sanely. Device and global catch-alls are deferred until after
 /// China-direct. A device catch-all replaces the global fallback for its
-/// source and does not hide earlier destination rules.
+/// source. Assigned sources skip the global destination phase.
 pub fn rule_mode_ruleset(rules: &[RoutingRule]) -> RuleSet {
     rule_mode_with_devices(rules, &[])
 }
@@ -34,6 +33,23 @@ pub fn rule_mode_with_devices(
     links: &[crate::config::model::DeviceRuleGroup],
 ) -> RuleSet {
     rule_mode_with_bindings(rules, links, false)
+}
+
+/// Sources with their own routing policy, including bindings whose members are disabled.
+pub fn device_policy_sources<'a>(
+    rules: &'a [RoutingRule],
+    links: &'a [crate::config::model::DeviceRuleGroup],
+) -> impl Iterator<Item = &'a str> {
+    links
+        .iter()
+        .map(|link| link.source.as_str())
+        .chain(
+            rules
+                .iter()
+                .filter(|rule| rule.enabled)
+                .map(|rule| rule.source.as_str()),
+        )
+        .filter(|source| !source.is_empty())
 }
 
 pub fn rule_mode_with_bindings(
@@ -46,7 +62,7 @@ pub fn rule_mode_with_bindings(
         .enumerate()
         .filter(|(_, r)| r.enabled)
         .collect();
-    if enabled.is_empty() {
+    if enabled.is_empty() && !links.iter().any(|link| !link.source.is_empty()) {
         return china_direct_ruleset();
     }
 
@@ -62,6 +78,7 @@ pub fn rule_mode_with_bindings(
     let mut set = RuleSet::from_indexed_config(device_rules);
     // Explicit device exceptions precede linked groups. Keep the original index
     // for trace/edit and resolve overlapping prefixes most-specific first on ties.
+    let configured_sources = device_policy_sources(rules, links);
     let mut links: Vec<_> = links.iter().collect();
     links.sort_by_key(|link| {
         std::cmp::Reverse(
@@ -101,11 +118,17 @@ pub fn rule_mode_with_bindings(
         }
     }
     // Each tier retains the normal member priority, config index and prefix tie-break.
-    for scoped in tiers.values().rev() {
+    let mut global_start = None;
+    for ((device, _), scoped) in tiers.iter().rev() {
+        if !device {
+            global_start.get_or_insert(set.rules().len());
+        }
         set.extend(RuleSet::from_indexed_config(
             scoped.iter().map(|(i, r)| (*i, r)),
         ));
     }
+
+    let end = set.rules().len();
 
     // Built-in China-direct without its catch-all. Placed after user
     // non-final rules so an explicit user `geoip:CN → proxy` (or a CN
@@ -118,6 +141,7 @@ pub fn rule_mode_with_bindings(
     }
 
     set.extend(RuleSet::from_indexed_config(device_finals));
+    set.isolate_devices(global_start.unwrap_or(end)..end, configured_sources);
     if finals.is_empty() {
         set.add_rule(MatchRule::MatchAll, RouteAction::Proxy);
     } else {
@@ -298,6 +322,69 @@ mod device_tests {
         }
     }
     #[tokio::test]
+    async fn disabled_members_do_not_remove_the_device_assignment() {
+        let mut member = rule("", "domain", "local.invalid", "reject", 0);
+        member.group = "Local".into();
+        member.enabled = false;
+        let link = crate::config::model::DeviceRuleGroup {
+            source: "192.0.2.8/32".into(),
+            group: "Local".into(),
+            target: String::new(),
+            priority: 0,
+        };
+        let router = Router::new(rule_mode_with_bindings(&[member], &[link], true));
+        with_client_source(Some("192.0.2.8".parse().unwrap()), async {
+            assert!(router.has_client_rules());
+            assert_eq!(router.route("local.invalid", 443), RouteAction::Proxy);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn device_binding_excludes_an_unrelated_all_devices_group() {
+        use crate::config::model::DeviceRuleGroup;
+        let mut shared = rule("", "domain", "only-global.invalid", "reject", 100);
+        shared.group = "Shared".into();
+        let mut local = rule("", "domain", "only-local.invalid", "direct", 0);
+        local.group = "Local".into();
+        let link = |source: &str, group: &str| DeviceRuleGroup {
+            source: source.into(),
+            group: group.into(),
+            target: String::new(),
+            priority: 0,
+        };
+        let router = Router::new(rule_mode_with_bindings(
+            &[shared, local, rule("", "final", "*", "direct", 0)],
+            &[link("", "Shared"), link("192.0.2.0/24", "Local")],
+            true,
+        ));
+        for (ip, expected) in [
+            ("192.0.2.7", RouteAction::Proxy),
+            ("198.51.100.7", RouteAction::Reject),
+        ] {
+            let source = Some(ip.parse().unwrap());
+            with_client_source(source, async {
+                assert_eq!(router.route("only-global.invalid", 443), expected);
+                assert_eq!(
+                    router.route_resolving("only-global.invalid", 443).await,
+                    expected
+                );
+                assert_eq!(
+                    router.route_domain_only("only-global.invalid"),
+                    (expected == RouteAction::Reject).then_some(RouteAction::Reject)
+                );
+                assert_eq!(
+                    router
+                        .trace_route("only-global.invalid", 443, source, None, false)
+                        .await
+                        .action,
+                    expected
+                );
+            })
+            .await;
+        }
+    }
+    #[tokio::test]
     async fn linked_groups_respect_member_state_scope_and_explicit_exceptions() {
         use crate::config::model::DeviceRuleGroup;
         let mut rules = vec![
@@ -419,7 +506,7 @@ mod device_tests {
         ]));
         with_client_source(Some("2001:db8:1::10".parse().unwrap()), async {
             assert_eq!(router.route("safe.invalid", 443), RouteAction::Direct);
-            assert_eq!(router.route("shared.invalid", 443), RouteAction::Direct);
+            assert_eq!(router.route("shared.invalid", 443), RouteAction::Reject);
             assert_eq!(router.route("www.baidu.com", 443), RouteAction::Direct);
             assert_eq!(router.route("other.invalid", 443), RouteAction::Reject);
         })

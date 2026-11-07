@@ -7,12 +7,14 @@ const c=vm.createContext({URL,confirm:()=>discard,SR_PROXY_GROUPS:[{name:'Japan'
 vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')),c);c.RULE_RULE_REVISION='revision';c.RULE_TARGET_LABEL['group:Japan']='Japan';c.renderRules();
 const request=action=>{const i=requests.findIndex(r=>r[0]===action);assert.ok(i>=0,action);return requests.splice(i,1)[0];};
 c.startRuleImport();assert.equal(c.RULE_WORKSPACE_MODE,'import');assert.equal(c.RULE_EDIT_GROUP,null);assert.equal(element('rule-target').value,'group:Japan');
-assert.equal(element('rule-import-panel').hidden,false);assert.equal(element('rule-list-panel').hidden,true);
+assert.equal(element('rule-batch').value,'');assert.match(element('rule-batch').placeholder,/读取链接后/);
+assert.equal(element('rule-import-panel').hidden,false);assert.equal(element('rule-list-panel').hidden,false);
 for(const url of ['file:///etc/passwd','https://','https://user:secret@example.invalid/list']){element('rule-import-url').value=url;c.fetchRuleList();assert.equal(requests.length,0);}
 element('rule-import-url').value='https://example.invalid/rules.list';c.fetchRuleList();let read=request('fetch_rule_list');
 assert.equal(read[1].target,'group:Japan');assert.equal(read[1].group,'Emby');assert.equal(c.rulePending,false,'read does not start a mutation');
 c.fetchRuleList();assert.equal(requests.length,0,'duplicate fetch is disabled');
-read[2]({ok:true,count:2,text:'DOMAIN,new.invalid,group:Japan\nGEOIP,CN,DIRECT'});
+read[2]({ok:true,count:2,skipped:{'IP-ASN':5,'PROCESS-NAME':5},text:'DOMAIN,new.invalid,group:Japan\nGEOIP,CN,DIRECT'});
+assert.match(element('rule-import-state').textContent,/IP-ASN × 5、PROCESS-NAME × 5/);
 assert.equal(requests.length,0,'successful fetch must not apply');assert.equal(c.ruleWorkspaceDirty(),true);
 assert.match(element('rule-batch').value,/group:Japan/);c.previewRuleChanges();assert.equal(requests.length,0);
 element('rule-dup').value='replace';c.previewRuleChanges();c.applyRulePreview();let add=request('batch_add_rules');
@@ -28,4 +30,14 @@ read[2]({ok:true,count:1,text:'DOMAIN,stale.invalid,PROXY'});assert.equal(c.RULE
 newest[3]({ok:false,msg:'链接返回 HTTP 404'});assert.equal(c.RULE_IMPORT_PENDING,false);assert.match(element('rule-import-state').textContent,/404/);assert.equal(c.RULE_SELECTED_GROUP,'Other');
 element('rule-batch').value='DOMAIN,keep.invalid,DIRECT';discard=false;c.fetchRuleList();assert.equal(requests.length,0,'reread protects the preview');c.changeRuleGroup('Emby');assert.equal(c.RULE_SELECTED_GROUP,'Other');
 discard=true;c.fetchRuleList();read=request('fetch_rule_list');read[3]({error_code:'timeout'});assert.match(element('rule-batch').value,/keep.invalid/);assert.equal(element('rule-import-fetch').disabled,false);
+c.openRuleGroupCreator('url');
+element('rule-new-group-name').value='Other';c.createRuleGroup();
+assert.equal(c.RULE_SELECTED_GROUP,'Other');assert.equal(element('rule-batch').value,'DOMAIN,keep.invalid,DIRECT');
+element('rule-new-group-name').value='New from URL';c.createRuleGroup();
+assert.equal(c.RULE_WORKSPACE_MODE,'import');assert.equal(requests.length,0);
+element('rule-import-url').value='https://example.invalid/list';c.fetchRuleList();read=request('fetch_rule_list');
+assert.equal(read[1].group,'New from URL');
+read[2]({ok:true,count:1,text:'DOMAIN,one.invalid,PROXY'});
+c.previewRuleChanges();assert.equal(requests.length,0);c.applyRulePreview();add=request('batch_add_rules');
+assert.equal(add[1].group,'New from URL');assert.equal(add[1].replace,false);
 assert.equal(requests.length,0);console.log('PASS: group/node-group import routing, explicit confirmation, append-only requests, validation, stale responses, failures and draft protection');

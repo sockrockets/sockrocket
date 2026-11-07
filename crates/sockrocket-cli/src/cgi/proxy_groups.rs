@@ -216,13 +216,16 @@ pub(super) fn device(post: &J) -> J {
         Ok(v) => v,
         Err(e) => return err_msg(&e),
     };
+    if source.is_empty() && post["all_devices"].as_bool() != Some(true) {
+        return err_msg("请选择设备或明确选择全局设备");
+    }
     let target = post.get("target").and_then(J::as_str).unwrap_or("");
     if target != "inherit" && !valid_target(target) {
         return err_msg("请选择有效的默认出口");
     }
     let mut rules = load_routing_rules(&map);
     // This editor owns the final policy for exactly this source. Destination
-    // exceptions stay intact. Reset removes the final and resumes inheritance.
+    // exceptions stay intact. Reset removes only the final for this source.
     rules.retain(|r| {
         !(sockrocket_core::router::normalize_rule_source(&r.source)
             .ok()

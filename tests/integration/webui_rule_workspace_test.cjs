@@ -17,9 +17,7 @@ assert.match(element('rule-list').innerHTML,/editRule\(0\)/);
 assert.equal(c.changeRuleGroup('Services'),true);
 assert.match(element('rule-list').innerHTML,/editRule\(3\)/,'normal group navigation restores all sources');
 
-vm.runInContext(source.slice(source.indexOf('function selectGroupContents()'),source.indexOf('function renderDevicePolicies()')),c);
-element('rule-search').value='no-match';element('global-rule-group').value='Services';
-c.selectGroupContents();assert.match(element('rule-count').textContent,/当前显示 4 条/);
+vm.runInContext(source.slice(source.indexOf('function keepRulePickerPosition('),source.indexOf('function renderDevicePolicies()')),c);
 element('rule-search').value='SERVICES';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 4 条/);
 element('rule-search').value='192.0.2.0';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 1 条/);assert.match(element('rule-group-summary').textContent,/共 4 条/);
 c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_MEMBERS.length,4);assert.equal(element('rule-list-panel').hidden,true);
@@ -95,3 +93,13 @@ c.SR_STATE.ruleRows=[rule(0,'Known','domain','known.invalid',{target:known})];c.
 assert.equal(target.value,known,'valid group defaults remain selected');assert.match(element('rule-batch').value,new RegExp(known));
 c.cancelRuleEditor();assert.equal(requests.length,0);
 console.log('PASS: native select missing-option semantics, editable bulk defaults, corrected requests and preserved explicit actions');
+
+// Keep the active picker anchored when a different group's list changes height.
+{
+  let offset = 450, scrolled = 0;
+  const picker = {getBoundingClientRect: () => ({top: offset})};
+  c.window = {scrollBy(x, y) { assert.equal(x, 0); scrolled += y; offset -= y; }};
+  c.keepRulePickerPosition(picker, () => { offset -= 180; });
+  assert.equal(offset, 450);
+  assert.equal(scrolled, -180);
+}
