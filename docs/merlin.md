@@ -69,9 +69,9 @@ Co-branded / limited editions (Gundam, Call of Duty, Haiyan, …) use the **same
 | RT-AX68U | BCM4906 | `sockrocket-merlin-hnd_v8.tar.gz` |
 | RT-AX86U | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
 | RT-AX86U_PRO | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
-| RT-AX86S | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| RT-AX86S | BCM4906 | `sockrocket-merlin-hnd_v8.tar.gz` |
 | GT-AXE11000 | BCM4908 | `sockrocket-merlin-hnd_v8.tar.gz` |
-| GT-AXE16000 | BCM4916 | `sockrocket-merlin-hnd_v8.tar.gz` |
+| GT-AXE16000 | BCM491x | `sockrocket-merlin-hnd_v8.tar.gz` |
 | GT-AX6000 | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
 | ZenWiFi Pro XT12 | BCM4912 | `sockrocket-merlin-hnd_v8.tar.gz` |
 
