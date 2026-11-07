@@ -250,3 +250,23 @@ function deviceConnections(html, source, hitsOnly=false) {
  assert.deepEqual(Array.from(globals,s=>[s.title,s.targets[0]]),[['Imported','proxy'],['Legacy','direct']]);
  assert.doesNotMatch(graph(),/<strong>Unbound<\/strong>/);
 }
+
+{
+ const f=fixture(), c=f.context;
+ const rows=[rule(0,{target:'direct'}),rule(1,{rule_type:'final',target:'proxy'})];
+ c.SR_STATE.ruleRows=rows;
+ c.SR_STATE.status.transparent_proxy=true;
+ const graph=()=>f.element('rule-flow').innerHTML;
+ c.renderRuleFlow();
+ assert.deepEqual(deviceConnections(graph(),''),['全局兜底','内置国内 / 局域网','未分组'].sort());
+ assert.match(graph(), /data-from="g0" data-to="e0"/);
+ assert.doesNotMatch(graph(), /data-from="g0" data-to="e1"/,'fallback proxy is not an outlet of the direct rule');
+ assert.match(graph(), /data-from="g2" data-to="e1"/);
+ for(const [i,group,outlet] of [[0,'未分组','直连'],[1,'全局兜底','代理']]){
+   c.RULE_TRACE=result(rows[i]);c.renderRuleFlow();
+   assert.deepEqual(deviceConnections(graph(),'',true),[group]);
+   assert.match(graph(), new RegExp('class="map-node outlet selected"[^>]*><strong>'+outlet+'</strong>'));
+   assert.equal((graph().match(/<path[^>]*class="selected"/g)||[]).length,2);
+ }
+ console.log('PASS: unnamed destination rule and global fallback have separate outlets and exclusive trace paths');
+}

@@ -529,7 +529,7 @@ body.bg {min-width:0!important}
           </div>
           <div class="toolbar"><button type="button" class="btn btn-accent btn-sm" id="sr-rule-flow-check" onclick="traceRuleFlow()">检查分流</button><button type="button" class="btn btn-sm" onclick="previewDeviceFlow()">只看配置流程</button><button type="button" class="btn btn-sm" onclick="resetDeviceFlow()">清除检查</button></div>
           <details><summary>DNS 与目的 IP</summary><div class="fg" style="margin-top:10px"><label for="sr-rule-flow-ip">真实目的 IP（选填，用于复现设备实际解析结果）</label><input id="sr-rule-flow-ip" type="text" autocomplete="off" placeholder="留空时按需解析" oninput="invalidateRuleTrace()"></div><label class="hint"><input id="sr-rule-flow-resolve" type="checkbox" checked onchange="invalidateRuleTrace()"> 遇到 IP / GeoIP 规则时查询 DNS</label></details>
-          <p class="hint" id="sr-rule-flow-query-state" role="status" aria-live="polite">点来源配置关联组和出口，点规则组查看规则；输入目的地址可高亮实际命中路径。</p>
+          <p class="hint" id="sr-rule-flow-query-state" role="status" aria-live="polite">连线表示可能的出口，每次匹配只选一个。输入目的地址可检查命中路径；点击规则组可查看规则。</p>
           <div id="sr-rule-flow" aria-label="分流配置路径"><p class="hint">正在加载规则…</p></div>
           <details class="flow-inspector" id="sr-flow-inspector"><summary>配置来源与出口</summary>
           <div class="toolbar"><h4 id="sr-device-title">全局与设备分流策略</h4><div class="spacer"></div><button class="btn btn-sm" onclick="srLoadRules()">刷新设备</button></div>
@@ -2667,7 +2667,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   var choice=srElement('rule-flow-device').value;
   var selected=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT||(choice==='global'?'':null);
   // Router status polls reuse the topology until a snapshot or selection changes.
-  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.compiledTargets,SR_STATE.nodes,(SR_STATE.status||{}).active_node,SR_PROXY_GROUPS,SR_RULE_NODES];
+  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.globalBindings,SR_STATE.compiledTargets,SR_STATE.nodes,(SR_STATE.status||{}).active_node,SR_PROXY_GROUPS,SR_RULE_NODES];
   if(sharedMapCache && inputs.every(function(value,i){return sharedMapCache.inputs[i]===value;}))return sharedMapCache.html;
   var names=new Map(),scopes=new Map([['','']]),groups=new Map(),exits=new Map(),edges=new Map();
   (SR_STATE.devices||[]).forEach(function(d){
@@ -2679,8 +2679,11 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   (SR_STATE.deviceBindings||[]).concat(all).forEach(function(r){if(r.source)scopes.set(flowSourceKey(r.source),flowHost(r.source)||r.source);});
   if(selected!==null)scopes.set(flowSourceKey(selected),selected);
   var sources=Array.from(scopes.values()), original=new Map(all.map(function(r){return [Number(r.index),r];}));
-  function groupKey(stage){
-    return stage.indices?'group:'+String(original.get(stage.indices[0]).group||'').trim():'stage:'+stage.kind;
+  function groupKey(stage,scope){
+    if(!stage.indices)return 'stage:'+stage.kind;
+    var name=String(original.get(stage.indices[0]).group||'').trim();
+    // Unnamed rules have no shared group identity across sources or matching phases.
+    return name?'group:'+name:'unnamed:'+stage.kind+':'+flowSourceKey(scope);
   }
   function edge(left,a,b,scope,hit){
     var id=[left,a,b].join('/'),e=edges.get(id);
@@ -2701,9 +2704,10 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
     var stages=ruleFlowModel(all,mode,scope,ordered,true);
     var ownsMatch=!!matched && flowSourceKey(scope)===matchedSource;
     stages.forEach(function(stage){
-      var key=groupKey(stage),g=groups.get(key);
-      if(!g){g={index:groups.size,title:stage.title,ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
-      g.phases.add(stage.phaseLabel||stage.title);
+      var key=groupKey(stage,scope),g=groups.get(key);
+      var unnamedFinal=key.indexOf('unnamed:')===0 && (stage.kind==='global_final'||stage.kind==='device_final');
+      if(!g){g={index:groups.size,title:unnamedFinal?stage.phaseLabel:stage.title,ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
+      g.phases.add(unnamedFinal?'前序规则均未命中时使用':stage.phaseLabel||stage.title);
       if(scope===selected && stage.bindingPriority!=null)g.bindingPriority=stage.bindingPriority;
       if(stage.disabled)return;
       g.enabled=true;
@@ -2772,7 +2776,7 @@ function resetDeviceFlow() {
   srElement('rule-flow-device').value='';srElement('rule-flow-manual').hidden=true;
   ['rule-flow-client','rule-flow-destination','rule-flow-port','rule-flow-ip'].forEach(function(id){srElement(id).value='';});
   srElement('rule-flow-resolve').checked=true;RULE_FLOW_SELECTED=0;
-  invalidateRuleTrace('点来源配置关联组和出口，点规则组查看规则；输入目的地址可高亮实际命中路径。');
+  invalidateRuleTrace('连线表示可能的出口，每次匹配只选一个。输入目的地址可检查命中路径；点击规则组可查看规则。');
 }
 function traceRuleFlow() {
   if(RULE_TRACE_PENDING)return;
