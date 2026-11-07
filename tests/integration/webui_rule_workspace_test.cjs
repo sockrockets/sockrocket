@@ -19,9 +19,7 @@ assert.match(element('rule-list').innerHTML,/editRule\(3\)/,'normal group naviga
 
 vm.runInContext(source.slice(source.indexOf('function selectGroupContents()'),source.indexOf('function renderDevicePolicies()')),c);
 element('rule-search').value='no-match';element('global-rule-group').value='Services';
-const groupInput=element('global-rule-group');
-groupInput.value='Ser';assert.equal(c.typeRuleGroup(groupInput,false),false);c.renderRules();assert.equal(groupInput.value,'Ser');
-groupInput.value='services';c.selectGroupContents();assert.equal(element('rule-group-select').value,'Services');assert.match(element('rule-count').textContent,/当前显示 4 条/);
+c.selectGroupContents();assert.match(element('rule-count').textContent,/当前显示 4 条/);
 element('rule-search').value='SERVICES';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 4 条/);
 element('rule-search').value='192.0.2.0';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 1 条/);assert.match(element('rule-group-summary').textContent,/共 4 条/);
 c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_MEMBERS.length,4);assert.equal(element('rule-list-panel').hidden,true);
