@@ -427,6 +427,18 @@ fn auto_detect(value: &str, target: &str) -> Result<RoutingRule, String> {
 }
 
 fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRule, String> {
+    let rule_type = if rule_type == "ip-cidr6" {
+        if !pattern
+            .split('/')
+            .next()
+            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+        {
+            return Err("IP-CIDR6 requires an IPv6 network".into());
+        }
+        "ip-cidr"
+    } else {
+        rule_type
+    };
     let pattern = match rule_type {
         "match" | "final" => "*".to_string(),
         "geoip" => {
@@ -498,6 +510,7 @@ fn looks_like_type(s: &str) -> bool {
             | "ip-cidr"
             | "ip_cidr"
             | "ipcidr"
+            | "ip-cidr6"
             | "geoip"
             | "dst-port"
             | "dst_port"
@@ -513,6 +526,7 @@ fn normalize_type(s: &str) -> &str {
         "domain-suffix" | "domain_suffix" | "domainsuffix" => "domain-suffix",
         "domain-keyword" | "domain_keyword" | "domainkeyword" => "domain-keyword",
         "ip-cidr" | "ip_cidr" | "ipcidr" => "ip-cidr",
+        "ip-cidr6" => "ip-cidr6",
         "geoip" => "geoip",
         "dst-port" | "dst_port" | "port" => "dst-port",
         "match" | "final" => "match",

@@ -13,6 +13,13 @@ assert.equal(requests.length,0,'loading the default catalog must not add or enab
 assert.equal(element('rule-preset').value,'ai');
 assert.equal(element('rule-preset-enable').hidden,true);assert.equal(element('rule-preset-add').disabled,false);
 assert.match(element('rule-preset-state').textContent,/未启用/);
+const application=source.indexOf('<h3 id="sr-rule-application-title">设备分流策略</h3>');
+const maintenance=source.indexOf('id="sr-rule-workspace-title">规则组维护');
+const preset=source.indexOf('>从预设导入</button>');
+assert.ok(maintenance>=0 && maintenance<preset && preset<source.indexOf('</section>',maintenance));
+assert.ok(application>preset && source.indexOf('id="sr-device-picker"')>application);
+element('rule-preset-panel').hidden=false;
+assert.match(element('rule-preset-description').textContent,/预设 · AI 服务/);
 c.addRulePreset();let add=request('add_rule_preset');
 assert.equal(add[1].preset,'ai');assert.equal(add[1].expected_revision,'current');assert.notEqual(add[1].enabled,true);
 assert.equal(element('rule-preset-add').disabled,true);assert.equal(element('rule-preset').disabled,true);
@@ -22,6 +29,9 @@ assert.equal(c.rulePending,true,'mutation lock must include authoritative refres
 c.toggleRulePreset(true);assert.equal(requests.filter(r=>r[0]==='set_rule_group_enabled').length,0,'cannot toggle against the previous snapshot during refresh');
 const rows=presets[0].domains.map((pattern,index)=>({index,source:'',name:'',group:presets[0].group,rule_type:'domain-suffix',pattern,target:'proxy',priority:-10,enabled:false}));
 refresh(rows,'added');
+assert.equal(c.RULE_SELECTED_GROUP,presets[0].group);
+assert.equal(element('rule-preset-panel').hidden,true);
+assert.equal(element('rule-list-panel').hidden,false);
 assert.equal(element('rule-preset-add').disabled,true);assert.equal(element('rule-preset-enable').hidden,false);assert.equal(element('rule-preset-disable').hidden,true);
 c.toggleRulePreset(true);let enable=request('set_rule_group_enabled');
 assert.equal(enable[1].group,presets[0].group);assert.equal(enable[1].enabled,true);assert.equal(enable[1].expected_rules.length,2);assert.equal(enable[1].expected_rules[0].enabled,false);

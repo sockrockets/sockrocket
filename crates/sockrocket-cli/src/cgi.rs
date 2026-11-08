@@ -575,7 +575,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "delete_rule_group" => act_delete_rule_group(post),
         "replace_rule_group" => act_replace_rule_group(post),
         "check_update" => act_check_update(),
-        "apply_update" => act_apply_update(),
+        "apply_update" => act_apply_update(post),
         "update_status" => act_update_status(),
         "diagnose" => act_diagnose(),
         _ => json!({"error": "Unknown action"}),
@@ -1985,12 +1985,7 @@ fn act_stats() -> J {
         }
     }
     let dns_active = dnsmasq_hijack_conf().exists();
-    let fw_active = run_cmd(
-        "iptables",
-        &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
-    )
-    .map(|out| out.contains("MARK"))
-    .unwrap_or(false);
+    let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
     let traffic_path = sockrocket_dir().join("traffic.yaml");
     let traffic_nodes: Vec<J> = sockrocket_core::TrafficLedger::read_file(&traffic_path)
         .unwrap_or_default()
@@ -2045,6 +2040,7 @@ fn act_stats() -> J {
         "pid": pid_val,
         "dns_active": dns_active,
         "fw_active": fw_active,
+        "fw_ipv6": fw_ipv6,
         "traffic": {
             "session_started": session_started,
             "nodes": traffic_nodes,
@@ -2067,23 +2063,105 @@ fn vm_rss_kb(pid: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn firewall_hooks(
+    command: impl Fn(&str, &[&str]) -> Option<String>,
+) -> (Option<bool>, Option<bool>) {
+    let mounted = |tool, chain: &str| {
+        command(tool, &["-t", "mangle", "-n", "-L", "PREROUTING"]).map(|listing| {
+            listing
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(chain))
+        })
+    };
+    (
+        mounted("iptables", "SOCKROCKET_MANGLE"),
+        mounted("ip6tables", "SOCKROCKET_IPV6_MANGLE"),
+    )
+}
+
+fn memory_usage(meminfo: &str) -> (Option<u64>, Option<u64>, &'static str) {
+    let kb = |key: &str| -> Option<u64> {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+    };
+    let total = kb("MemTotal:").filter(|v| *v > 0);
+    let estimate = || {
+        Some(
+            kb("MemFree:")?
+                .saturating_add(kb("Buffers:")?)
+                .saturating_add(kb("Cached:")?),
+        )
+    };
+    let (available, source) = match (total, kb("MemAvailable:")) {
+        (Some(_), Some(value)) => (Some(value), "measured"),
+        (Some(_), None) => match estimate() {
+            Some(value) => (Some(value), "estimated"),
+            None => (None, "unknown"),
+        },
+        _ => (None, "unknown"),
+    };
+    (
+        total,
+        total.zip(available).map(|(t, a)| t.saturating_sub(a)),
+        source,
+    )
+}
+
+fn wan_addresses(mut command: impl FnMut(&str, &[&str]) -> Option<String>) -> Vec<String> {
+    use std::net::IpAddr;
+    fn add(addresses: &mut Vec<IpAddr>, value: &str) {
+        if let Ok(ip) = value.trim().parse::<IpAddr>()
+            && !ip.is_unspecified()
+            && !ip.is_loopback()
+            && !addresses.contains(&ip)
+        {
+            addresses.push(ip);
+        }
+    }
+    let mut addresses = Vec::new();
+    // Local route lookups report the kernel-selected source, including PPP interfaces.
+    for (family, destination) in [("-4", "192.0.2.1"), ("-6", "2001:db8::1")] {
+        if let Some(route) = command("ip", &[family, "route", "get", destination])
+            && let Some(src) = route.split_whitespace().skip_while(|t| *t != "src").nth(1)
+        {
+            add(&mut addresses, src);
+        }
+    }
+    let has_ipv4_route = addresses.iter().any(IpAddr::is_ipv4);
+    let mut nvram = |key: &str| {
+        command("nvram", &["get", key])
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    if nvram("wans_mode") == "lb" {
+        for unit in [0, 1] {
+            if nvram(&format!("wan{unit}_state_t")) == "2" {
+                add(&mut addresses, &nvram(&format!("wan{unit}_ipaddr")));
+            }
+        }
+    } else if !has_ipv4_route {
+        let unit = if nvram("wan1_primary") == "1" { 1 } else { 0 };
+        let state = nvram(&format!("wan{unit}_state_t"));
+        if state.is_empty() || state == "2" {
+            add(&mut addresses, &nvram(&format!("wan{unit}_ipaddr")));
+        }
+    }
+    addresses.sort_by_key(IpAddr::is_ipv6);
+    addresses.iter().map(ToString::to_string).collect()
+}
+
 fn act_sysinfo() -> J {
     let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let kb_of = |key: &str| -> u64 {
-        meminfo
-            .lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    };
-    let mem_total = kb_of("MemTotal:");
-    let mem_avail = kb_of("MemAvailable:");
-    let mem_used = mem_total.saturating_sub(mem_avail);
+    let (mem_total, mem_used, mem_source) = memory_usage(&meminfo);
     let mem_pct = mem_used
-        .checked_mul(100)
-        .and_then(|v| v.checked_div(mem_total))
-        .unwrap_or(0);
+        .zip(mem_total)
+        .map(|(used, total)| ((used as u128 * 100 + total as u128 / 2) / total as u128) as u64);
     let load = fs::read_to_string("/proc/loadavg")
         .unwrap_or_default()
         .split_whitespace()
@@ -2096,9 +2174,7 @@ fn act_sysinfo() -> J {
         .next()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0) as u64;
-    let wan_ip = run_cmd("nvram", &["get", "wan0_ipaddr"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let wan_addresses = wan_addresses(run_cmd);
     // Per-process RSS so the UI can show Sockrocket's own footprint vs
     // system-wide MemAvailable pressure (often ~40–50% on Merlin even idle).
     let daemon_rss_kb = fs::read_to_string(pid_path())
@@ -2112,11 +2188,13 @@ fn act_sysinfo() -> J {
         "mem_total_kb": mem_total,
         "mem_used_kb": mem_used,
         "mem_pct": mem_pct,
+        "memory_source": mem_source,
         "daemon_rss_kb": daemon_rss_kb,
         "api_rss_kb": api_rss_kb,
         "load": load,
         "uptime": format!("{}h {}m", uptime_s / 3600, (uptime_s % 3600) / 60),
-        "wan_ip": wan_ip,
+        "wan_ip": wan_addresses.first().map(String::as_str).unwrap_or(""),
+        "wan_addresses": wan_addresses,
     })
 }
 
@@ -2802,7 +2880,9 @@ fn act_fetch_rule_list(post: &J) -> J {
         ))
     })();
     match result {
-        Ok(preview) => json!({"ok":true,"text":preview.text,"count":preview.count}),
+        Ok(preview) => {
+            json!({"ok":true,"text":preview.text,"count":preview.count,"skipped":preview.skipped})
+        }
         Err(error) => err_msg(&format!("{error:#}")),
     }
 }
@@ -3403,23 +3483,104 @@ fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<
     Ok(())
 }
 
+fn save_update_status(status: &str) -> Result<()> {
+    sockrocket_core::config::storage::atomic_write_private(
+        &sockrocket_dir().join("update-status"),
+        status,
+        false,
+    )
+}
+
+fn update_lock() -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sockrocket_dir().join(".update-worker-lock"))
+}
+
 fn act_update_status() -> J {
     let root = sockrocket_dir();
     let mut active = root.join(".update-transaction").is_dir();
-    let status = fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
+    let job_id = fs::read_to_string(root.join("update-job-id")).unwrap_or_default();
+    let mut status =
+        fs::read_to_string(root.join("update-status")).unwrap_or_else(|_| "idle".into());
     active |= status.trim() == "queued";
+    if !job_id.is_empty()
+        && matches!(
+            status.trim(),
+            "checking" | "downloading" | "verifying" | "queued" | "preparing"
+        )
+        && !root.join(".update-transaction").is_dir()
+    {
+        // The detached worker keeps the launch lock on stdin until the installer exits.
+        // On reboot or worker exit the kernel releases it.
+        if update_lock().is_ok_and(|lock| lock.try_lock_shared().is_ok()) {
+            active = false;
+            status = "failed: 更新进程已中断".into();
+        } else {
+            active = true;
+        }
+    }
     if status.starts_with("rollback-failed:") {
         active = false;
     }
     let stage = fs::read_to_string(root.join(".update-transaction/stage")).unwrap_or_default();
-    json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim()})
+    json!({"ok":true,"active":active,"status":status.trim(),"stage":stage.trim(),"job_id":job_id.trim()})
 }
 
-fn act_apply_update() -> J {
-    let Some(asset) = merlin_update_asset() else {
-        return err_msg("Unknown Merlin platform; reinstall the matching offline package first");
-    };
-    let result = (|| -> anyhow::Result<J> {
+fn act_apply_update(post: &J) -> J {
+    let id = post
+        .get("request_id")
+        .and_then(J::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err_msg("Invalid update request ID");
+    }
+    let launch = (|| -> Result<J> {
+        let root = sockrocket_dir();
+        let id_path = root.join("update-job-id");
+        if fs::read_to_string(&id_path).ok().as_deref() == Some(&id) {
+            return Ok(json!({"ok":true,"job_id":id}));
+        }
+        let lock = update_lock()?;
+        lock.try_lock()
+            .map_err(|_| anyhow::anyhow!("已有软件更新任务正在运行"))?;
+        anyhow::ensure!(
+            !root.join(".update-transaction").exists(),
+            "已有更新事务正在运行"
+        );
+        save_update_status("checking")?;
+        sockrocket_core::config::storage::atomic_write_private(&id_path, &id, false)?;
+        let child = Command::new(std::env::current_exe()?)
+            .arg("--merlin-update-worker")
+            .env("SOCKROCKET_DIR", &root)
+            .stdin(lock)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => {
+                save_update_status("failed: 无法启动更新进程")?;
+                return Err(e.into());
+            }
+        }
+        Ok(json!({"ok":true,"job_id":id,"msg":"更新任务已启动"}))
+    })();
+    launch.unwrap_or_else(|e| err_msg(&e.to_string()))
+}
+
+pub fn merlin_update_worker() -> Result<()> {
+    let result = (|| -> Result<()> {
+        let asset =
+            merlin_update_asset().ok_or_else(|| anyhow::anyhow!("无法识别当前机型的软件包"))?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -3428,7 +3589,7 @@ fn act_apply_update() -> J {
             Some(&asset),
         ))?;
         if check.availability != sockrocket_core::UpdateAvailability::Available {
-            return Ok(json!({"ok":true,"msg":"Already up to date"}));
+            return save_update_status("up-to-date");
         }
         let url = check
             .asset_url
@@ -3442,6 +3603,7 @@ fn act_apply_update() -> J {
         fs::create_dir(&work)?;
         let prepare = (|| -> anyhow::Result<()> {
             let archive = work.join("package.tar.gz");
+            save_update_status("downloading")?;
             rt.block_on(sockrocket_core::download_file_with_proxy_fallback(
                 &url,
                 &archive,
@@ -3451,6 +3613,7 @@ fn act_apply_update() -> J {
                     None
                 },
             ))?;
+            save_update_status("verifying")?;
             let listing = Command::new("tar").arg("-tzvf").arg(&archive).output()?;
             anyhow::ensure!(listing.status.success(), "Invalid package archive");
             for line in String::from_utf8_lossy(&listing.stdout).lines() {
@@ -3522,34 +3685,58 @@ fn act_apply_update() -> J {
                 "{}",
                 String::from_utf8_lossy(&space.stderr).trim()
             );
-            fs::write(sockrocket_dir().join("update-status"), "queued\n")?;
-            Command::new("sh")
+            save_update_status("queued")?;
+            // Replace the old binary before installation so unlinking it frees flash.
+            // Only the supervising shell retains the lock on stdin. The installer
+            // and any services that it starts must not inherit that descriptor.
+            let mut install = Command::new("sh");
+            install
                 .arg("-c")
-                .arg(r#"sleep 2; exec sh "$1" "$2" "$3""#)
-                .arg("sockrocket-update")
+                .arg(
+                    r#"
+                sh "$1" "$2" "$3" </dev/null
+                rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    case "$(cat "$SOCKROCKET_DIR/update-status")" in
+                        failed:*|rolled-back:*|rollback-failed:*) ;;
+                        *) echo 'failed: 安装未完成' > "$SOCKROCKET_DIR/update-status" ;;
+                    esac
+                fi
+                exit "$rc"
+            "#,
+                )
+                .arg("merlin-update")
                 .arg(work.join("worker.sh"))
                 .arg(&pkg)
                 .arg(&work)
-                .env("SOCKROCKET_DIR", sockrocket_dir())
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
-            Ok(())
+                .env("SOCKROCKET_DIR", sockrocket_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                Err(install.exec().into())
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::ensure!(install.status()?.success(), "安装未完成");
+                Ok(())
+            }
         })();
         if let Err(e) = prepare {
-            let _ = fs::write(
-                sockrocket_dir().join("update-status"),
-                "failed: preparation\n",
-            );
             let _ = fs::remove_dir_all(&work);
             return Err(e);
         }
-        Ok(
-            json!({"ok":true,"msg":"完整插件更新已启动；稍后刷新页面查看版本。失败时自动恢复旧版。"}),
-        )
+        Ok(())
     })();
-    result.unwrap_or_else(|e| err_msg(&format!("Plugin update failed: {e:#}")))
+    if let Err(ref error) = result {
+        let status = fs::read_to_string(sockrocket_dir().join("update-status")).unwrap_or_default();
+        if !status.starts_with("rolled-back:")
+            && !status.starts_with("rollback-failed:")
+            && !status.starts_with("failed:")
+        {
+            save_update_status(&format!("failed: {error}"))?;
+        }
+    }
+    result
 }
 
 fn act_diagnose() -> J {
@@ -3561,8 +3748,11 @@ fn act_diagnose() -> J {
         "iptables",
         &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
     )
-    .map(|out| out.matches("MARK").count())
-    .unwrap_or(0);
+    .map(|out| {
+        out.lines()
+            .filter(|line| line.split_whitespace().next() == Some("MARK"))
+            .count()
+    });
     let dns_rules = if dnsmasq_hijack_conf().exists() { 1 } else { 0 };
     // .output(), NOT .status(): the diagnose endpoint runs inside the api
     // bridge whose stderr is sockrocket.log — an inherited stderr would spill probe
@@ -3576,18 +3766,7 @@ fn act_diagnose() -> J {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let fw_active = Command::new("iptables")
-        .args([
-            "-t",
-            "mangle",
-            "-C",
-            "PREROUTING",
-            "-j",
-            "SOCKROCKET_MANGLE",
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
     let errors: Vec<String> = tail_lines(&log_path(), 500)
         .lines()
         .filter(|l| {
@@ -3612,6 +3791,7 @@ fn act_diagnose() -> J {
         "dns_rules": dns_rules,
         "dnsmasq_running": dnsmasq_running,
         "fw_active": fw_active,
+        "fw_ipv6": fw_ipv6,
         "last_errors_base64": B64.encode(last_errors),
     })
 }
@@ -3619,6 +3799,66 @@ fn act_diagnose() -> J {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_memory_sources() {
+        let legacy = "MemTotal: 100000 kB\nMemFree: 10000 kB\nBuffers: 5000 kB\nCached: 15000 kB\n";
+        assert_eq!(
+            memory_usage(legacy),
+            (Some(100000), Some(70000), "estimated")
+        );
+        assert_eq!(
+            memory_usage(&format!("{legacy}MemAvailable: 0 kB")),
+            (Some(100000), Some(100000), "measured")
+        );
+        assert_eq!(
+            memory_usage("MemTotal: 128 kB"),
+            (Some(128), None, "unknown")
+        );
+    }
+
+    #[test]
+    fn monitor_wan_failover_and_load_balancing() {
+        let wan = |mode: &str| {
+            wan_addresses(|cmd, args| match (cmd, args) {
+                ("ip", ["-6", ..]) => Some("dev eth1 src 2001:db8::2".into()),
+                ("nvram", ["get", key]) => Some(
+                    match *key {
+                        "wans_mode" => mode,
+                        "wan1_primary" => "1",
+                        "wan0_state_t" | "wan1_state_t" => "2",
+                        "wan0_ipaddr" => "192.0.2.3",
+                        "wan1_ipaddr" => "192.0.2.4",
+                        _ => "",
+                    }
+                    .into(),
+                ),
+                _ => None,
+            })
+        };
+        assert_eq!(wan("fo"), ["192.0.2.4", "2001:db8::2"]);
+        assert_eq!(wan("lb"), ["192.0.2.3", "192.0.2.4", "2001:db8::2"]);
+        assert_eq!(
+            wan_addresses(|_, args| match args {
+                ["-6", ..] => Some("dev eth1 src 2001:db8::3".into()),
+                _ => None,
+            }),
+            ["2001:db8::3"]
+        );
+    }
+
+    #[test]
+    fn monitor_firewall_distinguishes_unavailable_from_unmounted() {
+        assert_eq!(
+            firewall_hooks(|cmd, _| (cmd == "iptables")
+                .then(|| "SOCKROCKET_MANGLE all -- anywhere anywhere".into())),
+            (Some(true), None)
+        );
+        assert_eq!(
+            firewall_hooks(|_, _| Some("Chain PREROUTING (policy ACCEPT)".into())),
+            (Some(false), Some(false))
+        );
+    }
 
     async fn parse_test_request(bytes: Vec<u8>) -> Option<ApiRequest> {
         use tokio::io::AsyncWriteExt;
@@ -3831,6 +4071,28 @@ mod tests {
     }
 
     #[test]
+    fn saving_fallback_requires_an_explicit_scope() {
+        let env = TestEnv::new(SAMPLE);
+        let revision = route_trace::rules_revision(&load_conf().unwrap());
+        let before = fs::read(env.dir.join("config.yaml")).unwrap();
+        for post in [
+            json!({"target":"reject","revision":revision}),
+            json!({"source":"","all_devices":false,"target":"reject","revision":revision}),
+        ] {
+            assert_eq!(dispatch("save_device_policy", &post)["ok"], false);
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        assert_eq!(
+            dispatch(
+                "save_device_policy",
+                &json!({"source":"","all_devices":true,
+            "target":"reject","revision":revision})
+            )["ok"],
+            true
+        );
+    }
+
+    #[test]
     fn structured_network_policy_preserves_stop_and_private_configuration() {
         let env = TestEnv::new(SAMPLE);
         fs::write(env.dir.join("stopped"), "").unwrap();
@@ -3956,6 +4218,33 @@ mod tests {
             false
         );
         assert_eq!(fs::read(env.dir.join("config.yaml")).unwrap(), before);
+    }
+
+    #[test]
+    fn update_status_tracks_each_preinstall_phase_and_worker_exit() {
+        let env = TestEnv::new(SAMPLE);
+        let id = "00112233445566778899aabbccddeeff";
+        let lock = update_lock().unwrap();
+        lock.try_lock().unwrap();
+        fs::write(env.dir.join("update-job-id"), id).unwrap();
+        for phase in ["checking", "downloading", "verifying", "queued"] {
+            save_update_status(phase).unwrap();
+            let status = act_update_status();
+            assert_eq!(status["active"], true);
+            assert_eq!(status["job_id"], id);
+            assert_eq!(status["status"], phase);
+        }
+        assert_eq!(act_apply_update(&json!({"request_id":id}))["job_id"], id);
+        assert_eq!(act_apply_update(&json!({}))["ok"], false);
+        drop(lock);
+        let interrupted = act_update_status();
+        assert_eq!(interrupted["active"], false);
+        assert!(
+            interrupted["status"]
+                .as_str()
+                .unwrap()
+                .starts_with("failed:")
+        );
     }
 
     #[test]
@@ -5176,7 +5465,7 @@ dns_direct_domains:
             &json!({"revision":revision(),"source":"192.0.2.8","group":"Video","target":"","remove":true}),
         );
         assert_eq!(removed["ok"], true);
-        assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "proxy");
         assert_eq!(
             act_get_rules()["device_rule_groups"]
                 .as_array()
@@ -5185,6 +5474,14 @@ dns_direct_domains:
             2
         );
         assert_eq!(trace("192.0.2.8", "music.invalid"), "proxy");
+        for group in ["Music", "Work"] {
+            let removed = dispatch(
+                "save_device_binding",
+                &json!({"revision":revision(),"source":"192.0.2.8","group":group,"target":"","remove":true}),
+            );
+            assert_eq!(removed["ok"], true);
+        }
+        assert_eq!(trace("192.0.2.8", "new.invalid"), "direct");
     }
 
     #[test]

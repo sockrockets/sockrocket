@@ -281,7 +281,7 @@ mod tests {
                     .err()
                     .unwrap()
                     .to_string(),
-                "video"
+                "device"
             );
             assert_eq!(
                 outbound
@@ -294,7 +294,7 @@ mod tests {
             );
             assert_eq!(
                 outbound
-                    .connect_datagram("unlisted.invalid", 443)
+                    .connect_datagram("example.invalid", 443)
                     .await
                     .err()
                     .unwrap()

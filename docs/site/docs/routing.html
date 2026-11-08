@@ -94,10 +94,10 @@
         <h2 id="presets">预设、设备与去向检查</h2>
         <ul>
           <li><strong>常用预设</strong>：AI 服务、海外视频、Telegram 网页、开发工具、Apple 直连、Microsoft 直连、国内站点。添加后是停用的，再由你打开。它们覆盖常见域名，不是这些服务的全部地址；Telegram 数据中心的 IP 仍按 IP 规则或兜底走。</li>
-          <li><strong>设备兜底</strong>：给一台设备或一个网段单独的最终出口。没单独设置的设备继续用全部设备的规则。请给设备固定 DHCP 地址。选「继承全局」会删掉这个来源的最终规则，目的域名和 IP 例外还在。</li>
+          <li><strong>设备兜底</strong>：给一台设备或一个网段单独的最终出口。未配置专属策略的设备使用「全局设备」的规则。清除自定义默认出口后，如仍有专属规则或绑定，未命中时走代理。请给设备固定 DHCP 地址。</li>
           <li><strong>去向检查</strong>：输入网站，看命中哪一条、为什么、走哪个出口。不修改规则，不发起代理连接，也不保存查询记录。</li>
         </ul>
-        <p>匹配顺序是：这台设备的目的规则 → 全部设备的目的规则 → 国内直连 → 这台设备的兜底，否则全局兜底。</p>
+        <p>已配置专属策略的设备依次检查设备规则、关联组、内置国内直连，再走设备兜底。其余设备检查全局设备的规则、内置国内直连，再走全局兜底。</p>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <h2 id="en-modes">Three modes</h2>
@@ -134,10 +134,10 @@
         <h2 id="en-presets">Presets, devices and the routing check</h2>
         <ul>
           <li><strong>Presets</strong>: AI services, overseas video, Telegram web, developer tools, Apple direct, Microsoft direct and domestic sites. They are added disabled. The lists are common domains, not every endpoint. Telegram data-center IPs still follow IP rules or the final rule.</li>
-          <li><strong>Device default</strong>: a final exit for one device or prefix. Devices without one keep the shared rules. Use a DHCP reservation. Inherit removes that source's final rule and leaves destination exceptions.</li>
+          <li><strong>Device default</strong>: a final exit for one device or prefix. Devices without a dedicated policy use shared rules. Clearing the custom exit leaves device rules and bindings in effect. Use a DHCP reservation.</li>
           <li><strong>Routing check</strong>: enter a site and see which rule matched and which exit it uses. It does not change rules, open a proxy connection, or store the query.</li>
         </ul>
-        <p>Order: this device's destination rules → shared destination rules → domestic direct → this device's final, otherwise the global final.</p>
+        <p>Assigned devices check their own rules and bound groups, then domestic direct and their device fallback. Other devices check shared rules, then domestic direct and the global fallback.</p>
       </div>
       <div class="doc-next">
         <a href="configuration.html">→ 配置说明</a>

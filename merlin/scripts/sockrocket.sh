@@ -784,9 +784,16 @@ update_dnsmasq() {
 # Activate routing before DNS: fake-IP answers require a working data path.
 activate_startup_network() {
     if [ "$want_proxy" = "true" ]; then
-        if ! wait_for_tun 20 ||
-            ! "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1; then
-            enter_lan_degraded "startup TUN/routing setup failed"
+        if ! wait_for_tun 20; then
+            if is_running; then
+                enter_lan_degraded "startup TUN interface unavailable after 20s"
+            else
+                enter_lan_degraded "startup daemon exited before TUN interface became ready"
+            fi
+            return 1
+        fi
+        if ! "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1; then
+            enter_lan_degraded "startup firewall/routing setup failed"
             return 1
         fi
     fi
@@ -1073,19 +1080,23 @@ ensure_tun() {
     [ -e "$TUN_DEV" ]
 }
 
+tun_interface_ready() {
+    [ -d /sys/class/net/sockrocket-tun ] ||
+        ip link show sockrocket-tun >/dev/null 2>&1 ||
+        ip -4 addr show tun0 2>/dev/null | grep -Eq 'inet[[:space:]]+10[.]10[.]0[.]2([/[:space:]]|$)'
+}
+
 # Wait for Sockrocket's TUN device to appear (up to ~$1 seconds).
 wait_for_tun() {
     local tries="${1:-20}"
     while [ "$tries" -gt 0 ]; do
-        ip link show sockrocket-tun >/dev/null 2>&1 && return 0
-        # Older builds used the kernel-assigned tun0.
-        ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2" && return 0
+        tun_interface_ready && return 0
         # Stop early if the process died while we waited.
         is_running || return 1
         sleep 1
         tries=$((tries - 1))
     done
-    return 1
+    tun_interface_ready
 }
 
 # Poll until Sockrocket's DNS listener answers. sockrocket-cli binds the DNS port
@@ -1782,16 +1793,16 @@ outbound_probe_ok() {
 # shell arithmetic. awk also supports older kernels without MemAvailable.
 memory_used_pct() {
     awk '
-        /^MemTotal:/ { total=$2 }
-        /^MemAvailable:/ { available=$2; have_available=1 }
-        /^MemFree:/ { free_mem=$2 }
-        /^Buffers:/ { buffers=$2 }
-        /^Cached:/ { cached=$2 }
+        $2 ~ /^[0-9]+$/ { kb[$1]=$2 }
         END {
-            if (total > 0) {
-                if (!have_available) available=free_mem+buffers+cached
-                printf "%.0f\n", (total-available)*100/total
-            }
+            total=kb["MemTotal:"]+0
+            if (total <= 0) exit
+            if ("MemAvailable:" in kb) available=kb["MemAvailable:"]
+            else if ("MemFree:" in kb && "Buffers:" in kb && "Cached:" in kb)
+                available=kb["MemFree:"]+kb["Buffers:"]+kb["Cached:"]
+            else exit
+            if (available > total) available=total
+            print int((total-available)*100/total+0.5)
         }
     ' "${SOCKROCKET_MEMINFO_FILE:-/proc/meminfo}" 2>/dev/null
 }
@@ -1844,9 +1855,13 @@ try_recover_lan_proxy() {
     if [ "$want_proxy" = "true" ]; then
         # Never enable fake-IP DNS or clear the marker without a working
         # transparent path. A running SOCKS listener alone is insufficient.
-        wait_for_tun 1 || return 1
-        [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] || return 1
+        if ! wait_for_tun 1; then
+            hold_recover 60
+            log_warn "Recovery waiting for TUN interface; retry in 60s"
+            return 1
+        fi
         if ! "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1; then
+            hold_recover 60
             enter_lan_degraded "recovery firewall setup failed"
             return 1
         fi
@@ -2087,9 +2102,7 @@ do_watchdog() {
         # on the direct path until probe recovers).
         if [ ! -f "$DEGRADED_FILE" ] && [ "$(conf_bool transparent_proxy true)" = "true" ]; then
             ensure_tun || log_warn "Watchdog: TUN unavailable for transparent proxy"
-            if { ip link show sockrocket-tun >/dev/null 2>&1 || \
-                 ip -4 addr show tun0 2>/dev/null | grep -q "10.10.0.2"; } \
-                && ! iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
+            if tun_interface_ready && ! iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
                 log_warn "Watchdog: iptables rules missing, reapplying..."
                 [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1
                 issues=$((issues + 1))

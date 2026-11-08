@@ -4,7 +4,7 @@ const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 const elements={}, requests=[];
 const el=id=>elements[id]||=( {
   value:'',hidden:true,disabled:false,options:[],textContent:'',_html:'',
-  get innerHTML(){return this._html;},set innerHTML(value){this._html=value;var checks=Array.from(value.matchAll(/<input type="(?:checkbox|radio)" value="([^"]*)"([^>]*)>[\s\S]*?<span>([\s\S]*?)<\/span>/g),m=>({value:m[1],selected:/\bchecked\b/.test(m[2]),textContent:m[3]}));this.options=checks.length?checks:Array.from(value.matchAll(/<option value="([^"]*)"([^>]*)>(.*?)<\/option>/g),m=>({value:m[1],selected:m[2].includes('selected'),textContent:m[3]}));if(this.options.length)this.value=this.options[0].value;},
+  get innerHTML(){return this._html;},set innerHTML(value){this._html=value;var checks=Array.from(value.matchAll(/<input type="(?:checkbox|radio)" value="([^"]*)"([^>]*)>[\s\S]*?<span>([\s\S]*?)<\/span>/g),m=>({value:m[1],checked:/\bchecked\b/.test(m[2]),selected:/\bchecked\b/.test(m[2]),textContent:m[3]}));this.options=checks.length?checks:Array.from(value.matchAll(/<option value="([^"]*)"([^>]*)>(.*?)<\/option>/g),m=>({value:m[1],selected:m[2].includes('selected'),textContent:m[3]}));if(this.options.length)this.value=this.options[0].value;},
   appendChild(o){this.options.push(o);}
 });
 const c=vm.createContext({srElement:el,srEsc:v=>String(v??''),srApi:(...args)=>requests.push(args),srShowMsg(){},toastResp(){},invalidateRuleTrace(){},confirm:()=>true,document:{createElement:()=>({})},RULE_TARGET_LABEL:{proxy:'代理',direct:'直连',reject:'拒绝'},SR_PAGE_LOADED:{},SR_STATE:{ruleRows:[]},RULE_RULE_REVISION:'r1',isFinalRule:r=>['final','match'].includes(r.rule_type),ruleApi:(...args)=>requests.push(args)});
@@ -39,6 +39,7 @@ c.loadProxyGroups();const old=take('proxy_groups');c.loadProxyGroups();take('pro
 // Load the real source/CIDR, phase and locking helpers used by the device editor.
 vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')),c);
 c.RULE_RULE_REVISION='r1';
+c.setProxyGroupTargets([group]);
 el('device-available-groups').querySelectorAll=()=>el('device-available-groups').options.filter(box=>box.checked);
 c.ruleApi=(...args)=>requests.push(args);
 c.SR_STATE.devices=[{source:'192.0.2.8/32',key:'mac:00:11:22:33:44:55',alias_key:'mac:00:11:22:33:44:55',alias:'电视',host:'living-room'}];
@@ -49,12 +50,38 @@ c.SR_STATE.ruleRows=[
 c.SR_STATE.deviceBindings=[{source:'192.0.2.8/32',group:'Emby',target:'direct'}];
 c.renderDevicePolicies();
 assert.match(el('device-picker').innerHTML,/电视/);
+assert.equal(el('device-scope-note').hidden,false);
+assert.equal(el('device-picker').options[0].value,'global');
+assert.equal(el('device-picker').value,'global');
+assert.equal(requests.length,0,'default selection must not save a policy');
+const form=source.split('<fieldset id="sr-device-form"')[1].split('</fieldset>')[0];
+assert.equal(form.match(/<select id="([^"]+)"/)[1],'sr-device-picker');
+assert.doesNotMatch(form,/查看规则组内容|sr-global-rule-group/);
 assert.equal(el('device-picker').options.filter(o=>o.value.startsWith('192.0.2.8')).length,1,'a bare IP and its host CIDR identify the same device');
-el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();
+el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();c.renderDevicePolicies();
+assert.equal(el('device-scope-note').hidden,true);
+assert.equal(el('device-picker').value,'192.0.2.8/32');
 assert.equal(el('device-target').value,'direct');
+assert.equal(el('device-fallback-label').textContent,'未命中规则时直连');
+const subnetFinal={index:8,rule_type:'final',source:'192.0.2.0/24',priority:10,target:'reject'};
+c.SR_STATE.ruleRows.push(subnetFinal);
+c.updateDevicePolicySelection();
+assert.equal(el('device-fallback-label').textContent,'未命中规则时拒绝连接');
+assert.equal(el('device-target').value,'direct','the editor targets only the selected device');
+assert.equal(el('device-effective-policy').hidden,false);
+assert.match(el('device-effective-policy').textContent,/192\.0\.2\.0\/24/);
+subnetFinal.priority=0;
+c.updateDevicePolicySelection();
+assert.equal(el('device-fallback-label').textContent,'未命中规则时直连','equal priorities keep configuration order');
+assert.equal(el('device-effective-policy').hidden,true);
+c.SR_STATE.ruleRows.pop();
+c.updateDevicePolicySelection();
 assert.equal(el('device-group').value,'Emby');
-assert.deepEqual(el('global-rule-group').options.map(o=>o.value),['','Emby']);
-assert.match(el('global-rule-summary').textContent,/共 2 条，已启用 2 条/);
+assert.match(el('device-bindings').innerHTML,/Emby/);
+assert.equal(el('device-bound-editor').hidden,true);
+c.editDeviceBinding('Emby');
+assert.equal(el('device-bound-editor').hidden,false);
+assert.match(el('binding-name').textContent,/Emby/);
 assert.equal(el('device-group-target').value,'direct');
 assert.equal(el('device-unlink').hidden,false);
 for(const name of ['Music','Work'])c.SR_STATE.ruleRows.push({index:c.SR_STATE.ruleRows.length,rule_type:'domain',source:'',group:name,enabled:true,pattern:name+'.invalid',target:'proxy'});
@@ -80,7 +107,7 @@ assert.equal(el('device-target').value,'inherit','switching devices must not car
 el('device-target').value='group:Video';c.saveDevicePolicy();req=take('save_device_policy');
 assert.equal(req[1].source,'2001:db8:1::/64');assert.equal(req[1].target,'group:Video');
 el('device-picker').value='global';c.selectPolicyDevice();c.saveDevicePolicy();req=take('save_device_policy');
-assert.equal(req[1].source,'');assert.equal(req[1].target,'inherit');
+assert.equal(req[1].source,'');assert.equal(req[1].all_devices,true);assert.equal(req[1].target,'inherit');
 console.log('PASS: group selection, named router clients, device bindings, graph, manual CIDR and explicit global policy');
 
 el('device-picker').value='global';c.selectPolicyDevice();
@@ -92,3 +119,47 @@ c.SR_STATE.deviceBindings.push({source:'',group:'Music',target:'direct',priority
 c.updateDevicePolicySelection();assert.equal(el('device-group-priority').value,'8');
 c.saveDeviceBinding(true);req=take('save_device_binding');
 assert.equal(req[1].all_devices,true);assert.equal(req[1].group,'Music');assert.equal(req[1].remove,true);
+
+c.editDeviceBinding('Music');
+el('device-group-priority').value='54321';
+el('device-available-groups').options.find(box=>box.value==='Work').checked=true;
+el('device-add-priority').value='22';
+c.renderDevicePolicies();
+assert.equal(el('device-group-priority').value,'54321');
+assert.deepEqual([...c.selectedDeviceGroups()],['Work']);
+el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();
+el('device-picker').value='global';c.selectPolicyDevice();
+assert.equal(el('device-bound-editor').hidden,false);
+assert.equal(el('device-group-priority').value,'54321');
+assert.equal(el('device-add-priority').value,'22');
+c.SR_STATE.deviceBindings.find(b=>!b.source).priority=30;
+c.renderDevicePolicies();
+assert.equal(el('device-link').disabled,true);
+assert.match(el('device-group-state').textContent,/已被修改/);
+c.confirm=()=>false;c.closeDeviceBinding();assert.equal(el('device-bound-editor').hidden,false);
+c.confirm=()=>true;c.closeDeviceBinding();c.editDeviceBinding('Music');
+assert.equal(el('device-group-priority').value,'30');
+c.SR_STATE.globalBindings=c.SR_STATE.deviceBindings.filter(b=>!b.source);
+el('device-picker').value='manual';c.selectPolicyDevice();
+el('device-source').value='192.0.2.123';c.updateDevicePolicySelection();
+assert.equal(el('device-inherited').hidden,false);
+assert.match(el('device-inherited-list').innerHTML,/Music/);
+assert.equal(el('device-fallback-label').textContent,'未命中规则时走代理');
+console.log('PASS: scoped drafts, refresh conflicts, discard choice, inherited groups and fallback');
+
+el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();
+assert.equal(el('device-inherited').hidden,true);
+el('device-target').value='reject';el('device-alias').value='草稿名称';
+c.renderDevicePolicies();
+assert.equal(el('device-target').value,'reject');
+assert.equal(el('device-alias').value,'草稿名称');
+el('device-picker').value='global';c.selectPolicyDevice();
+assert.equal(el('device-target').value,'inherit');
+el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();
+assert.equal(el('device-target').value,'reject');
+assert.equal(el('device-alias').value,'草稿名称');
+c.SR_STATE.devices[0].alias='另一个名称';c.renderDevicePolicies();
+c.confirm=()=>false;c.saveDeviceAlias();assert.equal(requests.length,0);
+c.SR_STATE.devices[0].alias_key='mac:00:11:22:33:44:66';c.renderDevicePolicies();
+assert.equal(el('device-alias').value,'另一个名称');
+console.log('PASS: fallback and alias drafts survive refresh and stay scoped to the device');

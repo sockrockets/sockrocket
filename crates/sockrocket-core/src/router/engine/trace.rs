@@ -65,7 +65,7 @@ impl Router {
         let lower = host.to_lowercase();
         let mut builtin_misses = 0;
         let mut builtin_needs_ip = false;
-        for entry in &self.rules.rules {
+        for entry in self.rules.entries_for(source) {
             let source_ok = source_matches(entry.source, source);
             let needs_ip = matches!(entry.rule, MatchRule::IpCidr { .. } | MatchRule::GeoIp(_));
             if source_ok && needs_ip && !attempted {
@@ -220,10 +220,10 @@ mod tests {
             .await;
         assert_eq!(
             trace.matched_rule,
-            Some(0),
-            "global destination rules precede a device final"
+            Some(9),
+            "an assigned device skips global destination rules"
         );
-        assert_eq!(trace.action, RouteAction::Reject);
+        assert_eq!(trace.action, RouteAction::Direct);
         let trace = router
             .trace_route("example.com", 443, None, None, false)
             .await;

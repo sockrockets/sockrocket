@@ -9,4 +9,6 @@ pub use engine::{
     validate_rule,
 };
 pub use geoip::GeoIpDb;
-pub use rule_mode::{rule_mode_ruleset, rule_mode_with_bindings, rule_mode_with_devices};
+pub use rule_mode::{
+    device_policy_sources, rule_mode_ruleset, rule_mode_with_bindings, rule_mode_with_devices,
+};
