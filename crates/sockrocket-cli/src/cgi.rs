@@ -3486,10 +3486,11 @@ fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<
         .ok_or_else(|| anyhow::anyhow!("Cannot parse free space for {}", path.display()))?;
     anyhow::ensure!(
         available >= required,
-        "更新空间不足：{} 需要 {} KiB，可用 {} KiB；现有安装未修改",
+        "更新空间不足：{} 需要 {} KiB，可用 {} KiB，还差 {} KiB；现有安装未修改",
         path.display(),
         required.div_ceil(1024),
-        available / 1024
+        available / 1024,
+        required.saturating_sub(available).div_ceil(1024)
     );
     Ok(())
 }
@@ -3664,6 +3665,7 @@ pub fn merlin_update_worker() -> Result<()> {
                     .success(),
                 "Extraction failed"
             );
+            fs::remove_file(&archive).context("Cannot release temporary package space")?;
             let pkg = work.join("sockrocket");
             let platform = fs::read_to_string(pkg.join(".valid"))?;
             anyhow::ensure!(
@@ -3685,18 +3687,8 @@ pub fn merlin_update_worker() -> Result<()> {
                 work.join("worker.sh"),
                 include_str!("../../../merlin/scripts/update.sh"),
             )?;
-            let space = Command::new("sh")
-                .arg(work.join("worker.sh"))
-                .arg(&pkg)
-                .arg(&work)
-                .arg("--check-space")
-                .env("SOCKROCKET_DIR", sockrocket_dir())
-                .output()?;
-            anyhow::ensure!(
-                space.status.success(),
-                "{}",
-                String::from_utf8_lossy(&space.stderr).trim()
-            );
+            // The worker checks flash headroom under the update lock before
+            // copying its snapshot, then checks again once the backup is durable.
             save_update_status("queued")?;
             // Replace the old binary before installation so unlinking it frees flash.
             // Only the supervising shell retains the lock on stdin. The installer

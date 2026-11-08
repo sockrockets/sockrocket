@@ -1,6 +1,7 @@
 """Exercise durable recovery without a router or root filesystem changes."""
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import tarfile
@@ -141,15 +142,28 @@ class RecoveryTest(unittest.TestCase):
             for path in (root, pkg, work, commands):
                 path.mkdir()
             (root / 'sockrocket-cli').write_text('old')
+            for name in ('bin', 'scripts', 'webui', 'res'):
+                (pkg / name).mkdir()
+            for name in ('version', 'uninstall.sh'):
+                (pkg / name).touch()
+            # Same-size upgrade: the old binary can still be mapped.
+            data = b'x' * (2 * 1024 * 1024)
+            (root / 'sockrocket-cli').write_bytes(data)
+            (pkg / 'bin/sockrocket-cli').write_bytes(data)
             df = commands / 'df'
-            df.write_text('#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted\\nmock 100 99 1 99%% /\\n"\n')
+            df.write_text('#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted\\nmock 10000 5000 5000 50%% /\\n"\n')
             df.chmod(0o755)
             result = subprocess.run(['sh', str(WORKER), str(pkg), str(work), '--check-space'],
                 env={**os.environ, 'SOCKROCKET_DIR': str(root),
                      'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('空间不足', result.stderr.decode())
-            self.assertEqual((root / 'sockrocket-cli').read_text(), 'old')
+            message = result.stderr.decode()
+            match = re.search(r'需要 (\d+) KiB，可用 5000 KiB，还差 (\d+) KiB', message)
+            self.assertIsNotNone(match, message)
+            required, shortfall = map(int, match.groups())
+            self.assertEqual(shortfall, required - 5000)
+            self.assertFalse((root / 'update-status').exists())
+            self.assertEqual((root / 'sockrocket-cli').read_bytes(), data)
             self.assertFalse((root / '.update-transaction').exists())
 
     def test_incompatible_configuration_rejected_before_transaction(self):
@@ -202,6 +216,28 @@ class RecoveryTest(unittest.TestCase):
                 tool = commands / name
                 tool.write_text('#!/bin/sh\n' + body + '\n')
                 tool.chmod(0o755)
+            # Lose space after the durable backups are written. The running
+            # installation must not be stopped or sent through rollback.
+            df = commands / 'df'
+            success_df = df.read_text()
+            df.write_text('#!/bin/sh\nif test -f "$SOCKROCKET_DIR/.update-transaction/config-backed-up"; '
+                          'then echo "mock 1000 999 1 99% /"; else echo "mock 1000000 0 1000000 0% /"; fi\n')
+            (root / 'scripts/sockrocket.sh').write_text('#!/bin/sh\ntouch "$SOCKROCKET_DIR/service-called"\n')
+            attempt = base / 'attempt'
+            attempt.mkdir()
+            failed = subprocess.run(['sh', str(WORKER), str(pkg), str(attempt)],
+                env={**os.environ, 'SOCKROCKET_DIR': str(root),
+                     'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
+            message = (root / 'update-status').read_text()
+            self.assertIn('备份后 空间不足', message)
+            required, available, shortfall = map(int, re.findall(r'(\d+) KiB', message))
+            self.assertEqual((available, shortfall), (1, required - 1))
+            self.assertFalse((root / 'service-called').exists())
+            self.assertFalse((root / '.update-transaction').exists())
+            self.assertEqual((root / 'sockrocket-cli').read_text(), 'old')
+            self.assertEqual((root / 'config.yaml').read_text(), 'original config')
+            df.write_text(success_df)
             result = subprocess.run(['sh', str(WORKER), str(pkg), str(work)],
                 env={**os.environ, 'SOCKROCKET_DIR': str(root),
                      'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True, timeout=20)
