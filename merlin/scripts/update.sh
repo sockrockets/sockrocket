@@ -117,31 +117,60 @@ if [ "${1:-}" = --recover ]; then
 fi
 PKG=$1
 WORK=$2
-# Count only files actually staged. Existing installed bytes are already
-# deducted from df free space; they must not be reserved a second time.
-check_space() {
-    pkg_kb=$(du -sk "$PKG/bin/sockrocket-cli" "$PKG/scripts" "$PKG/webui" "$PKG/res" "$PKG/version" "$PKG/uninstall.sh" | awk '{s += $1} END {print s}')
+mode=${3:-install}
+# Package data is in /tmp. A running process can pin the unlinked old CLI;
+# never count the old installation as free space during replacement.
+size_kb() {
+    local sizes
+    sizes=$(du -sk "$@") || return 1
+    printf '%s\n' "$sizes" | awk '{s += $1} END {print s+0}'
+}
+require_space() {
+    local required="$1" phase="$2" available message
+    available=$(df -Pk "$ROOT" | awk 'END {print $4}')
+    case "$available" in ''|*[!0-9]*) message="无法读取 $ROOT 的可用空间" ;;
+        *) [ "$available" -lt "$required" ] || return 0
+           message="$phase 空间不足：$ROOT 需要 ${required} KiB，可用 ${available} KiB，还差 $((required - available)) KiB" ;;
+    esac
+    if [ "$mode" != --check-space ]; then
+        printf 'failed: %s\n' "$message" > "$ROOT/update-status"
+    fi
+    printf '%s\n' "$message" >&2
+    return 1
+}
+# Build the backup archives in tmpfs; only the compressed archives, external
+# file list and absence markers need to coexist with the new install on flash.
+snapshot="$WORK/backup"
+prepare_snapshot() {
+    rm -rf "$snapshot"
+    mkdir -p "$snapshot/external" "$snapshot/absent"
     set --
     for name in $BACKUP_NAMES; do [ ! -e "$ROOT/$name" ] || set -- "$@" "$name"; done
-    # Measure the real compressed backup without occupying flash first.
-    tar -czf "$WORK/backup-probe.tar.gz" -C "$ROOT" "$@" || return 1
-    gzip -t "$WORK/backup-probe.tar.gz" || return 1
-    backup_kb=$(du -sk "$WORK/backup-probe.tar.gz" | awk '{print $1}')
-    set --
-    for name in $NAMES; do [ ! -e "$ROOT/$name" ] || set -- "$@" "$name"; done
-    old_kb=$(cd "$ROOT" && du -sk "$@" | awk '{s += $1} END {print s+0}')
-    growth_kb=$((pkg_kb - old_kb))
-    [ "$growth_kb" -ge 0 ] || growth_kb=0
-    required=$((growth_kb + backup_kb + 4096))
-    available=$(df -Pk "$ROOT" | awk 'END {print $4}')
-    case "$available" in ''|*[!0-9]*) echo 'Cannot determine free space' >&2; return 1;; esac
-    if [ "$available" -lt "$required" ]; then
-        echo "更新空间不足：$ROOT 需要 ${required} KiB，可用 ${available} KiB；现有安装未修改" >&2
-        return 1
-    fi
+    tar -czf "$snapshot/backup.tar.gz" -C "$ROOT" "$@"
+    gzip -t "$snapshot/backup.tar.gz"
+    # All installer-owned external files, including firmware hook files.
+    for path in /jffs/scripts/firewall-start /jffs/scripts/nat-start /jffs/scripts/services-start /jffs/scripts/service-event /jffs/scripts/wan-start /jffs/scripts/wan-event /jffs/scripts/dhcpc-event /jffs/scripts/dnsmasq.postconf /koolshare/webs/Module_sockrocket.asp /koolshare/scripts/sockrocket_config.sh /koolshare/scripts/sockrocket_api.sh /koolshare/scripts/sockrocket_status.sh /koolshare/scripts/uninstall_sockrocket.sh /koolshare/init.d/S98sockrocket.sh /koolshare/res/icon-sockrocket.png /www/ext/sockrocket/sockrocket.asp; do
+        [ -d "$(dirname "$path")" ] || continue
+        echo "$path" >> "$snapshot/external-list"
+        mkdir -p "$snapshot/external$(dirname "$path")" "$snapshot/absent$(dirname "$path")"
+        if [ -e "$path" ] || [ -L "$path" ]; then cp -a "$path" "$snapshot/external$path"; else touch "$snapshot/absent$path"; fi
+    done
+    tar -czf "$snapshot/external.tar.gz" -C "$snapshot" external
+    gzip -t "$snapshot/external.tar.gz"
+    rm -rf "$snapshot/external"
 }
-check_space || { echo "failed: insufficient space" > "$ROOT/update-status"; rm -rf "$WORK"; exit 1; }
-[ "${3:-}" != --check-space ] || exit 0
+# Reserve the installed payload plus the second UI/scripts/resources copied
+# by the firmware integration, recovery bootstrap and filesystem headroom.
+payload_kb=$(size_kb "$PKG/bin/sockrocket-cli" "$PKG/scripts" "$PKG/webui" "$PKG/res" "$PKG/version" "$PKG/uninstall.sh")
+integration_kb=$(size_kb "$PKG/scripts" "$PKG/webui" "$PKG/res" "$PKG/uninstall.sh")
+install_kb=$((payload_kb + integration_kb + 4096))
+if [ "$mode" = --check-space ]; then
+    trap 'rm -rf "$snapshot"' EXIT
+    prepare_snapshot
+    backup_kb=$(size_kb "$snapshot")
+    require_space "$((backup_kb + install_kb))" "升级前"
+    exit 0
+fi
 # Compatibility is checked by the candidate itself, before any installed
 # file changes or service interruption. The candidate does not rewrite config.
 if ! "$PKG/bin/sockrocket-cli" --check-config "$ROOT/config.yaml" > "$WORK/config-check.log" 2>&1; then
@@ -153,38 +182,31 @@ config_hash=$(md5sum "$ROOT/config.yaml" | awk '{print $1}')
 mkdir "$TX" || { rm -rf "$WORK"; exit 1; }
 claim_owner
 echo preparing > "$ROOT/update-status"
-trap 'echo "failed: preparation" > "$ROOT/update-status"; rm -rf "$TX" "$WORK"' EXIT
+trap 'rm -rf "$TX" "$WORK"; echo "failed: preparation" > "$ROOT/update-status"' EXIT
 "$PKG/bin/sockrocket-cli" --update-config-barrier "$ROOT/config.yaml"
 trap 'echo "update failed; recovery required" > "$ROOT/update-status"; exit 1' HUP INT TERM
 # Preparation never changes installed files. Failed preparation is safe to discard.
-mkdir "$WORK/staged" "$TX/external" "$TX/absent"
-# Recreate the backup under the transaction lock; the preflight copy is only an estimate.
-set --
-for name in $BACKUP_NAMES; do [ ! -e "$ROOT/$name" ] || set -- "$@" "$name"; done
-tar -czf "$TX/backup.tar.gz" -C "$ROOT" "$@"
+prepare_snapshot
+backup_kb=$(size_kb "$snapshot")
+if ! require_space "$((backup_kb + install_kb))" "升级前"; then
+    trap - EXIT HUP INT TERM
+    rm -rf "$TX" "$WORK"
+    exit 1
+fi
+cp -R "$snapshot/." "$TX/"
 gzip -t "$TX/backup.tar.gz"
-tar -tzf "$TX/backup.tar.gz" >/dev/null
+gzip -t "$TX/external.tar.gz"
+rm -rf "$snapshot"
 touch "$TX/config-backed-up"
 RUNNING=0
 [ ! -f "$ROOT/sockrocket.pid" ] || ! kill -0 "$(cat "$ROOT/sockrocket.pid")" 2>/dev/null || RUNNING=1
 printf '%s\n' "$RUNNING" > "$TX/running"
-cp "$PKG/bin/sockrocket-cli" "$WORK/staged/"
-cp -R "$PKG/scripts" "$PKG/webui" "$PKG/res" "$WORK/staged/"
-# Match install_common_files: package layout differs from installed layout.
-cp "$PKG/scripts/dnsmasq.conf" "$WORK/staged/scripts/dnsmasq.conf.template"
-[ -s "$WORK/staged/scripts/dnsmasq.conf.template" ]
-cp "$PKG/version" "$PKG/uninstall.sh" "$WORK/staged/"
-chmod +x "$WORK/staged/sockrocket-cli" "$WORK/staged/scripts/"*.sh
-# All installer-owned external files, including firmware hook files.
-for path in /jffs/scripts/firewall-start /jffs/scripts/nat-start /jffs/scripts/services-start /jffs/scripts/service-event /jffs/scripts/wan-start /jffs/scripts/wan-event /jffs/scripts/dhcpc-event /jffs/scripts/dnsmasq.postconf /koolshare/webs/Module_sockrocket.asp /koolshare/scripts/sockrocket_config.sh /koolshare/scripts/sockrocket_api.sh /koolshare/scripts/sockrocket_status.sh /koolshare/scripts/uninstall_sockrocket.sh /koolshare/init.d/S98sockrocket.sh /koolshare/res/icon-sockrocket.png /www/ext/sockrocket/sockrocket.asp; do
-    [ -d "$(dirname "$path")" ] || continue
-    echo "$path" >> "$TX/external-list"
-    mkdir -p "$TX/external$(dirname "$path")" "$TX/absent$(dirname "$path")"
-    if [ -e "$path" ] || [ -L "$path" ]; then cp -a "$path" "$TX/external$path"; else touch "$TX/absent$path"; fi
-done
-tar -czf "$TX/external.tar.gz" -C "$TX" external
-gzip -t "$TX/external.tar.gz"
-rm -rf "$TX/external"
+# Backups now occupy flash. Re-read df before arming rollback or stopping services.
+if ! require_space "$install_kb" "备份后"; then
+    trap - EXIT HUP INT TERM
+    rm -rf "$TX" "$WORK"
+    exit 1
+fi
 rollback() {
     trap - EXIT HUP INT TERM
     set +e
@@ -225,11 +247,18 @@ sync
 }
 echo stopping > "$TX/stage"
 sh "$SH" stop
+sh "$SH" api-stop
 echo replacing > "$TX/stage"
 for name in $NAMES; do
     rm -rf "$ROOT/$name"
-    mv "$WORK/staged/$name" "$ROOT/$name"
+    source="$PKG/$name"
+    [ "$name" != sockrocket-cli ] || source="$PKG/bin/$name"
+    cp -R "$source" "$ROOT/$name"
 done
+# Match the installed layout without duplicating the extracted payload in /tmp.
+cp "$ROOT/scripts/dnsmasq.conf" "$ROOT/scripts/dnsmasq.conf.template"
+test -s "$ROOT/scripts/dnsmasq.conf.template"
+chmod +x "$ROOT/sockrocket-cli" "$ROOT/scripts/"*.sh
 # Reuse the package installer for firmware hooks and Software Center integration.
 echo integration > "$TX/stage"
 SOCKROCKET_INTEGRATION_ONLY=1 sh -e "$PKG/install.sh"
