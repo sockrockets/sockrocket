@@ -455,7 +455,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<T> {
         let application = this.outbound.feed(&buf[..n], false);
         let command = if application {
             if this.inbound.enabled { 2 } else { 1 }
-        } else if this.writes >= 8 {
+        } else if this.writes >= 8 && (!this.inbound.enabled || this.outbound.failed) {
             1
         } else {
             0
@@ -622,6 +622,45 @@ mod tests {
             assert_eq!(&bytes[10..], &[23, 3, 3, 0, 3, 9, 8, 7]);
             assert!(client.raw_read);
             writer.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn fragmented_application_record_after_tls13_uses_direct_mode() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut client, mut server) = pair().await;
+            // Start after the inbound ServerHello detector confirmed TLS 1.3.
+            client.inbound.enabled = true;
+            let record = [23, 3, 3, 0, 5, 1, 2, 3, 4, 5];
+            let (marker_read, wait_marker) = tokio::sync::oneshot::channel();
+            let receiver = tokio::spawn(async move {
+                let mut uuid = [0; 16];
+                server.read_exact(&mut uuid).await.unwrap();
+                assert_eq!(uuid, ID);
+                for (index, byte) in record.iter().enumerate() {
+                    let mut header = [0; 5];
+                    server.read_exact(&mut header).await.unwrap();
+                    assert_eq!(header[0], if index + 1 == record.len() { 2 } else { 0 });
+                    assert_eq!(&header[1..3], &[0, 1]);
+                    let padding = u16::from_be_bytes([header[3], header[4]]) as usize;
+                    let mut payload = vec![0; 1 + padding];
+                    server.read_exact(&mut payload).await.unwrap();
+                    assert_eq!(payload[0], *byte);
+                }
+                marker_read.send(()).unwrap();
+                let mut tail = [0; 4];
+                server.get_mut().0.read_exact(&mut tail).await.unwrap();
+                assert_eq!(&tail, b"tail");
+            });
+            for byte in record {
+                client.write_all(&[byte]).await.unwrap();
+            }
+            client.flush().await.unwrap();
+            wait_marker.await.unwrap();
+            client.write_all(b"tail").await.unwrap();
+            client.flush().await.unwrap();
+            receiver.await.unwrap();
         })
         .await
         .unwrap();
