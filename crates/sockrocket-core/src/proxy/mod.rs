@@ -84,6 +84,7 @@ pub struct TunDiagnostics {
     pub tcp_peer_resets: usize,
     pub tcp_handshake_resets: usize,
     pub tcp_task_errors: usize,
+    pub tcp_ingress_drops: usize,
 }
 
 /// Connection and traffic statistics, shared across server tasks.

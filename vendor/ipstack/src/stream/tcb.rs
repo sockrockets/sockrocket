@@ -8,6 +8,7 @@ pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
+const MAX_READ_CHUNKS: usize = 64;
 const MAX_REASSEMBLY_ENTRIES: usize = 64;
 const MAX_REASSEMBLY_CHUNK: usize = 16 * 1024;
 
@@ -275,7 +276,7 @@ impl Tcb {
         self.read_reserved += increase;
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        if self.queued_read_chunks >= 64 {
+        if self.queued_read_chunks >= MAX_READ_CHUNKS {
             return 0;
         }
         self.buffer_limit()
@@ -357,7 +358,7 @@ impl Tcb {
     }
 
     pub(super) fn can_queue_read(&self) -> bool {
-        self.queued_read_chunks < 64
+        self.queued_read_chunks < MAX_READ_CHUNKS
     }
     #[cfg(test)]
     pub(super) fn queued_read_chunks(&self) -> usize {
@@ -460,7 +461,17 @@ impl Tcb {
         Self::scale_window(window, self.snd_scale)
     }
     pub(super) fn get_recv_window(&self) -> u16 {
-        let mut bytes = self.get_available_read_buffer_size();
+        // The reader may lag behind packet ingress and the outbound socket.
+        // Bound the advertised burst by both queues, while retaining the
+        // larger backing buffer for reordered and already-in-flight data.
+        let queued = self.queued_read_bytes;
+        let ingress = crate::queue::TCP_INGRESS_PAYLOAD_WINDOW.saturating_sub(queued);
+        let slots = MAX_READ_CHUNKS.saturating_sub(self.queued_read_chunks);
+        let per_segment = usize::from(self.mtu.saturating_sub(60).max(1));
+        let mut bytes = self
+            .get_available_read_buffer_size()
+            .min(ingress)
+            .min(slots * per_segment);
         if self.unordered_packets.len() >= MAX_REASSEMBLY_ENTRIES
             && let Some((&first, _)) = self.unordered_packets.first_key_value()
             && first > self.ack
@@ -1303,6 +1314,35 @@ mod tests {
     }
 
     #[test]
+    fn advertised_upload_burst_fits_the_ingress_queue_before_receiver_runs() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(512 * 1024));
+        tcb.max_unacked_bytes = 512 * 1024;
+        tcb.read_buffer_size = 512 * 1024;
+        tcb.window_limit.store(512 * 1024, Ordering::Relaxed);
+        let (sender, _receiver) = crate::queue::channel(
+            crate::queue::TCP_INGRESS_BYTES,
+            crate::queue::Budget::new(4 * 1024 * 1024),
+        );
+        tcb.enable_window_scale(7, 4);
+        let window = usize::from(tcb.get_recv_window()) << 4;
+        assert!(window >= 16 * 1024);
+        let mut offset = 0;
+        while offset < window {
+            let len = (window - offset).min(1352);
+            let mut wire = Vec::new();
+            etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [192, 0, 2, 2], 64)
+                .tcp(1000, 443, offset as u32, 4096)
+                .ack(1)
+                .write(&mut wire, &vec![0; len])
+                .unwrap();
+            sender
+                .send(crate::packet::NetworkPacket::parse(&wire).unwrap())
+                .unwrap();
+            offset += len;
+        }
+    }
+
+    #[test]
     fn negotiated_scale_widens_the_peer_window_and_the_advertisement() {
         let limit = Arc::new(AtomicU32::new(512 * 1024));
         let mut tcb = Tcb::new(
@@ -1320,7 +1360,10 @@ mod tests {
         tcb.update_send_window(1000);
         assert_eq!(tcb.get_send_window(), 1000 << 7);
         assert_eq!(tcb.advertised_scale(), Some(4));
-        assert_eq!(tcb.get_recv_window(), ((512 * 1024) >> 4) as u16);
+        assert_eq!(
+            usize::from(tcb.get_recv_window()) << 4,
+            crate::queue::TCP_INGRESS_PAYLOAD_WINDOW
+        );
     }
 
     #[test]
@@ -1340,7 +1383,22 @@ mod tests {
         tcb.update_send_window(1000);
         assert_eq!(tcb.get_send_window(), 1000);
         assert_eq!(tcb.advertised_scale(), None);
-        assert_eq!(tcb.get_recv_window(), u16::MAX);
+        assert_eq!(
+            usize::from(tcb.get_recv_window()),
+            crate::queue::TCP_INGRESS_PAYLOAD_WINDOW
+        );
+        tcb.add_unordered_packet(tcb.get_ack(), vec![0; 31 * 1024]);
+        let queued = tcb.consume_unordered_packets(31 * 1024).unwrap();
+        tcb.queue_read(queued.len());
+        assert_eq!(tcb.get_recv_window(), 1024);
+        tcb.consume_read(queued.len(), 1);
+        assert_eq!(
+            usize::from(tcb.get_recv_window()),
+            crate::queue::TCP_INGRESS_PAYLOAD_WINDOW
+        );
+        // The outstanding download allowance is independent of our upload window.
+        tcb.update_send_window(60_000);
+        assert_eq!(tcb.get_send_window(), 60_000);
     }
 }
 

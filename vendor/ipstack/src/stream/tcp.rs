@@ -215,7 +215,7 @@ impl IpStackTcpStream {
         if let Some(peer) = peer_window_scale(&tcp) {
             let bytes = config
                 .read_buffer_size
-                .max(config.max_unacked_bytes as usize);
+                .min(crate::queue::TCP_INGRESS_PAYLOAD_WINDOW);
             tcb.enable_window_scale(peer, window_scale_shift(bytes));
         }
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
@@ -241,7 +241,7 @@ impl IpStackTcpStream {
         }
 
         let (stream_sender, stream_receiver) =
-            crate::queue::channel(64 * 1024, up_packet_sender.global());
+            crate::queue::channel(crate::queue::TCP_INGRESS_BYTES, up_packet_sender.global());
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let deadline = tokio::time::Instant::now() + config.timeout;
 
