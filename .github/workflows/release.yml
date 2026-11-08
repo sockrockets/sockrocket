@@ -341,6 +341,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          make_latest: false
           files: |
             ${{ matrix.cli_asset }}
             ${{ matrix.gui_asset }}
@@ -441,7 +442,27 @@ jobs:
       - name: Upload Merlin packages to release
         uses: softprops/action-gh-release@v2
         with:
+          make_latest: false
           files: dist/merlin/*
           fail_on_unmatched_files: true
           generate_release_notes: false
 
+
+  finalize:
+    name: Verify release assets and update Latest
+    needs: [build-release, merlin-package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check for stale assets before promoting the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > release.json
+          jq -e --arg start "$started" '.assets | length > 0 and all(.[]; .state == "uploaded" and .updated_at >= $start)' release.json
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [[ "$(printf '%s\n' "$latest" "$TAG" | sort -V | tail -1)" == "$TAG" ]]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          fi
