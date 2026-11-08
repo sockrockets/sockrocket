@@ -33,6 +33,8 @@ pub struct TcpEventCounts {
     pub peer_resets: usize,
     pub handshake_resets: usize,
     pub task_errors: usize,
+    /// Incoming TCP packets rejected by per-flow or global packet queue budgets.
+    pub ingress_drops: usize,
 }
 
 #[cfg(unix)]
@@ -446,7 +448,12 @@ async fn process_device_read(
             log::trace!("packet sent to stream: {network_tuple} len {len}");
             match entry.get().send(packet) {
                 Ok(()) => return Ok(()),
-                Err(error) if error.1 => return Ok(()),
+                Err(error) if error.1 => {
+                    if matches!(error.0.transport_header(), TransportHeader::Tcp(_)) {
+                        up_pkt_sender.global().record_tcp_ingress_drop();
+                    }
+                    return Ok(());
+                }
                 Err(error) => {
                     // The receiver can close before its asynchronous removal
                     // reaches this loop. Recover ownership of the packet and

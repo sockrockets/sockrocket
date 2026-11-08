@@ -98,6 +98,7 @@ async fn peer_resets_preserve_errors_counts_and_handshake_warnings() {
                 peer_resets: 1,
                 handshake_resets: usize::from(!established),
                 task_errors: 0,
+                ingress_drops: 0,
             }
         );
         // Repeated error reads do not count a reset more than once.

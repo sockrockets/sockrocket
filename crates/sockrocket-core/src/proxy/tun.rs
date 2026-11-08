@@ -639,9 +639,9 @@ impl TunProxy {
         tcp_config.options = Some(vec![TcpOptions::MaximumSegmentSize(tun_tcp_mss(mtu))]);
         // Ceiling for one LAN flow. The live cap sits on `window_limit` and
         // shrinks toward 64 KiB as more TCP sessions appear, so a speed test
-        // gets a wide window without reserving 512 KiB for every flow. Both
-        // directions use it: the receive buffer used to stay at ipstack's
-        // 16 KiB default, which capped uploads the same way.
+        // can keep a wide download window. The receive backing budget also
+        // covers reordering; ipstack bounds the window advertised to uploaders
+        // separately by the capacity of its ingress and reader queues.
         let window_limit = Arc::new(AtomicU32::new(crate::resources::tun_tcp_window_bytes(1)));
         tcp_config.max_unacked_bytes = 512 * 1024;
         tcp_config.read_buffer_size = 512 * 1024;
@@ -749,6 +749,7 @@ impl TunProxy {
                             tcp_peer_resets: tcp_events.peer_resets,
                             tcp_handshake_resets: tcp_events.handshake_resets,
                             tcp_task_errors: tcp_events.task_errors,
+                            tcp_ingress_drops: tcp_events.ingress_drops,
                         });
                         tracing::info!(
                             queued_packet_bytes,
@@ -763,6 +764,7 @@ impl TunProxy {
                             tcp_peer_resets = tcp_events.peer_resets,
                             tcp_handshake_resets = tcp_events.handshake_resets,
                             tcp_task_errors = tcp_events.task_errors,
+                            tcp_ingress_drops = tcp_events.ingress_drops,
                             active_sessions = active_streams.load(Ordering::Relaxed),
                             active_tcp = active_tcp.load(Ordering::Relaxed),
                             active_dns = active_dns.load(Ordering::Relaxed),
