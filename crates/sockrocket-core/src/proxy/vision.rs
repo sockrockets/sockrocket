@@ -118,14 +118,24 @@ struct Records {
 }
 impl Records {
     fn feed(&mut self, bytes: &[u8], server: bool) -> bool {
+        self.feed_until(bytes, server, false).1
+    }
+
+    fn feed_until(
+        &mut self,
+        bytes: &[u8],
+        server: bool,
+        stop_at_application: bool,
+    ) -> (usize, bool) {
         if self.failed {
-            return false;
+            return (bytes.len(), false);
         }
         if self.bytes.len() + bytes.len() > 131072 {
             self.failed = true;
             self.bytes = Vec::new();
-            return false;
+            return (bytes.len(), false);
         }
+        let previous = self.bytes.len();
         self.bytes.extend_from_slice(bytes);
         let mut last_application = false;
         let mut consumed = 0;
@@ -154,13 +164,19 @@ impl Records {
                 }
             }
             consumed += size + 5;
+            if stop_at_application && last_application {
+                // poll_write accepts only through this record. The caller retries
+                // the suffix after drain_wire has flushed the direct marker.
+                self.bytes = Vec::new();
+                return (consumed - previous, true);
+            }
         }
         if self.failed {
             self.bytes = Vec::new();
         } else if consumed > 0 {
             self.bytes = release_prefix(std::mem::take(&mut self.bytes), consumed);
         }
-        last_application && self.bytes.is_empty()
+        (bytes.len(), last_application && self.bytes.is_empty())
     }
 }
 fn server_hello(bytes: &[u8]) -> Option<bool> {
@@ -452,10 +468,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<T> {
         }
         let n = buf.len().min(CHUNK);
         this.writes += 1;
-        let application = this.outbound.feed(&buf[..n], false);
+        let (n, application) = this
+            .outbound
+            .feed_until(&buf[..n], false, this.inbound.enabled);
         let command = if application {
             if this.inbound.enabled { 2 } else { 1 }
-        } else if this.writes >= 8 {
+        } else if this.writes >= 8 && (!this.inbound.enabled || this.outbound.failed) {
             1
         } else {
             0
@@ -506,6 +524,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_transition_consumes_only_through_the_first_application_record() {
+        let mut records = Records::default();
+        assert_eq!(
+            records.feed_until(&[20, 3, 3, 0, 1, 1, 23, 3], false, true),
+            (8, false)
+        );
+        let next = [3, 0, 2, 10, 11, 23, 3, 3, 0, 4, 12];
+        assert_eq!(records.feed_until(&next, false, true), (5, true));
+        assert!(records.bytes.is_empty());
+    }
 
     #[test]
     fn parsed_record_drops_the_buffer() {
@@ -622,6 +652,45 @@ mod tests {
             assert_eq!(&bytes[10..], &[23, 3, 3, 0, 3, 9, 8, 7]);
             assert!(client.raw_read);
             writer.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn fragmented_application_record_after_tls13_uses_direct_mode() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut client, mut server) = pair().await;
+            // Start after the inbound ServerHello detector confirmed TLS 1.3.
+            client.inbound.enabled = true;
+            let record = [23, 3, 3, 0, 5, 1, 2, 3, 4, 5];
+            let (marker_read, wait_marker) = tokio::sync::oneshot::channel();
+            let receiver = tokio::spawn(async move {
+                let mut uuid = [0; 16];
+                server.read_exact(&mut uuid).await.unwrap();
+                assert_eq!(uuid, ID);
+                for (index, byte) in record.iter().enumerate() {
+                    let mut header = [0; 5];
+                    server.read_exact(&mut header).await.unwrap();
+                    assert_eq!(header[0], if index + 1 == record.len() { 2 } else { 0 });
+                    assert_eq!(&header[1..3], &[0, 1]);
+                    let padding = u16::from_be_bytes([header[3], header[4]]) as usize;
+                    let mut payload = vec![0; 1 + padding];
+                    server.read_exact(&mut payload).await.unwrap();
+                    assert_eq!(payload[0], *byte);
+                }
+                marker_read.send(()).unwrap();
+                let mut tail = [0; 4];
+                server.get_mut().0.read_exact(&mut tail).await.unwrap();
+                assert_eq!(&tail, b"tail");
+            });
+            for byte in record {
+                client.write_all(&[byte]).await.unwrap();
+            }
+            client.flush().await.unwrap();
+            wait_marker.await.unwrap();
+            client.write_all(b"tail").await.unwrap();
+            client.flush().await.unwrap();
+            receiver.await.unwrap();
         })
         .await
         .unwrap();

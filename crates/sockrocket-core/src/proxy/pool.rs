@@ -39,6 +39,7 @@ struct PoolInner<S> {
     capacity: usize,
     budget: Arc<Semaphore>,
     refill: Notify,
+    max_age: Duration,
 }
 
 // Background work owns only PoolInner. Dropping the last public handle aborts
@@ -69,8 +70,12 @@ impl<S> Clone for ConnPool<S> {
 
 impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> ConnPool<S> {
     pub fn new(factory: Arc<dyn ConnFactory<S>>) -> Self {
+        Self::with_max_age(factory, DEFAULT_MAX_AGE)
+    }
+
+    pub fn with_max_age(factory: Arc<dyn ConnFactory<S>>, max_age: Duration) -> Self {
         let (base, capacity, _) = crate::resources::connection_pool_limits();
-        Self::with_limits(factory, base, capacity, shared_budget())
+        Self::with_limits(factory, base, capacity, shared_budget(), max_age)
     }
 
     /// One-shot probes never create background connections.
@@ -79,7 +84,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> C
     }
 
     pub fn with_capacity(factory: Arc<dyn ConnFactory<S>>, capacity: usize) -> Self {
-        Self::with_limits(factory, capacity, capacity, shared_budget())
+        Self::with_limits(
+            factory,
+            capacity,
+            capacity,
+            shared_budget(),
+            DEFAULT_MAX_AGE,
+        )
     }
 
     fn with_limits(
@@ -87,6 +98,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> C
         base: usize,
         capacity: usize,
         budget: Arc<Semaphore>,
+        max_age: Duration,
     ) -> Self {
         let now = Instant::now();
         let pool = Self {
@@ -104,6 +116,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> C
                     capacity,
                     budget,
                     refill: Notify::new(),
+                    max_age,
                 }),
                 task: std::sync::Mutex::new(None),
             }),
@@ -149,7 +162,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> C
             let Some(mut candidate) = candidate else {
                 break;
             };
-            if candidate.created.elapsed() < DEFAULT_MAX_AGE
+            if candidate.created.elapsed() < inner.max_age
                 && idle_stream_is_ready(&mut candidate.stream).await
             {
                 inner.refill.notify_one();
@@ -204,7 +217,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> P
                 _ = self.refill.notified() => self.fill().await,
                 _ = tick.tick() => {
                     let mut state = self.state.lock().await;
-                    state.conns.retain(|c| c.created.elapsed() < DEFAULT_MAX_AGE);
+                    state.conns.retain(|c| c.created.elapsed() < self.max_age);
                     if state.last_get.elapsed() >= DEFAULT_MAX_AGE {
                         state.target = self.base;
                     }
@@ -221,7 +234,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> P
             .lock()
             .await
             .conns
-            .retain(|c| c.created.elapsed() < DEFAULT_MAX_AGE);
+            .retain(|c| c.created.elapsed() < self.max_age);
         let mut failed_rounds = 0;
         // Bound maintenance even if foreground demand continually drains it.
         let mut attempts = 0;
@@ -309,6 +322,7 @@ mod tests {
             2,
             8,
             budget.clone(),
+            DEFAULT_MAX_AGE,
         );
         filled(&pool, 2).await;
         for _ in 0..8 {
@@ -324,10 +338,32 @@ mod tests {
         filled(&pool, 2).await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn short_lived_preconnect_is_discarded_at_checkout() {
+        let factory = MockFactory::new(Duration::ZERO, false);
+        let pool = ConnPool::with_limits(
+            factory.clone(),
+            1,
+            1,
+            Arc::new(Semaphore::new(2)),
+            Duration::from_secs(2),
+        );
+        filled(&pool, 1).await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let _stream = pool.get().await.unwrap();
+        assert!(factory.attempts.load(AtomicOrdering::SeqCst) >= 2);
+    }
+
     #[tokio::test]
     async fn closed_preconnects_are_discarded_before_any_user_data() {
         let factory = MockFactory::new(Duration::ZERO, false);
-        let pool = ConnPool::with_limits(factory.clone(), 2, 2, Arc::new(Semaphore::new(4)));
+        let pool = ConnPool::with_limits(
+            factory.clone(),
+            2,
+            2,
+            Arc::new(Semaphore::new(4)),
+            DEFAULT_MAX_AGE,
+        );
         filled(&pool, 2).await;
         factory.peers.lock().unwrap().clear();
         let mut stream = pool.get().await.unwrap();
@@ -390,7 +426,8 @@ mod tests {
             .await
             .unwrap();
         let factory = Arc::new(ReadyFactory(std::sync::Mutex::new(Some(Box::new(client)))));
-        let pool = ConnPool::with_limits(factory, 1, 1, Arc::new(Semaphore::new(1)));
+        let pool =
+            ConnPool::with_limits(factory, 1, 1, Arc::new(Semaphore::new(1)), DEFAULT_MAX_AGE);
         filled(&pool, 1).await;
         let mut stream = pool.get().await.unwrap();
         stream.write_all(b"ping").await.unwrap();
@@ -409,6 +446,7 @@ mod tests {
             2,
             8,
             budget.clone(),
+            DEFAULT_MAX_AGE,
         );
         filled(&first, 2).await;
         let second = ConnPool::with_limits(
@@ -416,6 +454,7 @@ mod tests {
             2,
             8,
             budget.clone(),
+            DEFAULT_MAX_AGE,
         );
         filled(&second, 1).await;
         assert_eq!(budget.available_permits(), 0);
@@ -428,7 +467,7 @@ mod tests {
     async fn dropping_last_pool_handle_cancels_inflight_warmup() {
         let factory = MockFactory::new(Duration::from_secs(3600), false);
         let budget = Arc::new(Semaphore::new(4));
-        let pool = ConnPool::with_limits(factory.clone(), 4, 4, budget.clone());
+        let pool = ConnPool::with_limits(factory.clone(), 4, 4, budget.clone(), DEFAULT_MAX_AGE);
         let weak = Arc::downgrade(&pool.owner.inner);
         for _ in 0..200 {
             if factory.attempts.load(AtomicOrdering::SeqCst) == 4 {

@@ -2102,6 +2102,9 @@ do_watchdog() {
         # on the direct path until probe recovers).
         if [ ! -f "$DEGRADED_FILE" ] && [ "$(conf_bool transparent_proxy true)" = "true" ]; then
             ensure_tun || log_warn "Watchdog: TUN unavailable for transparent proxy"
+            if tun_interface_ready && [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ]; then
+                "$SOCKROCKET_DIR/scripts/iptables.sh" repair-node-tcp
+            fi
             if tun_interface_ready && ! iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "MARK"; then
                 log_warn "Watchdog: iptables rules missing, reapplying..."
                 [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && "$SOCKROCKET_DIR/scripts/iptables.sh" start >> "$SOCKROCKET_LOG" 2>&1

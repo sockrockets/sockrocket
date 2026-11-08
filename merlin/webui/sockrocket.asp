@@ -414,6 +414,9 @@ body.bg {min-width:0!important}
           <button type="button" class="chip toggle" id="sr-chip-fw" onclick="toggleProxy()" title="控制 TUN 透明代理。单独关闭它会保留 DNS 接管；恢复直连请使用诊断页的停止操作。">
             <span class="dot" id="sr-fw-dot"></span>透明代理 <b id="sr-fw-state">—</b>
           </button>
+          <button type="button" class="chip toggle" id="sr-chip-cn" onclick="toggleCnDirect()" disabled>
+            <span class="dot" id="sr-cn-dot"></span>国内 IP 绕过 TUN <b id="sr-cn-state">—</b>
+          </button>
           <div class="mode-seg" id="sr-mode-seg" title="选择规则、全局或直连模式">
             <button type="button" id="sr-mode-rule" onclick="setProxyMode('rule')">规则</button>
             <button type="button" id="sr-mode-global" onclick="setProxyMode('global')">全局</button>
@@ -1371,7 +1374,13 @@ function renderNetworkControls() {
   var st=SR_STATE.status||{},online=SR_STATE.statusKnown&&!!st.running,busy=networkControlsBusy();
   ['chip-dns','chip-fw'].forEach(function(id){srElement(id).disabled=!online||busy;srElement(id).classList.toggle('pending',networkPending);});
   setChip('dns',online&&st.dns_hijack);setChip('fw',online&&st.transparent_proxy);
-  if(!SR_STATE.statusKnown){['dns','fw'].forEach(function(id){srElement(id+'-state').textContent='待确认';srElement('chip-'+id).title='状态尚未确认，请等待最新状态。';});return;}
+  var cn=srElement('chip-cn'),globalMode=st.proxy_mode==='global';
+  cn.disabled=!SR_STATE.statusKnown||busy||globalMode;
+  cn.classList.toggle('pending',networkPending);
+  setChip('cn',!!st.cn_ipset_direct);
+  if(st.cn_ipset_direct&&!(online&&st.transparent_proxy))srElement('cn-state').textContent='已保存，待启用 TUN';
+  cn.title=globalMode?'全局模式下国内 IP 也走代理。':'命中国内 IP 的局域网流量会绕过 TUN 和域名分流规则。开启透明代理后生效。';
+  if(!SR_STATE.statusKnown){['dns','fw','cn'].forEach(function(id){srElement(id+'-state').textContent='待确认';srElement('chip-'+id).title='状态尚未确认，请等待最新状态。';});return;}
   srElement('chip-dns').title=!online?'服务已停止，DNS 接管已关闭；启动服务时默认开启。':st.dns_hijack?(st.transparent_proxy?'DNS 接管与 TUN 已开启，使用短 TTL Fake-IP':'DNS 接管已开启，使用短 TTL 真实地址'):'DNS 接管已关闭，局域网使用原有 DNS';
   srElement('chip-fw').title=!online?'服务已停止，TUN 透明代理已关闭；启动服务时默认开启。':st.transparent_proxy?'透明代理已开启；单独关闭它会保留 DNS 接管':'透明代理已关闭，DNS 接管由单独开关控制';
 }
@@ -1390,6 +1399,10 @@ function applyNetworkToggles(body) {
     });
   }
   srApi('set_toggles',body,function(d){reconcile(d,false);},function(d){reconcile(d,true);},60000);
+}
+function toggleCnDirect() {
+  if (!SR_STATE.statusKnown || networkControlsBusy() || SR_STATE.status.proxy_mode==='global') return;
+  applyNetworkToggles({cn_ipset_direct:!SR_STATE.status.cn_ipset_direct});
 }
 function toggleDns() {
   if (!SR_STATE.statusKnown || !SR_STATE.status.running || networkControlsBusy()) return;

@@ -1692,6 +1692,11 @@ fn act_set_toggles(post: &J) -> J {
     let Ok(map) = load_conf() else {
         return err_msg("Config file not found");
     };
+    if want_cn == Some(true)
+        && conf_str(&map, "proxy_mode").is_some_and(|mode| mode.eq_ignore_ascii_case("global"))
+    {
+        return err_msg("全局模式下不能开启国内 IP 绕过 TUN");
+    }
     let (cur_proxy, mut cur_dns) = effective_toggles(&map);
     let cur_cn = conf_bool(&map, "cn_ipset_direct", false);
 
@@ -5736,6 +5741,19 @@ dns_direct_domains:
         assert_eq!(conf_str(&map, "dns_hijack").as_deref(), Some("false"));
         assert_eq!(conf_str(&map, "mode").as_deref(), Some("tun"));
         assert!(map.contains_key(ykey("nodes")));
+    }
+
+    #[test]
+    fn stale_toggle_cannot_enable_cn_bypass_after_switching_to_global() {
+        let _env = TestEnv::new(SAMPLE);
+        assert_eq!(
+            act_set_proxy_mode(&json!({"proxy_mode":"global"}))["ok"],
+            true
+        );
+        let before = load_conf().unwrap();
+        let reply = act_set_toggles(&json!({"cn_ipset_direct":true,"transparent_proxy":false}));
+        assert_eq!(reply["ok"], false);
+        assert_eq!(load_conf().unwrap(), before);
     }
 
     #[test]
