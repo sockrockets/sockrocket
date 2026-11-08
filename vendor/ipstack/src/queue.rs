@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 /// Bytes charged to one TCP flow before its receive task dequeues packets.
-pub(crate) const TCP_INGRESS_BYTES: usize = 64 * 1024;
+pub(crate) const TCP_INGRESS_BYTES: usize = 128 * 1024;
 /// Leave room for per-packet charges, control packets and small-segment bursts.
 pub(crate) const TCP_INGRESS_PAYLOAD_WINDOW: usize = TCP_INGRESS_BYTES / 2;
 

@@ -461,6 +461,9 @@ impl Tcb {
         Self::scale_window(window, self.snd_scale)
     }
     pub(super) fn get_recv_window(&self) -> u16 {
+        u16::try_from(self.recv_window_bytes() >> self.rcv_scale).unwrap_or(u16::MAX)
+    }
+    pub(super) fn recv_window_bytes(&self) -> usize {
         // The reader may lag behind packet ingress and the outbound socket.
         // Bound the advertised burst by both queues, while retaining the
         // larger backing buffer for reordered and already-in-flight data.
@@ -482,8 +485,7 @@ impl Tcb {
             let unit = 1usize << self.rcv_scale;
             bytes = bytes.min(gap.div_ceil(unit) * unit);
         }
-        let available = bytes >> self.rcv_scale;
-        u16::try_from(available).unwrap_or(u16::MAX)
+        bytes
     }
 
     fn scale_window(window: u16, shift: u8) -> u32 {
@@ -1385,16 +1387,17 @@ mod tests {
         assert_eq!(tcb.advertised_scale(), None);
         assert_eq!(
             usize::from(tcb.get_recv_window()),
-            crate::queue::TCP_INGRESS_PAYLOAD_WINDOW
+            usize::from(u16::MAX)
         );
-        tcb.add_unordered_packet(tcb.get_ack(), vec![0; 31 * 1024]);
-        let queued = tcb.consume_unordered_packets(31 * 1024).unwrap();
+        let burst = crate::queue::TCP_INGRESS_PAYLOAD_WINDOW - 1024;
+        tcb.add_unordered_packet(tcb.get_ack(), vec![0; burst]);
+        let queued = tcb.consume_unordered_packets(burst).unwrap();
         tcb.queue_read(queued.len());
         assert_eq!(tcb.get_recv_window(), 1024);
         tcb.consume_read(queued.len(), 1);
         assert_eq!(
             usize::from(tcb.get_recv_window()),
-            crate::queue::TCP_INGRESS_PAYLOAD_WINDOW
+            usize::from(u16::MAX)
         );
         // The outstanding download allowance is independent of our upload window.
         tcb.update_send_window(60_000);
