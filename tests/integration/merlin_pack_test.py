@@ -126,9 +126,11 @@ class PackageTest(unittest.TestCase):
                 )
                 self.assertNotEqual(failed.returncode, 0)
                 self.assertFalse(list(bad_out.glob('*.tar.gz')))
+            self.assertFalse((out / 'sockrocket-cli-linux-aarch64').exists())
             for arch, binary in binaries.items():
-                self.assertEqual((out / f'sockrocket-cli-linux-{arch}').read_bytes(),
-                                 binary.read_bytes())
+                name = ('sockrocket-cli-merlin-aarch64' if arch == 'aarch64'
+                        else f'sockrocket-cli-linux-{arch}')
+                self.assertEqual((out / name).read_bytes(), binary.read_bytes())
             checksums = {}
             for line in (out / 'SHA256SUMS-merlin.txt').read_text().splitlines():
                 digest, name = line.split()
