@@ -1,38 +1,29 @@
-name: Recover verified Merlin assets for v0.1.1
+name: Correct v0.1.1 release metadata
 on: workflow_dispatch
 permissions:
-  actions: read
   contents: write
 jobs:
   publish:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: v0.1.1
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify provenance and publish Merlin assets
+      - name: Update release notes and latest pointer
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 184d37dfe0604d32e4f1820e3dc340ded055b444
-          test "$(git rev-parse HEAD^{tree})" = "$(git rev-parse 6284ac0505822b610a6b8e818b275a29db5bf459^{tree})"
-          gh api repos/"$GITHUB_REPOSITORY"/actions/artifacts/13612324282/zip > "$RUNNER_TEMP/ci.zip"
-          echo "5fef877556aa662c5d390471aacbc92cec59d9df2df34fca3fc5c0decd1d704b  $RUNNER_TEMP/ci.zip" | sha256sum -c
-          mkdir "$RUNNER_TEMP/assets"
-          cd "$RUNNER_TEMP/assets"
-          unzip -q "$RUNNER_TEMP/ci.zip"
-          sha256sum -c SHA256SUMS-merlin.txt
-          for f in sockrocket-merlin-*.tar.gz; do test "$(tar -xOf "$f" sockrocket/version)" = 0.1.1; done
-          mv sockrocket-cli-linux-aarch64 sockrocket-cli-merlin-aarch64
-          sed -i 's/  sockrocket-cli-linux-aarch64$/  sockrocket-cli-merlin-aarch64/' SHA256SUMS-merlin.txt
-          sha256sum -c SHA256SUMS-merlin.txt
-          gh release upload v0.1.1 --repo "$GITHUB_REPOSITORY" --clobber sockrocket-merlin-*.tar.gz sockrocket-cli-linux-armv7{,sf} sockrocket-cli-merlin-aarch64 merlin-models.md
-          gh release upload v0.1.1 --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS-merlin.txt
-          gh api repos/"$GITHUB_REPOSITORY"/releases/tags/v0.1.1 --jq '.assets[] | [.name,.digest] | @tsv' > "$RUNNER_TEMP/remote"
-          for f in *; do
-            digest=$(sha256sum "$f" | cut -d' ' -f1)
-            grep -Fx "$(printf '%s\tsha256:%s' "$f" "$digest")" "$RUNNER_TEMP/remote"
-          done
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/e3491819d1f5f2df688d86298b54ecfb04986a48" --jq .object.sha)" = 184d37dfe0604d32e4f1820e3dc340ded055b444
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          case "$latest" in v0.1.0|v0.1.1) ;; *) exit 1;; esac
+          cat > notes.md <<'NOTES'
+          ## Sockrocket v0.1.1
+
+          Built from commit 184d37d, including pull requests #32 and #33.
+
+          - Improve TCP upload reassembly and receive-window handling in TUN mode.
+          - Handle fragmented TLS records in VLESS Vision and expire idle WebSocket preconnections earlier.
+          - On Merlin, expire stale low TCP thresholds for configured IPv4 proxy endpoints and align the domestic IP bypass control with routing mode.
+
+          For RT-AX86U Pro, install `sockrocket-merlin-hnd_v8.tar.gz`. Check the package against `SHA256SUMS-merlin.txt`.
+          NOTES
+          gh release edit v0.1.1 --repo "$GITHUB_REPOSITORY" --latest --notes-file notes.md
+          test "$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)" = v0.1.1
