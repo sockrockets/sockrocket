@@ -244,7 +244,10 @@ jobs:
 
       - name: Install cross
         if: steps.changes.outputs.merlin == 'true'
-        run: cargo install cross --version 0.2.5 --locked
+        run: |
+          if ! cross --version 2>/dev/null | grep -Eq '^cross 0[.]2[.]5([[:space:]]|$)'; then
+            cargo install cross --version 0.2.5 --locked --force
+          fi
 
       - name: Install ARM64 artifact inspection tools
         if: steps.changes.outputs.merlin == 'true' && matrix.target == 'aarch64-unknown-linux-musl'

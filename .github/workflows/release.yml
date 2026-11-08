@@ -384,7 +384,10 @@ jobs:
           key: merlin-${{ matrix.name }}-release
 
       - name: Install cross-compilation toolchain
-        run: cargo install cross --version 0.2.5 --locked
+        run: |
+          if ! cross --version 2>/dev/null | grep -Eq '^cross 0[.]2[.]5([[:space:]]|$)'; then
+            cargo install cross --version 0.2.5 --locked --force
+          fi
 
       - name: Install ARM64 artifact inspection tools
         if: matrix.target == 'aarch64-unknown-linux-musl'

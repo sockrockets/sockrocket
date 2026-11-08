@@ -207,7 +207,10 @@ jobs:
           key: pkg-merlin-${{ matrix.name }}
 
       - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
+        run: |
+          if ! cross --version 2>/dev/null | grep -Eq '^cross 0[.]2[.]5([[:space:]]|$)'; then
+            cargo install cross --version 0.2.5 --locked --force
+          fi
 
       - name: Install ARM64 artifact inspection tools
         if: matrix.target == 'aarch64-unknown-linux-musl'
