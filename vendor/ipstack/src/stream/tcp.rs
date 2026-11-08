@@ -215,7 +215,7 @@ impl IpStackTcpStream {
         if let Some(peer) = peer_window_scale(&tcp) {
             let bytes = config
                 .read_buffer_size
-                .max(config.max_unacked_bytes as usize);
+                .min(crate::queue::TCP_INGRESS_PAYLOAD_WINDOW);
             tcb.enable_window_scale(peer, window_scale_shift(bytes));
         }
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
@@ -241,7 +241,7 @@ impl IpStackTcpStream {
         }
 
         let (stream_sender, stream_receiver) =
-            crate::queue::channel(64 * 1024, up_packet_sender.global());
+            crate::queue::channel(crate::queue::TCP_INGRESS_BYTES, up_packet_sender.global());
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let deadline = tokio::time::Instant::now() + config.timeout;
 
@@ -284,9 +284,9 @@ impl IpStackTcpStream {
 
     fn read_consumed(&self, n: usize, completed_chunks: usize) {
         let mut tcb = self.tcb.lock().unwrap();
-        let old_window = tcb.get_recv_window();
+        let old_window = tcb.recv_window_bytes();
         tcb.consume_read(n, completed_chunks);
-        if old_window >= tcb.get_mtu() {
+        if old_window >= usize::from(tcb.get_mtu()) {
             return;
         }
         // Reopen a zero/small receive window after application consumption.
@@ -1517,7 +1517,13 @@ pub(crate) fn write_packet_to_device(
     let owned_payload = seq.is_some() && payload.as_ref().is_some_and(|bytes| !bytes.is_empty());
     let retry_segment = seq.is_some() && flags & (SYN | FIN | RST) == 0;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window());
+    let ack = tcb.get_ack().0;
+    // The SYN window is in bytes even when both peers negotiate scaling.
+    let window_size = if flags & SYN != 0 {
+        u16::try_from(tcb.recv_window_bytes()).unwrap_or(u16::MAX)
+    } else {
+        tcb.get_recv_window()
+    };
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| {
         if owned_payload {
@@ -1741,6 +1747,38 @@ mod read_batch_tests {
             tcb.payload_budget = crate::TcpPayloadBudget::new(payload_limit);
         }
         (stream, receiver)
+    }
+
+    #[tokio::test]
+    async fn only_post_handshake_packets_encode_a_scaled_receive_window() {
+        let (stream, mut packets) = writer(65536, 65536);
+        let tuple = stream.network_tuple();
+        let bytes = {
+            let mut tcb = stream.tcb.lock().unwrap();
+            tcb.enable_window_scale(7, 2);
+            let bytes = tcb.recv_window_bytes();
+            for flags in [SYN | ACK, ACK] {
+                write_packet_to_device(
+                    &stream.up_packet_sender,
+                    tuple,
+                    &tcb,
+                    None,
+                    flags,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            bytes
+        };
+        assert!(bytes >= 4);
+        for expected in [bytes.min(u16::MAX as usize), bytes >> 2] {
+            let packet = packets.recv().await.unwrap();
+            let TransportHeader::Tcp(header) = packet.transport_header() else {
+                panic!("expected TCP")
+            };
+            assert_eq!(usize::from(header.window_size), expected);
+        }
     }
 
     #[tokio::test]

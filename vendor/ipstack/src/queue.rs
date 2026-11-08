@@ -8,6 +8,11 @@ use std::{
     task::{Context, Poll, Waker},
 };
 use tokio::sync::mpsc;
+/// Bytes charged to one TCP flow before its receive task dequeues packets.
+pub(crate) const TCP_INGRESS_BYTES: usize = 128 * 1024;
+/// Leave room for per-packet charges, control packets and small-segment bursts.
+pub(crate) const TCP_INGRESS_PAYLOAD_WINDOW: usize = TCP_INGRESS_BYTES / 2;
+
 #[derive(Debug)]
 pub(crate) struct Budget {
     used: AtomicUsize,
@@ -18,6 +23,7 @@ pub(crate) struct Budget {
     tcp_peer_resets: AtomicUsize,
     tcp_handshake_resets: AtomicUsize,
     tcp_task_errors: AtomicUsize,
+    tcp_ingress_drops: AtomicUsize,
 }
 impl Budget {
     pub fn new(limit: usize) -> Arc<Self> {
@@ -30,6 +36,7 @@ impl Budget {
             tcp_peer_resets: AtomicUsize::new(0),
             tcp_handshake_resets: AtomicUsize::new(0),
             tcp_task_errors: AtomicUsize::new(0),
+            tcp_ingress_drops: AtomicUsize::new(0),
         })
     }
     pub fn record_tcp_reset(&self, during_handshake: bool) {
@@ -37,6 +44,9 @@ impl Budget {
         if during_handshake {
             self.tcp_handshake_resets.fetch_add(1, Ordering::Relaxed);
         }
+    }
+    pub fn record_tcp_ingress_drop(&self) {
+        self.tcp_ingress_drops.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_tcp_task_error(&self) {
         self.tcp_task_errors.fetch_add(1, Ordering::Relaxed);
@@ -47,6 +57,7 @@ impl Budget {
             peer_resets: self.tcp_peer_resets.load(Ordering::Relaxed),
             handshake_resets,
             task_errors: self.tcp_task_errors.load(Ordering::Relaxed),
+            ingress_drops: self.tcp_ingress_drops.load(Ordering::Relaxed),
         }
     }
     pub fn register_flow(&self, flow: &Arc<Mutex<crate::stream::tcb::Tcb>>) {
