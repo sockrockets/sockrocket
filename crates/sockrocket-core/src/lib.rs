@@ -105,9 +105,9 @@ pub use traffic::{
     subscription_public_id, sum_subscription_members, with_traffic_scope,
 };
 pub use update::{
-    UpdateAvailability, UpdateCheck, check_for_update, compare_versions, download_file,
-    download_file_with_proxy_fallback, merlin_package_asset, preferred_gui_asset,
-    preferred_merlin_cli_asset,
+    UpdateAvailability, UpdateCheck, check_for_update, check_for_update_with_proxy,
+    compare_versions, download_file, download_file_with_proxy_fallback, merlin_package_asset,
+    preferred_gui_asset, preferred_merlin_cli_asset,
 };
 
 pub mod resources;

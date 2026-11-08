@@ -3423,8 +3423,14 @@ fn act_check_update() -> J {
         Ok(rt) => rt,
         Err(e) => return err_msg(&format!("Runtime error: {e}")),
     };
-    let result =
-        rt.block_on(async { sockrocket_core::check_for_update(current, prefer.as_deref()).await });
+    let result = rt.block_on(async {
+        sockrocket_core::check_for_update_with_proxy(
+            current,
+            prefer.as_deref(),
+            is_running().then(local_socks_addr).flatten(),
+        )
+        .await
+    });
     match result {
         Ok(check) => {
             let available = check.availability == sockrocket_core::UpdateAvailability::Available;
@@ -3589,9 +3595,10 @@ pub fn merlin_update_worker() -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let check = rt.block_on(sockrocket_core::check_for_update(
+        let check = rt.block_on(sockrocket_core::check_for_update_with_proxy(
             env!("CARGO_PKG_VERSION"),
             Some(&asset),
+            is_running().then(local_socks_addr).flatten(),
         ))?;
         if check.availability != sockrocket_core::UpdateAvailability::Available {
             return save_update_status("up-to-date");

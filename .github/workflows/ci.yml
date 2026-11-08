@@ -244,9 +244,7 @@ jobs:
 
       - name: Install cross
         if: steps.changes.outputs.merlin == 'true'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Install ARM64 artifact inspection tools
         if: steps.changes.outputs.merlin == 'true' && matrix.target == 'aarch64-unknown-linux-musl'

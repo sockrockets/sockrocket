@@ -64,7 +64,7 @@ pub fn preferred_gui_asset() -> Option<&'static str> {
 pub fn preferred_merlin_cli_asset() -> Option<&'static str> {
     let arch = std::env::consts::ARCH;
     match arch {
-        "aarch64" => Some("sockrocket-cli-linux-aarch64"),
+        "aarch64" => Some("sockrocket-cli-merlin-aarch64"),
         "arm" | "armv7" => Some(if cfg!(target_abi = "eabihf") {
             "sockrocket-cli-linux-armv7"
         } else {
@@ -196,16 +196,19 @@ async fn latest_release(
         .context("Failed to contact GitHub Releases")?;
 
     let status = response.status();
-    if matches!(
-        status,
-        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
-    ) && let Some(asset) = prefer_asset.filter(|name| {
-        name.strip_prefix("sockrocket-merlin-")
-            .and_then(|s| s.strip_suffix(".tar.gz"))
-            .and_then(merlin_package_asset)
-            .as_deref()
-            == Some(*name)
-    }) {
+    if (status.is_server_error()
+        || matches!(
+            status,
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ))
+        && let Some(asset) = prefer_asset.filter(|name| {
+            name.strip_prefix("sockrocket-merlin-")
+                .and_then(|s| s.strip_suffix(".tar.gz"))
+                .and_then(merlin_package_asset)
+                .as_deref()
+                == Some(*name)
+        })
+    {
         merlin_web_release(client, releases, asset, current)
             .await
             .map_err(|error| {
@@ -228,24 +231,54 @@ async fn latest_release(
 ///
 /// `prefer_asset` is an exact asset file name to resolve a direct download URL.
 pub async fn check_for_update(current: &str, prefer_asset: Option<&str>) -> Result<UpdateCheck> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent(format!(
-            "Sockrocket/{} (+https://github.com/sockrockets/sockrocket)",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()
-        .context("Failed to create HTTP client")?;
+    check_for_update_with_proxy(current, prefer_asset, None).await
+}
 
-    let release = latest_release(
-        &client,
-        RELEASES_LATEST,
-        "https://github.com/sockrockets/sockrocket/releases",
-        prefer_asset,
-        current,
-    )
-    .await?;
+/// Try the router's local proxy when the direct GitHub lookup stalls or fails.
+pub async fn check_for_update_with_proxy(
+    current: &str,
+    prefer_asset: Option<&str>,
+    socks: Option<std::net::SocketAddr>,
+) -> Result<UpdateCheck> {
+    let lookup = |proxy: Option<std::net::SocketAddr>| async move {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent(format!("Sockrocket/{}", env!("CARGO_PKG_VERSION")));
+        if let Some(addr) = proxy {
+            builder = builder
+                .no_proxy()
+                .proxy(reqwest::Proxy::all(format!("socks5h://{addr}"))?);
+        }
+        latest_release(
+            &builder.build()?,
+            RELEASES_LATEST,
+            "https://github.com/sockrockets/sockrocket/releases",
+            prefer_asset,
+            current,
+        )
+        .await
+    };
+    let direct = lookup(None);
+    let release = if let Some(addr) = socks {
+        let proxied = async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            lookup(Some(addr)).await
+        };
+        tokio::pin!(direct, proxied);
+        tokio::select! {
+            result = &mut direct => match result {
+                Ok(release) => release,
+                Err(e) => proxied.await.with_context(|| format!("Direct GitHub lookup failed: {e:#}; proxy retry failed"))?,
+            },
+            result = &mut proxied => match result {
+                Ok(release) => release,
+                Err(e) => direct.await.with_context(|| format!("Proxied GitHub lookup failed: {e:#}; direct lookup failed"))?,
+            },
+        }
+    } else {
+        direct.await?
+    };
 
     let latest = release
         .tag_name
@@ -371,6 +404,12 @@ mod tests {
                 "1.0.0",
                 Some("200 OK\r\nContent-Length: 12345"),
             ),
+            (
+                "503 Service Unavailable",
+                "1.0.0",
+                Some("200 OK\r\nContent-Length: 12345"),
+            ),
+            ("504 Gateway Timeout", "1.2.3", None),
             ("403 Forbidden", "1.0.0", Some("404 Not Found")),
             ("403 Forbidden", "1.2.3", None),
             ("429 Too Many Requests", "1.2.4", None),
