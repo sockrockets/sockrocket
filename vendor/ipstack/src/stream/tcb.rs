@@ -8,6 +8,9 @@ pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
+const MAX_REASSEMBLY_ENTRIES: usize = 64;
+const MAX_REASSEMBLY_CHUNK: usize = 16 * 1024;
+
 /// Retransmission timeout
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -219,32 +222,57 @@ impl Tcb {
         if buf.is_empty() {
             return;
         }
-        if self.unordered_packets.len() >= 64
-            && seq != self.ack
-            && !self.unordered_packets.contains_key(&seq)
-        {
-            return;
-        }
         let old = self.unordered_packets.get(&seq).map_or(0, Vec::len);
-        // A shorter retransmission must not erase an already buffered tail.
         if old >= buf.len() {
             return;
         }
-        if buf.len() > self.get_available_read_buffer_size().saturating_add(old) {
+        let mut overlap = old;
+        let mut available = self.get_available_read_buffer_size();
+        let mut append_to = None;
+        if seq != self.ack {
+            // Leave per-flow room for the segment that closes the leading gap.
+            let first = self
+                .unordered_packets
+                .first_key_value()
+                .map_or(seq, |(&key, _)| key.min(seq));
+            available = available
+                .saturating_sub(first.distance(self.ack).min(u32::from(self.mtu)) as usize);
+            if old == 0 {
+                // A burst following one lost packet should consume one bounded
+                // chunk per run of bytes, not one map entry per wire packet.
+                if let Some((&start, bytes)) = self.unordered_packets.range_mut(..seq).next_back() {
+                    let offset = seq.distance(start) as usize;
+                    if offset <= bytes.len() {
+                        let covered = bytes.len() - offset;
+                        if covered >= buf.len() {
+                            return;
+                        }
+                        if offset + buf.len() <= MAX_REASSEMBLY_CHUNK {
+                            overlap = covered;
+                            append_to = Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+        let increase = buf.len() - overlap;
+        if increase > available {
             return;
         }
-        if buf.len() > old {
-            let increase = buf.len() - old;
-            let Some(credit) = self.payload_budget.reserve(increase) else {
-                return;
-            };
-            credit.commit(increase);
-            self.read_reserved += increase;
+        let Some(credit) = self.payload_budget.reserve(increase) else {
+            return;
+        };
+        if let Some(bytes) = append_to {
+            bytes.extend_from_slice(&buf[overlap..]);
         } else {
-            self.payload_budget.release(old - buf.len());
-            self.read_reserved -= old - buf.len();
+            if seq != self.ack && old == 0 && self.unordered_packets.len() >= MAX_REASSEMBLY_ENTRIES
+            {
+                return;
+            }
+            self.unordered_packets.insert(seq, buf);
         }
-        self.unordered_packets.insert(seq, buf);
+        credit.commit(increase);
+        self.read_reserved += increase;
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
         if self.queued_read_chunks >= 64 {
@@ -432,7 +460,18 @@ impl Tcb {
         Self::scale_window(window, self.snd_scale)
     }
     pub(super) fn get_recv_window(&self) -> u16 {
-        let available = self.get_available_read_buffer_size() >> self.rcv_scale;
+        let mut bytes = self.get_available_read_buffer_size();
+        if self.unordered_packets.len() >= MAX_REASSEMBLY_ENTRIES
+            && let Some((&first, _)) = self.unordered_packets.first_key_value()
+            && first > self.ack
+        {
+            // At the metadata limit only promise space to repair the first
+            // hole. Keep a sub-scale-unit hole visible on the wire.
+            let gap = first.distance(self.ack) as usize;
+            let unit = 1usize << self.rcv_scale;
+            bytes = bytes.min(gap.div_ceil(unit) * unit);
+        }
+        let available = bytes >> self.rcv_scale;
         u16::try_from(available).unwrap_or(u16::MAX)
     }
 
@@ -898,6 +937,68 @@ mod tests {
             assert_eq!(pool.usage().0, 0);
         }
         eprintln!("32768 cumulative ACKs (256 in-flight segments per round): {elapsed:?}");
+    }
+
+    #[test]
+    fn upload_burst_behind_one_gap_is_delivered_without_retransmitting_the_tail() {
+        let pool = crate::TcpPayloadBudget::new(512 * 1024);
+        let mut tcb = flow(pool.clone());
+        tcb.read_buffer_size = 512 * 1024;
+        tcb.max_unacked_bytes = 512 * 1024;
+        tcb.window_limit.store(512 * 1024, Ordering::Relaxed);
+        let base = SeqNum(u32::MAX - 4096);
+        tcb.ack = base;
+        let segment = 1352;
+        let body: Vec<_> = (0..180 * segment).map(|i| (i % 251) as u8).collect();
+        for (i, bytes) in body.chunks(segment).enumerate().skip(1) {
+            tcb.add_unordered_packet(base + (i * segment) as u32, bytes.to_vec());
+        }
+        assert!(tcb.unordered_packets.len() <= MAX_REASSEMBLY_ENTRIES);
+        let reserved = pool.usage().0;
+        for (i, bytes) in body.chunks(segment).enumerate().skip(1) {
+            tcb.add_unordered_packet(base + (i * segment) as u32, bytes.to_vec());
+        }
+        assert_eq!(pool.usage().0, reserved);
+        tcb.add_unordered_packet(base, body[..segment].to_vec());
+        let mut delivered = Vec::new();
+        while let Some(bytes) = tcb.consume_unordered_packets(8192) {
+            tcb.queue_read(bytes.len());
+            delivered.extend_from_slice(&bytes);
+            tcb.consume_read(bytes.len(), 1);
+        }
+        assert_eq!(delivered.len(), body.len());
+        assert_eq!(delivered, body);
+        assert_eq!(pool.usage().0, 0);
+    }
+
+    #[test]
+    fn sparse_full_reassembly_table_advertises_only_the_leading_gap() {
+        let mut tcb = flow(crate::TcpPayloadBudget::new(8192));
+        let base = tcb.get_ack();
+        for i in 0..64 {
+            tcb.add_unordered_packet(base + (100 + 2 * i), vec![1]);
+        }
+        assert_eq!(tcb.get_recv_window(), 100);
+        tcb.add_unordered_packet(base, vec![1; 100]);
+        assert_eq!(tcb.consume_unordered_packets(8192).unwrap().len(), 101);
+        assert!(tcb.get_recv_window() > 100);
+    }
+
+    #[test]
+    fn out_of_order_bytes_leave_room_to_repair_the_gap() {
+        let pool = crate::TcpPayloadBudget::new(8192);
+        let mut tcb = flow(pool.clone());
+        let base = tcb.get_ack();
+        tcb.add_unordered_packet(base + 1352, vec![2; 6840]);
+        tcb.add_unordered_packet(base + 8192, vec![3; 1352]);
+        assert_eq!(pool.usage().0, 6840);
+        tcb.add_unordered_packet(base, vec![1; 1352]);
+        let data = tcb.consume_unordered_packets(8192).unwrap();
+        assert_eq!(data.len(), 8192);
+        assert_eq!(tcb.get_ack(), base + 8192);
+        tcb.queue_read(data.len());
+        tcb.consume_read(data.len(), 1);
+        assert_eq!(pool.usage().0, 0);
     }
 
     #[test]
