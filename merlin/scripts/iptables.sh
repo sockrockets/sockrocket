@@ -722,13 +722,48 @@ do_ipv6_guard() {
     ipv6_compat_guard_start
 }
 
+# Merlin 4.19 reuses a destination's slow-start threshold across connections.
+# Keep recent congestion feedback. Once a low threshold has sat unchanged
+# for a minute, let the next connection to that configured node learn afresh.
+repair_node_tcp_metrics() {
+    local candidates dest
+    [ -s "$SOCKROCKET_RUNTIME_DIR/node-endpoints" ] || return 0
+    candidates=$(ip tcp_metrics show 2>/dev/null | awk '
+        FILENAME != "-" { node[$1] = 1; next }
+        $1 in node && $1 ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ {
+            count[$1]++
+            age = 0; threshold = 0
+            for (i = 2; i < NF; i++) {
+                if ($i == "age") age = $(i+1) + 0
+                if ($i == "ssthresh") threshold = $(i+1) + 0
+            }
+            if (age >= 60 && threshold > 0 && threshold <= 32) stale[$1] = 1
+        }
+        END { for (ip in stale) if (count[ip] == 1) print ip }' "$SOCKROCKET_RUNTIME_DIR/node-endpoints" -)
+    for dest in $candidates; do
+        ip tcp_metrics delete "$dest" 2>/dev/null || true
+    done
+    return 0
+}
+
 # Node addresses used by this router, and by a LAN device that runs its own
 # proxy against the same servers. Those flows must leave directly: marking
 # them into the TUN wraps the proxy connection a second time.
 proxy_endpoint_returns() {
-    local family="$1" dest endpoints
+    local family="$1" dest endpoints snapshot
     [ -x "$SOCKROCKET_DIR/sockrocket-cli" ] || return 0
     endpoints=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-proxy-endpoints "$SOCKROCKET_CONF" 2>/dev/null) || return 0
+    if [ "$family" = 4 ]; then
+        snapshot="$SOCKROCKET_RUNTIME_DIR/endpoints.$$"
+        if mkdir -p "$SOCKROCKET_RUNTIME_DIR" &&
+            (umask 077; set -C; printf '%s\n' "$endpoints" > "$snapshot"); then
+            if mv -f "$snapshot" "$SOCKROCKET_RUNTIME_DIR/node-endpoints"; then
+                repair_node_tcp_metrics
+            else
+                rm -f "$snapshot"
+            fi
+        fi
+    fi
     for dest in $endpoints; do
         case "$family:$dest" in
             4:*.*.*.*)
@@ -762,6 +797,7 @@ proxy_endpoint_returns() {
 }
 
 flush_chains() {
+    rm -f "$SOCKROCKET_RUNTIME_DIR/node-endpoints"
     ipv6_guard_stop || return 1
     # Flush proxy chains only. NEVER flush SOCKROCKET_DNS here: firewall-start
     # (and every `iptables.sh start`) would wipe LAN :53 REDIRECT and never put
@@ -991,6 +1027,7 @@ do_dns_stop() {
 }
 
 do_stop() {
+    rm -f "$SOCKROCKET_RUNTIME_DIR/node-endpoints"
     info "Removing transparent proxy rules..."
     local cleanup_rc=0
     # Cleanup must still work after NVRAM has become invalid. Only the legacy
@@ -1107,6 +1144,7 @@ case "$1" in
     start)   do_start ;;
     stop)    do_stop ;;
     restart) do_stop; do_start ;;
+    repair-node-tcp) repair_node_tcp_metrics ;;
     ipv6-apply) do_ipv6_apply ;;
     ipv6-guard) do_ipv6_guard ;;
     dns-start) do_dns_start ;;
