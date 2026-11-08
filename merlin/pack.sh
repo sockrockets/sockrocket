@@ -115,7 +115,7 @@ pack_one ipq32 "$ARMV7HF_BIN"
 pack_one arm "$ARMV7SF_BIN"
 
 # Standalone binaries for --online / manual replace
-cp "$AARCH64_BIN" "$OUT_DIR/sockrocket-cli-linux-aarch64"
+cp "$AARCH64_BIN" "$OUT_DIR/sockrocket-cli-merlin-aarch64"
 cp "$ARMV7HF_BIN" "$OUT_DIR/sockrocket-cli-linux-armv7"
 cp "$ARMV7SF_BIN" "$OUT_DIR/sockrocket-cli-linux-armv7sf"
 cp "$ROOT/docs/merlin-models.md" "$OUT_DIR/"
@@ -123,9 +123,9 @@ cp "$ROOT/docs/merlin-models.md" "$OUT_DIR/"
 (
   cd "$OUT_DIR"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum sockrocket-merlin-*.tar.gz sockrocket-cli-linux-* merlin-models.md > SHA256SUMS-merlin.txt
+    sha256sum sockrocket-merlin-*.tar.gz sockrocket-cli-merlin-aarch64 sockrocket-cli-linux-armv7 sockrocket-cli-linux-armv7sf merlin-models.md > SHA256SUMS-merlin.txt
   else
-    shasum -a 256 sockrocket-merlin-*.tar.gz sockrocket-cli-linux-* merlin-models.md > SHA256SUMS-merlin.txt
+    shasum -a 256 sockrocket-merlin-*.tar.gz sockrocket-cli-merlin-aarch64 sockrocket-cli-linux-armv7 sockrocket-cli-linux-armv7sf merlin-models.md > SHA256SUMS-merlin.txt
   fi
   cat SHA256SUMS-merlin.txt
 )

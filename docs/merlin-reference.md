@@ -177,7 +177,7 @@ Manual binary-only swap:
 ```bash
 # shellcheck source=/dev/null
 . .local/router.env
-scp -O -P "$ROUTER_PORT" sockrocket-cli-linux-aarch64 \
+scp -O -P "$ROUTER_PORT" sockrocket-cli-merlin-aarch64 \
   "${ROUTER_USER}@${ROUTER_HOST}:/jffs/addons/sockrocket/sockrocket-cli.new"
 ssh -p "$ROUTER_PORT" "${ROUTER_USER}@${ROUTER_HOST}" '
   cd /jffs/addons/sockrocket
