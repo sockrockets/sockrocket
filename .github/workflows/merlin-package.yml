@@ -1,127 +1,38 @@
-name: Merlin Package (on demand)
-
-# Manually triggered Merlin router plugin build. Cross-compiles CLI for
-# Cross-compile aarch64 + armv7 (hardfloat + softfloat), then packs all
-# koolcenter platform tarballs via merlin/pack.sh. Artifacts are downloadable from the
-# workflow run; optionally attached to a GitHub release.
-
-on:
-  workflow_dispatch:
-    inputs:
-      attach_to_release:
-        description: "Attach assets to a GitHub release"
-        type: boolean
-        default: false
-      release_tag:
-        description: "Release tag to attach assets to (created if missing)"
-        type: string
-        default: "merlin-nightly"
-      prerelease:
-        description: "Mark the attached release as a prerelease"
-        type: boolean
-        default: true
-
+name: Recover verified Merlin assets for v0.1.1
+on: workflow_dispatch
 permissions:
-  contents: write # needed when attach_to_release is enabled
-
+  actions: read
+  contents: write
 jobs:
-  merlin:
-    # Explicit name avoids GitHub appending the full Rust triple
-    # (…-unknown-linux-musl) into the Actions UI job title.
-    name: Merlin binaries (${{ matrix.name }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: aarch64
-            target: aarch64-unknown-linux-musl
-          - name: armv7hf
-            target: armv7-unknown-linux-musleabihf
-          - name: armv7sf
-            target: armv7-unknown-linux-musleabi
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache Cargo registry & build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: merlin-${{ matrix.name }}-dispatch
-
-      - name: Install cross-compilation toolchain
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - name: Install ARM64 artifact inspection tools
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: sudo apt-get update -y && sudo apt-get install -y llvm
-
-      - name: Cross-compile CLI (${{ matrix.name }})
-        run: bash tools/build-merlin-cross.sh ${{ matrix.target }}
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: merlin-bin-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/sockrocket-cli
-          retention-days: 14
-
-  pack:
-    name: Merlin packages
-    needs: merlin
+  publish:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Download aarch64 binary
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
         with:
-          name: merlin-bin-aarch64
-          path: target/aarch64-unknown-linux-musl/release
-
-      - name: Download armv7hf binary
-        uses: actions/download-artifact@v4
-        with:
-          name: merlin-bin-armv7hf
-          path: target/armv7-unknown-linux-musleabihf/release
-
-      - name: Download armv7sf binary
-        uses: actions/download-artifact@v4
-        with:
-          name: merlin-bin-armv7sf
-          path: target/armv7-unknown-linux-musleabi/release
-
-      - name: Make binaries executable
+          ref: v0.1.1
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify provenance and publish Merlin assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          chmod +x target/aarch64-unknown-linux-musl/release/sockrocket-cli
-          chmod +x target/armv7-unknown-linux-musleabihf/release/sockrocket-cli
-          chmod +x target/armv7-unknown-linux-musleabi/release/sockrocket-cli
-
-      - name: Pack all platforms
-        run: ./merlin/pack.sh
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sockrocket-merlin-all
-          path: dist/merlin/*
-          retention-days: 90
-
-      - name: Attach assets to release
-        if: ${{ inputs.attach_to_release }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          prerelease: ${{ inputs.prerelease }}
-          files: dist/merlin/*
-          fail_on_unmatched_files: true
-          generate_release_notes: false
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 184d37dfe0604d32e4f1820e3dc340ded055b444
+          test "$(git rev-parse HEAD^{tree})" = "$(git rev-parse 6284ac0505822b610a6b8e818b275a29db5bf459^{tree})"
+          gh api repos/"$GITHUB_REPOSITORY"/actions/artifacts/13612324282/zip > "$RUNNER_TEMP/ci.zip"
+          echo "5fef877556aa662c5d390471aacbc92cec59d9df2df34fca3fc5c0decd1d704b  $RUNNER_TEMP/ci.zip" | sha256sum -c
+          mkdir "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP/assets"
+          unzip -q "$RUNNER_TEMP/ci.zip"
+          sha256sum -c SHA256SUMS-merlin.txt
+          for f in sockrocket-merlin-*.tar.gz; do test "$(tar -xOf "$f" sockrocket/version)" = 0.1.1; done
+          mv sockrocket-cli-linux-aarch64 sockrocket-cli-merlin-aarch64
+          sed -i 's/  sockrocket-cli-linux-aarch64$/  sockrocket-cli-merlin-aarch64/' SHA256SUMS-merlin.txt
+          sha256sum -c SHA256SUMS-merlin.txt
+          gh release upload v0.1.1 --repo "$GITHUB_REPOSITORY" --clobber sockrocket-merlin-*.tar.gz sockrocket-cli-linux-armv7{,sf} sockrocket-cli-merlin-aarch64 merlin-models.md
+          gh release upload v0.1.1 --repo "$GITHUB_REPOSITORY" --clobber SHA256SUMS-merlin.txt
+          gh api repos/"$GITHUB_REPOSITORY"/releases/tags/v0.1.1 --jq '.assets[] | [.name,.digest] | @tsv' > "$RUNNER_TEMP/remote"
+          for f in *; do
+            digest=$(sha256sum "$f" | cut -d' ' -f1)
+            grep -Fx "$(printf '%s\tsha256:%s' "$f" "$digest")" "$RUNNER_TEMP/remote"
+          done
