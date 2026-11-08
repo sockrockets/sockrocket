@@ -109,7 +109,12 @@ impl VlessOutbound {
         ));
         let is_xhttp = transport
             .is_some_and(|t| t.transport_type == crate::config::model::TransportType::Xhttp);
-        let pool = if warm_pool && !is_xhttp {
+        let websocket = transport
+            .is_some_and(|t| t.transport_type == crate::config::model::TransportType::WebSocket);
+        let pool = if warm_pool && websocket {
+            // Upgraded sockets can be closed while waiting for their first VLESS header.
+            ConnPool::with_max_age(factory, std::time::Duration::from_secs(2))
+        } else if warm_pool && !is_xhttp {
             ConnPool::new(factory)
         } else {
             ConnPool::lazy(factory)
