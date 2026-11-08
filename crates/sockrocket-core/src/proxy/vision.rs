@@ -118,14 +118,24 @@ struct Records {
 }
 impl Records {
     fn feed(&mut self, bytes: &[u8], server: bool) -> bool {
+        self.feed_until(bytes, server, false).1
+    }
+
+    fn feed_until(
+        &mut self,
+        bytes: &[u8],
+        server: bool,
+        stop_at_application: bool,
+    ) -> (usize, bool) {
         if self.failed {
-            return false;
+            return (bytes.len(), false);
         }
         if self.bytes.len() + bytes.len() > 131072 {
             self.failed = true;
             self.bytes = Vec::new();
-            return false;
+            return (bytes.len(), false);
         }
+        let previous = self.bytes.len();
         self.bytes.extend_from_slice(bytes);
         let mut last_application = false;
         let mut consumed = 0;
@@ -154,13 +164,19 @@ impl Records {
                 }
             }
             consumed += size + 5;
+            if stop_at_application && last_application {
+                // poll_write accepts only through this record. The caller retries
+                // the suffix after drain_wire has flushed the direct marker.
+                self.bytes = Vec::new();
+                return (consumed - previous, true);
+            }
         }
         if self.failed {
             self.bytes = Vec::new();
         } else if consumed > 0 {
             self.bytes = release_prefix(std::mem::take(&mut self.bytes), consumed);
         }
-        last_application && self.bytes.is_empty()
+        (bytes.len(), last_application && self.bytes.is_empty())
     }
 }
 fn server_hello(bytes: &[u8]) -> Option<bool> {
@@ -452,7 +468,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<T> {
         }
         let n = buf.len().min(CHUNK);
         this.writes += 1;
-        let application = this.outbound.feed(&buf[..n], false);
+        let (n, application) = this
+            .outbound
+            .feed_until(&buf[..n], false, this.inbound.enabled);
         let command = if application {
             if this.inbound.enabled { 2 } else { 1 }
         } else if this.writes >= 8 && (!this.inbound.enabled || this.outbound.failed) {
@@ -506,6 +524,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_transition_consumes_only_through_the_first_application_record() {
+        let mut records = Records::default();
+        assert_eq!(
+            records.feed_until(&[20, 3, 3, 0, 1, 1, 23, 3], false, true),
+            (8, false)
+        );
+        let next = [3, 0, 2, 10, 11, 23, 3, 3, 0, 4, 12];
+        assert_eq!(records.feed_until(&next, false, true), (5, true));
+        assert!(records.bytes.is_empty());
+    }
 
     #[test]
     fn parsed_record_drops_the_buffer() {
