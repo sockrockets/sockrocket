@@ -569,7 +569,7 @@ body.bg {min-width:0!important}
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-bulk-edit" onclick="changeRuleWorkspaceMode('bulk')">批量编辑</button><button class="btn btn-sm" onclick="exportRules()">导出规则</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-group-enable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),true)">启用该组</button><button class="btn btn-sm" id="sr-rule-group-disable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),false)">停用该组</button><button class="btn btn-danger btn-sm" id="sr-rule-group-delete" onclick="deleteRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP))">删除该组</button></div>
             </details>
-            <button class="btn btn-accent btn-sm" id="sr-rule-add" onclick="startRuleAddition()">添加规则</button>
+            <button class="btn btn-sm" onclick="cancelRuleEditor()">规则列表</button><button class="btn btn-accent btn-sm" id="sr-rule-add" onclick="startRuleAddition()">添加规则</button>
           </div>
           <p class="hint" id="sr-rule-group-summary" aria-live="polite"></p>
           <datalist id="sr-rule-group-list"></datalist><input type="hidden" id="sr-rule-group"><input type="hidden" id="sr-rule-entry-mode" value="single">
@@ -2497,7 +2497,7 @@ function syncRuleWorkspace() {
   srElement('rule-import').disabled=locked || !RULE_SELECTED_GROUP;
   var types=[];members.forEach(function(r){var label=RULE_TYPE_LABEL[r.rule_type] || r.rule_type;if(types.indexOf(label)<0)types.push(label);});
   srElement('rule-group-summary').textContent=RULE_SELECTED_GROUP === null?'先新建一个分组，再添加规则。':(RULE_SELECTED_GROUP || '未分组')+' · 共 '+members.length+' 条 · 已启用 '+members.filter(function(r){return r.enabled!==false;}).length+' 条'+(types.length?' · '+types.join(' / '):' · 添加第一条规则后保存');
-  srElement('rule-list-panel').hidden=RULE_WORKSPACE_MODE!=='list' && !RULE_IMPORT_MODE;
+  srElement('rule-list-panel').hidden=!srElement('rule-create-menu').hidden || RULE_ADD_BASELINE!==null || RULE_ROW_BASELINE!==null || RULE_PRESET_GROUP!==null;
   ['rule-add-panel','rule-edit-panel'].forEach(function(id){var el=srElement(id);if(el.querySelectorAll)Array.prototype.forEach.call(el.querySelectorAll('input,select,textarea,button'),function(input){input.disabled=locked;});});
   if(!locked){ruleTypeChanged();editRuleTypeChanged();}
   srElement('rule-import-fetch').disabled=locked || RULE_IMPORT_PENDING;
@@ -2523,15 +2523,19 @@ function changeRuleWorkspaceMode(mode) {
 function closeRuleCreateMenu() {
   srElement('rule-create-menu').hidden=true;
   srElement('rule-create-toggle').setAttribute('aria-expanded','false');
+  srElement('rule-list-panel').hidden=!srElement('rule-create-menu').hidden || RULE_ADD_BASELINE!==null || RULE_ROW_BASELINE!==null || RULE_PRESET_GROUP!==null;
 }
 var ruleCreateMethod = 'blank';
 function openRuleGroupCreator(method) {
   if(ruleWorkspaceLocked())return;
+  if(!discardRuleDraft())return;
+  srElement('rule-add-panel').hidden=true;srElement('rule-edit-panel').hidden=true;
   ruleCreateMethod = method || 'blank';
   var preset = ruleCreateMethod === 'preset';
   srElement('rule-preset-panel').hidden = !preset;
   srElement('rule-group-creator').hidden = preset;
   srElement('rule-create-menu').hidden=false;
+  srElement('rule-list-panel').hidden=true;
   srElement('rule-create-toggle').setAttribute('aria-expanded','true');
   srElement(preset ? 'rule-preset' : 'rule-new-group-name').focus();
 }
@@ -2560,7 +2564,7 @@ function startRulePresetAddition() {
   resetRuleEditor();RULE_PRESET_GROUP=RULE_SELECTED_GROUP;
   srElement('rule-add-panel').hidden=false;
   srElement('rule-editor-state').textContent='向「'+(RULE_SELECTED_GROUP||'未分组')+'」添加规则';
-  renderRuleAddMethod('preset');renderRulePreset();RULE_ADD_BASELINE=ruleEditorSnapshot();
+  renderRuleAddMethod('preset');renderRulePreset();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);
 }
 function startRuleAddition() {
   if(ruleWorkspaceLocked() || RULE_SELECTED_GROUP === null || !discardRuleDraft())return;
@@ -3346,6 +3350,7 @@ function saveRuleEdit() {
 }
 function cancelRuleEditor() {if(discardRuleDraft()){resetRuleEditor();renderRules(false);}}
 function resetRuleEditor() {
+  closeRuleCreateMenu();srElement('rule-group-creator').hidden=true;
   RULE_EDIT_GROUP=null;RULE_EDIT_MEMBERS=null;RULE_EDIT_ROW=null;RULE_ADD_BASELINE=null;RULE_ROW_BASELINE=null;RULE_WORKSPACE_MODE='list';
   RULE_IMPORT_MODE=false;RULE_IMPORT_PENDING=false;RULE_IMPORT_GENERATION++;RULE_PRESET_GROUP=null;renderRuleAddMethod('manual');
   srElement('rule-import-panel').hidden=true;srElement('rule-import-url').value='';srElement('rule-import-state').textContent='';
@@ -3663,6 +3668,11 @@ function toggleLogAuto() {
   if (on) logAutoTimer = setInterval(function () { if (SR_STATE.page === 'logs' && !document.hidden) loadLog(); }, 5000);
 }
 
+srElement('rule-workspace').addEventListener('click', function(event) {
+  var control=event.target.closest('button,summary,select');
+  if(!control || control.closest('#sr-rule-create-menu') || control.id==='sr-rule-create-toggle')return;
+  closeRuleCreateMenu();srElement('rule-group-creator').hidden=true;
+},true);
 document.addEventListener('visibilitychange', function () {
   if (!document.hidden && TRANSPORT) { refreshStatus(true); if (SR_STATE.page === 'logs' && srElement('log-auto').checked) loadLog(); }
 });

@@ -8,7 +8,7 @@ vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexO
 const request=action=>{const i=requests.findIndex(r=>r[0]===action);assert.ok(i>=0,action);return requests.splice(i,1)[0];};
 c.startRuleImport();assert.equal(c.RULE_WORKSPACE_MODE,'import');assert.equal(c.RULE_EDIT_GROUP,null);assert.equal(element('rule-target').value,'group:Japan');
 assert.equal(element('rule-batch').value,'');assert.match(element('rule-batch').placeholder,/读取链接后/);
-assert.equal(element('rule-import-panel').hidden,false);assert.equal(element('rule-list-panel').hidden,false);
+assert.equal(element('rule-import-panel').hidden,false);assert.equal(element('rule-list-panel').hidden,true);
 for(const url of ['file:///etc/passwd','https://','https://user:secret@example.invalid/list']){element('rule-import-url').value=url;c.fetchRuleList();assert.equal(requests.length,0);}
 element('rule-import-url').value='https://example.invalid/rules.list';c.fetchRuleList();let read=request('fetch_rule_list');
 assert.equal(read[1].target,'group:Japan');assert.equal(read[1].group,'Emby');assert.equal(c.rulePending,false,'read does not start a mutation');
