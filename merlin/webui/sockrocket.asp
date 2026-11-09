@@ -129,6 +129,9 @@
 #sockrocket-plugin .rule-workspace-controls .fg {min-width:0}
 #sockrocket-plugin .rule-workspace-controls select {width:100%;min-width:0}
 #sockrocket-plugin .rule-workspace-actions {margin:12px 0}
+#sockrocket-plugin #sr-rule-default-fields.rule-simple > .fg:not(:first-child) {display:none}
+#sockrocket-plugin #sr-rule-default-fields.rule-simple {grid-template-columns:1fr}
+#sockrocket-plugin #sr-rule-add-panel .toolbar {margin-bottom:8px}
 #sockrocket-plugin .rule-inline-editor {padding:16px;background:var(--bg-hover);border:1px solid var(--border);border-radius:9px;margin:14px 0}
 #sockrocket-plugin .rule-inline-editor .toolbar {margin-bottom:12px}
 #sockrocket-plugin #sr-rule-list-panel {border-top:1px solid var(--border);margin-top:14px;padding-top:4px}
@@ -245,7 +248,7 @@
 #sockrocket-plugin .flow-checks .matched {color:var(--text-accent);font-weight:600}
 #sockrocket-plugin .flow-warning {color:var(--warning);font-size:11px;margin-top:8px;overflow-wrap:anywhere}
 #sockrocket-plugin .proxy-group-grid {grid-template-columns:repeat(2,minmax(0,1fr))}
-#sockrocket-plugin #sr-rule-add-methods [aria-pressed="true"] {background:var(--accent);color:white}
+#sockrocket-plugin #sr-rule-workspace-tabs [aria-selected="true"],#sockrocket-plugin #sr-rule-add-methods [aria-pressed="true"] {background:var(--accent);color:white;border-color:var(--accent)}
 #sockrocket-plugin .pg-member-list {max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-sidebar)}
 #sockrocket-plugin .pg-member {display:flex;align-items:flex-start;gap:8px;margin:0;padding:7px 10px;border-bottom:1px solid var(--border);font-size:12px;line-height:1.4}
 #sockrocket-plugin .pg-member:last-child {border-bottom:0}
@@ -558,28 +561,32 @@ body.bg {min-width:0!important}
         </section>
         <section class="card" id="sr-rule-workspace" aria-labelledby="sr-rule-workspace-title">
           <div class="toolbar"><h3 id="sr-rule-workspace-title">规则组维护</h3><div class="spacer"></div></div>
+          <div class="toolbar" id="sr-rule-workspace-tabs" role="tablist" aria-label="规则组维护">
+<button type="button" class="btn btn-sm" id="sr-rule-list-tab" role="tab" aria-selected="true" onclick="cancelRuleEditor()">规则列表</button>
+            <button class="btn btn-sm" id="sr-rule-add" role="tab" aria-selected="false" onclick="startRuleAddition()">添加规则</button>            <button class="btn btn-sm" aria-controls="sr-rule-create-menu" aria-expanded="false" onclick="openRuleGroupCreator('blank')" id="sr-rule-create-toggle" role="tab" aria-selected="false">新建规则组</button>
+</div>
           <p class="hint" id="sr-rule-operation-state" role="status" aria-live="polite"></p>
           <div id="sr-rule-create-menu" class="rule-inline-editor" hidden>
           <div id="sr-rule-group-creator" class="rule-inline-editor" hidden><div class="fg"><label for="sr-rule-new-group-name">规则组名称</label><input id="sr-rule-new-group-name" type="text" placeholder="例如：常用服务" onkeydown="if(event.key==='Enter')createRuleGroup()"></div><p class="hint">添加第一条规则后保存分组，同一组可以包含多种类型的规则。</p><div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-rule-group-new" onclick="createRuleGroup()">创建规则组</button><button class="btn btn-sm" onclick="closeRuleCreateMenu()">取消</button></div></div>
           </div>
           <div class="toolbar rule-workspace-actions">
             <div class="fg"><label for="sr-rule-group-select">选择分组</label><select id="sr-rule-group-select" onchange="keepRulePickerPosition(this, () => { changeRuleGroup(this.value); })" disabled><option value="">正在加载…</option></select></div>
-            <button class="btn btn-sm" aria-controls="sr-rule-create-menu" aria-expanded="false" onclick="openRuleGroupCreator('blank')" id="sr-rule-create-toggle">新建规则组</button>
+
             <details><summary>分组设置</summary>
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-bulk-edit" onclick="changeRuleWorkspaceMode('bulk')">批量编辑</button><button class="btn btn-sm" onclick="exportRules()">导出规则</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-group-enable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),true)">启用该组</button><button class="btn btn-sm" id="sr-rule-group-disable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),false)">停用该组</button><button class="btn btn-danger btn-sm" id="sr-rule-group-delete" onclick="deleteRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP))">删除该组</button></div>
             </details>
-            <button class="btn btn-sm" onclick="cancelRuleEditor()">规则列表</button><button class="btn btn-accent btn-sm" id="sr-rule-add" onclick="startRuleAddition()">添加规则</button>
+
           </div>
           <p class="hint" id="sr-rule-group-summary" aria-live="polite"></p>
           <datalist id="sr-rule-group-list"></datalist><input type="hidden" id="sr-rule-group"><input type="hidden" id="sr-rule-entry-mode" value="single">
           <div id="sr-rule-add-panel" class="rule-inline-editor" hidden>
-            <div class="toolbar"><h3 id="sr-rule-editor-state">添加规则</h3><button class="btn btn-sm" id="sr-rule-edit-cancel" onclick="cancelRuleEditor()">取消</button></div>
             <div class="toolbar" id="sr-rule-add-methods" aria-label="添加方式">
               <button class="btn btn-sm" id="sr-rule-method-manual" onclick="startRuleAddition()">手动填写</button>
               <button class="btn btn-sm" id="sr-rule-import" onclick="startRuleImport()">从链接导入</button>
               <button class="btn btn-sm" id="sr-rule-method-preset" onclick="startRulePresetAddition()">使用预设</button>
             </div>
+            <div class="toolbar"><h3 id="sr-rule-editor-state">添加规则</h3><button class="btn btn-sm" id="sr-rule-edit-cancel" onclick="cancelRuleEditor()">取消</button></div>
           <div id="sr-rule-preset-panel" hidden>
             <p class="hint">导入后可在对应分组查看、编辑和启用规则。</p>
             <div class="toolbar" style="margin-top:12px"><div class="fg" style="flex:1;min-width:180px"><label for="sr-rule-preset">选择常用预设</label><select id="sr-rule-preset" onchange="renderRulePreset()" disabled><option value="">正在加载…</option></select></div><span class="badge" id="sr-rule-preset-target"></span><div class="fg"><label for="sr-preset-route-target">添加时的出口</label><select id="sr-preset-route-target"><option value="">使用预设默认</option></select></div></div>
@@ -622,6 +629,7 @@ body.bg {min-width:0!important}
               </select>
             </div>
           </div>
+          <div class="toolbar"><button type="button" class="btn btn-sm" id="sr-rule-options-toggle" aria-expanded="false" onclick="toggleRuleOptions()">高级选项</button><span class="hint">出口在设备关联规则组时选择；这里可设置单条规则的特殊行为。</span></div>
           <div class="hint" id="sr-rule-input-hint" style="margin-bottom:6px">每行一条，支持域名及其子域名。</div>
           <div id="sr-rule-single-wrap" style="display:none">
             <div class="form-grid adaptive-form" style="grid-template-columns: 1fr auto">
@@ -2430,8 +2438,16 @@ var RULE_BULK_PLACEHOLDER = {
   'dst-port': 'DST-PORT,443,PROXY\nDST-PORT,1000-2000,DIRECT',
   'final': 'MATCH,PROXY'
 };
+var RULE_OPTIONS_OPEN=false;
+function toggleRuleOptions() {
+  RULE_OPTIONS_OPEN=!RULE_OPTIONS_OPEN;ruleTypeChanged();
+}
 function ruleTypeChanged() {
   var t = srElement('rule-type').value;
+  var simple=!RULE_OPTIONS_OPEN && !RULE_IMPORT_MODE && RULE_EDIT_GROUP===null;
+  srElement('rule-default-fields').className='form-grid adaptive-form'+(simple?' rule-simple':'');
+  srElement('rule-options-toggle').setAttribute('aria-expanded',String(!simple));
+  srElement('rule-options-toggle').textContent=simple?'高级选项':'收起高级选项';
   var bulk = RULE_EDIT_GROUP !== null || srElement('rule-entry-mode').value === 'bulk';
   srElement('rule-bulk-wrap').style.display = bulk ? '' : 'none';
   srElement('rule-single-wrap').style.display = bulk ? 'none' : '';
@@ -2479,6 +2495,7 @@ function ruleWorkspaceDirty() {
 function discardRuleDraft() { return !ruleWorkspaceDirty() || confirm('放弃当前未保存的规则修改？'); }
 function ruleWorkspaceLocked() {return rulePending || RULE_READ_PENDING || RULE_FLOW_ERROR || !RULE_RULE_REVISION;}
 function syncRuleWorkspace() {
+  syncWorkspaceTabs();
   var names=[];
   (SR_STATE.ruleRows || []).forEach(function(r){var name=(r.group || '').trim();if(names.indexOf(name)<0)names.push(name);});
   RULE_LOCAL_GROUPS=RULE_LOCAL_GROUPS.filter(function(name){return names.indexOf(name)<0;});
@@ -2520,9 +2537,14 @@ function changeRuleWorkspaceMode(mode) {
   }
   renderRules(false);
 }
+function syncWorkspaceTabs() {
+  var creating=!srElement('rule-create-menu').hidden;
+  var adding=!srElement('rule-add-panel').hidden;
+  [['rule-list-tab',!creating&&!adding],['rule-add',!creating&&adding],['rule-create-toggle',creating]].forEach(function(pair){srElement(pair[0]).setAttribute('aria-selected',String(pair[1]));});
+}
 function closeRuleCreateMenu() {
   srElement('rule-create-menu').hidden=true;
-  srElement('rule-create-toggle').setAttribute('aria-expanded','false');
+  srElement('rule-create-toggle').setAttribute('aria-expanded','false');syncWorkspaceTabs();
   srElement('rule-list-panel').hidden=!srElement('rule-create-menu').hidden || RULE_ADD_BASELINE!==null || RULE_ROW_BASELINE!==null || RULE_PRESET_GROUP!==null;
 }
 var ruleCreateMethod = 'blank';
@@ -2536,7 +2558,7 @@ function openRuleGroupCreator(method) {
   srElement('rule-group-creator').hidden = preset;
   srElement('rule-create-menu').hidden=false;
   srElement('rule-list-panel').hidden=true;
-  srElement('rule-create-toggle').setAttribute('aria-expanded','true');
+  srElement('rule-create-toggle').setAttribute('aria-expanded','true');syncWorkspaceTabs();
   srElement(preset ? 'rule-preset' : 'rule-new-group-name').focus();
 }
 function createRuleGroup() {
@@ -3350,6 +3372,7 @@ function saveRuleEdit() {
 }
 function cancelRuleEditor() {if(discardRuleDraft()){resetRuleEditor();renderRules(false);}}
 function resetRuleEditor() {
+  RULE_OPTIONS_OPEN=false;
   closeRuleCreateMenu();srElement('rule-group-creator').hidden=true;
   RULE_EDIT_GROUP=null;RULE_EDIT_MEMBERS=null;RULE_EDIT_ROW=null;RULE_ADD_BASELINE=null;RULE_ROW_BASELINE=null;RULE_WORKSPACE_MODE='list';
   RULE_IMPORT_MODE=false;RULE_IMPORT_PENDING=false;RULE_IMPORT_GENERATION++;RULE_PRESET_GROUP=null;renderRuleAddMethod('manual');
