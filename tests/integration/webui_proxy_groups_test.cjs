@@ -4,7 +4,7 @@ const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 const elements={}, requests=[];
 const el=id=>elements[id]||=( {
   value:'',hidden:true,disabled:false,options:[],textContent:'',_html:'',
-  get innerHTML(){return this._html;},set innerHTML(value){this._html=value;var checks=Array.from(value.matchAll(/<input type="(?:checkbox|radio)" value="([^"]*)"([^>]*)>[\s\S]*?<span>([\s\S]*?)<\/span>/g),m=>({value:m[1],checked:/\bchecked\b/.test(m[2]),selected:/\bchecked\b/.test(m[2]),textContent:m[3]}));this.options=checks.length?checks:Array.from(value.matchAll(/<option value="([^"]*)"([^>]*)>(.*?)<\/option>/g),m=>({value:m[1],selected:m[2].includes('selected'),textContent:m[3]}));if(this.options.length)this.value=this.options[0].value;},
+  get innerHTML(){return this._html;},set innerHTML(value){this._html=value;var checks=Array.from(value.matchAll(/<input type="(?:checkbox|radio)" value="([^"]*)"([^>]*)>[\s\S]*?<span>([\s\S]*?)<\/span>/g),m=>({value:m[1],checked:/(?:^|\s)checked(?:\s|$)/.test(m[2]),selected:/(?:^|\s)checked(?:\s|$)/.test(m[2]),textContent:m[3]}));this.options=checks.length?checks:Array.from(value.matchAll(/<option value="([^"]*)"([^>]*)>(.*?)<\/option>/g),m=>({value:m[1],selected:m[2].includes('selected'),textContent:m[3]}));if(this.options.length)this.value=this.options[0].value;},
   appendChild(o){this.options.push(o);}
 });
 const c=vm.createContext({srElement:el,srEsc:v=>String(v??''),srApi:(...args)=>requests.push(args),srShowMsg(){},toastResp(){},invalidateRuleTrace(){},confirm:()=>true,document:{createElement:()=>({})},RULE_TARGET_LABEL:{proxy:'代理',direct:'直连',reject:'拒绝'},SR_PAGE_LOADED:{},SR_STATE:{ruleRows:[]},RULE_RULE_REVISION:'r1',isFinalRule:r=>['final','match'].includes(r.rule_type),ruleApi:(...args)=>requests.push(args)});
@@ -15,13 +15,16 @@ const group={name:'Video',type:'select',members:nodes.map(n=>n.fingerprint),curr
 c.loadProxyGroups();take('proxy_groups')[2]({ok:true,revision:'r1',groups:[group],nodes});
 assert.equal(el('rule-target').options.at(-1).value,'group:Video');
 c.editProxyGroup(0);
-assert.deepEqual(c.proxyGroupMemberState().filter(row=>row.selected).map(row=>row.value),[nodes[1].fingerprint],'manual mode keeps only the chosen node');
-assert.equal(el('pg-member-tools').hidden,true,'manual mode has no select-all');
+assert.deepEqual(c.proxyGroupMemberState().filter(row=>row.selected).map(row=>row.value),nodes.map(n=>n.fingerprint),'manual mode retains all members');
+assert.equal(el('pg-member-tools').hidden,false);
+assert.equal(el('pg-current').value,nodes[1].fingerprint);
+assert.equal(el('pg-current-field').hidden,false);
 c.setProxyGroupMember(nodes[0].fingerprint,true);
-assert.deepEqual(c.proxyGroupMemberState().filter(row=>row.selected).map(row=>row.value),[nodes[0].fingerprint],'choosing another node replaces the previous one');
+assert.deepEqual(c.proxyGroupMemberState().filter(row=>row.selected).map(row=>row.value),nodes.map(n=>n.fingerprint),'checking a member does not remove other members');
+c.pickProxyGroupMember(nodes[0].fingerprint);
 el('pg-name').value='Media';c.saveProxyGroup();let req=take('save_proxy_group');
 assert.equal(req[1].original_name,'Video');assert.equal(req[1].revision,'r1');
-assert.deepEqual(req[1].group.members,[nodes[0].fingerprint],'manual save keeps the single node');
+assert.deepEqual(req[1].group.members,nodes.map(n=>n.fingerprint),'manual save retains multiple members');
 assert.equal(req[1].group.current,nodes[0].fingerprint);
 c.saveProxyGroup();assert.equal(requests.length,0,'double save is blocked');
 req[2]({ok:false,msg:'stale'});assert.equal(el('proxy-group-editor').hidden,false,'failed saves retain draft');
@@ -31,7 +34,15 @@ c.setProxyGroupMembers(true);
 assert.equal(c.proxyGroupMemberState().filter(row=>row.selected).length,2,'fallback can include every node');
 assert.equal(c.proxyGroupCurrent(),nodes[0].fingerprint,'fallback keeps the node chosen in manual mode');
 el('pg-type').value='select';c.updateProxyGroupMode();
-assert.deepEqual(c.proxyGroupMemberState().filter(row=>row.selected).map(row=>row.value),[nodes[0].fingerprint]);
+assert.deepEqual(c.proxyGroupMemberState().filter(row=>row.selected).map(row=>row.value),nodes.map(n=>n.fingerprint));
+assert.equal(c.proxyGroupCurrent(),nodes[0].fingerprint);
+c.setProxyGroupMember(nodes[0].fingerprint,false);
+assert.equal(c.proxyGroupCurrent(),nodes[1].fingerprint,'removing current selects a remaining member');
+c.setProxyGroupMembers(false);
+assert.equal(c.proxyGroupCurrent(),null);
+assert.equal(el('pg-current').disabled,true);
+c.setProxyGroupMembers(true);
+assert.equal(el('pg-current').options.length,2);
 take('proxy_groups')[2]({ok:true,revision:'r2',groups:[group],nodes});
 assert.equal(c.PG_EDIT_REVISION,'r1','fresh catalog cannot silently rebase an old editor');
 assert.equal(el('pg-name').value,'Media');
@@ -163,3 +174,36 @@ c.confirm=()=>false;c.saveDeviceAlias();assert.equal(requests.length,0);
 c.SR_STATE.devices[0].alias_key='mac:00:11:22:33:44:66';c.renderDevicePolicies();
 assert.equal(el('device-alias').value,'另一个名称');
 console.log('PASS: fallback and alias drafts survive refresh and stay scoped to the device');
+
+// A deletion callback runs after the refreshed catalog has been rendered.
+// Rebuild the picker at a valid scope, including when the deleted client is offline.
+c.resetDeviceFlow=()=>{};
+c.confirm=()=>true;
+for (const result of [{ok:true},{ok:false,saved:true,applied:false}]) {
+  c.SR_STATE.devices=[{source:'192.0.2.8/32',alias:'电视'}];
+  el('device-picker').value='192.0.2.8/32';c.renderDevicePolicies();
+  el('device-alias').value='待删除的草稿';c.rememberDeviceDraft();
+  c.deletePolicyDevice();const deletion=take('delete_device');
+  assert.equal(deletion[1].source,'192.0.2.8/32');
+  c.SR_STATE.devices=[];
+  c.SR_STATE.ruleRows=c.SR_STATE.ruleRows.filter(r=>!r.source);
+  c.SR_STATE.deviceBindings=c.SR_STATE.deviceBindings.filter(r=>!r.source);
+  c.renderDevicePolicies();
+  deletion[2](result);
+  assert.equal(el('device-picker').value,'global');
+  assert.equal(el('device-source').value,'');
+  assert.equal(el('device-settings').hidden,false,'bindings remain visible without a page reload');
+  assert.equal(el('device-scope-note').hidden,false);
+  assert.equal(el('device-picker').options.some(o=>o.value==='192.0.2.8/32'),false,'offline deleted client is removed from picker');
+  assert.equal(c.deviceDrafts.has(c.flowSourceKey('192.0.2.8/32')),false);
+  c.renderDevicePolicies();
+  assert.equal(el('device-settings').hidden,false,'refresh retains the same visible scope');
+}
+c.SR_STATE.devices=[{source:'192.0.2.9/32',host:'online-client'}];
+el('device-picker').value='192.0.2.9/32';c.renderDevicePolicies();
+c.deletePolicyDevice();take('delete_device')[2]({ok:false});
+assert.equal(el('device-picker').value,'192.0.2.9/32','failed deletion keeps selection');
+c.deletePolicyDevice();take('delete_device')[2]({ok:true});
+assert.equal(el('device-picker').value,'global');
+assert.ok(el('device-picker').options.some(o=>o.value==='192.0.2.9/32'),'online discovered devices remain selectable');
+console.log('PASS: deleted device returns to visible global bindings, clears stale selection and preserves discovered clients');

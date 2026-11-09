@@ -378,6 +378,191 @@ const PRESETS: &[Preset] = &[
             "awqq.isvip.ddns-ip.net",
         ],
     },
+    Preset {
+        id: "ai_extended",
+        title: "AI 扩展服务",
+        description: "Claude 文件、Perplexity、Poe、Grok、Mistral、Hugging Face 与创作工具。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "claudeusercontent.com",
+            "perplexity.ai",
+            "pplx.ai",
+            "poe.com",
+            "grok.com",
+            "x.ai",
+            "mistral.ai",
+            "huggingface.co",
+            "hf.co",
+            "replicate.com",
+            "midjourney.com",
+            "runwayml.com",
+            "suno.com",
+            "elevenlabs.io",
+        ],
+    },
+    Preset {
+        id: "video_disney",
+        title: "Disney+",
+        description: "Disney+ 登录、媒体与图片。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "disneyplus.com",
+            "disney-plus.net",
+            "dssott.com",
+            "bamgrid.com",
+            "disney.demdex.net",
+        ],
+    },
+    Preset {
+        id: "video_prime",
+        title: "Prime Video",
+        description: "Prime Video 网页及媒体；Amazon 其他业务可另行配置。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "primevideo.com",
+            "amazonvideo.com",
+            "aiv-cdn.net",
+            "aiv-delivery.net",
+        ],
+    },
+    Preset {
+        id: "video_streaming",
+        title: "视频直播与流媒体",
+        description: "Twitch、TikTok 国际版、Hulu、Max、Crunchyroll 与 Vimeo。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "twitch.tv",
+            "ttvnw.net",
+            "jtvnw.net",
+            "twitchcdn.net",
+            "tiktok.com",
+            "tiktokv.com",
+            "tiktokcdn.com",
+            "hulu.com",
+            "hulustream.com",
+            "hbonow.com",
+            "hbomax.com",
+            "max.com",
+            "crunchyroll.com",
+            "vrv.co",
+            "vimeo.com",
+            "vimeocdn.com",
+        ],
+    },
+    Preset {
+        id: "music",
+        title: "音乐服务",
+        description: "Spotify、Tidal、SoundCloud 与 Deezer。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "spotify.com",
+            "scdn.co",
+            "spotifycdn.com",
+            "spotifycdn.net",
+            "tidal.com",
+            "soundcloud.com",
+            "sndcdn.com",
+            "deezer.com",
+            "dzcdn.net",
+        ],
+    },
+    Preset {
+        id: "games_steam",
+        title: "Steam",
+        description: "商店、社区、登录与游戏下载。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "steampowered.com",
+            "steamcommunity.com",
+            "steamstatic.com",
+            "steamcontent.com",
+            "steamserver.net",
+            "steamusercontent.com",
+            "steam-chat.com",
+            "steamuserimages-a.akamaihd.net",
+        ],
+    },
+    Preset {
+        id: "games_epic",
+        title: "Epic 与 Fortnite",
+        description: "Epic 商店、账户、在线服务与 Fortnite。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "epicgames.com",
+            "epicgames.dev",
+            "unrealengine.com",
+            "fortnite.com",
+            "unrealenginecdn.com",
+        ],
+    },
+    Preset {
+        id: "games_console",
+        title: "主机游戏",
+        description: "PlayStation、Xbox、Nintendo 的账户、商店及服务。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "playstation.com",
+            "playstation.net",
+            "sonyentertainmentnetwork.com",
+            "xbox.com",
+            "xboxlive.com",
+            "xboxservices.com",
+            "nintendo.com",
+            "nintendo.net",
+            "nintendo.co.jp",
+        ],
+    },
+    Preset {
+        id: "games_publishers",
+        title: "游戏发行商",
+        description: "EA、Ubisoft、Battle.net、Riot 与 Rockstar。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "ea.com",
+            "origin.com",
+            "eaassets.com",
+            "ubisoft.com",
+            "ubi.com",
+            "ubisoftconnect.com",
+            "battle.net",
+            "blizzard.com",
+            "blizzard.net",
+            "riotgames.com",
+            "riotcdn.net",
+            "leagueoflegends.com",
+            "valorant.com",
+            "rockstargames.com",
+            "rockstar.com",
+        ],
+    },
+    Preset {
+        id: "gaming_chat",
+        title: "游戏语音与社区",
+        description: "Discord、TeamSpeak 与 Reddit。域名规则覆盖常用入口；服务动态 IP 与游戏 UDP 会话仍依赖出口能力。",
+        target: "proxy",
+        rule_type: "domain-suffix",
+        domains: &[
+            "discord.com",
+            "discord.gg",
+            "discordapp.com",
+            "discordapp.net",
+            "discord.media",
+            "teamspeak.com",
+            "reddit.com",
+            "redd.it",
+            "redditmedia.com",
+            "redditstatic.com",
+        ],
+    },
 ];
 
 fn group(p: &Preset) -> String {
@@ -420,14 +605,26 @@ pub(super) fn add(post: &J) -> J {
         Ok(v) => v,
         Err(e) => return err_msg(&e),
     };
-    let group_name = group(preset);
+    let explicit_group = post.get("group");
+    let group_name = match explicit_group {
+        None => group(preset),
+        Some(J::String(name))
+            if name.trim().len() <= 256 && !name.chars().any(char::is_control) =>
+        {
+            name.trim().to_owned()
+        }
+        _ => return err_msg("规则组名称无效"),
+    };
     let mut added = 0;
     for domain in preset.domains {
         // An existing global selector belongs to the user, even if its target,
         // priority or enabled state differs. Do not replace or re-enable it.
         if rules.iter().any(|r| {
-            (preset.rule_type != "domain" || r.group == group_name)
-                && r.source == source
+            (if explicit_group.is_some() {
+                r.group == group_name
+            } else {
+                preset.rule_type != "domain" || r.group == group_name
+            }) && r.source == source
                 && r.rule_type.eq_ignore_ascii_case(preset.rule_type)
                 && r.pattern
                     .trim_start_matches('.')
@@ -453,5 +650,5 @@ pub(super) fn add(post: &J) -> J {
             return err_msg("预设保存失败，请检查存储状态后重试");
         }
     }
-    json!({"ok":true,"added":added,"skipped":preset.domains.len()-added,"group":group(preset),"msg":format!("已添加 {added} 条停用规则，跳过 {} 条已有规则；可在规则页按组开启",preset.domains.len()-added)})
+    json!({"ok":true,"added":added,"skipped":preset.domains.len()-added,"group":group_name,"msg":format!("已添加 {added} 条停用规则，跳过 {} 条已有规则；可在规则页按组开启",preset.domains.len()-added)})
 }

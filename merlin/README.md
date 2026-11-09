@@ -6,6 +6,16 @@ In the v0.0.19 packaging test, the offline installer was 6.36 MiB for ARMv7 and 
 
 Transparent proxy integration for **AsusWRT-Merlin** routers.
 
+## 梅林快速使用
+
+主说明已迁移到中文 [项目首页](../README.md)，包含型号对应安装包、首次启动、设备绑定及常见问题。
+
+在软件中心安装对应型号的离线包后，导入订阅或节点，选择出口并启动。进入「分流规则」，先创建规则组或添加预设，再启用规则并绑定到「全部设备」或具体设备。预设现有 20 组，覆盖 AI、视频、音乐、游戏、开发工具、国内网站与 Emby。支持按规则组从 HTTP(S) 链接读取规则、预览并追加。
+
+设备可关联多个组，每条绑定独立指定优先级和出口。删除设备配置会清理该来源的绑定、专属规则、默认出口和自定义名称，在线设备仍可从固件的 DHCP 和邻居表重新发现。使用「检查分流」核对当前设备命中的规则与出口。
+
+下文保留安装包布局和固件集成说明，供手动安装与排障使用。
+
 ## Features
 
 - **Transparent proxy** — iptables/policy routing for LAN TCP (no client config)
@@ -17,7 +27,7 @@ Transparent proxy integration for **AsusWRT-Merlin** routers.
 - **Node groups** — manual uses one member. Fallback tries members in order, remembers a success for five minutes, then starts at the first member again; UDP stays on the first member. URL test races handshakes and reuses the winner for five minutes. A group carries traffic only in rule mode, after a rule exit names it. Switching a member does not change the global node.
 - **Rule exits** — a rule folder can use the global node, one saved node, or a node group. Direct and reject rules in a mixed folder stay unchanged. A missing pinned node fails closed.
 - **Traffic** — Overview counts bytes since this process started. Subscriptions show the last three calendar months per node, including manual nodes and Direct. A subscription total is the sum of nodes that currently belong to it. Subscription addresses are not shown.
-- **Optional rule presets** — seven bundled groups: AI services, overseas video, Telegram web, developer tools, Apple direct, Microsoft direct and domestic sites. Preview domains, add disabled rules, then explicitly enable a group. Imports skip existing global domain-suffix selectors without changing their state, action or priority; new rules start at priority −10. Importing disabled rules does not restart the proxy. Preset contents and per-rule/group changes persist in the normal configuration; opening the catalog never writes configuration. Existing upgrades do not inject or enable presets automatically.
+- **Optional rule presets** — 20 bundled groups covering AI, streaming video, music, gaming platforms, communities, developer tools, Apple, Microsoft, domestic sites and regional Emby lists. Preview domains, add disabled rules, then explicitly enable a group. Imports skip existing global domain-suffix selectors without changing their state, action or priority; new rules start at priority −10. Importing disabled rules does not restart the proxy. Preset contents and per-rule/group changes persist in the normal configuration; opening the catalog never writes configuration. Existing upgrades do not inject or enable presets automatically.
 - **Modes** — TUN, SOCKS5, or system-style proxy (see `config.yaml`)
 - **Watchdog** — restarts crashed daemon; optional subscription cron
 - **IPv6 policy** — compatibility is the default and does not require ISP IPv6. It keeps the IPv4 proxy, answers LAN DNS with IPv4 only, and rejects forwarded external IPv6 only when firmware IPv6 is already on. Dual-stack is optional after the firmware already has an IPv6 address and a LAN prefix. If dual-stack cannot finish, the IPv4 proxy and DNS hijack stay in place. Saving Network & DNS reapplies the firewall without restarting a running proxy. Firmware IPv6 enablement is not changed.
