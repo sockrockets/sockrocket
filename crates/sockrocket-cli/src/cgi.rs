@@ -5101,7 +5101,7 @@ dns_direct_domains:
         assert_eq!(
             dispatch(
                 "save_device_binding",
-                &json!({"source":"192.0.2.8","groups":["Shared"],"revision":revision()})
+                &json!({"source":"192.0.2.8","groups":["Shared"],"target":"proxy","revision":revision()})
             )["ok"],
             true
         );
@@ -5423,7 +5423,10 @@ dns_direct_domains:
         let tv = "192.0.2.8";
         let laptop = "192.0.2.9";
         for src in [tv, laptop] {
-            assert_eq!(save(src, json!({"groups":["Media","Japan"]}))["ok"], true);
+            assert_eq!(
+                save(src, json!({"groups":["Media","Japan"],"target":"direct"}))["ok"],
+                true
+            );
         }
         let winner = |source: &str| {
             let trace = dispatch(
@@ -5444,7 +5447,10 @@ dns_direct_domains:
         assert_eq!(winner(laptop), (json!(0), json!("direct")));
         assert_eq!(winner(""), (json!(0), json!("direct")));
         // Older clients can update the outlet without resetting the saved priority.
-        assert_eq!(save(tv, json!({"group":"Japan","target":""}))["ok"], true);
+        assert_eq!(
+            save(tv, json!({"group":"Japan","target":"proxy"}))["ok"],
+            true
+        );
         assert_eq!(winner(tv), (json!(1), json!("proxy")));
         for invalid in [json!(-1), json!(65536), json!(1.5)] {
             assert_eq!(
@@ -5453,7 +5459,7 @@ dns_direct_domains:
             );
         }
         assert_eq!(
-            save(tv, json!({"group":"Japan","target":"","priority":0}))["ok"],
+            save(tv, json!({"group":"Japan","target":"proxy","priority":0}))["ok"],
             true
         );
         assert_eq!(winner(tv), (json!(0), json!("direct")));
@@ -5504,7 +5510,7 @@ dns_direct_domains:
         let add_groups = |groups: &[&str]| {
             dispatch(
                 "save_device_binding",
-                &json!({"revision":revision(),"source":"192.0.2.8","groups":groups}),
+                &json!({"revision":revision(),"source":"192.0.2.8","groups":groups,"target":"direct"}),
             )
         };
         assert_eq!(add_groups(&["Music", "Missing"])["ok"], false);

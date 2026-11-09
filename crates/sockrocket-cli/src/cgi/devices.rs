@@ -77,6 +77,13 @@ pub(super) fn save_binding(post: &J) -> J {
     // Adding several groups is one configuration write and one service apply.
     // Existing bindings retain their per-device exits, including on retry.
     if let Some(names) = post.get("groups") {
+        let Some(target) = post
+            .get("target")
+            .and_then(J::as_str)
+            .filter(|t| !t.is_empty() && proxy_groups::valid_target(t))
+        else {
+            return err_msg("请选择有效的规则组出口");
+        };
         let Some(names) = names.as_array().filter(|v| !v.is_empty() && v.len() <= 256) else {
             return err_msg("请选择 1 至 256 个规则组");
         };
@@ -102,7 +109,7 @@ pub(super) fn save_binding(post: &J) -> J {
                     source: source.clone(),
                     group: group.into(),
                     priority: priority.unwrap_or_default(),
-                    target: String::new(),
+                    target: target.into(),
                 });
             }
         }
@@ -121,7 +128,7 @@ pub(super) fn save_binding(post: &J) -> J {
         return err_msg("请选择规则组出口");
     };
     if !remove {
-        if !target.is_empty() && !proxy_groups::valid_target(target) {
+        if target.is_empty() || !proxy_groups::valid_target(target) {
             return err_msg("请选择有效出口");
         }
         if !rules

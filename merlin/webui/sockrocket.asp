@@ -566,7 +566,6 @@ body.bg {min-width:0!important}
             <div class="fg"><label for="sr-rule-group-select">选择分组</label><select id="sr-rule-group-select" onchange="keepRulePickerPosition(this, () => { changeRuleGroup(this.value); })" disabled><option value="">正在加载…</option></select></div>
             <button class="btn btn-sm" aria-controls="sr-rule-create-menu" aria-expanded="false" onclick="openRuleGroupCreator('blank')" id="sr-rule-create-toggle">新建规则组</button>
             <details><summary>分组设置</summary>
-              <div class="fg"><label for="sr-rule-group-outlet-select">分组代理出口</label><div id="sr-rule-group-outlet"></div></div>
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-bulk-edit" onclick="changeRuleWorkspaceMode('bulk')">批量编辑</button><button class="btn btn-sm" onclick="exportRules()">导出规则</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-group-enable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),true)">启用该组</button><button class="btn btn-sm" id="sr-rule-group-disable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),false)">停用该组</button><button class="btn btn-danger btn-sm" id="sr-rule-group-delete" onclick="deleteRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP))">删除该组</button></div>
             </details>
@@ -657,11 +656,11 @@ body.bg {min-width:0!important}
               <div class="fg" id="sr-device-manual" hidden><label for="sr-device-source">来源 IP / 网段</label><input id="sr-device-source" placeholder="例如 192.168.50.20" oninput="updateDevicePolicySelection()" onchange="syncEditorToMap()"></div>
             </div>
             <div id="sr-device-settings" hidden>
-              <h4 id="sr-device-binding-title">使用的规则组</h4>
+              <div class="toolbar"><h4 id="sr-device-binding-title">使用的规则组</h4><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="switchDevicePanel('add')">关联规则组</button><button type="button" class="btn btn-sm" onclick="switchDevicePanel('fallback')">默认出口</button></div>
               <div id="sr-device-bindings" class="rows"></div>
               <details id="sr-device-inherited" hidden><summary id="sr-device-inherited-title"></summary><ul id="sr-device-inherited-list"></ul><button type="button" class="btn btn-sm" onclick="srElement('device-picker').value='global';selectPolicyDevice();syncEditorToMap()">查看全局设备策略</button></details>
                 <div id="sr-device-bound-editor" class="rule-inline-editor" hidden>
-                  <div class="toolbar"><strong id="sr-binding-name"></strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="closeDeviceBinding()">关闭编辑</button></div>
+                  <div class="toolbar"><strong id="sr-binding-name"></strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="closeDeviceBinding()">取消</button></div>
                   <div class="form-grid">
                     <input type="hidden" id="sr-device-group">
                     <div class="fg"><label for="sr-device-group-priority">关联优先级</label><input id="sr-device-group-priority" type="number" min="0" max="65535" step="1" value="0"></div>
@@ -671,14 +670,14 @@ body.bg {min-width:0!important}
                   <p id="sr-device-group-state" class="hint" aria-live="polite"></p>
                   <div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-device-link" onclick="saveDeviceBinding(false)">保存绑定</button><button class="btn btn-sm" id="sr-device-unlink" onclick="saveDeviceBinding(true)">解除该组关联</button></div>
                 </div>
-                <details id="sr-device-add-groups"><summary>关联规则组（可多选）</summary>
+                <div id="sr-device-add-groups" class="rule-inline-editor" hidden><div class="toolbar"><strong>关联规则组（可多选）</strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div>
                   <div class="pg-member-list" id="sr-device-available-groups" onchange="updateDeviceAddCount()"></div>
-                  <div class="toolbar"><div class="fg"><label for="sr-device-add-target">命中规则时的出口</label><select id="sr-device-add-target"><option value="">沿用组内各条规则的出口</option></select></div><div class="fg"><label for="sr-device-add-priority">新关联优先级（数字越大越先匹配）</label><input id="sr-device-add-priority" type="number" min="0" max="65535" step="1" value="0"></div><button type="button" id="sr-device-add-selected" class="btn btn-accent btn-sm" disabled onclick="addDeviceGroups()">关联所选组</button></div>
-                </details>
-              <details id="sr-device-fallback"><summary id="sr-device-fallback-label">未命中规则时的处理方式</summary><div class="toolbar"><div class="fg"><label for="sr-device-target">处理方式</label><select id="sr-device-target" aria-describedby="sr-device-effective-policy"></select><span class="hint" id="sr-device-effective-policy" hidden></span></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存</button></div></details>
+                  <div class="toolbar"><div class="fg"><label for="sr-device-add-target">命中规则时的出口</label><select id="sr-device-add-target"><option value="">请选择出口（必填）</option></select></div><div class="fg"><label for="sr-device-add-priority">新关联优先级（数字越大越先匹配）</label><input id="sr-device-add-priority" type="number" min="0" max="65535" step="1" value="0"></div><button type="button" id="sr-device-add-selected" class="btn btn-accent btn-sm" disabled onclick="addDeviceGroups()">关联所选组</button></div>
+                </div>
+              <div id="sr-device-fallback" class="rule-inline-editor" hidden><div class="toolbar"><strong id="sr-device-fallback-label">未命中规则时的处理方式</strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div><div class="toolbar"><div class="fg"><label for="sr-device-target">处理方式</label><select id="sr-device-target" aria-describedby="sr-device-effective-policy"></select><span class="hint" id="sr-device-effective-policy" hidden></span></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存</button></div></div>
               <div id="sr-device-specific">
                 <div class="toolbar"><button type="button" class="btn btn-sm" id="sr-device-trace" onclick="inspectDeviceTraffic()">检查这台设备的分流</button><button type="button" class="btn btn-danger btn-sm" onclick="deletePolicyDevice()">删除设备配置</button></div>
-                <details><summary>自定义设备名称</summary><div class="toolbar"><input id="sr-device-alias" aria-label="自定义设备名称" maxlength="48" placeholder="例如 客厅电视"><button class="btn btn-sm" onclick="saveDeviceAlias()">保存名称</button></div></details>
+                <button type="button" class="btn btn-sm" onclick="switchDevicePanel('alias')">修改设备名称</button><div id="sr-device-alias-panel" class="rule-inline-editor" hidden><div class="toolbar"><input id="sr-device-alias" aria-label="自定义设备名称" maxlength="48" placeholder="例如 客厅电视"><button class="btn btn-sm" onclick="saveDeviceAlias()">保存名称</button><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div></div>
               </div>
 
             </div>
@@ -2021,7 +2020,7 @@ function setProxyGroupTargets(groups) {
   SR_PROXY_GROUPS.forEach(function(g){RULE_TARGET_LABEL['group:'+g.name]='分组 · '+g.name;});
   ['rule-target','edit-rule-target','rule-filter-target','device-target','device-add-target','preset-route-target'].forEach(function(id){
     var el=srElement(id);if(!el)return;var old=el.value;
-    var prefix=id==='device-add-target'?'<option value="">沿用组内各条规则的出口</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除自定义默认出口</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
+    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除自定义默认出口</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
     el.innerHTML=prefix+['proxy','direct','reject'].concat(SR_PROXY_GROUPS.map(function(g){return 'group:'+g.name;})).map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
     if(Array.from(el.options).some(function(o){return o.value===old;}))el.value=old;
     else if(old && old.indexOf('group:')===0){var o=document.createElement('option');o.value=old;o.textContent='已失效 · '+old;el.appendChild(o);el.value=old;}
@@ -2187,6 +2186,17 @@ function changedBinding() {
   var fields=bindingFields();
   return fields.priority!==bindingBase.priority || fields.target!==bindingBase.target ? fields : null;
 }
+function switchDevicePanel(panel) {
+  if(changedBinding() && !confirm('放弃这条绑定尚未保存的修改？'))return;
+  srElement('device-bound-editor').hidden=true;
+  [['device-add-groups','add'],['device-fallback','fallback'],['device-alias-panel','alias']].forEach(function(pair){srElement(pair[0]).hidden=panel!==pair[1];});
+}
+function cancelDevicePanel() {
+  if(confirm('取消当前操作并放弃未保存的修改？')){
+    deviceDrafts.delete(activeDraftScope);activeDraftScope=null;bindingBase=null;
+    switchDevicePanel('');updateDevicePolicySelection();
+  }
+}
 function closeDeviceBinding() {
   if(changedBinding() && !confirm('放弃这条绑定尚未保存的修改？'))return;
   srElement('device-bound-editor').hidden=true;
@@ -2245,7 +2255,7 @@ function updateDevicePolicySelection() {
   srElement('device-inherited').hidden=global || hasDeviceAssignment(source) || !inherited.length;
   srElement('device-inherited-title').textContent='当前使用全局设备规则 · '+inherited.length+' 组';
   srElement('device-inherited-list').innerHTML=inherited.map(function(b){
-    return '<li>'+srEsc(b.group)+' · '+srEsc(b.target?(RULE_TARGET_LABEL[b.target]||b.target):'沿用组内出口')+'</li>';
+    return '<li>'+srEsc(b.group)+' · '+srEsc(b.target?(RULE_TARGET_LABEL[b.target]||b.target):'尚未指定出口（请编辑）')+'</li>';
   }).join('');
   var globalFinal=rows.find(function(r){return !r.source && isFinalRule(r) && r.enabled!==false;});
   var assigned=hasDeviceAssignment(source);
@@ -2259,7 +2269,7 @@ function updateDevicePolicySelection() {
   var automatic=Array.from(exit.options).find(function(o){return o.value==='inherit';});
   if(automatic)automatic.textContent=policy?'清除自定义默认出口':'未单独设置';
   srElement('device-bindings').innerHTML=bindings.map(function(binding){
-    var target=binding.target?(RULE_TARGET_LABEL[binding.target]||binding.target):'沿用组内出口';
+    var target=binding.target?(RULE_TARGET_LABEL[binding.target]||binding.target):'尚未指定出口（请编辑）';
     return '<div class="row"><div class="r-name"><strong>'+srEsc(binding.group)+'</strong><span class="r-sub">优先级 '+Number(binding.priority||0)+' · '+srEsc(target)+'</span></div>'+
       '<button type="button" class="btn btn-sm" data-group="'+srEsc(binding.group)+'" onclick="editDeviceBinding(this.dataset.group)">编辑</button></div>';
   }).join('') || '<p class="hint">尚未关联规则组</p>';
@@ -2276,7 +2286,7 @@ function updateDevicePolicySelection() {
   srElement('device-available-groups').innerHTML=Array.from(available,function(name){
     return '<label class="pg-member"><input type="checkbox" value="'+srEsc(name)+'"'+(draft && draft.groups.includes(name)?' checked':'')+'><span>'+srEsc(name)+'</span></label>';
   }).join('') || '<p class="hint">没有可添加的规则组</p>';
-  srElement('device-add-groups').open=!bindings.length || !!(draft && (selectedDeviceGroups().length || draft.priority!=='0'));
+  if(editor._scope!==activeDraftScope){switchDevicePanel('');editor._scope=activeDraftScope;}
   updateDeviceAddCount();
   var group=srElement('device-group');
   if(!bound.has(group.value)){
@@ -2316,13 +2326,15 @@ function addDeviceGroups() {
   if((srElement('device-picker').value!=='global' && !sourceNetwork(source)) || !groups.length || ruleWorkspaceLocked())return;
   var priority=readBindingPriority('device-add-priority');if(priority===null)return;
   var target=srElement('device-add-target').value;
-  if(confirm('为「'+(source||'全局设备')+'」关联 '+groups.length+' 个规则组，出口：'+(target?(RULE_TARGET_LABEL[target]||target):'沿用组内出口')+'？')){
+  if(!target || !Object.prototype.hasOwnProperty.call(RULE_TARGET_LABEL,target)){srShowMsg('请选择有效出口。','err');return;}
+  if(confirm('为「'+(source||'全局设备')+'」关联 '+groups.length+' 个规则组，出口：'+(target?(RULE_TARGET_LABEL[target]||target):'尚未指定出口（请编辑）')+'？')){
     ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,all_devices:srElement('device-picker').value==='global',groups:groups,priority:priority,target:target},toastResp);
   }
 }
 function editDeviceBinding(group) {
   if(changedBinding() && !confirm('放弃这条绑定尚未保存的修改？'))return;
   FLOW_EDIT_GROUP=group;
+  srElement('device-add-groups').hidden=true;srElement('device-add-groups').open=false;srElement('device-fallback').hidden=true;srElement('device-alias-panel').hidden=true;
   srElement('device-group').value=group;
   renderDeviceBinding();
   srElement('device-bound-editor').hidden=false;
@@ -2333,7 +2345,7 @@ function renderDeviceBinding() {
   srElement('binding-name').textContent='编辑「'+group+'」';
   var bind=(SR_STATE.deviceBindings||[]).find(function(b){return sameDeviceSource(b.source,deviceSource()) && b.group===group;});
   var target=srElement('device-group-target');
-  target.innerHTML=deviceOption('','沿用组内各条规则的出口')+Object.keys(RULE_TARGET_LABEL).map(function(key){return deviceOption(key,RULE_TARGET_LABEL[key]);}).join('');
+  target.innerHTML=deviceOption('','请选择出口（必填）')+Object.keys(RULE_TARGET_LABEL).map(function(key){return deviceOption(key,RULE_TARGET_LABEL[key]);}).join('');
   if(bind && bind.target && !Object.prototype.hasOwnProperty.call(RULE_TARGET_LABEL,bind.target))target.innerHTML+=deviceOption(bind.target,'已失效 · '+bind.target);
   target.value=bind?bind.target:'';
   srElement('device-group-priority').value=String(bind && bind.priority || 0);
@@ -2354,6 +2366,7 @@ function saveDeviceBinding(remove) {
   var picker=srElement('device-picker').value,source=deviceSource(),group=srElement('device-group').value;
   if(ruleWorkspaceLocked() || !picker || (picker!=='global' && !sourceNetwork(source)) || !group)return;
   var target=srElement('device-group-target').value;
+  if(!remove && (!target || !Object.prototype.hasOwnProperty.call(RULE_TARGET_LABEL,target))){srShowMsg('请选择有效出口。','err');return;}
   var priority=remove?undefined:readBindingPriority('device-group-priority');if(priority===null)return;
   var who=source||'全局设备';
   var ask=remove?'解除 '+who+' 与「'+group+'」的关联？':'将「'+group+'」用于 '+who+'，优先级 '+priority+'，命中后'+(RULE_TARGET_LABEL[target]?'使用「'+RULE_TARGET_LABEL[target]+'」':'沿用各条规则的出口')+'？';
@@ -2484,7 +2497,6 @@ function syncRuleWorkspace() {
   srElement('rule-import').disabled=locked || !RULE_SELECTED_GROUP;
   var types=[];members.forEach(function(r){var label=RULE_TYPE_LABEL[r.rule_type] || r.rule_type;if(types.indexOf(label)<0)types.push(label);});
   srElement('rule-group-summary').textContent=RULE_SELECTED_GROUP === null?'先新建一个分组，再添加规则。':(RULE_SELECTED_GROUP || '未分组')+' · 共 '+members.length+' 条 · 已启用 '+members.filter(function(r){return r.enabled!==false;}).length+' 条'+(types.length?' · '+types.join(' / '):' · 添加第一条规则后保存');
-  srElement('rule-group-outlet').innerHTML=groupOutletSelect(encodeURIComponent(RULE_SELECTED_GROUP || '').replace(/'/g,'%27'),members);
   srElement('rule-list-panel').hidden=RULE_WORKSPACE_MODE!=='list' && !RULE_IMPORT_MODE;
   ['rule-add-panel','rule-edit-panel'].forEach(function(id){var el=srElement(id);if(el.querySelectorAll)Array.prototype.forEach.call(el.querySelectorAll('input,select,textarea,button'),function(input){input.disabled=locked;});});
   if(!locked){ruleTypeChanged();editRuleTypeChanged();}
@@ -2609,7 +2621,7 @@ function rebuildRuleTargets() {
   var values=['proxy','direct','reject'].concat(SR_RULE_NODES.map(function(n){return 'node:'+n.id;})).concat((SR_PROXY_GROUPS||[]).map(function(g){return 'group:'+g.name;}));
   ['rule-target','edit-rule-target','rule-filter-target','device-target','device-add-target','preset-route-target'].forEach(function(id){
     var el=srElement(id);if(!el)return;var old=el.value;
-    var prefix=id==='device-add-target'?'<option value="">沿用组内各条规则的出口</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除自定义默认出口</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
+    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除自定义默认出口</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
     el.innerHTML=prefix+values.map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
     var current=el.options?Array.from(el.options):[];
     if(current.some(function(o){return o.value===old;}))el.value=old;
@@ -2830,7 +2842,7 @@ function openMapGroup(index) {
     }else{
       var boxes=srElement('device-available-groups').querySelectorAll('input');
       Array.from(boxes).forEach(function(box){if(box.value===name)box.checked=true;});
-      srElement('device-add-groups').open=true;updateDeviceAddCount();
+      switchDevicePanel('add');updateDeviceAddCount();
       srElement('device-add-selected').focus();
     }
     renderRuleFlow();
@@ -3253,7 +3265,7 @@ function renderRules(resetPage) {
   rules=rules.slice(RULE_PAGE*RULE_PAGE_SIZE,(RULE_PAGE+1)*RULE_PAGE_SIZE);
   var phase=-1,labels=['设备目的规则','组内或未分组目的规则','设备兜底（内置国内直连之后）','全局兜底'];
   el.innerHTML=rules.length?rules.map(function(r){var next=rulePhase(r),head=next!==phase?'<div class="rule-phase">'+labels[next]+'</div>':'';phase=next;return head+ruleRowHtml(r,positions[r.index],sorted);}).join(''):'<div class="hint">'+(members.length?'没有匹配的规则，请调整筛选条件。':'本组还没有规则，点击「添加规则」开始。')+'</div>';
-  if(ruleWorkspaceLocked() || RULE_ADD_BASELINE!==null || RULE_ROW_BASELINE!==null){if(el.querySelectorAll)Array.prototype.forEach.call(el.querySelectorAll('.rule-actions button'),function(button){button.disabled=true;});}
+  if(ruleWorkspaceLocked()){if(el.querySelectorAll)Array.prototype.forEach.call(el.querySelectorAll('.rule-actions button'),function(button){button.disabled=true;});}
 }
 
 function proxyLikeTarget(target) {
