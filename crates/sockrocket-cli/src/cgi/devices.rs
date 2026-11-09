@@ -77,6 +77,13 @@ pub(super) fn save_binding(post: &J) -> J {
     // Adding several groups is one configuration write and one service apply.
     // Existing bindings retain their per-device exits, including on retry.
     if let Some(names) = post.get("groups") {
+        let Some(target) = post
+            .get("target")
+            .and_then(J::as_str)
+            .filter(|t| !t.is_empty() && proxy_groups::valid_target(t))
+        else {
+            return err_msg("请选择有效的规则组出口");
+        };
         let Some(names) = names.as_array().filter(|v| !v.is_empty() && v.len() <= 256) else {
             return err_msg("请选择 1 至 256 个规则组");
         };
@@ -102,7 +109,7 @@ pub(super) fn save_binding(post: &J) -> J {
                     source: source.clone(),
                     group: group.into(),
                     priority: priority.unwrap_or_default(),
-                    target: String::new(),
+                    target: target.into(),
                 });
             }
         }
@@ -121,7 +128,7 @@ pub(super) fn save_binding(post: &J) -> J {
         return err_msg("请选择规则组出口");
     };
     if !remove {
-        if !target.is_empty() && !proxy_groups::valid_target(target) {
+        if target.is_empty() || !proxy_groups::valid_target(target) {
             return err_msg("请选择有效出口");
         }
         if !rules
@@ -232,7 +239,13 @@ fn clients(leases: &str, arp: &str) -> BTreeMap<Ipv4Addr, Client> {
     rows
 }
 pub(super) fn catalog() -> Vec<J> {
-    let aliases = aliases().unwrap_or_default();
+    let mut aliases = aliases().unwrap_or_default();
+    let removed: Vec<String> = load_conf()
+        .ok()
+        .and_then(|m| m.get(ykey("removed_device_sources")).cloned())
+        .and_then(|v| serde_yaml::from_value(v).ok())
+        .unwrap_or_default();
+    aliases.retain(|_, a| !removed.contains(&a.source));
     let leases = fs::read_to_string("/var/lib/misc/dnsmasq.leases").unwrap_or_default();
     let arp = fs::read_to_string("/proc/net/arp").unwrap_or_default();
     let mut rows = BTreeMap::new();
@@ -252,6 +265,46 @@ pub(super) fn catalog() -> Vec<J> {
         }
     }
     rows.into_values().collect()
+}
+/// Remove only this exact source's policies; broader subnet policies still apply.
+pub(super) fn delete(post: &J) -> J {
+    let Ok(mut map) = load_conf() else {
+        return err_msg("配置读取失败");
+    };
+    if !proxy_groups::check_revision(&map, post) {
+        return err_msg("规则已变化，请刷新后重试");
+    }
+    let Ok(source) = requested_rule_source(post, "") else {
+        return err_msg("设备来源无效");
+    };
+    if source.is_empty() {
+        return err_msg("不能删除全部设备");
+    }
+    let Ok(mut rules) = checked_rules(&map) else {
+        return err_msg("规则读取失败");
+    };
+    let Ok(mut bindings) = links(&map) else {
+        return err_msg("绑定读取失败");
+    };
+    rules.retain(|r| r.source != source);
+    bindings.retain(|b| b.source != source);
+    store_links(&mut map, &bindings);
+    save_routing_rules(&mut map, rules);
+    // Alias cleanup is recorded in the same configuration transaction.
+    let mut removed: Vec<String> = serde_yaml::from_value(
+        map.get(ykey("removed_device_sources"))
+            .cloned()
+            .unwrap_or(Y::Sequence(vec![])),
+    )
+    .unwrap_or_default();
+    if !removed.contains(&source) {
+        removed.push(source);
+    }
+    map.insert(
+        ykey("removed_device_sources"),
+        serde_yaml::to_value(removed).unwrap(),
+    );
+    proxy_groups::applied(&map)
 }
 pub(super) fn save_alias(post: &J) -> J {
     let Ok(source) = requested_rule_source(post, "") else {
@@ -279,7 +332,16 @@ pub(super) fn save_alias(post: &J) -> J {
     let Ok(mut aliases) = aliases() else {
         return err_msg("读取设备名称失败");
     };
-    if post["previous"].as_str() != Some(aliases.get(key).map_or("", |a| a.name.as_str())) {
+    let removed: Vec<String> = load_conf()
+        .ok()
+        .and_then(|m| m.get(ykey("removed_device_sources")).cloned())
+        .and_then(|v| serde_yaml::from_value(v).ok())
+        .unwrap_or_default();
+    let previous = aliases
+        .get(key)
+        .filter(|a| !removed.contains(&a.source))
+        .map_or("", |a| a.name.as_str());
+    if post["previous"].as_str() != Some(previous) {
         return err_msg("名称已变化，请刷新后重试");
     }
     if name.is_empty() {
@@ -289,9 +351,17 @@ pub(super) fn save_alias(post: &J) -> J {
             key.into(),
             Alias {
                 name: name.into(),
-                source,
+                source: source.clone(),
             },
         );
+    }
+    if let Ok(mut map) = load_conf() {
+        if let Some(Y::Sequence(removed)) = map.get_mut(ykey("removed_device_sources")) {
+            removed.retain(|v| v.as_str() != Some(&source));
+            if save_conf(&map).is_err() {
+                return err_msg("设备名称恢复失败");
+            }
+        }
     }
     let path = sockrocket_dir().join("device-aliases.json");
     let saved = serde_json::to_string(&aliases)

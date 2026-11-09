@@ -555,6 +555,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "delete_proxy_group" => proxy_groups::delete(post),
         "save_device_binding" => devices::save_binding(post),
         "save_device_alias" => devices::save_alias(post),
+        "delete_device" => devices::delete(post),
         "save_device_policy" => proxy_groups::device(post),
         "network_settings" => network_settings::get(),
         "save_network_settings" => network_settings::save(post),
@@ -5087,6 +5088,67 @@ dns_direct_domains:
     }
 
     #[test]
+    fn deleting_device_preserves_shared_and_other_device_policies() {
+        let _env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain, group: Shared, pattern: example.com, target: direct}\n  - {rule_type: final, source: 192.0.2.8, pattern: '*', target: reject}\n  - {rule_type: final, source: 192.0.2.9, pattern: '*', target: direct}"));
+        let revision = || act_get_rules()["revision"].clone();
+        assert_eq!(
+            dispatch(
+                "save_device_alias",
+                &json!({"source":"192.0.2.8","name":"TV","previous":""})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                "save_device_binding",
+                &json!({"source":"192.0.2.8","groups":["Shared"],"target":"proxy","revision":revision()})
+            )["ok"],
+            true
+        );
+        let before = revision();
+        assert_eq!(
+            dispatch("delete_device", &json!({"source":"","revision":before}))["ok"],
+            false
+        );
+        assert_eq!(
+            dispatch(
+                "delete_device",
+                &json!({"source":"192.0.2.8","revision":"stale"})
+            )["ok"],
+            false
+        );
+        assert_eq!(
+            dispatch(
+                "delete_device",
+                &json!({"source":"192.0.2.8","revision":before})
+            )["ok"],
+            true
+        );
+        let snapshot = act_get_rules();
+        assert_eq!(snapshot["rules"].as_array().unwrap().len(), 2);
+        assert!(
+            snapshot["device_rule_groups"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !snapshot["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["alias"] == "TV")
+        );
+        assert_eq!(
+            dispatch(
+                "save_device_alias",
+                &json!({"source":"192.0.2.8","name":"New TV","previous":""})
+            )["ok"],
+            true
+        );
+    }
+
+    #[test]
     fn emby_presets_import_exact_domains_without_activating() {
         let _env = TestEnv::new(SAMPLE);
         for (id, count, target) in [
@@ -5124,12 +5186,28 @@ dns_direct_domains:
     }
 
     #[test]
+    fn preset_can_be_added_to_selected_group() {
+        let _env = TestEnv::new(&SAMPLE);
+        fs::write(conf_path().parent().unwrap().join("stopped"), "").unwrap();
+        let add = || {
+            dispatch(
+                "add_rule_preset",
+                &json!({"preset":"ai", "group":"My AI", "expected_revision":act_get_rules()["revision"]}),
+            )
+        };
+        assert_eq!(add()["added"], 9);
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert!(rules.iter().all(|r| r.group == "My AI" && !r.enabled));
+        assert_eq!(add()["added"], 0);
+    }
+
+    #[test]
     fn rule_presets_are_opt_in_idempotent_and_preserve_custom_rules() {
         let env=TestEnv::new(&SAMPLE.replace("rules: []","rules:\n  - {rule_type: domain-suffix, pattern: '.OPENAI.COM', target: reject, priority: 99, enabled: false, group: Custom}\n  - {rule_type: domain-suffix, pattern: chatgpt.com, target: direct, source: 192.0.2.8, priority: 10}"));
         fs::write(env.dir.join("stopped"), "").unwrap();
         let before = fs::read(conf_path()).unwrap();
         let catalog = dispatch("get_rules", &json!({}));
-        assert_eq!(catalog["presets"].as_array().unwrap().len(), 10);
+        assert_eq!(catalog["presets"].as_array().unwrap().len(), 20);
         assert_eq!(
             fs::read(conf_path()).unwrap(),
             before,
@@ -5233,12 +5311,17 @@ dns_direct_domains:
         let mut count = 0;
         for p in catalog.as_array().unwrap() {
             assert_eq!(p["enabled"], false);
-            count += p["domains"].as_array().unwrap().len();
+
             let result = dispatch(
                 "add_rule_preset",
                 &json!({"preset":p["id"],"expected_revision":route_trace::rules_revision(&load_conf().unwrap())}),
             );
             assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(
+                result["added"].as_u64().unwrap() + result["skipped"].as_u64().unwrap(),
+                p["domains"].as_array().unwrap().len() as u64
+            );
+            count += result["added"].as_u64().unwrap() as usize;
         }
         let rules = load_routing_rules(&load_conf().unwrap());
         assert_eq!(rules.len(), count);
@@ -5340,7 +5423,10 @@ dns_direct_domains:
         let tv = "192.0.2.8";
         let laptop = "192.0.2.9";
         for src in [tv, laptop] {
-            assert_eq!(save(src, json!({"groups":["Media","Japan"]}))["ok"], true);
+            assert_eq!(
+                save(src, json!({"groups":["Media","Japan"],"target":"direct"}))["ok"],
+                true
+            );
         }
         let winner = |source: &str| {
             let trace = dispatch(
@@ -5361,7 +5447,10 @@ dns_direct_domains:
         assert_eq!(winner(laptop), (json!(0), json!("direct")));
         assert_eq!(winner(""), (json!(0), json!("direct")));
         // Older clients can update the outlet without resetting the saved priority.
-        assert_eq!(save(tv, json!({"group":"Japan","target":""}))["ok"], true);
+        assert_eq!(
+            save(tv, json!({"group":"Japan","target":"proxy"}))["ok"],
+            true
+        );
         assert_eq!(winner(tv), (json!(1), json!("proxy")));
         for invalid in [json!(-1), json!(65536), json!(1.5)] {
             assert_eq!(
@@ -5370,7 +5459,7 @@ dns_direct_domains:
             );
         }
         assert_eq!(
-            save(tv, json!({"group":"Japan","target":"","priority":0}))["ok"],
+            save(tv, json!({"group":"Japan","target":"proxy","priority":0}))["ok"],
             true
         );
         assert_eq!(winner(tv), (json!(0), json!("direct")));
@@ -5421,7 +5510,7 @@ dns_direct_domains:
         let add_groups = |groups: &[&str]| {
             dispatch(
                 "save_device_binding",
-                &json!({"revision":revision(),"source":"192.0.2.8","groups":groups}),
+                &json!({"revision":revision(),"source":"192.0.2.8","groups":groups,"target":"direct"}),
             )
         };
         assert_eq!(add_groups(&["Music", "Missing"])["ok"], false);

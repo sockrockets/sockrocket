@@ -15,7 +15,7 @@ assert.equal(element('rule-preset-enable').hidden,true);assert.equal(element('ru
 assert.match(element('rule-preset-state').textContent,/未启用/);
 const application=source.indexOf('<h3 id="sr-rule-application-title">设备分流策略</h3>');
 const maintenance=source.indexOf('id="sr-rule-workspace-title">规则组维护');
-const preset=source.indexOf('>从预设导入</button>');
+const preset=source.indexOf('>使用预设</button>');
 assert.ok(maintenance>=0 && maintenance<preset && preset<source.indexOf('</section>',maintenance));
 assert.ok(application>preset && source.indexOf('id="sr-device-picker"')>application);
 element('rule-preset-panel').hidden=false;
@@ -65,3 +65,13 @@ assert.equal(element('rule-preset-domains').textContent,'DOMAIN,example.com,PROX
 assert.equal(element('rule-preset-add').disabled,false,'a suffix rule does not replace an exact rule');
 c.srLoadRules();refresh(rows.concat({...rows[0],group:presets[2].group,rule_type:'domain'}));
 assert.equal(element('rule-preset-add').disabled,true,'an existing exact rule is skipped');
+
+c.RULE_SELECTED_GROUP='My AI';c.startRulePresetAddition();
+assert.equal(element('rule-input-fields').hidden,true);
+assert.match(element('rule-editor-state').textContent,/My AI/);
+assert.match(element('rule-preset-description').textContent,/My AI/);
+assert.equal(c.rulePresetGroup(presets[0]),'My AI');
+element('rule-type').focus=()=>{};c.startRuleAddition();
+assert.equal(element('rule-input-fields').hidden,false);
+assert.equal(element('rule-preset-panel').hidden,true);
+console.log('PASS: preset destination follows selected group and method switching restores manual fields');

@@ -9,7 +9,7 @@
 离线安装包实测约 6.4 MiB。RT-AX86U Pro 在 153–172 个活跃会话下，代理进程常驻内存实测为 29–37 MiB。装在路由器上，全家设备共用节点、规则和 DNS。
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.vi.md">Tiếng Việt</a> · <strong>中文</strong>
+   <a href="README.vi.md">Tiếng Việt</a> · <strong>中文</strong>
 </p>
 <p align="center">
   <a href="https://sockrockets.github.io/sockrocket/">网站</a> · <a href="https://t.me/sockrocket">Telegram · @sockrocket</a> ·
@@ -19,6 +19,42 @@
   <a href="docs/merlin.md">Merlin 路由器</a> ·
   <a href="https://github.com/sockrockets/sockrocket/issues">反馈问题</a>
 </p>
+
+## 从安装到设备分流
+
+1. 按完整型号及硬件修订选择下方安装包，在梅林软件中心离线安装。
+2. 打开 Sockrocket，导入节点或订阅，选择可用出口并启动服务。
+3. 在「分流规则」创建规则组，或从常用预设添加 AI、视频、游戏等规则。预设初始停用，检查内容后启用。
+4. 选择「全部设备」或某台设备，绑定一个或多个规则组，分别指定优先级和出口。
+5. 在流程图选择设备，输入目标网站并检查分流，核对命中的规则和出口。
+
+规则组保存一份内容，多台设备可以复用。设备自己的关联先匹配，再检查「全部设备」关联。关联优先级越高越先匹配，同级按组内规则优先级与配置顺序匹配。设备名称可以自定义，建议在固件中保留 DHCP 地址。
+
+「删除设备配置」清理该来源的组绑定、专属规则、默认出口和自定义名称。仍在线的设备会继续由 DHCP 或邻居表发现，之后可以重新配置；更大网段的策略仍可覆盖该设备。
+
+## 内置预设与链接导入
+
+| 场景 | 可选预设 |
+| --- | --- |
+| AI | AI 服务（ChatGPT、Claude、Gemini）、AI 扩展（Perplexity、Poe、Grok、Mistral、Hugging Face、创作工具） |
+| 视频 | YouTube / Netflix、Disney+、Prime Video、Twitch / TikTok / Hulu / Max / Crunchyroll / Vimeo |
+| 音乐 | Spotify、Tidal、SoundCloud、Deezer |
+| 游戏 | Steam、Epic / Fortnite、PlayStation / Xbox / Nintendo、EA / Ubisoft / Battle.net / Riot / Rockstar |
+| 社区 | Telegram、Discord / TeamSpeak / Reddit |
+| 其他 | 开发工具、Apple、Microsoft、国内常用网站、Emby 日本 / 美国 / 直连域名 |
+
+预设适合按场景选择出口。服务会调整域名和 CDN，游戏对战还可能直接访问动态 IP，并使用 UDP；这些域名规则不能保证所有游戏连接或地区解锁。可用连接列表和分流检查补充个别规则。
+
+选择具名规则组后，使用「从链接添加」读取 HTTP(S) 原始规则列表，预览并确认追加。支持的目的规则包含完整域名、域名后缀、关键词、IP 网段、GeoIP 和端口。链接导入是手动操作，保存后按组绑定生效。同组重复条目会跳过。
+
+## 日常维护
+
+- 更新前查看插件状态与磁盘空间，使用软件中心离线包或插件更新入口。升级失败时查看诊断与更新状态。
+- 修改规则后以「检查分流」核对新连接判定。已有连接可能仍使用建立时的出口。
+- 网络异常时先检查节点可用性、DNS 和设备来源 IP，再核对组是否启用、是否绑定、绑定优先级以及默认出口。
+- 提交问题时附固件版本、路由器完整型号、插件版本和脱敏诊断。订阅 URL、访问令牌、节点密码及设备标识应先移除。
+
+详细安装与架构说明见 [梅林安装指南](merlin/README.md)，规则工作方式见 [分流说明](docs/routing.md)。下面的功能描述对应当前源码，已发布安装包以发布说明为准。
 
 ## 按路由器型号下载安装包
 

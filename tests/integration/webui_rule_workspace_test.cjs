@@ -103,3 +103,13 @@ console.log('PASS: native select missing-option semantics, editable bulk default
   assert.equal(offset, 450);
   assert.equal(scrolled, -180);
 }
+
+allowDiscard=true;c.rulePending=false;c.RULE_READ_PENDING=false;c.RULE_FLOW_ERROR=false;c.RULE_RULE_REVISION='switch';c.SR_STATE.ruleRows=[rule(2,'Services','domain','example.invalid')];c.changeRuleGroup('Services');c.startRuleAddition();c.editRule(2);
+assert.equal(element('rule-add-panel').hidden,true,'editing an existing rule closes addition');
+assert.equal(element('rule-edit-panel').hidden,false);
+
+c.cancelRuleEditor();c.openRuleGroupCreator('blank');
+assert.equal(element('rule-create-menu').hidden,false);
+c.startRuleAddition();assert.equal(element('rule-create-menu').hidden,true);
+c.cancelRuleEditor();c.openRuleGroupCreator('blank');c.changeRuleGroup('Services');
+assert.equal(element('rule-create-menu').hidden,true);
