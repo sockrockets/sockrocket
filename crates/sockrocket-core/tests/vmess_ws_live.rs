@@ -152,7 +152,8 @@ async fn vmess_ws_against_local_xray() {
         protocol: ProxyProtocol::VMess {
             uuid,
             alter_id: 0,
-            cipher: "none".into(),
+            cipher: common::optional(&env, "LIVE_XRAY_VMESS_CIPHER")
+                .unwrap_or_else(|| "aes-128-gcm".into()),
             udp: true,
         },
         transport: Some(TransportConfig {

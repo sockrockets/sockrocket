@@ -3,7 +3,7 @@
 //! shadow-tls wraps a shadowsocks server behind a genuine-looking TLS 1.3
 //! endpoint (SNI = plugin-opts.host). The client authenticates by signing
 //! the ClientHello session id with HMAC-SHA1(password); the server proves
-//! itself by splicing an HMAC into its first encrypted record. After the
+//! itself by signing each encrypted handshake record. After the
 //! TLS handshake the connection is dropped down to raw TCP and the
 //! shadowsocks payload flows in fake TLS application-data frames with
 //! rolling HMACs. Reference implementation:
@@ -147,8 +147,8 @@ impl HandshakeState {
 /// Read-side TLS record interceptor used during the TLS handshake.
 ///
 /// rustls reads the server flight through this wrapper. It extracts the
-/// server random from ServerHello and, on the server's first encrypted
-/// record, verifies the shadow-tls splice HMAC, un-XORs the payload and
+/// server random from ServerHello and, on each encrypted
+/// handshake record, verifies the shadow-tls splice HMAC, un-XORs the payload and
 /// strips the 4 signature bytes so rustls sees a genuine TLS record.
 struct HandshakeTap<S> {
     inner: S,
@@ -162,7 +162,6 @@ struct HandshakeTap<S> {
     body: Vec<u8>,
     body_pos: usize,
     state: Option<HandshakeState>,
-    auth_checked: bool,
     authorized: bool,
 }
 
@@ -178,21 +177,12 @@ impl<S> HandshakeTap<S> {
             body: Vec::new(),
             body_pos: 0,
             state: None,
-            auth_checked: false,
             authorized: false,
         }
     }
 
-    fn state(&self) -> Option<&HandshakeState> {
-        self.state.as_ref()
-    }
-
     fn authorized(&self) -> bool {
         self.authorized
-    }
-
-    fn into_inner(self) -> S {
-        self.inner
     }
 
     /// Inspect one complete record and queue the (possibly modified) bytes.
@@ -207,13 +197,12 @@ impl<S> HandshakeTap<S> {
                 let tls13 = support_tls13(&record);
                 self.state = Some(HandshakeState::new(&self.password, server_random, tls13));
             }
-            TLS_APPLICATION_DATA if self.state.is_some() && !self.auth_checked => {
-                self.auth_checked = true;
-                let state = self.state.as_ref().expect("checked above");
+            TLS_APPLICATION_DATA if self.state.is_some() => {
+                self.authorized = false;
+                let state = self.state.as_mut().expect("checked above");
                 if record.len() > TLS_HMAC_HEADER_SIZE {
-                    let mut mac = state.hmac_sr.clone();
-                    mac.update(&record[TLS_HMAC_HEADER_SIZE..]);
-                    if mac4(&mac) == record[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] {
+                    state.hmac_sr.update(&record[TLS_HMAC_HEADER_SIZE..]);
+                    if mac4(&state.hmac_sr) == record[TLS_HEADER_SIZE..TLS_HMAC_HEADER_SIZE] {
                         // Un-XOR the payload with the cycling KDF key.
                         for (i, byte) in record[TLS_HMAC_HEADER_SIZE..].iter_mut().enumerate() {
                             *byte ^= state.key[i % state.key.len()];
@@ -530,10 +519,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowTlsIo<S> {
 
             // Skip server control frames while they still verify against the
             // plain server-random HMAC.
-            if let Some(ignore) = this.ignore_hmac.as_ref() {
-                let mut mac = ignore.clone();
-                mac.update(data);
-                if mac4(&mac) == tag {
+            if let Some(ignore) = this.ignore_hmac.as_mut() {
+                ignore.update(data);
+                if mac4(ignore) == tag {
                     continue;
                 }
                 this.ignore_hmac = None;
@@ -664,16 +652,17 @@ impl ShadowTlsConnFactory {
                 addr
             );
         }
-        let server_random = tap
-            .state()
-            .expect("authorized implies handshake state")
-            .server_random;
-        Ok(ShadowTlsIo::new(
-            tap.into_inner(),
+        let state = tap
+            .state
+            .expect("authorized implies handshake state");
+        let mut relay = ShadowTlsIo::new(
+            tap.inner,
             &self.tls_password,
-            &server_random,
+            &state.server_random,
             FrameRole::Client,
-        ))
+        );
+        relay.ignore_hmac = Some(state.hmac_sr);
+        Ok(relay)
     }
 }
 
@@ -860,18 +849,16 @@ mod tests {
         record
     }
 
-    /// Build the spliced first-encrypted-record as the shadow-tls server
+    /// Build a signed handshake record as the shadow-tls server
     /// would: [hdr][hmac4][XOR(payload)].
-    fn spliced_record(password: &str, server_random: &[u8; 32], payload: &[u8]) -> Vec<u8> {
-        let key = kdf(password, server_random);
+    fn spliced_record(mac: &mut HmacSha1, key: &[u8; 32], payload: &[u8]) -> Vec<u8> {
         let mut body = Vec::with_capacity(HMAC_SIZE + payload.len());
-        let mut mac = hmac_password(password, &[server_random]);
         let mut xored = payload.to_vec();
         for (i, b) in xored.iter_mut().enumerate() {
             *b ^= key[i % key.len()];
         }
         mac.update(&xored);
-        body.extend_from_slice(&mac4(&mac));
+        body.extend_from_slice(&mac4(mac));
         body.extend_from_slice(&xored);
 
         let mut record = Vec::new();
@@ -909,7 +896,10 @@ mod tests {
         let payload = b"encrypted-flight-record";
 
         let sh = server_hello_record(sr, true);
-        let splice = spliced_record(password, &sr, payload);
+        let mut mac = hmac_password(password, &[&sr]);
+        let key = kdf(password, &sr);
+        let splice = spliced_record(&mut mac, &key, payload);
+        let second = spliced_record(&mut mac, &key, b"finished");
 
         let feeder = tokio::spawn({
             let sh = sh.clone();
@@ -917,6 +907,7 @@ mod tests {
             async move {
                 server_side.write_all(&sh).await.unwrap();
                 server_side.write_all(&splice).await.unwrap();
+                server_side.write_all(&second).await.unwrap();
                 server_side.flush().await.unwrap();
             }
         });
@@ -930,9 +921,12 @@ mod tests {
         let mut cleaned = vec![0u8; splice.len() - HMAC_SIZE];
         tap.read_exact(&mut cleaned).await.unwrap();
 
+        let mut finished = [0; TLS_HEADER_SIZE + 8];
+        tap.read_exact(&mut finished).await.unwrap();
+        assert_eq!(&finished[TLS_HEADER_SIZE..], b"finished");
         feeder.await.unwrap();
 
-        let state = tap.state().expect("state extracted");
+        let state = tap.state.as_ref().expect("state extracted");
         assert_eq!(state.server_random, sr);
         assert!(state.tls13);
         assert!(tap.authorized());
