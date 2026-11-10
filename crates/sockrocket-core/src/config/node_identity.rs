@@ -45,6 +45,7 @@ pub(super) fn fingerprint(node: &Node) -> String {
     let extra: BTreeMap<_, _> = [
         super::v2ray::TLS_CERT_PIN,
         super::v2ray::TUIC_CERT_PIN,
+        super::v2ray::TUIC_ZERO_RTT,
         super::v2ray::UDP_ONLY,
         super::v2ray::VMESS_PADDING,
         super::v2ray::VMESS_AUTH_LEN,

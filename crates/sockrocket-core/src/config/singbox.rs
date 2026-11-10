@@ -331,6 +331,9 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
     }
     let transport = build_singbox_transport(ob)?;
     let mut extra = HashMap::new();
+    if ob.outbound_type == "tuic" && ob.zero_rtt_handshake {
+        extra.insert(super::v2ray::TUIC_ZERO_RTT.into(), "true".into());
+    }
     if ob.network.as_deref() == Some("udp") {
         extra.insert(super::v2ray::UDP_ONLY.into(), "true".into());
     }
@@ -647,6 +650,12 @@ mod tests {
         let nodes = parse_singbox_config(json).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "MY-TUIC");
+        let key = super::super::v2ray::TUIC_ZERO_RTT;
+        assert_eq!(nodes[0].extra.get(key).map(String::as_str), Some("true"));
+        let shared = crate::parse_tuic_uri(&crate::node_to_share_uri(&nodes[0])).unwrap();
+        let yaml = crate::export_clash_config(std::slice::from_ref(&shared));
+        let reparsed = crate::parse_clash_config(&yaml).unwrap();
+        assert_eq!(reparsed[0].extra.get(key), nodes[0].extra.get(key));
         assert_eq!(nodes[0].server, "tuic.example.com");
         assert_eq!(nodes[0].port, 60000);
 

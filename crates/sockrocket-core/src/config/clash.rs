@@ -48,6 +48,8 @@ struct ClashConfig {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ClashProxy {
+    #[serde(default, rename = "reduce-rtt")]
+    reduce_rtt: bool,
     #[serde(default, rename = "sockrocket-udp-only")]
     udp_only: bool,
     #[serde(default, rename = "global-padding")]
@@ -410,6 +412,9 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
 
     let port = resolve_port(proxy)?;
     let mut extra = HashMap::new();
+    if proxy.proxy_type == "tuic" && proxy.reduce_rtt {
+        extra.insert(super::v2ray::TUIC_ZERO_RTT.into(), "true".into());
+    }
     if proxy.udp_only {
         anyhow::ensure!(
             proxy.proxy_type == "trojan" && udp,

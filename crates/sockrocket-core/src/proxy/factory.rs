@@ -260,6 +260,9 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                 congestion_control,
                 tls_config,
                 pin,
+                node.extra
+                    .get(crate::config::v2ray::TUIC_ZERO_RTT)
+                    .is_some_and(|v| v == "true"),
             )?;
             out.relay = *relay;
             if let Some(ms) = heartbeat_ms.filter(|ms| *ms > 0) {

@@ -25,7 +25,7 @@ UDP availability also depends on the node's `udp` option. Certificate verificati
 | VMess | AES-GCM and ChaCha20-Poly1305 support global padding and authenticated chunk lengths. Legacy nonzero alterId is outstanding. |
 | VLESS | Xray VLESS Encryption is outstanding. |
 | Trojan | REALITY is limited to raw TCP. sing-box UDP-only outbound policy is enforced. TLS gRPC and HTTPUpgrade carry TCP and UDP in sing-box interoperability tests. Xray TunMulti is also tested. |
-| TUIC v5 | Native, reliable QUIC-stream and UDP-over-stream v1/v2 are covered. Heartbeat timing is configurable. 0-RTT remains outstanding. |
+| TUIC v5 | Native, reliable QUIC-stream and UDP-over-stream v1/v2 are covered. Heartbeat timing and opt-in 0-RTT session resumption are configurable. |
 | Hysteria2 | Salamander and Gecko are tested against sing-box. Hopping changes the UDP destination port. |
 | AnyTLS | Configurable idle check intervals, timeouts, minimum idle counts and disabled reuse are supported. Minimum idle count is bounded by the 64-session per-node capacity. |
 | WireGuard | Multi-peer longest-prefix routing, a fixed local listen port and per-peer reserved bytes are supported. AmneziaWG and OS interface hooks are outside the userspace implementation. |
@@ -64,6 +64,12 @@ sing-box's `udp_over_stream` selects v2. The relay selection survives local
 saves, share links and Mihomo YAML exports. The heartbeat timer accepts sing-box
 Go-style durations and Mihomo millisecond intervals, with millisecond resolution.
 The client sends the TUIC heartbeat command on live datagram-capable connections.
+TUIC accepts sing-box `zero_rtt_handshake` and Mihomo `reduce-rtt`. The first
+connection establishes a TLS session ticket. A resumed connection may send
+application streams early, and sends its exporter-bound authentication after
+handshake completion. Early application data has QUIC's replay semantics.
+A loopback regression with a QUIC server verifies early transmission before
+server acceptance and checks the resumed session's authentication token.
 
 VMess reference cases exercise both TCP and UDP with `auto`, `aes-128-gcm`,
 `chacha20-poly1305`, `none` and `zero`. Zero streams forward the TCP payload

@@ -372,6 +372,13 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             }
             put(&mut m, "password", s(password));
             put(&mut m, "congestion-controller", s(congestion_control));
+            if node
+                .extra
+                .get(super::v2ray::TUIC_ZERO_RTT)
+                .is_some_and(|v| v == "true")
+            {
+                put(&mut m, "reduce-rtt", Value::Bool(true));
+            }
             if let Some(ms) = heartbeat_ms {
                 put(&mut m, "heartbeat-interval", Value::Number((*ms).into()));
             }

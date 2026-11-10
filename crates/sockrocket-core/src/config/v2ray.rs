@@ -397,6 +397,7 @@ fn import_tls_pin(
     Ok(())
 }
 
+pub(crate) const TUIC_ZERO_RTT: &str = "tuic_zero_rtt";
 pub(crate) const TUIC_CERT_PIN: &str = "tuic_certificate_sha256";
 
 pub(crate) fn parse_tuic_certificate_pin(value: &str) -> Result<[u8; 32]> {
@@ -451,6 +452,9 @@ pub fn parse_tuic_uri(uri: &str) -> Result<Node> {
         .map(str::to_string)
         .collect();
     let mut extra = HashMap::new();
+    if query_truthy(&params, "zero_rtt_handshake") {
+        extra.insert(TUIC_ZERO_RTT.into(), "true".into());
+    }
     if let Some(pin) = params.get("pcs") {
         let bytes = parse_tuic_certificate_pin(pin)?;
         extra.insert(
@@ -1783,6 +1787,9 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 .map(|t| t.skip_cert_verify)
                 .unwrap_or(false);
             let mut extra = format!("?congestion_control={}", congestion_control);
+            if node.extra.get(TUIC_ZERO_RTT).is_some_and(|v| v == "true") {
+                extra.push_str("&zero_rtt_handshake=1");
+            }
             if let Some(ms) = heartbeat_ms {
                 extra.push_str(&format!("&heartbeat_interval={ms}"));
             }
