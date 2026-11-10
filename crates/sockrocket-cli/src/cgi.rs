@@ -243,12 +243,14 @@ fn is_running() -> bool {
     let Ok(pid) = fs::read_to_string(pid_path()) else {
         return false;
     };
-    let pid = pid.trim();
-    if pid.is_empty() {
+    let Ok(pid) = pid.trim().parse::<u32>() else {
         return false;
-    }
-    // Verify the PID is alive and belongs to sockrocket-cli (not a recycled PID).
-    match fs::read_to_string(format!("/proc/{}/comm", pid)) {
+    };
+    // Match the process table used by the Merlin lifecycle controller.
+    let proc = env::var_os("SOCKROCKET_PROC_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/proc".into());
+    match fs::read_to_string(proc.join(pid.to_string()).join("comm")) {
         Ok(comm) => comm.contains("sockrocket-cli"),
         Err(_) => false,
     }
@@ -707,7 +709,7 @@ fn act_restart() -> J {
 
 fn act_nodes() -> J {
     let Ok(map) = load_conf() else {
-        return json!({"nodes": [], "active": 0});
+        return err_msg("无法读取节点配置，请检查配置文件后刷新。");
     };
     let names: Vec<J> = conf_seq(&map, "nodes")
         .iter()
@@ -718,7 +720,7 @@ fn act_nodes() -> J {
 
 fn act_node_details() -> J {
     let Ok(map) = load_conf() else {
-        return json!({"nodes": [], "active": 0});
+        return err_msg("无法读取节点配置，请检查配置文件后刷新。");
     };
     let nodes: Vec<J> = conf_seq(&map, "nodes")
         .iter()
@@ -738,6 +740,22 @@ fn act_node_details() -> J {
     json!({"nodes": nodes, "active": conf_usize(&map, "active_node").unwrap_or(0)})
 }
 
+fn verify_node_selection(map: &Mapping, index: usize, post: &J) -> Result<(), J> {
+    let node = map
+        .get(ykey("nodes"))
+        .and_then(Y::as_sequence)
+        .and_then(|seq| seq.get(index));
+    let Some(node) = node else {
+        return Err(err_msg("节点已不存在，请刷新列表。"));
+    };
+    if let Some(expected) = post.get("expected_id")
+        && expected.as_str() != Some(&speedtest_jobs::key(index, node))
+    {
+        return Err(err_msg("节点列表已变化，请刷新后重新选择。"));
+    }
+    Ok(())
+}
+
 fn act_set_node(post: &J) -> J {
     let Some(index) = post
         .get("index")
@@ -749,9 +767,8 @@ fn act_set_node(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let count = node_count(&map);
-    if count > 0 && index >= count {
-        return json!({"ok": false, "msg": format!("Index {} out of range (0-{})", index, count - 1)});
+    if let Err(error) = verify_node_selection(&map, index, post) {
+        return error;
     }
     set_active_node(&mut map, index);
     match save_conf(&map) {
@@ -770,9 +787,18 @@ fn act_log() -> J {
     json!({"log_base64": B64.encode(tail_lines(&log_path(), 150))})
 }
 
+fn content_digest(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content))
+}
+
 fn act_config() -> J {
-    let content = fs::read(conf_path()).unwrap_or_default();
-    json!({"config_base64": B64.encode(content)})
+    match fs::read(conf_path()) {
+        Ok(content) => {
+            json!({"revision": content_digest(&content), "config_base64": B64.encode(content)})
+        }
+        Err(_) => err_msg("无法读取高级配置，请检查配置文件后重新加载。"),
+    }
 }
 
 fn act_save_config(post: &J) -> J {
@@ -793,6 +819,19 @@ fn act_save_config(post: &J) -> J {
     if let Err(e) = validate_advanced_config(&text) {
         return json!({"ok": false, "msg": format!("Config validation failed: {e}")});
     }
+    // dispatch holds the same config lock used by subscription refresh commits.
+    if let Some(expected) = post.get("expected_revision") {
+        let Ok(current) = fs::read(conf_path()) else {
+            return err_msg("无法核对当前配置，请重新加载。");
+        };
+        if expected.as_str() != Some(&content_digest(&current)) {
+            return err_msg("配置已被其他操作更新，请保留草稿并重新加载后再保存。");
+        }
+        if current == text.as_bytes() {
+            return json!({"ok": true, "revision": expected, "msg": "配置没有变化"});
+        }
+    }
+    let revision = content_digest(text.as_bytes());
     if let Err(error) =
         sockrocket_core::config::storage::atomic_write_private(&conf_path(), &text, true)
     {
@@ -801,9 +840,10 @@ fn act_save_config(post: &J) -> J {
     if is_running()
         && let Err(error) = run_sh("restart")
     {
-        return err_msg(&error.to_string());
+        return json!({"ok": false, "saved": true, "revision": revision,
+                      "msg": format!("配置已保存，服务重启失败，请查看诊断。{error}")});
     }
-    json!({"ok": true, "msg": "Config saved and validated"})
+    json!({"ok": true, "saved": true, "revision": revision, "msg": "Config saved and validated"})
 }
 
 fn validate_advanced_config(text: &str) -> Result<()> {
@@ -833,7 +873,7 @@ fn validate_advanced_config(text: &str) -> Result<()> {
 
 fn act_subscriptions() -> J {
     let Ok(map) = load_conf() else {
-        return json!({"subs": []});
+        return err_msg("无法读取订阅配置，请检查配置文件后刷新。");
     };
     let mut node_counts = std::collections::HashMap::<String, usize>::new();
     let mut shared_nodes = 0usize;
@@ -859,7 +899,7 @@ fn act_subscriptions() -> J {
             };
             let url = get("url");
             let count = node_counts.get(&url).copied().unwrap_or(0);
-            json!({"index": i, "name": get("name"), "url": url,
+            json!({"index": i, "id": content_digest(url.as_bytes()), "name": get("name"), "url": url,
                    "node_count": count,
                    "format": match get("format") { f if f.is_empty() => "auto".into(), f => f }})
         })
@@ -1079,6 +1119,15 @@ fn act_add_sub(post: &J) -> J {
     }
 }
 
+fn verify_subscription_selection(post: &J, url: &str) -> Result<(), J> {
+    if let Some(expected) = post.get("expected_id")
+        && expected.as_str() != Some(&content_digest(url.as_bytes()))
+    {
+        return Err(err_msg("订阅列表已变化，请刷新后重新选择。"));
+    }
+    Ok(())
+}
+
 fn act_del_sub(post: &J) -> J {
     let Some(index) = post
         .get("index")
@@ -1093,6 +1142,9 @@ fn act_del_sub(post: &J) -> J {
     let Some(url) = cfg.subscriptions.get(index).map(|sub| sub.url.clone()) else {
         return err_msg("Subscription index out of range");
     };
+    if let Err(error) = verify_subscription_selection(post, &url) {
+        return error;
+    }
     sockrocket_core::remove_subscription_nodes(&mut cfg, &url);
     match persist_subscription_state(&cfg) {
         Ok(_) => json!({"ok": true, "msg": "Subscription deleted"}),
@@ -1129,6 +1181,10 @@ fn act_rename_sub(post: &J) -> J {
     }
     match &mut seq[index] {
         Y::Mapping(m) => {
+            let url = m.get(ykey("url")).and_then(Y::as_str).unwrap_or_default();
+            if let Err(error) = verify_subscription_selection(post, url) {
+                return error;
+            }
             m.insert(ykey("name"), Y::String(name.to_string()));
         }
         _ => return err_msg("Invalid subscription entry"),
@@ -1566,21 +1622,21 @@ fn act_del_node(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Invalid parameters");
     };
+    if let Err(error) = verify_node_selection(&map, index, post) {
+        return error;
+    }
     let mut seq = match map.remove(ykey("nodes")) {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
-    if index < seq.len() {
-        seq.remove(index);
-    }
+    seq.remove(index);
     let count = seq.len();
     map.insert(ykey("nodes"), Y::Sequence(seq));
-    // Clamp active_node if it now exceeds the node count.
-    if let Some(active) = conf_usize(&map, "active_node")
-        && count > 0
-        && active >= count
-    {
-        set_active_node(&mut map, count - 1);
+    if count == 0 {
+        map.remove(ykey("active_node"));
+    } else if let Some(active) = conf_usize(&map, "active_node") {
+        let shifted = if index < active { active - 1 } else { active };
+        set_active_node(&mut map, shifted.min(count - 1));
     }
     match save_conf(&map) {
         Ok(()) => json!({"ok": true, "msg": "Node deleted"}),
@@ -1877,8 +1933,8 @@ fn act_set_toggles(post: &J) -> J {
                     "--match-set",
                     "sockrocket_cn",
                     "dst",
-                    "-j",
-                    "RETURN",
+                    "-g",
+                    "SOCKROCKET_CN_FLOW",
                 ],
             )
             .is_some();
@@ -2740,16 +2796,16 @@ fn act_del_rule(post: &J) -> J {
     let Some(index) = post
         .get("index")
         .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
+        .and_then(|n| usize::try_from(n).ok())
     else {
         return err_msg("Invalid parameters");
     };
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let mut seq = match map.remove(ykey("rules")) {
-        Some(Y::Sequence(s)) => s,
-        _ => Vec::new(),
+    let previous_sources = accelerated_rule_sources(&map);
+    let Some(seq) = map.get_mut(ykey("rules")).and_then(Y::as_sequence_mut) else {
+        return err_msg("Rule index out of range");
     };
     if index >= seq.len() {
         return err_msg("Rule index out of range");
@@ -2758,20 +2814,9 @@ fn act_del_rule(post: &J) -> J {
         return err_msg("规则已变化，请刷新后重试");
     }
     seq.remove(index);
-    map.insert(ykey("rules"), Y::Sequence(seq));
     let remaining = load_routing_rules(&map);
     prune_device_links(&mut map, &remaining);
-    match save_conf(&map) {
-        Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
-            }
-            json!({"ok": true, "msg": "Deleted (takes effect after service restart)"})
-        }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
-    }
+    save_hot_rules(&map, previous_sources)
 }
 
 /// Swap a rule with its neighbour (`dir`: -1 = up / higher in list, +1 = down).
@@ -2906,10 +2951,12 @@ fn act_batch_add_rules(post: &J) -> J {
     if !proxy_groups::valid_target(default_target) {
         return err_msg("Invalid target action (direct / proxy / reject)");
     }
-    let replace = post
-        .get("replace")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let group_only = post.get("group_only").and_then(J::as_bool) == Some(true);
+    let replace = !group_only
+        && post
+            .get("replace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     let group = post
         .get("group")
         .and_then(|v| v.as_str())
@@ -2979,7 +3026,7 @@ fn act_batch_add_rules(post: &J) -> J {
     };
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
-        if post.get("group_only").and_then(J::as_bool) == Some(true) {
+        if group_only {
             if group.is_empty() || !source.is_empty() || !rule.is_global_destination() {
                 return err_msg("请选择具名规则组并导入目的规则；设备来源和默认出口请在绑定处配置");
             }
@@ -3012,22 +3059,23 @@ fn act_batch_add_rules(post: &J) -> J {
         conflict,
         true,
     );
-    save_routing_rules(&mut map, existing);
-    match save_conf(&map) {
-        Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
-            }
-            let msg = format!(
-                "Batch: +{} added, {} replaced, {} duplicates (from {} parsed)",
-                stats.added, stats.replaced, stats.skipped, n_in
-            );
-            json!({"ok": true, "msg": msg})
-        }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+    let summary = format!(
+        "共解析 {n_in} 条，新增 {} 条，替换 {} 条，跳过重复 {} 条。",
+        stats.added, stats.replaced, stats.skipped
+    );
+    if stats.added == 0 && stats.replaced == 0 {
+        return json!({"ok":true,"msg":summary});
     }
+    let previous_sources = accelerated_rule_sources(&map);
+    save_routing_rules(&mut map, existing);
+    let mut result = save_hot_rules(&map, previous_sources);
+    if result["ok"] == true {
+        result["msg"] = json!(format!(
+            "{summary}{}",
+            result["msg"].as_str().unwrap_or_default()
+        ));
+    }
+    result
 }
 
 fn act_apply_rule_scene(post: &J) -> J {
@@ -3147,6 +3195,39 @@ fn act_set_rule_group_target(post: &J) -> J {
     }
 }
 
+fn accelerated_rule_sources(map: &Mapping) -> std::collections::BTreeSet<String> {
+    if !effective_toggles(map).0
+        || !conf_bool(map, "cn_ipset_direct", false)
+        || conf_str(map, "proxy_mode").is_some_and(|m| !m.eq_ignore_ascii_case("rule"))
+    {
+        return Default::default();
+    }
+    let links = devices::links(map).unwrap_or_default();
+    let rules = load_routing_rules(map);
+    sockrocket_core::router::device_policy_sources(&rules, &links)
+        .filter(|source| !source.contains(':'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Existing streams keep their outbound. The daemon's config watcher publishes
+/// the new router for subsequent connections without rebinding any listener.
+fn save_hot_rules(map: &Mapping, previous_sources: std::collections::BTreeSet<String>) -> J {
+    if let Err(error) = save_conf(map) {
+        return err_msg(&format!("保存规则失败：{error}"));
+    }
+    if !is_running() {
+        return json!({"ok":true,"saved":true,"applied":false,"msg":"规则已保存，下次启动时生效。"});
+    }
+    if accelerated_rule_sources(map) != previous_sources
+        && let Err(error) = run_sh("refresh-rule-sources")
+    {
+        return json!({"ok":false,"saved":true,"applied":false,"error_code":"rule_apply_failed",
+            "msg":"规则已保存，国内直连加速的设备范围未能同步，请查看诊断。","detail":error.to_string()});
+    }
+    json!({"ok":true,"saved":true,"reload_pending":true,"msg":"规则已保存，代理将在后台热加载，新连接使用更新后的规则。"})
+}
+
 fn act_set_rule_group_enabled(post: &J) -> J {
     let group = post
         .get("group")
@@ -3188,27 +3269,9 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     if !changed {
         return json!({"ok":true,"msg":"分组已处于所选状态"});
     }
+    let previous_sources = accelerated_rule_sources(&map);
     save_routing_rules(&mut map, rules);
-    match save_conf(&map) {
-        Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return json!({"ok":false,"saved":true,"applied":false,"error_code":"rule_apply_failed","msg":"规则已保存，但代理重新加载失败；已保存状态与当前运行状态可能不同，请查看诊断后重试应用。","detail":error.to_string()});
-            }
-            json!({
-                "ok": true,
-                "saved":true,
-                "applied":is_running(),
-                "msg": format!(
-                    "{} {} rule(s) in group",
-                    if enabled { "Enabled" } else { "Disabled" },
-                    n
-                )
-            })
-        }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
-    }
+    save_hot_rules(&map, previous_sources)
 }
 
 fn act_replace_rule_group(post: &J) -> J {
@@ -3356,10 +3419,10 @@ fn act_replace_rule_group(post: &J) -> J {
             rule.name.clone_from(&previous.name);
         }
     }
-    let n = match sockrocket_core::replace_rule_group(&mut rules, &old_group, incoming) {
-        Ok(n) => n,
-        Err(e) => return err_msg(&e),
-    };
+    if let Err(e) = sockrocket_core::replace_rule_group(&mut rules, &old_group, incoming) {
+        return err_msg(&e);
+    }
+    let previous_sources = accelerated_rule_sources(&map);
     if old_group != new_group
         && let Ok(mut links) = devices::links(&map)
     {
@@ -3371,47 +3434,41 @@ fn act_replace_rule_group(post: &J) -> J {
         devices::store_links(&mut map, &links);
     }
     save_routing_rules(&mut map, rules);
-    match save_conf(&map) {
-        Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
-            }
-            json!({"ok": true, "msg": format!("Saved group ({n} rule(s))")})
-        }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
-    }
+    save_hot_rules(&map, previous_sources)
 }
 
 fn act_delete_rule_group(post: &J) -> J {
-    let group = post
-        .get("group")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let Some(group) = post.get("group").and_then(J::as_str) else {
+        return err_msg("请选择要删除的规则组");
+    };
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let mut rules = load_routing_rules(&map);
-    let before_n = rules.len();
-    rules.retain(|r| !same_rule_group(&r.group, &group));
-    let removed = before_n - rules.len();
+    if post.get("expected_revision").and_then(J::as_str) != Some(&route_trace::rules_revision(&map))
+    {
+        return err_msg("规则或关联配置已变化，请刷新后重新确认删除");
+    }
+    let previous_sources = accelerated_rule_sources(&map);
+    let Some(rows) = map.get_mut(ykey("rules")).and_then(Y::as_sequence_mut) else {
+        return err_msg("无法读取规则列表");
+    };
+    if rows.iter().any(|row| yaml_to_routing_rule(row).is_none()) {
+        return err_msg("规则配置损坏，请先修复后再删除规则组");
+    }
+    let before = rows.len();
+    rows.retain(|row| {
+        !same_rule_group(
+            row.get(ykey("group")).and_then(Y::as_str).unwrap_or(""),
+            group,
+        )
+    });
+    let removed = before - rows.len();
     if removed == 0 {
-        return err_msg("No rules in that group");
+        return err_msg("该组没有可删除的规则");
     }
-    save_routing_rules(&mut map, rules);
-    match save_conf(&map) {
-        Ok(()) => {
-            if is_running()
-                && let Err(error) = run_sh("restart")
-            {
-                return err_msg(&error.to_string());
-            }
-            json!({"ok": true, "msg": format!("Removed {removed} rule(s) from group")})
-        }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
-    }
+    let remaining = load_routing_rules(&map);
+    prune_device_links(&mut map, &remaining);
+    save_hot_rules(&map, previous_sources)
 }
 
 fn act_check_update() -> J {
@@ -4818,6 +4875,91 @@ dns_direct_domains:
     }
 
     #[test]
+    fn stale_node_actions_cannot_retarget_or_move_the_active_exit() {
+        let _env = TestEnv::new(SAMPLE);
+        let mut map = load_conf().unwrap();
+        let nodes = map
+            .get_mut(ykey("nodes"))
+            .unwrap()
+            .as_sequence_mut()
+            .unwrap();
+        let mut third = nodes[0].clone();
+        third["name"] = Y::String("Node C".into());
+        nodes.push(third);
+        set_active_node(&mut map, 1);
+        save_conf(&map).unwrap();
+
+        let id = act_node_details()["nodes"][0]["test_id"].clone();
+        let row = json!({"index": 0, "expected_id": id});
+        assert_eq!(dispatch("del_node", &row)["ok"], true);
+        let updated = act_node_details();
+        assert_eq!(updated["active"], 0);
+        assert_eq!(updated["nodes"][0]["name"], "Node B");
+        let before = fs::read(conf_path()).unwrap();
+        for action in ["del_node", "set_node"] {
+            assert_eq!(dispatch(action, &row)["ok"], false);
+            assert_eq!(dispatch(action, &json!({"index": 8}))["ok"], false);
+        }
+        assert_eq!(fs::read(conf_path()).unwrap(), before);
+        for _ in 0..2 {
+            assert_eq!(dispatch("del_node", &json!({"index":0}))["ok"], true);
+        }
+        assert_eq!(dispatch("set_node", &json!({"index":0}))["ok"], false);
+        assert!(conf_usize(&load_conf().unwrap(), "active_node").is_none());
+
+        fs::write(conf_path(), "nodes: {0: malformed}").unwrap();
+        for action in ["set_node", "del_node"] {
+            assert_eq!(dispatch(action, &json!({"index":0}))["ok"], false);
+        }
+    }
+
+    #[test]
+    fn stale_subscription_actions_leave_the_replacement_untouched() {
+        let _env = TestEnv::new(SAMPLE);
+        let current = act_subscriptions()["subs"][0]["id"].clone();
+        let old = json!({"index":0,"expected_id":"removed","name":"Renamed"});
+        let before = fs::read(conf_path()).unwrap();
+        for action in ["rename_sub", "del_sub"] {
+            assert_eq!(dispatch(action, &old)["ok"], false);
+        }
+        assert_eq!(fs::read(conf_path()).unwrap(), before);
+        assert_eq!(
+            dispatch(
+                "rename_sub",
+                &json!({"index":0,"expected_id":current,"name":"Renamed"})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch("del_sub", &json!({"index":0,"expected_id":current}))["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn advanced_config_preserves_newer_edits_and_reports_unreadable_files() {
+        let _env = TestEnv::new(SAMPLE);
+        let first = dispatch("config", &J::Null);
+        let draft = json!({"config":first["config_base64"],"expected_revision":first["revision"]});
+        let unchanged = dispatch("save_config", &draft);
+        assert_eq!(unchanged["ok"], true);
+        assert!(unchanged.get("saved").is_none());
+        let replacement = B64.encode(format!("{SAMPLE}\n# keep comment\n"));
+        let saved = dispatch(
+            "save_config",
+            &json!({"config":replacement,"expected_revision":first["revision"]}),
+        );
+        assert_eq!(saved["saved"], true);
+        assert_ne!(saved["revision"], first["revision"]);
+        assert_eq!(dispatch("save_config", &draft)["ok"], false);
+        assert_eq!(dispatch("config", &J::Null)["config_base64"], replacement);
+        fs::remove_file(conf_path()).unwrap();
+        for action in ["config", "nodes", "node_details", "subscriptions"] {
+            assert_eq!(dispatch(action, &J::Null)["ok"], false, "{action}");
+        }
+    }
+
+    #[test]
     fn del_node_clamps_active() {
         let _env = TestEnv::new(SAMPLE);
         act_set_node(&json!({"index": 1}));
@@ -5463,6 +5605,51 @@ dns_direct_domains:
             true
         );
         assert_eq!(winner(tv), (json!(0), json!("direct")));
+    }
+
+    #[test]
+    fn deleting_a_group_only_removes_confirmed_rules_and_links() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Video, pattern: tv.invalid, target: proxy}\n  - {rule_type: domain, pattern: stay.invalid, target: direct, custom_key: preserved}",
+        ));
+        let revision = || route_trace::rules_revision(&load_conf().unwrap());
+        let old = revision();
+        assert_eq!(
+            dispatch(
+                "save_device_binding",
+                &json!({"revision":old,"group":"Video","source":"192.0.2.8","target":"direct"})
+            )["ok"],
+            true
+        );
+        let before = fs::read(conf_path()).unwrap();
+        for request in [
+            json!({"group":"Video","expected_revision":old}),
+            json!({"expected_revision":revision()}),
+            json!({"group":"Video"}),
+        ] {
+            assert_eq!(dispatch("delete_rule_group", &request)["ok"], false);
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        assert_eq!(
+            dispatch(
+                "delete_rule_group",
+                &json!({"group":"Video","expected_revision":revision()})
+            )["ok"],
+            true
+        );
+        let map = load_conf().unwrap();
+        assert!(devices::links(&map).unwrap().is_empty());
+        let rows = conf_seq(&map, "rules");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["custom_key"].as_str(), Some("preserved"));
+        assert_eq!(
+            dispatch(
+                "delete_rule_group",
+                &json!({"group":"","expected_revision":revision()})
+            )["ok"],
+            true
+        );
     }
 
     #[test]

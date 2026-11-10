@@ -126,3 +126,15 @@ legacy.context.acceptSubscriptionJob({ok:true,job:{id:'old-job',state:'running',
 assert.equal(legacy.nodeLoads.length,0,'old backends cannot confirm that nodes have been saved');
 assert.doesNotMatch(legacy.messages.at(-1),/节点已保存/);
 console.log('PASS: older backend progress does not falsely confirm saved nodes');
+
+const list = fixture();
+list.context.SR_STATE.subs = [{index: 0, id: 'fixture-id', name: 'Original', url: 'https://example.invalid/private'}];
+list.context.prompt = () => 'Renamed';
+list.context.confirm = () => true;
+list.context.renameSub(0);
+list.context.delSub(0);
+for (const action of ['rename_sub', 'del_sub']) {
+  const body = list.request(action)[1];
+  assert.equal(body.expected_id, 'fixture-id');
+  assert.doesNotMatch(JSON.stringify(body), /example\.invalid/);
+}

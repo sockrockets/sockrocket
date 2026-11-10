@@ -64,6 +64,10 @@ iptables -t mangle -X SOCKROCKET_MANGLE 2>/dev/null || true
         iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
         iptables -t mangle -F SOCKROCKET_DEVICES 2>/dev/null || true
         iptables -t mangle -X SOCKROCKET_DEVICES 2>/dev/null || true
+        iptables -t mangle -F SOCKROCKET_CN_FLOW 2>/dev/null || true
+        iptables -t mangle -X SOCKROCKET_CN_FLOW 2>/dev/null || true
+        ipset destroy sockrocket_cn_sources 2>/dev/null || true
+        ipset destroy sockrocket_cn 2>/dev/null || true
 iptables -t nat -D PREROUTING -j SOCKROCKET_DNS 2>/dev/null || true
 iptables -t nat -F SOCKROCKET_DNS 2>/dev/null || true
 iptables -t nat -X SOCKROCKET_DNS 2>/dev/null || true
@@ -263,6 +267,10 @@ if iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q MARK; then
         iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
         iptables -t mangle -F SOCKROCKET_DEVICES 2>/dev/null || true
         iptables -t mangle -X SOCKROCKET_DEVICES 2>/dev/null || true
+        iptables -t mangle -F SOCKROCKET_CN_FLOW 2>/dev/null || true
+        iptables -t mangle -X SOCKROCKET_CN_FLOW 2>/dev/null || true
+        ipset destroy sockrocket_cn_sources 2>/dev/null || true
+        ipset destroy sockrocket_cn 2>/dev/null || true
     leftover=$((leftover + 1))
 fi
 

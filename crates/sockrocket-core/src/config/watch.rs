@@ -1,6 +1,6 @@
-//! Config file hot-reload via simple mtime polling (no `notify` dependency).
+//! Config file hot-reload via file metadata polling (no `notify` dependency).
 //!
-//! The watcher polls the file every few seconds; when the mtime changes it
+//! The watcher polls the file every few seconds; when a file is edited or replaced it
 //! re-reads and re-parses the YAML. A parsed config is emitted together with
 //! the list of fields that require a service restart to take effect
 //! (listen address / ports). Parse failures are reported as errors and the
@@ -84,7 +84,7 @@ impl ConfigWatchHandle {
     }
 }
 
-/// Watches a config file for changes via mtime polling.
+/// Watches a config file for changes via metadata polling.
 pub struct ConfigWatcher {
     shutdown_tx: watch::Sender<bool>,
     handle: JoinHandle<()>,
@@ -103,6 +103,17 @@ impl ConfigWatcher {
         let content_hash = std::fs::read_to_string(&path)
             .map(|c| config_content_hash(&c))
             .unwrap_or(0);
+        Self::spawn_with_hash(path, current, poll_interval, content_hash)
+    }
+
+    /// Use the exact revision loaded by a daemon whose startup can take time.
+    pub fn spawn_with_hash(
+        path: impl Into<PathBuf>,
+        current: &AppConfig,
+        poll_interval: Duration,
+        content_hash: u64,
+    ) -> Self {
+        let path = path.into();
         let state = Arc::new(Mutex::new(WatcherState {
             content_hash,
             restart_baseline: (
@@ -119,18 +130,17 @@ impl ConfigWatcher {
         let task_state = state.clone();
 
         let handle = tokio::spawn(async move {
-            let mut last_mtime = file_mtime(&path);
+            let mut last_stamp = None;
             let poll = poll_interval.max(Duration::from_millis(500));
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(poll) => {}
                     _ = shutdown_rx.changed() => break,
                 }
-                let mtime = file_mtime(&path);
-                if mtime == last_mtime {
+                let stamp = file_stamp(&path);
+                if stamp.is_some() && stamp == last_stamp {
                     continue;
                 }
-                last_mtime = mtime;
 
                 let content = match std::fs::read_to_string(&path) {
                     Ok(c) => c,
@@ -139,6 +149,7 @@ impl ConfigWatcher {
                         continue;
                     }
                 };
+                last_stamp = stamp;
                 let hash = config_content_hash(&content);
                 {
                     let state = task_state.lock().unwrap();
@@ -221,8 +232,23 @@ impl Drop for ConfigWatcher {
     }
 }
 
-fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: metadata.modified().ok()?,
+        len: metadata.len(),
+        // Atomic replacements on router filesystems can share an mtime and size.
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+    })
 }
 
 fn parse_reload(content: &str) -> anyhow::Result<(AppConfig, super::dns::DnsSettings)> {
@@ -399,6 +425,46 @@ mod tests {
 
         watcher.shutdown();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watcher_tracks_replacements_even_with_identical_size_and_mtime() {
+        let path = temp_config_path("rename");
+        let replacement = path.with_extension("new");
+        let mut config = AppConfig::default();
+        let hash = write_config(&path, &config);
+        let mtime = file_stamp(&path).unwrap().modified;
+        let len = file_stamp(&path).unwrap().len;
+        // The first change happens during daemon startup, before the watcher exists.
+        config.socks_port = 1081;
+        write_config(&path, &config);
+        let mut watcher =
+            ConfigWatcher::spawn_with_hash(&path, &config, Duration::from_millis(500), hash);
+        for port in [1081, 1082] {
+            if port == 1082 {
+                config.socks_port = port;
+                write_config(&replacement, &config);
+                std::fs::File::open(&replacement)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+            } else {
+                std::fs::File::open(&path)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+            }
+            assert_eq!(file_stamp(&path).unwrap().len, len);
+            let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+                .await
+                .unwrap();
+            assert!(
+                matches!(event, Some(ConfigWatchEvent::Reloaded(r)) if r.config.socks_port == port)
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

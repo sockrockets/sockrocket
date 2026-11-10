@@ -53,7 +53,11 @@ make_fake_bin() {
     [ -x /bin/sleep ] && sleep_bin=/bin/sleep
     cat > "$SOCKROCKET_DIR/sockrocket-cli" <<SH
 #!/bin/sh
-case "\$1" in --dns-health) "$SANDBOX/stub/netstat" | grep -q 5300; exit \$?;; --supports-udp|--dump-rule-sources|--dump-cn-cidrs) exit 0;; esac
+case "\$1" in
+    --dns-health) "$SANDBOX/stub/netstat" | grep -q 5300; exit \$? ;;
+    --daemon-health) kill -0 "\$2" 2>/dev/null; exit \$? ;;
+    --supports-udp|--dump-rule-sources|--dump-cn-cidrs) exit 0 ;;
+esac
 mkdir -p "$PROC_FAKE/\$\$" 2>/dev/null
 echo "sockrocket-cli" > "$PROC_FAKE/\$\$/comm" 2>/dev/null
 exec "$sleep_bin" 300
@@ -242,7 +246,7 @@ teardown() {
     local pids="" f pid
     [ -n "${FAKE_PID:-}" ] && pids="$FAKE_PID"
     if [ -n "${SOCKROCKET_DIR:-}" ]; then
-        for f in "$SOCKROCKET_DIR/sockrocket.pid" "$SOCKROCKET_DIR/sockrocket-api.pid"; do
+        for f in "$SOCKROCKET_DIR/sockrocket-guard.pid" "$SOCKROCKET_DIR/sockrocket-supervisor.pid" "$SOCKROCKET_DIR/sockrocket.pid" "$SOCKROCKET_DIR/sockrocket-api.pid"; do
             [ -f "$f" ] || continue
             pid=$(cat "$f" 2>/dev/null)
             [ -n "$pid" ] && pids="$pids $pid"

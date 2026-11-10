@@ -29,3 +29,11 @@ requests.shift().ok({ok:true,job:finished});
 assert.equal(state.lat[0],10);
 assert.ok(renders<=4);
 console.log('PASS: one backend batch, duplicate identities, failures, bounded rendering, reload reattachment');
+
+context.confirm = () => true;
+vm.runInContext(source.slice(source.indexOf('var nodeSwitchPending'), source.indexOf('function testNode(')) +
+  source.slice(source.indexOf('function delNode('), source.indexOf('/* ══ Subscriptions')), context);
+context.setNode(1);
+context.delNode(0);
+assert.equal(requests.shift().data.expected_id, state.nodes[1].test_id);
+assert.equal(requests.shift().data.expected_id, state.nodes[0].test_id);
