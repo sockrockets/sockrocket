@@ -387,6 +387,57 @@ pub static SAFARI_17_1_EXT: Vec<ExtensionSpec> = {
 
 define_fingerprint!(SAFARI_17_1 { &SAFARI_17_1_EXT, &SAFARI_17_1_CIPHERS });
 
+// uTLS HelloQQ_11_1 and HelloEdge_85 share the Chromium cipher order.
+// Edge omits ALPS. Only TLS versions supported by this client are offered.
+pub use self::CHROME_108 as QQ_11_1;
+#[dynamic]
+static EDGE_85_EXT: Vec<ExtensionSpec> = CHROME_108_EXT.iter()
+    .filter(|ext| !matches!(ext, ExtensionSpec::Craft(CraftExtension::FakeApplicationSettings)))
+    .cloned()
+    .collect();
+define_fingerprint!(EDGE_85 { &EDGE_85_EXT, &CHROME_CIPHER });
+
+// uTLS HelloIOS_14 uses the Apple extension order without cert compression.
+#[dynamic]
+static IOS_14_EXT: Vec<ExtensionSpec> = SAFARI_17_1_EXT.iter()
+    .filter(|ext| !matches!(ext, ExtensionSpec::Craft(CraftExtension::CompressCert(_))))
+    .cloned()
+    .collect();
+#[dynamic]
+static IOS_14_CIPHERS: Vec<GreaseOrCipher> = {
+    use CipherSuite::*;
+    vec![
+        GreaseOrCipher::Grease,
+        TLS13_AES_128_GCM_SHA256.into(),
+        TLS13_AES_256_GCM_SHA384.into(),
+        TLS13_CHACHA20_POLY1305_SHA256.into(),
+        TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.into(),
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.into(),
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.into(),
+        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.into(),
+        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.into(),
+        TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.into(),
+        TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384.into(),
+        TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256.into(),
+        TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA.into(),
+        TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA.into(),
+        TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384.into(),
+        TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256.into(),
+        TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA.into(),
+        TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA.into(),
+        TLS_RSA_WITH_AES_256_GCM_SHA384.into(),
+        TLS_RSA_WITH_AES_128_GCM_SHA256.into(),
+        TLS_RSA_WITH_AES_256_CBC_SHA256.into(),
+        TLS_RSA_WITH_AES_128_CBC_SHA256.into(),
+        TLS_RSA_WITH_AES_256_CBC_SHA.into(),
+        TLS_RSA_WITH_AES_128_CBC_SHA.into(),
+        TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA.into(),
+        TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA.into(),
+        TLS_RSA_WITH_3DES_EDE_CBC_SHA.into(),
+    ]
+};
+define_fingerprint!(IOS_14 { &IOS_14_EXT, &IOS_14_CIPHERS });
+
 /// The cipher list of firefox 105
 ///
 /// This list includes \*CBC* and \*TLS_RSA* ciphers for correctness, even though they are not supported by Rustls due to security concerns and deprecation. As these older cipher suites are seldom used in modern secure communications, their absence in Rustls is unlikely to cause compatibility issues.

@@ -49,6 +49,9 @@ fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::Fingerpr
             SAFARI_17_1.builder().dangerous_disable_strict_mode()
         }
         Some("firefox") => FIREFOX_105.builder(),
+        Some("edge") => EDGE_85.builder(),
+        Some("qq") => QQ_11_1.builder(),
+        Some("ios") => IOS_14.builder().dangerous_disable_strict_mode(),
         Some("chrome108") => CHROME_108.builder(),
         Some("chrome112") => CHROME_112.builder(),
         // Preserve the default-to-Chrome behavior for unknown names.
@@ -59,8 +62,18 @@ fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::Fingerpr
 fn modern_chrome(name: Option<&str>) -> bool {
     !matches!(
         name.map(str::to_ascii_lowercase).as_deref(),
-        Some("chrome108" | "chrome112" | "safari" | "firefox")
+        Some("chrome108" | "chrome112" | "safari" | "firefox" | "edge" | "ios" | "qq")
     )
+}
+
+fn reality_fingerprint<'a>(
+    reality: &'a RealityConfig,
+    tls: Option<&'a TlsConfig>,
+) -> Option<&'a str> {
+    reality
+        .client_fingerprint
+        .as_deref()
+        .or_else(|| tls.and_then(|c| c.fingerprint.as_deref()))
 }
 
 /// Apply TCP_NODELAY and keepalive to a connected stream.
@@ -100,7 +113,20 @@ pub(crate) fn format_host_port(host: &str, port: u16) -> String {
 /// domains use the process-wide server cache ([`resolve_server_ips`]); only
 /// that generic path may fall back to system resolution on lookup failure.
 pub(crate) async fn connect_tcp(addr: &str, timeout: Duration) -> Result<TcpStream> {
-    let tcp = tokio::time::timeout(timeout, connect_tcp_inner(addr))
+    connect_tcp_timeout(addr, timeout, false).await
+}
+
+/// Connect to a known proxy endpoint, including probes before the service starts.
+pub(crate) async fn connect_server_tcp(addr: &str, timeout: Duration) -> Result<TcpStream> {
+    connect_tcp_timeout(addr, timeout, true).await
+}
+
+async fn connect_tcp_timeout(
+    addr: &str,
+    timeout: Duration,
+    proxy_endpoint: bool,
+) -> Result<TcpStream> {
+    let tcp = tokio::time::timeout(timeout, connect_tcp_inner(addr, proxy_endpoint))
         .await
         .map_err(|_| {
             anyhow::anyhow!(
@@ -114,7 +140,7 @@ pub(crate) async fn connect_tcp(addr: &str, timeout: Duration) -> Result<TcpStre
     Ok(tcp)
 }
 
-async fn connect_tcp_inner(addr: &str) -> Result<TcpStream> {
+async fn connect_tcp_inner(addr: &str, proxy_endpoint: bool) -> Result<TcpStream> {
     if let Some((host, port_str)) = addr.rsplit_once(':')
         && let Ok(port) = port_str.parse::<u16>()
     {
@@ -128,11 +154,20 @@ async fn connect_tcp_inner(addr: &str) -> Result<TcpStream> {
                 .await
                 .with_context(|| format!("TCP connection to {} failed", addr));
         }
-        let ips = if let Some(result) = crate::dns::scoped_direct_resolve(bare).await {
+        let ips = if proxy_endpoint {
+            Some(
+                resolve_host_ips(bare, true)
+                    .await
+                    .context("Proxy server DNS lookup failed")?,
+            )
+        } else if let Some(result) = crate::dns::scoped_direct_resolve(bare).await {
             Some(result?) // An explicit direct DNS failure must not use proxy/system DNS.
         } else {
             resolve_server_ips(host).await
         };
+        if ips.is_none() && crate::dns::bootstrap_resolver(bare).is_some_and(|(_, node)| node) {
+            anyhow::bail!("Proxy server DNS lookup failed");
+        }
         if let Some(ips) = ips {
             let sockaddrs: Vec<SocketAddr> =
                 ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
@@ -479,6 +514,10 @@ fn finish_reality_probe(server: &str, port: u16, notify: Arc<tokio::sync::Notify
 /// 60s cache. Returns `None` on any failure (callers fall back to the
 /// uncached path).
 pub(crate) async fn resolve_server_ips(host: &str) -> Option<Vec<IpAddr>> {
+    resolve_host_ips(host, false).await
+}
+
+async fn resolve_host_ips(host: &str, proxy_endpoint: bool) -> Option<Vec<IpAddr>> {
     // Node configs may carry bracketed IPv6 literals (`[2001:db8::1]` from
     // url-crate parsing); normalize before the literal check and lookup.
     let host = host.trim_matches(['[', ']']);
@@ -486,7 +525,7 @@ pub(crate) async fn resolve_server_ips(host: &str) -> Option<Vec<IpAddr>> {
         return None; // literal IPs don't need caching
     }
     let configured = crate::dns::bootstrap_resolver(host);
-    let node_host = matches!(configured, Some((_, true)));
+    let node_host = proxy_endpoint || matches!(configured, Some((_, true)));
     // Destinations follow per-request DNS policy. Node hostnames do not: they
     // must resolve the same way whatever flow first dials them.
     if !node_host
@@ -497,7 +536,12 @@ pub(crate) async fn resolve_server_ips(host: &str) -> Option<Vec<IpAddr>> {
     }
     let cache = server_addr_cache();
     let now = Instant::now();
-    if let Some(ips) = cache.get(host, now) {
+    if let Some(ips) = cache.get(host, now)
+        && (!node_host
+            || ips
+                .iter()
+                .all(|ip| crate::dns::fakeip::fake_ipv4(*ip).is_none()))
+    {
         return Some(ips);
     }
     if recently_failed(host, now) {
@@ -505,43 +549,60 @@ pub(crate) async fn resolve_server_ips(host: &str) -> Option<Vec<IpAddr>> {
     }
     // Desktop TUN binds outbound sockets to the physical interface; direct
     // UDP to a public resolver would otherwise enter the TUN itself.
-    if node_host && super::outbound_bind::outbound_bind().is_none() {
-        if let Some((resolver, _)) = &configured
-            && let Ok(ips) = resolver.resolve_addresses(host).await
-            && !ips.is_empty()
-        {
-            cache.insert(host, ips.clone(), Instant::now());
-            return Some(ips);
+    let bound = super::outbound_bind::outbound_bind().is_some();
+    let resolved = if let Some((resolver, _)) = configured.as_ref().filter(|_| node_host && !bound)
+    {
+        match resolver.resolve_addresses(host).await {
+            Ok(ips) if !ips.is_empty() => Some(ips),
+            _ if !crate::dns::bootstrap_is_default() => None,
+            _ => match resolve_with_bootstrap(global_bootstrap_dns_resolver(), host).await {
+                Some(ips) => Some(ips),
+                None if system_resolver_is_loopback() => None,
+                None => resolve_via_system(host).await,
+            },
         }
-        if !crate::dns::bootstrap_is_default() {
-            return remember_resolution(host, None);
-        }
-        let resolved = match resolve_with_bootstrap(global_bootstrap_dns_resolver(), host).await {
-            Some(ips) => Some(ips),
-            None if system_resolver_is_loopback() => None,
-            None => resolve_via_system(host).await,
-        };
-        return remember_resolution(host, resolved);
-    }
-    // Bootstrap through domestic resolvers FIRST (see
-    // `resolve_via_bootstrap_dns`). A resolv.conf that only lists 127.0.0.1
-    // or ::1 is this process's own pipeline on a transparent gateway, so
-    // falling through to it looks up the tunnel's own server through the
-    // tunnel. systemd-resolved's 127.0.0.53 is a different resolver and
-    // still counts as a usable system fallback. Desktop TUN
-    // (`outbound_bind` active) keeps the system resolver because direct UDP
-    // would loop into the TUN device.
-    let resolved = if super::outbound_bind::outbound_bind().is_some() {
+    } else if bound {
         resolve_via_system(host).await
-    } else if system_resolver_is_loopback() {
-        resolve_via_bootstrap_dns(host).await
     } else {
         match resolve_via_bootstrap_dns(host).await {
             Some(ips) => Some(ips),
+            None if system_resolver_is_loopback() => None,
             None => resolve_via_system(host).await,
         }
     };
+    let resolved = match resolved {
+        Some(ips) if node_host => usable_node_addresses(host, ips).await,
+        other => other,
+    };
     remember_resolution(host, resolved)
+}
+
+/// Some network-wide DNS proxies return synthetic addresses even for direct
+/// bootstrap queries. Recover only known proxy hosts on the default policy.
+async fn usable_node_addresses(host: &str, mut ips: Vec<IpAddr>) -> Option<Vec<IpAddr>> {
+    ips.retain(|ip| crate::dns::fakeip::fake_ipv4(*ip).is_none());
+    if !ips.is_empty() {
+        return Some(ips);
+    }
+    if !crate::dns::bootstrap_is_default() {
+        return None;
+    }
+    static ENCRYPTED: OnceLock<crate::dns::DnsResolver> = OnceLock::new();
+    let resolver = ENCRYPTED.get_or_init(|| {
+        crate::dns::DnsResolver::with_config(crate::dns::DnsConfig {
+            servers: vec![crate::dns::DnsServer::Endpoint {
+                url: "https://1.1.1.1/dns-query".into(),
+                proxy: false,
+                bootstrap: vec![],
+            }],
+            fallback: vec![],
+            reject_local_addresses: true,
+            ..Default::default()
+        })
+    });
+    let mut ips = resolver.resolve_addresses(host).await.ok()?;
+    ips.retain(|ip| crate::dns::fakeip::fake_ipv4(*ip).is_none());
+    (!ips.is_empty()).then_some(ips)
 }
 
 /// A failed lookup is retried after this long instead of on every dial, so
@@ -784,9 +845,10 @@ pub fn build_reality_tls_connector(
     let short_id: Vec<u8> = hex::decode(reality.short_id.as_bytes())
         .context("invalid REALITY short id (expected hex)")?;
 
-    let fp_name = tls.and_then(|c| c.fingerprint.as_deref());
+    let fp_name = reality_fingerprint(reality, tls);
 
-    // REALITY key shares: hybrid X25519MLKEM768 first (new servers demand it
+    // Legacy browser profiles only offer classic X25519. Modern Chrome offers
+    // both REALITY key shares: hybrid X25519MLKEM768 first (new servers demand it
     // before any classic share), then classic X25519 (old servers only
     // understand this one; xray's auth prefers the classic share when both
     // are present). Both groups retain their private keys for auth-key
@@ -795,7 +857,7 @@ pub fn build_reality_tls_connector(
     // uTLS cannot parse the hybrid group at all (used as a one-shot retry
     // after a detected fallback).
     let mut provider = craft_tls::rustls::crypto::ring::default_provider();
-    provider.kx_groups = if force_classic {
+    provider.kx_groups = if force_classic || !modern_chrome(fp_name) {
         vec![&RealityX25519KxGroup]
     } else {
         vec![&RealityX25519MlKem768Group, &RealityX25519KxGroup]
@@ -877,7 +939,7 @@ pub async fn connect_with_connector(
     timeout: Duration,
 ) -> Result<Box<dyn super::connector::ProxyStream>> {
     let addr = format_host_port(server, port);
-    let tcp = connect_tcp(&addr, timeout).await?;
+    let tcp = connect_server_tcp(&addr, timeout).await?;
 
     if use_tls {
         let tls = tokio::time::timeout(timeout, connect_tls_with(tcp, sni, connector))
@@ -1263,7 +1325,11 @@ impl TlsConnFactory {
         let (reality_connector, reality_classic_connector, reality_error) = match reality {
             Some(r) => match build_reality_tls_connector(r, tls_config, false) {
                 Ok(c) => {
-                    let classic = build_reality_tls_connector(r, tls_config, true).ok();
+                    let classic = if modern_chrome(reality_fingerprint(r, tls_config)) {
+                        build_reality_tls_connector(r, tls_config, true).ok()
+                    } else {
+                        None
+                    };
                     (Some(c), classic, None)
                 }
                 Err(e) => (None, None, Some(format!("{e:#}"))),
@@ -1331,7 +1397,9 @@ impl ConnFactory for TlsConnFactory {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e)
-                    if can_retry_classic && format!("{e:#}").contains("Ed25519 SPKI not found") =>
+                    if can_retry_classic
+                        && !prefer_classic
+                        && format!("{e:#}").contains("Ed25519 SPKI not found") =>
                 {
                     // The server forwarded us to the camouflage target: it
                     // cannot parse the hybrid key share (pre-MLKEM xray).
@@ -1339,12 +1407,7 @@ impl ConnFactory for TlsConnFactory {
                     // remember it so the next connection to this server skips
                     // the doomed first attempt entirely.
                     tracing::info!("REALITY fallback detected, retrying with classic X25519 share");
-                    if let Some(guard) = probe_guard.take() {
-                        guard.finish(true);
-                    } else {
-                        mark_server_needs_classic_reality(&self.server, self.port);
-                    }
-                    let retried = connect_with_connector(
+                    let stream = connect_with_connector(
                         &self.server,
                         self.port,
                         self.reality_classic_connector.as_ref().expect("checked"),
@@ -1352,15 +1415,13 @@ impl ConnFactory for TlsConnFactory {
                         self.use_tls,
                         Duration::from_secs(15),
                     )
-                    .await;
-                    // A classic retry that fails leaves the server classified
-                    // as classic (a transient error must not flip it back).
-                    // The wake-up already happened through finish_reality_probe,
-                    // so followers re-check the cache and go straight to classic.
-                    match retried {
-                        Ok(s) => s,
-                        Err(e) => return Err(e),
+                    .await?;
+                    if let Some(guard) = probe_guard.take() {
+                        guard.finish(true);
+                    } else {
+                        mark_server_needs_classic_reality(&self.server, self.port);
                     }
+                    stream
                 }
                 Err(e) => {
                     // The hybrid attempt failed for a non-fallback reason
@@ -1390,6 +1451,14 @@ impl ConnFactory for TlsConnFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn node_dns_keeps_real_addresses_from_mixed_answers() {
+        let real: IpAddr = "192.0.2.1".parse().unwrap();
+        let fake = "198.18.0.1".parse().unwrap();
+        let ips = usable_node_addresses("node.invalid", vec![fake, real]).await;
+        assert_eq!(ips, Some(vec![real]));
+    }
 
     #[tokio::test]
     async fn reality_probe_entries_are_reclaimed_after_completion() {

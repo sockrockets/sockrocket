@@ -1,6 +1,5 @@
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use super::connector::SharedOutbound;
 
@@ -204,9 +203,7 @@ pub async fn tcp_latency_test(server: &str, port: u16, timeout_secs: u64) -> Res
     let timeout = std::time::Duration::from_secs(timeout_secs);
     let addr = super::transport::format_host_port(server, port);
     let start = std::time::Instant::now();
-    let _stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
-        .await
-        .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out ({}s)", addr, timeout_secs))??;
+    let _stream = super::transport::connect_server_tcp(&addr, timeout).await?;
     Ok(start.elapsed().as_millis() as u32)
 }
 

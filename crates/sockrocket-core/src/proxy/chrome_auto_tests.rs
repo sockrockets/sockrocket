@@ -55,6 +55,45 @@ fn shares(extensions: &HashMap<u16, Vec<u8>>) -> Vec<(u16, Vec<u8>)> {
     }
     shares
 }
+#[tokio::test]
+async fn trojan_reality_uri_selects_the_requested_client_hello() {
+    use base64::Engine;
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]);
+    for fp in ["chrome", "qq", "edge", "ios", "safari", "firefox"] {
+        let uri = format!("trojan://pw@localhost:443?security=reality&pbk={key}&sid=abcd&fp={fp}");
+        let node = crate::config::v2ray::parse_trojan_uri(&uri).unwrap();
+        let factory =
+            TlsConnFactory::from_transport("localhost", 443, node.transport.as_ref(), true);
+        let connector = factory.reality_connector.unwrap();
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let hello = async {
+            let mut header = [0; 5];
+            peer.read_exact(&mut header).await.unwrap();
+            let mut wire = header.to_vec();
+            wire.resize(5 + u16::from_be_bytes([header[3], header[4]]) as usize, 0);
+            peer.read_exact(&mut wire[5..]).await.unwrap();
+            extensions_from_wire(&wire)
+        };
+        let ext = tokio::select! {
+            ext = hello => ext,
+            result = connector.connect(ServerName::try_from("localhost").unwrap(), client) => panic!("premature TLS result {result:?}"),
+        };
+        assert_eq!(ext.contains_key(&0xfe0d), fp == "chrome", "{fp}");
+        assert_eq!(ext.contains_key(&17513), fp == "qq", "{fp}");
+        assert_eq!(ext.contains_key(&28), fp == "firefox", "{fp}");
+        assert_eq!(
+            ext.contains_key(&27),
+            !matches!(fp, "ios" | "firefox"),
+            "{fp}"
+        );
+        assert_eq!(
+            shares(&ext).iter().any(|(g, _)| *g == 0x11ec),
+            fp == "chrome",
+            "{fp}"
+        );
+    }
+}
+
 #[test]
 fn chrome_auto_wire_matches_reference_profile_and_has_fresh_real_keys() {
     let config = build_tls_config(None, None);
