@@ -128,7 +128,7 @@ Limits: up to 64 peers per node, at most two local addresses (one per family), f
 
 ## Transport boundaries and remaining work
 
-Raw TCP, TLS, WebSocket and VLESS REALITY are implemented. Requested gRPC, HTTPUpgrade and other unsupported transports are rejected during conversion; they are never silently changed to raw TCP. VLESS `xtls-rprx-vision` is implemented natively over TLS 1.3 or REALITY/TCP: padding, fragmented frames, independent read/write raw-copy transitions, half-close and XUDP. The standard flow rejects UDP/443 to permit client TCP fallback. Other flows and Vision over WebSocket are rejected; the flow is never silently removed. Legacy VMess with nonzero `alterId` is also rejected.
+Raw TCP, TLS, WebSocket, HTTPUpgrade and VLESS REALITY are implemented. Requested gRPC and other unsupported transports are rejected during conversion; they are never silently changed to raw TCP. VLESS `xtls-rprx-vision` is implemented natively over TLS 1.3 or REALITY/TCP: padding, fragmented frames, independent read/write raw-copy transitions, half-close and XUDP. The standard flow rejects UDP/443 to permit client TCP fallback. Other flows and Vision over WebSocket are rejected; the flow is never silently removed. Legacy VMess with nonzero `alterId` is also rejected.
 
 Further protocol work must retain the native Rust core and pass independent interoperability tests before being listed as supported. Current remaining candidates include gRPC and broader WireGuard profile compatibility.
 

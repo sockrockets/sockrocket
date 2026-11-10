@@ -143,6 +143,8 @@ struct ClashProxy {
 
 #[derive(Debug, Deserialize)]
 struct ClashWsOpts {
+    #[serde(default, rename = "v2ray-http-upgrade")]
+    http_upgrade: bool,
     path: Option<String>,
     headers: Option<HashMap<String, String>>,
 }
@@ -488,7 +490,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     // (grpc/h2/http/httpupgrade/...) must be rejected loudly — silently
     // downgrading to bare TCP/TLS produces a node that imports fine but can
     // never connect.
-    if !matches!(network, "tcp" | "ws" | "xhttp") {
+    if !matches!(network, "tcp" | "ws" | "httpupgrade" | "xhttp") {
         anyhow::bail!("Unsupported Clash transport; expected TCP, WebSocket or VLESS XHTTP");
     }
 
@@ -562,7 +564,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     }
 
     let has_tls = proxy.tls || force_tls;
-    let has_ws = network == "ws";
+    let has_ws = matches!(network, "ws" | "httpupgrade");
 
     if !has_tls && !has_ws {
         return Ok(None);
@@ -593,6 +595,12 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     };
 
     let transport_type = match (has_ws, has_tls) {
+        (true, _)
+            if network == "httpupgrade"
+                || proxy.ws_opts.as_ref().is_some_and(|o| o.http_upgrade) =>
+        {
+            TransportType::HttpUpgrade
+        }
         (true, _) => TransportType::WebSocket,
         (false, true) => TransportType::Tls,
         _ => TransportType::Tcp,
@@ -889,7 +897,7 @@ proxies:
     fn test_unknown_network_is_rejected_not_downgraded() {
         // grpc/h2/httpupgrade/... used to be silently downgraded to bare
         // TLS/TCP, producing a node that imports but can never connect.
-        for network in ["grpc", "h2", "http", "httpupgrade", "xhttp"] {
+        for network in ["grpc", "h2", "http", "xhttp"] {
             let yaml = format!(
                 r#"
 proxies:

@@ -335,6 +335,7 @@ fn transport_summary(transport: Option<&TransportConfig>) -> String {
         TransportType::WebSocket => "ws",
         TransportType::Xhttp => "xhttp",
         TransportType::Quic => "quic",
+        TransportType::HttpUpgrade => "httpupgrade",
         TransportType::Reality => "reality",
     };
     let mut summary = ttype.to_string();

@@ -609,6 +609,7 @@ pub enum TransportType {
     Tcp,
     Tls,
     WebSocket,
+    HttpUpgrade,
     Xhttp,
     Quic,
     Reality,

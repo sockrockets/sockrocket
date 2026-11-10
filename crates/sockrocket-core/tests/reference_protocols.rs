@@ -61,6 +61,11 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
             server["tls"] = json!({"enabled":true,"alpn":[alpn],"certificate":pem("CERTIFICATE",include_bytes!("../src/proxy/testdata/localhost-cert.der")),"key":pem("PRIVATE KEY",include_bytes!("../src/proxy/testdata/localhost-key.der"))});
             client["tls"] =
                 json!({"enabled":true,"insecure":true,"server_name":"localhost","alpn":[alpn]});
+            if option == Some("httpupgrade") {
+                let transport = json!({"type":"httpupgrade","host":"echo.example.invalid","path":"/synthetic","headers":{"X-Example":"fixture"}});
+                server["transport"] = transport.clone();
+                client["transport"] = transport;
+            }
             server["users"] = json!([{"password":pw}]);
             client["password"] = json!(pw);
             if kind == "tuic" {
@@ -237,6 +242,11 @@ reference!(
     Some("aes-128-gcm+global_padding+authenticated_length")
 );
 reference!(reference_vmess_zero_tcp_udp, "vmess", Some("zero"));
+reference!(
+    reference_trojan_httpupgrade_tcp_udp,
+    "trojan",
+    Some("httpupgrade")
+);
 reference!(reference_trojan_tcp_udp, "trojan", None);
 reference!(reference_tuic_tcp_udp, "tuic", None);
 reference!(reference_vmess_aes_tcp_udp, "vmess", Some("aes-128-gcm"));

@@ -821,6 +821,52 @@ pub async fn connect_ws(
     Ok(Box::new(WsStream::new(stream, leftover)))
 }
 
+/// V2Ray HTTPUpgrade carries unframed application bytes after the HTTP 101.
+pub(super) async fn connect_http_upgrade(
+    stream: BoxProxyStream,
+    server: &str,
+    config: &WsConfig,
+) -> Result<BoxProxyStream> {
+    use hyper::{Request, StatusCode, header};
+    use hyper_util::rt::TokioIo;
+    let path = normalize_path(config.path.as_deref());
+    let uri: hyper::http::uri::PathAndQuery = path.parse()?;
+    let mut request = Request::get(uri.as_str())
+        .header(header::HOST, config.host.as_deref().unwrap_or(server))
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade");
+    if let Some(headers) = &config.headers {
+        for (name, value) in headers {
+            if !is_reserved_header(name) {
+                request = request.header(name, value);
+            }
+        }
+    }
+    let request = request.body(http_body_util::Empty::<bytes::Bytes>::new())?;
+    let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+        .max_buf_size(8192)
+        .handshake(TokioIo::new(stream))
+        .await?;
+    tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
+    let response = sender.send_request(request).await?;
+    ensure!(
+        response.status() == StatusCode::SWITCHING_PROTOCOLS,
+        "HTTPUpgrade rejected with status {}",
+        response.status()
+    );
+    ensure!(
+        response
+            .headers()
+            .get(header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.eq_ignore_ascii_case("websocket")),
+        "HTTPUpgrade peer selected another protocol"
+    );
+    Ok(Box::new(TokioIo::new(hyper::upgrade::on(response).await?)))
+}
+
 /// Convenience wrapper with a handshake timeout, used by the connection
 /// factory so a stuck upgrade can't hang a connection attempt forever.
 pub async fn connect_ws_timeout(

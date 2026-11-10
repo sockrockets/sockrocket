@@ -29,6 +29,8 @@ struct V2RayStreamSettings {
     security: Option<String>,
     #[serde(rename = "tlsSettings")]
     tls_settings: Option<V2RayTlsSettings>,
+    #[serde(rename = "httpupgradeSettings")]
+    http_upgrade_settings: Option<V2RayWsSettings>,
     #[serde(rename = "wsSettings")]
     ws_settings: Option<V2RayWsSettings>,
     #[serde(rename = "xhttpSettings")]
@@ -50,6 +52,7 @@ struct V2RayTlsSettings {
 
 #[derive(Debug, Deserialize)]
 struct V2RayWsSettings {
+    host: Option<String>,
     path: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
@@ -179,7 +182,7 @@ pub fn parse_vmess_uri(uri: &str) -> Result<Node> {
     let network = link.net.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "ws"),
+        matches!(network, "tcp" | "ws" | "httpupgrade"),
         "Unsupported VMess URI transport; configuration was not downgraded"
     );
     let transport = build_vmess_transport(network, has_tls, &link);
@@ -1216,7 +1219,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     let network = ss.network.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "raw" | "ws" | "xhttp"),
+        matches!(network, "tcp" | "raw" | "ws" | "httpupgrade" | "xhttp"),
         "Unsupported Xray transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -1296,9 +1299,14 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     } else {
         None
     };
-    let ws = if network == "ws" {
-        ss.ws_settings.as_ref().map(|w| {
-            let host = w.headers.get("Host").cloned();
+    let ws = if matches!(network, "ws" | "httpupgrade") {
+        let settings = if network == "httpupgrade" {
+            &ss.http_upgrade_settings
+        } else {
+            &ss.ws_settings
+        };
+        settings.as_ref().map(|w| {
+            let host = w.host.clone().or_else(|| w.headers.get("Host").cloned());
             WsConfig {
                 path: w.path.clone(),
                 host,
@@ -1311,6 +1319,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
 
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
+        "httpupgrade" => TransportType::HttpUpgrade,
         "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
@@ -1348,7 +1357,7 @@ fn build_vmess_transport(
         None
     };
 
-    let ws = if network == "ws" {
+    let ws = if matches!(network, "ws" | "httpupgrade") {
         Some(WsConfig {
             path: link.path.clone(),
             host: link.host.clone(),
@@ -1360,6 +1369,7 @@ fn build_vmess_transport(
 
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
+        "httpupgrade" => TransportType::HttpUpgrade,
         _ if has_tls => TransportType::Tls,
         _ => TransportType::Tcp,
     };
@@ -1379,7 +1389,10 @@ fn build_uri_transport(
     params: &HashMap<String, String>,
 ) -> Result<Option<TransportConfig>> {
     anyhow::ensure!(
-        matches!(transport_type_str, "tcp" | "raw" | "ws" | "xhttp"),
+        matches!(
+            transport_type_str,
+            "tcp" | "raw" | "ws" | "httpupgrade" | "xhttp"
+        ),
         "Unsupported URI transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -1439,7 +1452,7 @@ fn build_uri_transport(
         None
     };
 
-    let ws = if transport_type_str == "ws" {
+    let ws = if matches!(transport_type_str, "ws" | "httpupgrade") {
         Some(WsConfig {
             path: params.get("path").cloned(),
             host: params.get("host").cloned(),
@@ -1470,6 +1483,7 @@ fn build_uri_transport(
     };
     let transport_type = match transport_type_str {
         "ws" => TransportType::WebSocket,
+        "httpupgrade" => TransportType::HttpUpgrade,
         "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
@@ -1495,6 +1509,7 @@ pub fn node_to_share_uri(node: &Node) -> String {
             Tcp => "tcp",
             Tls => "tcp",
             WebSocket => "ws",
+            HttpUpgrade => "httpupgrade",
             Xhttp => "xhttp",
             Quic => "quic",
             Reality => "tcp",
@@ -1637,6 +1652,7 @@ pub fn node_to_share_uri(node: &Node) -> String {
             let (net, tls_str, host_val, path_val) = if let Some(ref tc) = node.transport {
                 let n = match tc.transport_type {
                     TransportType::WebSocket => "ws",
+                    TransportType::HttpUpgrade => "httpupgrade",
                     TransportType::Quic => "quic",
                     _ => "tcp",
                 };
@@ -2309,7 +2325,7 @@ mod native_protocol_regressions {
     }
     #[test]
     fn unsupported_uri_transports_fail_closed() {
-        for transport in ["grpc", "httpupgrade"] {
+        for transport in ["grpc", "kcp"] {
             assert!(parse_vless_uri(&format!("vless://00000000-0000-0000-0000-000000000001@vpn.example.invalid:443?security=tls&type={transport}")).is_err());
         }
     }

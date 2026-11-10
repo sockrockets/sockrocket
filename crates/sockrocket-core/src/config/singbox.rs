@@ -113,6 +113,7 @@ struct SingBoxUtls {
 
 #[derive(Debug, Deserialize)]
 struct SingBoxTransport {
+    host: Option<String>,
     #[serde(rename = "type")]
     transport_type: Option<String>,
     path: Option<String>,
@@ -401,7 +402,10 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
 fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfig>> {
     if let Some(transport) = &ob.transport {
         anyhow::ensure!(
-            transport.transport_type.as_deref() == Some("ws"),
+            matches!(
+                transport.transport_type.as_deref(),
+                Some("ws" | "httpupgrade")
+            ),
             "Unsupported sing-box transport; configuration was not downgraded"
         );
     }
@@ -460,7 +464,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
         .transport
         .as_ref()
         .and_then(|t| t.transport_type.as_deref())
-        .map(|t| t == "ws")
+        .map(|t| matches!(t, "ws" | "httpupgrade"))
         .unwrap_or(false);
 
     if !has_tls && !has_ws {
@@ -486,7 +490,10 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
     let ws = if has_ws {
         ob.transport.as_ref().map(|t| WsConfig {
             path: t.path.clone(),
-            host: t.headers.as_ref().and_then(|h| h.get("Host").cloned()),
+            host: t
+                .host
+                .clone()
+                .or_else(|| t.headers.as_ref().and_then(|h| h.get("Host").cloned())),
             headers: t.headers.clone(),
         })
     } else {
@@ -494,6 +501,15 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
     };
 
     let transport_type = match (has_ws, has_tls) {
+        (true, _)
+            if ob
+                .transport
+                .as_ref()
+                .and_then(|t| t.transport_type.as_deref())
+                == Some("httpupgrade") =>
+        {
+            TransportType::HttpUpgrade
+        }
         (true, _) => TransportType::WebSocket,
         (false, true) => TransportType::Tls,
         _ => TransportType::Tcp,

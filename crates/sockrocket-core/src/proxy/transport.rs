@@ -1166,6 +1166,7 @@ pub struct TlsConnFactory {
     /// WebSocket layer config; set when the transport is ws. The WS
     /// handshake runs on top of TCP/TLS/Reality inside `create()`.
     ws: Option<WsConfig>,
+    http_upgrade: bool,
     xhttp: Option<Arc<super::xhttp::Factory>>,
     xhttp_error: Option<String>,
 }
@@ -1195,7 +1196,12 @@ impl TlsConnFactory {
     ) -> Self {
         let (tls_config, resolved_tls) = resolve_transport_tls(transport, server);
         let ws = match transport {
-            Some(t) if t.transport_type == TransportType::WebSocket => {
+            Some(t)
+                if matches!(
+                    t.transport_type,
+                    TransportType::WebSocket | TransportType::HttpUpgrade
+                ) =>
+            {
                 // Nodes parsed before ws settings were captured carry
                 // `ws: null` — fall back to the defaults (path "/", Host=server).
                 Some(t.ws.clone().unwrap_or(WsConfig {
@@ -1229,6 +1235,8 @@ impl TlsConnFactory {
             transport.and_then(|t| t.reality.as_ref()),
             ws,
         );
+        factory.http_upgrade =
+            transport.is_some_and(|t| t.transport_type == TransportType::HttpUpgrade);
         if let Some(t) = transport.filter(|t| t.transport_type == TransportType::Xhttp) {
             match super::xhttp::Factory::new(Arc::new(factory.clone()), server, port, t) {
                 Ok(xhttp) => factory.xhttp = Some(xhttp),
@@ -1346,6 +1354,7 @@ impl TlsConnFactory {
             reality_classic_connector,
             reality_error,
             ws,
+            http_upgrade: false,
             xhttp: None,
             xhttp_error: None,
         }
@@ -1439,6 +1448,14 @@ impl ConnFactory for TlsConnFactory {
                 guard.finish(false);
             }
             if let Some(ws) = &self.ws {
+                if self.http_upgrade {
+                    return tokio::time::timeout(
+                        Duration::from_secs(15),
+                        super::ws::connect_http_upgrade(stream, &self.server, ws),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("HTTPUpgrade handshake timed out"))?;
+                }
                 super::ws::connect_ws_timeout(stream, &self.server, ws, Duration::from_secs(15))
                     .await
             } else {

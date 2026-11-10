@@ -496,9 +496,15 @@ fn apply_ws_and_tls(m: &mut Mapping, node: &Node, sni_key: &str) {
             );
         }
     }
-    if tc.transport_type == TransportType::WebSocket {
+    if matches!(
+        tc.transport_type,
+        TransportType::WebSocket | TransportType::HttpUpgrade
+    ) {
         put(m, "network", s("ws"));
         let mut ws = Mapping::new();
+        if tc.transport_type == TransportType::HttpUpgrade {
+            put(&mut ws, "v2ray-http-upgrade", Value::Bool(true));
+        }
         if let Some(wsc) = &tc.ws {
             if let Some(path) = &wsc.path {
                 put(&mut ws, "path", s(path));
