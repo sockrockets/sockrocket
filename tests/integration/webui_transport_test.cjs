@@ -76,3 +76,43 @@ assert.deepEqual(JSON.parse(Buffer.from(staged,'base64').toString()),preview);
 assert.deepEqual(packet.params,['batch_add_rules',transfer,String(staged.length)]);
 assert.deepEqual(packet.fields,{});
 console.log('PASS: edited URL preview is staged in order and committed once');
+
+const configElements = {};
+const configRequests = [];
+let beforeUnload;
+const config = vm.createContext({
+  srElement: id => configElements[id] ||= { value: '' },
+  srApi: (...args) => configRequests.push(args),
+  b64utf8: value => Buffer.from(value, 'base64').toString(),
+  utf8b64: value => Buffer.from(value).toString('base64'),
+  window: { addEventListener: (_, callback) => { beforeUnload = callback; } },
+  ruleWorkspaceDirty: () => false, dnsPolicyDirty: false, SR_PAGE_LOADED: {},
+  srShowMsg() {}, toastResp() {}, setTimeout() {}, refreshStatus() {}
+});
+vm.runInContext(source.slice(source.indexOf('var savedConfigText'), source.indexOf('var pendingUpdateAsset')), config);
+config.srLoadConfig();
+configRequests.shift()[2]({ok: false, msg: '读取失败'});
+assert.equal(configElements['config-state'].textContent, '读取失败');
+config.srLoadConfig();
+configRequests.shift()[2]({config_base64: Buffer.from('first').toString('base64'), revision: 'r1'});
+config.srSaveConfig();
+assert.equal(configRequests.length, 0, 'unchanged save cannot restart a service');
+const editor = configElements['config-text'];
+editor.value = 'draft';
+config.configEdited();
+config.srSaveConfig();
+const staleSave = configRequests.shift();
+assert.equal(staleSave[1].expected_revision, 'r1');
+staleSave[2]({ok: false, msg: '配置已被其他操作更新'});
+assert.equal(editor.value, 'draft');
+assert.equal(config.savedConfigText, 'first');
+config.srSaveConfig();
+configRequests.shift()[2]({ok: false, saved: true, revision: 'r2', msg: '服务重启失败'});
+assert.equal(config.savedConfigRevision, 'r2');
+assert.equal(config.savedConfigText, 'draft');
+assert.match(configElements['config-state'].textContent, /重启失败/);
+config.dnsPolicyDirty = true;
+let prevented = false;
+beforeUnload({preventDefault() { prevented = true; }});
+assert.equal(prevented, true, 'unloading the page protects unsaved DNS edits');
+console.log('PASS: config read errors, no-op save, stale revisions, apply failure and DNS draft protection');

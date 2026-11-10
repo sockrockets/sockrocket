@@ -567,13 +567,20 @@ body.bg {min-width:0!important}
 </div>
           <p class="hint" id="sr-rule-operation-state" role="status" aria-live="polite"></p>
           <div id="sr-rule-create-menu" class="rule-inline-editor" hidden>
-          <div id="sr-rule-group-creator" class="rule-inline-editor" hidden><div class="fg"><label for="sr-rule-new-group-name">规则组名称</label><input id="sr-rule-new-group-name" type="text" placeholder="例如：常用服务" onkeydown="if(event.key==='Enter')createRuleGroup()"></div><p class="hint">添加第一条规则后保存分组，同一组可以包含多种类型的规则。</p><div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-rule-group-new" onclick="createRuleGroup()">创建规则组</button><button class="btn btn-sm" onclick="closeRuleCreateMenu()">取消</button></div></div>
+            <div id="sr-rule-group-creator" hidden>
+              <div class="form-grid adaptive-form">
+                <div class="fg"><label for="sr-rule-new-group-name">规则组名称</label><input id="sr-rule-new-group-name" type="text" placeholder="例如：常用服务" onkeydown="if(event.key==='Enter' && !event.isComposing)createRuleGroup()"></div>
+                <div class="fg"><label for="sr-rule-new-method">规则来源</label><select id="sr-rule-new-method"><option value="blank">手动填写</option><option value="url">从链接导入</option><option value="preset">从预设导入</option></select></div>
+              </div>
+              <p class="hint">添加第一条规则后保存这个组。</p>
+              <div class="toolbar"><button class="btn btn-accent btn-sm" id="sr-rule-group-new" onclick="createRuleGroup()">下一步</button><button class="btn btn-sm" onclick="cancelRuleEditor()">取消</button></div>
+            </div>
           </div>
           <div class="toolbar rule-workspace-actions">
             <div class="fg"><label for="sr-rule-group-select">选择分组</label><select id="sr-rule-group-select" onchange="keepRulePickerPosition(this, () => { changeRuleGroup(this.value); })" disabled><option value="">正在加载…</option></select></div>
 
             <details><summary>分组设置</summary>
-              <div class="toolbar"><button class="btn btn-sm" id="sr-rule-bulk-edit" onclick="changeRuleWorkspaceMode('bulk')">批量编辑</button><button class="btn btn-sm" onclick="exportRules()">导出规则</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
+              <div class="toolbar"><button class="btn btn-sm" id="sr-rule-bulk-edit" onclick="changeRuleWorkspaceMode('bulk')">批量编辑</button><button class="btn btn-sm" onclick="exportRules()">导出全部规则</button><button class="btn btn-sm" onclick="srLoadRules()">刷新</button></div>
               <div class="toolbar"><button class="btn btn-sm" id="sr-rule-group-enable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),true)">启用该组</button><button class="btn btn-sm" id="sr-rule-group-disable" onclick="setRuleGroupEnabled(encodeURIComponent(RULE_SELECTED_GROUP),false)">停用该组</button><button class="btn btn-danger btn-sm" id="sr-rule-group-delete" onclick="deleteRuleGroup(encodeURIComponent(RULE_SELECTED_GROUP))">删除该组</button></div>
             </details>
 
@@ -717,7 +724,7 @@ body.bg {min-width:0!important}
             </div>
             <div class="fg"><label for="sr-dns-domains">额外直连解析域名（选填，每行一个后缀）</label><textarea id="sr-dns-domains" rows="3" spellcheck="false" placeholder="example.test" oninput="networkPolicyEdited()"></textarea></div>
           </details>
-          <div class="toolbar"><button type="button" class="btn btn-success" id="sr-network-save" onclick="saveNetworkPolicy()" disabled>保存并应用</button><button type="button" class="btn" id="sr-network-reload" onclick="loadNetworkPolicy()">重新加载</button></div>
+          <div class="toolbar"><button type="button" class="btn btn-success" id="sr-network-save" onclick="saveNetworkPolicy()" disabled>保存并应用</button><button type="button" class="btn" id="sr-network-reload" onclick="reloadNetworkPolicy()">重新加载</button></div>
           <p class="hint">运行中会就地重新应用防火墙策略，代理不重启；停止时只保存，不会启动代理。订阅、节点和其他配置会保留。</p>
         </div>
         <div class="card"><h3>DNS 测试</h3><p class="hint">测试当前表单，不保存更改。此处验证上游解析，实际 LAN 转发需要单独验证。</p>
@@ -731,11 +738,11 @@ body.bg {min-width:0!important}
       <div class="page" id="sr-page-config" role="tabpanel" aria-labelledby="sr-nav-config">
         <div class="page-title">高级配置</div>
         <div class="toolbar">
-          <button class="btn btn-success btn-sm" id="sr-config-save" onclick="srSaveConfig()">校验并保存</button>
+          <button class="btn btn-success btn-sm" id="sr-config-save" disabled onclick="srSaveConfig()">校验并保存</button>
           <button class="btn btn-sm" onclick="srLoadConfig()">重新加载</button>
           <span class="hint">保存前自动校验，校验失败不会覆盖当前配置。</span>
         </div>
-        <div class="hint">配置包含私有订阅地址和凭据，请勿截图或直接分享。</div><div class="config-state" id="sr-config-state" role="status">配置已保存</div><textarea id="sr-config-text" aria-label="高级配置" spellcheck="false" oninput="configEdited()"></textarea>
+        <div class="hint">配置包含私有订阅地址和凭据，请勿截图或直接分享。</div><div class="config-state" id="sr-config-state" role="status">等待读取配置</div><textarea id="sr-config-text" disabled aria-label="高级配置" spellcheck="false" oninput="configEdited()"></textarea>
         <div class="card" style="margin-top:12px">
           <h3>软件更新</h3>
           <div class="toolbar">
@@ -804,9 +811,9 @@ body.bg {min-width:0!important}
 
 
 <dialog id="sr-rule-dialog" aria-labelledby="sr-rule-dialog-title"><h2 id="sr-rule-dialog-title">规则详情</h2><pre id="sr-rule-detail-text" class="rule-preview"></pre><div class="dialog-actions"><button class="btn" onclick="srElement('rule-dialog').close()">关闭</button></div></dialog>
-<dialog id="sr-rule-preview-dialog" aria-labelledby="sr-rule-preview-title"><h2 id="sr-rule-preview-title">确认规则更改</h2><p class="hint" id="sr-rule-preview-summary"></p><pre id="sr-rule-preview-text" class="rule-preview"></pre><p class="hint">确认后由路由器校验并保存；任一行格式有误将不保存。运行中的服务会重启以应用规则，可能短暂影响连接。</p><div class="dialog-actions"><button class="btn" onclick="srElement('rule-preview-dialog').close()">返回编辑</button><button type="button" class="btn btn-accent" id="sr-rule-preview-apply" onclick="applyRulePreview()">确认应用</button></div></dialog>
+<dialog id="sr-rule-preview-dialog" aria-labelledby="sr-rule-preview-title"><h2 id="sr-rule-preview-title">确认规则更改</h2><p class="hint" id="sr-rule-preview-summary"></p><pre id="sr-rule-preview-text" class="rule-preview"></pre><p class="hint">确认后由路由器校验并保存；任一行格式有误将不保存。<span id="sr-rule-preview-effect"></span></p><div class="dialog-actions"><button class="btn" onclick="srElement('rule-preview-dialog').close()">返回编辑</button><button type="button" class="btn btn-accent" id="sr-rule-preview-apply" onclick="applyRulePreview()">确认应用</button></div></dialog>
 
-<dialog id="sr-rule-export-dialog" aria-labelledby="sr-rule-export-title"><h2 id="sr-rule-export-title">导出规则</h2><p class="hint" id="sr-rule-export-count"></p><textarea id="sr-rule-export-text" readonly aria-label="导出的规则" spellcheck="false"></textarea><div class="dialog-actions"><button class="btn" onclick="srElement('rule-export-dialog').close()">关闭</button><button class="btn btn-accent" onclick="srCopyText(srElement('rule-export-text').value)">复制规则</button></div></dialog>
+<dialog id="sr-rule-export-dialog" aria-labelledby="sr-rule-export-title"><h2 id="sr-rule-export-title">导出全部规则</h2><p class="hint" id="sr-rule-export-count"></p><textarea id="sr-rule-export-text" readonly aria-label="导出的规则" spellcheck="false"></textarea><div class="dialog-actions"><button class="btn" onclick="srElement('rule-export-dialog').close()">关闭</button><button class="btn btn-accent" onclick="srCopyText(srElement('rule-export-text').value)">复制规则</button></div></dialog>
 
 <script>
 /* ══ API ═══════════════════════════════════════════════════════════ */
@@ -1187,6 +1194,10 @@ function dnsPolicyBody(){
   function number(id,min,max){var text=srElement(id).value.trim(),n=Number(text);if(!text||!Number.isInteger(n)||n<min||n>max)throw new Error('请核对缓存条数、TTL 和查询超时的范围。');return n;}
   return {dns:{direct_servers:lines('dns-direct'),proxy_servers:lines('dns-proxy'),bootstrap_servers:lines('dns-bootstrap'),direct_domains:lines('dns-domains'),strategy:srElement('dns-strategy').value,cache_enabled:srElement('dns-cache').value==='true',cache_capacity:number('dns-capacity',16,16384),cache_ttl:number('dns-ttl',0,86400),timeout_secs:number('dns-timeout',1,12)},ipv6_mode:srElement('ipv6-mode').value,revision:dnsPolicyRevision};
 }
+function reloadNetworkPolicy(){
+  if(dnsPolicyDirty && !confirm('放弃未保存的网络与 DNS 修改并重新加载？'))return;
+  loadNetworkPolicy();
+}
 function loadNetworkPolicy(done){
   if(dnsPolicyPending)return;
   var generation=++dnsPolicyGeneration;lockDnsPolicy(true);
@@ -1206,7 +1217,11 @@ function saveNetworkPolicy(){
   srElement('network-state').textContent='正在保存并应用网络策略…';
   function finish(d,failed){
     lockDnsPolicy(false);
-    if(!failed && !d.ok && !d.saved){networkPending=false;lockDnsPolicy(false);renderChrome();srElement('network-state').textContent=d.msg||'保存失败，表单修改已保留';srShowMsg(d.msg||'保存失败，请检查表单。','err');return;}
+    if(!d.ok && !d.saved){
+      networkPending=false;dnsPolicyDirty=true;lockDnsPolicy(false);renderChrome();
+      var message=d.msg||(failed?'保存结果未确认，草稿已保留。请重新加载核对。':'保存失败，草稿已保留。');
+      srElement('network-state').textContent=message;srShowMsg(message,'err');return;
+    }
     // Refresh both saved policy and runtime status before releasing mutation controls.
     loadNetworkPolicy(function(ok){
       var generation=++statusGeneration;
@@ -1583,9 +1598,16 @@ function saveSpeedTests() {
   try { sessionStorage.setItem('sr-speedtests-v1', JSON.stringify(savedSpeedTests)); }
   catch (e) { /* Measurement still works if browser storage is unavailable. */ }
 }
+var nodeLoadError = '';
 function srLoadNodes() {
+  function failed(d) {
+    SR_PAGE_LOADED.nodes = false;
+    nodeLoadError = (d && d.msg) || '节点读取失败，请刷新。';
+    renderNodes();
+  }
   srApi('node_details', null, function (d) {
-    if (d.ok === false || !Array.isArray(d.nodes)) { srShowMsg(d.msg || '节点加载失败，请重试。','err'); return; }
+    if (d.ok === false || !Array.isArray(d.nodes)) { failed(d); return; }
+    nodeLoadError = '';
     var previous = Object.create(null);
     (savedSpeedTests.results || []).forEach(function (entry) { previous[entry.key] = entry.latency; });
     SR_STATE.nodes.forEach(function (n,i) { if (SR_STATE.lat[i] != null) previous[nodeViewKey(n)] = SR_STATE.lat[i]; });
@@ -1599,10 +1621,15 @@ function srLoadNodes() {
     SR_STATE.activeNode = d.active || 0;
     renderNodes();
     renderChrome();
-  }, function () { SR_PAGE_LOADED['nodes'] = false; srElement('node-list').textContent = '加载失败，请点击刷新或重新打开此页。'; });
+  }, failed);
 }
 function renderNodes() {
   var el = srElement('node-list');
+  if (nodeLoadError) {
+    srElement('nodes-count').textContent = '未能读取';
+    el.textContent = nodeLoadError;
+    return;
+  }
   srElement('nodes-count').textContent = SR_STATE.nodes.length + ' 个节点';
   if (!SR_STATE.nodes.length) { el.innerHTML = '<div class="hint">还没有节点，请添加订阅或手动添加节点。</div>'; return; }
   var html = '';
@@ -1651,7 +1678,7 @@ function setNode(i) {
   if (nodeSwitchPending || !SR_STATE.nodes[i]) return;
   nodeSwitchPending = true; renderNodes();
   function complete() { nodeSwitchPending = false; renderNodes(); }
-  srApi('set_node', { index: i }, function (d) {
+  srApi('set_node', { index: i, expected_id: SR_STATE.nodes[i].test_id }, function (d) {
     complete(); toastResp(d);
     if (d.ok === false) return;
     srLoadNodes(); refreshStatus(true);
@@ -1769,8 +1796,9 @@ function addNode() {
   });
 }
 function delNode(i) {
-  if (!confirm('删除节点 ' + (SR_STATE.nodes[i] ? SR_STATE.nodes[i].name : '#' + i) + ' ?')) return;
-  srApi('del_node', { index: i }, function (d) {
+  var node = SR_STATE.nodes[i];
+  if (!node || !confirm('删除节点「' + node.name + '」？')) return;
+  srApi('del_node', { index: i, expected_id: node.test_id }, function (d) {
     toastResp(d);
     if (d.ok !== false) { srLoadNodes(); refreshStatus(); }
   });
@@ -1778,10 +1806,14 @@ function delNode(i) {
 
 /* ══ Subscriptions ═════════════════════════════════════════════════ */
 function srLoadSubs() {
+  function failed(d) {
+    SR_PAGE_LOADED.subs = false;
+    srElement('sub-list').textContent = (d && d.msg) || '订阅读取失败，请刷新。';
+  }
   restoreSubscriptionJob();
   srApi('subscriptions', null, function (d) {
     var el = srElement('sub-list');
-    if (d.ok === false || !Array.isArray(d.subs)) { srShowMsg(d.msg || '订阅加载失败，请重试。','err'); return; }
+    if (d.ok === false || !Array.isArray(d.subs)) { failed(d); return; }
     var subs = d.subs;
     SR_STATE.subs = subs;
     if (!subs.length) { el.innerHTML = '<div class="hint">还没有订阅，请先添加订阅。</div>'; return; }
@@ -1797,7 +1829,7 @@ function srLoadSubs() {
         '<button class="btn btn-danger btn-sm" onclick="event.stopPropagation();delSub(' + Number(s.index) + ')">删除</button>' +
         '</div>';
     }).join('');
-  }, function () { SR_PAGE_LOADED['subs'] = false; srElement('sub-list').textContent = '加载失败，请点击刷新或重新打开此页。'; });
+  }, failed);
 }
 function findSubscription(i) {
   return SR_STATE.subs.filter(function (sub) { return Number(sub.index) === Number(i); })[0];
@@ -1817,18 +1849,13 @@ function revealSubscriptionUrl() {
   srElement('sub-detail-url').textContent = sub && sub.url === inspectedSubUrl && srElement('sub-detail-reveal').checked ? sub.url : '已隐藏';
 }
 function renameSub(i) {
-  var subs = SR_STATE.subs || [];
-  var s = null;
-  for (var k = 0; k < subs.length; k++) {
-    if (subs[k].index === i) { s = subs[k]; break; }
-  }
-  if (!s) s = subs[i];
+  var s = findSubscription(i);
   if (!s) { srShowMsg('未找到该订阅', 'err'); return; }
   var next = prompt('重命名订阅', s.name || '');
   if (next === null) return;
   next = String(next).trim();
   if (!next) { srShowMsg('名称不能为空', 'err'); return; }
-  srApi('rename_sub', { index: i, name: next }, function (d) {
+  srApi('rename_sub', { index: i, expected_id: s.id, name: next }, function (d) {
     toastResp(d);
     if (d.ok !== false) srLoadSubs();
   });
@@ -2035,8 +2062,9 @@ function addSub() {
   startSubscriptionJob('add_sub', data);
 }
 function delSub(i) {
-  if (!confirm('删除订阅 #' + i + ' ?')) return;
-  srApi('del_sub', { index: i }, function (d) {
+  var sub = findSubscription(i);
+  if (!sub || !confirm('删除订阅「' + (sub.name || '未命名订阅') + '」及其专属节点？')) return;
+  srApi('del_sub', { index: i, expected_id: sub.id }, function (d) {
     toastResp(d);
     if (d.ok !== false) { srLoadSubs(); refreshStatus(); }
   });
@@ -2575,19 +2603,17 @@ function closeRuleCreateMenu() {
   srElement('rule-create-toggle').setAttribute('aria-expanded','false');syncWorkspaceTabs();
   srElement('rule-list-panel').hidden=!srElement('rule-create-menu').hidden || RULE_ADD_BASELINE!==null || RULE_ROW_BASELINE!==null || RULE_PRESET_GROUP!==null;
 }
-var ruleCreateMethod = 'blank';
 function openRuleGroupCreator(method) {
   if(ruleWorkspaceLocked())return;
   if(!discardRuleDraft())return;
   srElement('rule-add-panel').hidden=true;srElement('rule-edit-panel').hidden=true;
-  ruleCreateMethod = method || 'blank';
-  var preset = ruleCreateMethod === 'preset';
-  srElement('rule-preset-panel').hidden = !preset;
-  srElement('rule-group-creator').hidden = preset;
+  srElement('rule-new-method').value=method || 'blank';
+  srElement('rule-preset-panel').hidden=true;
+  srElement('rule-group-creator').hidden=false;
   srElement('rule-create-menu').hidden=false;
   srElement('rule-list-panel').hidden=true;
   srElement('rule-create-toggle').setAttribute('aria-expanded','true');syncWorkspaceTabs();
-  srElement(preset ? 'rule-preset' : 'rule-new-group-name').focus();
+  srElement('rule-new-group-name').focus();
 }
 function createRuleGroup() {
   if(ruleWorkspaceLocked())return;
@@ -2598,7 +2624,9 @@ function createRuleGroup() {
   resetRuleEditor();RULE_LOCAL_GROUPS.push(name);RULE_SELECTED_GROUP=name;
   srElement('rule-search').value='';srElement('rule-filter-target').value='';srElement('rule-filter-state').value='';srElement('rule-filter-scope').value='';
   closeRuleCreateMenu();srElement('rule-group-creator').hidden=true;srElement('rule-new-group-name').value='';
-  if(ruleCreateMethod === 'url')startRuleImport();
+  var method=srElement('rule-new-method').value;
+  if(method === 'url')startRuleImport();
+  else if(method === 'preset')startRulePresetAddition();
   else startRuleAddition();
 }
 function renderRuleAddMethod(method) {
@@ -3254,7 +3282,7 @@ function ruleApi(action, data, cb, errCb) {
   function reconcile(d,failed) {
     srLoadRules(function(fresh){
       rulePending=false;renderRuleBusy();
-      var message=failed?'请求未完成，已尝试读取保存结果；应用状态未确认，请结合诊断检查，勿重复提交。':d.ok===false?(d.msg||d.error_message||'规则更新失败；已重新读取保存状态。'):d.saved&&d.applied===false?'规则已保存；代理当前停止，下次启动后生效。':renaming?'设备名称已保存。':'规则已保存并完成状态核对。';
+      var message=failed?'请求未完成，已尝试读取保存结果；应用状态未确认，请结合诊断检查，勿重复提交。':d.ok===false?(d.msg||d.error_message||'规则更新失败；已重新读取保存状态。'):d.reload_pending?d.msg:d.saved&&d.applied===false?'规则已保存；代理当前停止，下次启动后生效。':renaming?'设备名称已保存。':'规则已保存并完成状态核对。';
       if(!fresh)message+=' 最新状态读取失败，当前为上次快照，请先刷新。';
       srElement('rule-operation-state').textContent=message;
       if(fresh&&!RULE_TRACE&&!RULE_TRACE_PENDING)srElement('rule-flow-query-state').textContent='已核对保存的配置，输入网站可重新检查规则判定。';
@@ -3355,9 +3383,15 @@ function setRuleGroupEnabled(enc, enabled) {
   });
 }
 function deleteRuleGroup(enc) {
-  var name = decodeURIComponent(enc) || '未分组';
-  if (!confirm('删除分组「' + name + '」内的全部规则及设备对该组的关联？')) return;
-  ruleApi('delete_rule_group', { group: decodeURIComponent(enc) }, function (d) {
+  if(ruleWorkspaceLocked())return;
+  var group=decodeURIComponent(enc), revision=RULE_RULE_REVISION;
+  var members=ruleGroupMembers(group);
+  if(!members.length)return;
+  var links=(SR_STATE.deviceBindings||[]).filter(function(link){return link.group===group && group!=='';});
+  var scopes=new Set(links.map(function(link){return link.source||'';}));
+  var impact=scopes.size?'，并解除 '+scopes.size+' 个设备或全局策略与该组的关联':'';
+  if (!confirm('删除「'+(group||'未分组')+'」内的 '+members.length+' 条规则'+impact+'？'))return;
+  ruleApi('delete_rule_group', {group:group, expected_revision:revision}, function (d) {
     toastResp(d);
   });
 }
@@ -3433,6 +3467,7 @@ function previewRuleChanges() {
   srElement('rule-preview-summary').textContent += ' 来源：'+(RULE_EDIT_GROUP !== null ? '保留每行 SOURCE 或原分组来源' : srElement('rule-source').value.trim() || (RULE_IMPORT_MODE?'由组绑定决定':'按组绑定、规则来源或兜底设置生效'))+'。';
   if (RULE_EDIT_GROUP !== null) srElement('rule-preview-summary').textContent += ' 未填写 ACTION 的行默认处理：'+(RULE_TARGET_LABEL[srElement('rule-target').value] || srElement('rule-target').value)+'。';
   if(RULE_IMPORT_MODE)srElement('rule-preview-summary').textContent+=' 本次追加到当前组；当前组内同类型、匹配内容和来源的已有规则跳过，不替换现有规则。';
+  srElement('rule-preview-effect').textContent = bulk ? '保存后热加载，新连接使用更新后的规则。' : '运行中的服务会重启以应用规则，可能短暂影响连接。';
   srElement('rule-preview-dialog').showModal();
 }
 function applyRulePreview() {
@@ -3564,9 +3599,10 @@ function exportRules() {
 }
 
 /* ══ Config ════════════════════════════════════════════════════════ */
-var savedConfigText = null, configSaving = false, configReadGeneration = 0;
+var savedConfigText = null, savedConfigRevision, configSaving = false, configReadGeneration = 0;
 function configEdited() {
   var dirty = srElement('config-text').value !== savedConfigText;
+  srElement('config-save').disabled = configSaving || savedConfigText === null || !dirty;
   srElement('config-state').textContent = dirty ? '有未保存的修改' : '配置已保存';
 }
 function srLoadConfig() {
@@ -3574,29 +3610,44 @@ function srLoadConfig() {
   var el = srElement('config-text');
   if (savedConfigText !== null && el.value !== savedConfigText && !confirm('放弃未保存的配置修改并重新加载？')) return;
   var before = el.value, generation = ++configReadGeneration;
+  function failed(d) {
+    if (generation !== configReadGeneration) return;
+    SR_PAGE_LOADED.config = false;
+    srElement('config-state').textContent = (d && d.msg) || '高级配置读取失败，请重新加载。';
+  }
   srApi('config', null, function (d) {
     if (generation !== configReadGeneration) return;
-    if (d.ok === false || typeof d.config_base64 !== 'string') { srShowMsg(d.msg || '配置加载失败，请重试。','err'); return; }
+    if (d.ok === false || typeof d.config_base64 !== 'string') { failed(d); return; }
     if (el.value !== before) { srShowMsg('加载期间已有新修改，未覆盖编辑内容；如需替换请重新加载。', 'info'); return; }
-    savedConfigText = b64utf8(d.config_base64); el.value = savedConfigText; configEdited();
-  });
+    savedConfigRevision = d.revision;
+    el.value = b64utf8(d.config_base64); savedConfigText = el.value; el.disabled = false; configEdited();
+  }, failed);
 }
 function srSaveConfig() {
   if (configSaving) return;
   if (savedConfigText === null) { srShowMsg('请先加载现有配置，再编辑保存。','err'); return; }
   var text = srElement('config-text').value;
+  if (text === savedConfigText) return;
   // Reads begun before this write are no longer an authoritative snapshot.
   ++configReadGeneration;
   configSaving = true; srElement('config-save').disabled = true;
   srElement('config-state').textContent = '正在校验并保存…';
-  function done() { configSaving = false; srElement('config-save').disabled = false; configEdited(); }
-  srApi('save_config', { config: utf8b64(text) }, function (d) {
-    if (d.ok !== false) savedConfigText = text;
-    done(); toastResp(d); setTimeout(refreshStatus, 800);
-  }, done);
+  function done() { configSaving = false; configEdited(); }
+  srApi('save_config', { config: utf8b64(text), expected_revision: savedConfigRevision }, function (d) {
+    if (d.ok !== false || d.saved) {
+      savedConfigText = text;
+      savedConfigRevision = d.revision;
+    }
+    done();
+    if (d.ok === false) srElement('config-state').textContent = d.msg || '保存失败，请检查配置。';
+    toastResp(d); setTimeout(refreshStatus, 800);
+  }, function () {
+    done();
+    srElement('config-state').textContent = '保存结果未确认，请保留草稿并重新加载核对。';
+  }, 60000);
 }
 window.addEventListener('beforeunload', function (event) {
-  if (ruleWorkspaceDirty() || srElement('config-text').value !== (savedConfigText === null ? '' : savedConfigText)) { event.preventDefault(); event.returnValue = ''; }
+  if (dnsPolicyDirty || ruleWorkspaceDirty() || srElement('config-text').value !== (savedConfigText === null ? '' : savedConfigText)) { event.preventDefault(); event.returnValue = ''; }
 });
 
 var pendingUpdateAsset = null;

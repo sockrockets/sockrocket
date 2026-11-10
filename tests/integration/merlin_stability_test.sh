@@ -43,6 +43,7 @@ YAML
     chmod +x "$SOCKROCKET_DIR/scripts/iptables.sh"
     printf '#!/bin/sh\nexit 0\n' > "$SOCKROCKET_BIN"
     chmod +x "$SOCKROCKET_BIN"
+    ipset() { return 1; }
     logger() { :; }
     nvram() { case "$2" in ipv6_service) echo disabled ;; lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; *) echo 192.168.1.1 ;; esac; }
     pidof() { :; }
@@ -558,6 +559,47 @@ test_policy_routing_staged_and_idempotent() {
 
 }
 
+test_hot_rule_sources() {
+    sed '/^case "\$1" in/,$d' "$ROOT/merlin/scripts/iptables.sh" > "$SANDBOX/firewall.sh"
+    . "$SANDBOX/firewall.sh"
+    SOCKROCKET_DIR="$SANDBOX/plugin"
+    SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
+    calls="$SANDBOX/kernel.calls"
+    # Only the first-packet selector is replaced. Model a failed load to
+    # ensure the previous source set remains visible to the live jump.
+    printf '#!/bin/sh\nprintf "192.0.2.1/32\\n0.0.0.0/0\\n"\n' > "$SOCKROCKET_DIR/sockrocket-cli"
+    ipset() {
+        echo "$*" >> "$calls"
+        case "$1" in
+            restore) cat > "$SANDBOX/staged"; return "$fail_restore" ;;
+            swap) cp "$SANDBOX/staged" "$SANDBOX/active" ;;
+        esac
+        return 0
+    }
+    iptables() {
+        echo "iptables $*" >> "$calls"
+        case "$*" in *"--line-numbers"*) printf '1 RETURN\n2 RETURN\n3 SOCKROCKET_DEVICES\n4 MARK\n';; esac
+        return 0
+    }
+    fail_restore=0
+    install_cn_flow || return 1
+    grep -q -- '-I SOCKROCKET_MANGLE 3 -m set --match-set sockrocket_cn dst -g SOCKROCKET_CN_FLOW' "$calls" || return 1
+    for proto in tcp udp; do
+        grep -q -- "-p $proto .* ! --ctstatus CONFIRMED -m set ! --match-set sockrocket_cn_sources src -j CONNMARK" "$calls" || return 1
+        grep -q -- "-p $proto -m conntrack --ctdir ORIGINAL -m connmark ! --mark .* -j MARK --set-mark $TUN_MARK" "$calls" || return 1
+    done
+    : > "$calls"
+    sync_cn_sources || return 1
+    grep -q ' 0.0.0.0/1$' "$SANDBOX/active" && grep -q ' 128.0.0.0/1$' "$SANDBOX/active" || return 1
+    if grep -q '^iptables\|^destroy sockrocket_cn' "$calls"; then return 1; fi
+    : > "$calls"
+    echo previous > "$SANDBOX/active"
+    fail_restore=1
+    if sync_cn_sources; then return 1; fi
+    check previous "$(cat "$SANDBOX/active")" 'failed import leaves previous scopes active'
+    grep -q '^destroy sr_cn_src_' "$calls" || return 1
+}
+
 test_proxy_endpoints_leave_directly() {
     sed '/^case "\$1" in/,$d' "$ROOT/merlin/scripts/iptables.sh" > "$SANDBOX/iptables-functions.sh"
     . "$SANDBOX/iptables-functions.sh"
@@ -954,5 +996,6 @@ run_test test_wan_reconnect_restores_rules_and_dns_safely
 run_test test_dhcpv6_prefix_change_reconciles_ipv6_without_ipv4_rebuild
 run_test test_reapply_respects_fail_open_and_clears_stale_ipv6_dns
 run_test test_policy_routing_staged_and_idempotent
+run_test test_hot_rule_sources
 run_test test_proxy_endpoints_leave_directly
 echo "$PASS stability scenarios passed"

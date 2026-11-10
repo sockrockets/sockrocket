@@ -130,6 +130,61 @@ detect_tun_dev() {
     return 1
 }
 
+# The CN shortcut is the only place where changing an IPv4 device scope
+# changes the packet path. Keep the lookup set separate from the destination
+# set; swap it only after every new network has been validated and added.
+CN_SOURCES=sockrocket_cn_sources
+CN_FLOW=SOCKROCKET_CN_FLOW
+# Owned conntrack bit for the CN shortcut. Other mark bits (firmware QoS,
+# multi-WAN) are preserved. The packet routing mark is still TUN_MARK.
+CN_DIRECT_BIT=0x40000000
+
+sync_cn_sources() (
+    local staged sources
+    staged="sr_cn_src_$$"
+    sources=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-rule-sources "$SOCKROCKET_CONF") || return 1
+    ipset create "$CN_SOURCES" hash:net family inet maxelem 65536 -exist || return 1
+    ipset create "$staged" hash:net family inet maxelem 65536 || return 1
+    trap 'ipset destroy "$staged" >/dev/null 2>&1 || :' 0
+    # hash:net cannot store /0; the two /1s represent the same network.
+    printf '%s\n' "$sources" | awk -v name="$staged" '
+        $1 == "0.0.0.0/0" {print "add", name, "0.0.0.0/1"; print "add", name, "128.0.0.0/1"; next}
+        NF {print "add", name, $1}
+    ' | ipset restore -exist || return 1
+    ipset swap "$staged" "$CN_SOURCES"
+)
+
+cn_flow_installed() {
+    iptables -t mangle -C "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null
+}
+
+install_cn_flow() {
+    local proto first
+    load_lan_scope && sync_cn_sources || return 1
+    iptables -t mangle -N "$CN_FLOW" 2>/dev/null || iptables -t mangle -F "$CN_FLOW" || return 1
+    for proto in tcp udp; do
+        # Only a new LAN flow picks a path from the current set. Established
+        # connections reuse that decision across all subsequent group edits.
+        iptables -t mangle -A "$CN_FLOW" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
+            -m conntrack ! --ctstatus CONFIRMED -j CONNMARK --set-xmark "0/$CN_DIRECT_BIT" || return 1
+        iptables -t mangle -A "$CN_FLOW" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
+            -m conntrack ! --ctstatus CONFIRMED -m set ! --match-set "$CN_SOURCES" src \
+            -j CONNMARK --or-mark "$CN_DIRECT_BIT" || return 1
+        # LAN replies to inbound port forwards must keep their return path.
+        iptables -t mangle -A "$CN_FLOW" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
+            -m conntrack --ctdir ORIGINAL -m connmark ! --mark "$CN_DIRECT_BIT/$CN_DIRECT_BIT" -j MARK --set-mark "$TUN_MARK" || return 1
+    done
+    # After private/node exceptions, before both device marks and the generic
+    # TUN mark. --goto returns to PREROUTING when CN_FLOW finishes.
+    first=$(iptables -t mangle -L "$MANGLE_CHAIN" --line-numbers -n) || return 1
+    first=$(printf '%s\n' "$first" | awk '$2 == "SOCKROCKET_DEVICES" || $2 == "MARK" {print $1;exit}')
+    if [ -n "$first" ]; then
+        iptables -t mangle -I "$MANGLE_CHAIN" "$first" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW"
+    else
+        iptables -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW"
+    fi
+}
+
 # Load (or reload) the CN ipset and insert the bypass rule into SOCKROCKET_MANGLE
 # just before the first MARK rule. Idempotent: safe to call standalone
 # (`ipset-on`) while the chain is live, or from do_start on a fresh chain.
@@ -138,6 +193,7 @@ do_ipset_start() {
     # (as spawned by the API bridge) lacks the `command` builtin, so the
     # usual `command -v ipset` guard fails with 127 even when ipset exists.
     ipset list >/dev/null 2>&1 || { err "ipset not available"; return 1; }
+    if cn_flow_installed; then sync_cn_sources; return $?; fi
     # ALWAYS recreate. `ipset create -exist` keeps the previous maxelem; an
     # older 4096-cap set silently truncated the expanded CN list (~6k+) and
     # CN destinations fell through to MARK → proxy.
@@ -163,20 +219,28 @@ do_ipset_start() {
         err "CN ipset truncated ($loaded/$want) — check maxelem"
         return 1
     fi
-    local mark_line
-    mark_line=$(iptables -t mangle -L "$MANGLE_CHAIN" --line-numbers -n 2>/dev/null \
-        | awk '/MARK/{print $1; exit}')
-    if [ -n "$mark_line" ]; then
-        iptables -t mangle -I "$MANGLE_CHAIN" "$mark_line" \
-            -m set --match-set "$IPSET_NAME" dst -j RETURN
-    else
-        iptables -t mangle -A "$MANGLE_CHAIN" \
-            -m set --match-set "$IPSET_NAME" dst -j RETURN
+    if ! install_cn_flow; then
+        do_ipset_stop
+        # Older kernels can lack xt_connmark. On startup the generic TUN path
+        # handles domestic destinations too, so keep routing available.
+        if [ "${1:-}" = startup ]; then
+            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn_via_tun" || return 1
+            info "CN acceleration unavailable; routing domestic connections through TUN"
+            return 0
+        fi
+        err "Could not install connection-aware CN acceleration"
+        return 1
     fi
+    rm -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
     ok "CN ipset direct applied ($IPSET_NAME, $loaded ranges)"
 }
 
 do_ipset_stop() {
+    rm -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
+    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null || true
+    iptables -t mangle -F "$CN_FLOW" 2>/dev/null || true
+    iptables -t mangle -X "$CN_FLOW" 2>/dev/null || true
+    ipset destroy "$CN_SOURCES" 2>/dev/null || true
     iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
     ipset destroy "$IPSET_NAME" 2>/dev/null || true
     ok "CN ipset direct removed"
@@ -797,7 +861,7 @@ proxy_endpoint_returns() {
 }
 
 flush_chains() {
-    rm -f "$SOCKROCKET_RUNTIME_DIR/node-endpoints"
+    rm -f "$SOCKROCKET_RUNTIME_DIR/node-endpoints" "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
     ipv6_guard_stop || return 1
     # Flush proxy chains only. NEVER flush SOCKROCKET_DNS here: firewall-start
     # (and every `iptables.sh start`) would wipe LAN :53 REDIRECT and never put
@@ -815,6 +879,10 @@ flush_chains() {
     iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
     iptables -t mangle -F SOCKROCKET_DEVICES 2>/dev/null || true
     iptables -t mangle -X SOCKROCKET_DEVICES 2>/dev/null || true
+    iptables -t mangle -F "$CN_FLOW" 2>/dev/null || true
+    iptables -t mangle -X "$CN_FLOW" 2>/dev/null || true
+    ipset destroy "$CN_SOURCES" 2>/dev/null || true
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
     info "Flushed existing Sockrocket proxy iptables chains"
 }
 
@@ -904,7 +972,7 @@ do_start() {
     # Optional: CN-range bypass BEFORE the MARK rules (hardware NAT for
     # domestic traffic). Gated by the cn_ipset_direct config toggle.
     if [ "$(get_conf cn_ipset_direct)" = "true" ]; then
-        do_ipset_start
+        do_ipset_start startup
     fi
     # Mark all other LAN-originated TCP+UDP; policy routing sends them into TUN.
     for proto in tcp udp; do
@@ -1125,8 +1193,8 @@ do_verify() {
         err "Fake-IP reverse route to TUN missing"
         errors=$((errors + 1))
     }
-    if [ "$(get_conf cn_ipset_direct)" = "true" ]; then
-        iptables -t mangle -L SOCKROCKET_MANGLE -n 2>/dev/null | grep -q "match-set $IPSET_NAME" || {
+    if [ "$(get_conf cn_ipset_direct)" = "true" ] && [ ! -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun" ]; then
+        cn_flow_installed || {
             err "cn_ipset_direct enabled but $IPSET_NAME bypass rule missing"
             errors=$((errors + 1))
         }
@@ -1149,12 +1217,17 @@ case "$1" in
     ipv6-guard) do_ipv6_guard ;;
     dns-start) do_dns_start ;;
     dns-stop)  do_dns_stop ;;
+    refresh-rule-sources)
+        if [ ! -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun" ]; then
+            cn_flow_installed && sync_cn_sources
+        fi
+        ;;
     ipset-on)  do_ipset_start ;;
     ipset-off) do_ipset_stop ;;
     status)  do_status ;;
     verify)  do_verify ;;
     *)
-        echo "Usage: $0 {start|stop|restart|ipv6-apply|ipv6-guard|dns-start|dns-stop|ipset-on|ipset-off|status|verify}"
+        echo "Usage: $0 {start|stop|restart|ipv6-apply|ipv6-guard|dns-start|dns-stop|ipset-on|ipset-off|refresh-rule-sources|status|verify}"
         exit 1
         ;;
 esac

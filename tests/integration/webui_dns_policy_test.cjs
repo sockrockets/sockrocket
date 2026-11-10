@@ -13,8 +13,11 @@ assert.match(el('network-state').textContent,/停止/);
 el('dns-timeout').value='';c.saveNetworkPolicy();assert.equal(requests.length,0,'empty numeric field must not become zero');
 el('dns-timeout').value='5';el('dns-direct').value='invalid://keep-this-draft';c.saveNetworkPolicy();
 assert.equal(el('network-save').disabled,true);c.saveNetworkPolicy();assert.equal(requests.length,1,'duplicate apply is suppressed');
-take('save_network_settings')[2]({ok:false,error_code:'dns_config_invalid',msg:'Invalid endpoint'});
+take('save_network_settings')[3]({ok:false,error_code:'dns_config_invalid',msg:'Invalid endpoint'});
 assert.equal(el('dns-direct').value,'invalid://keep-this-draft','validation failure preserves edits');assert.equal(c.networkPending,false);
+assert.equal(requests.length, 0, 'transport dispatches validation errors via the error callback; it must not reload the form');
+c.saveNetworkPolicy();take('save_network_settings')[3]({error_code:'timeout'});
+assert.equal(requests.length, 0);assert.equal(el('dns-direct').value,'invalid://keep-this-draft');
 el('dns-direct').value=dns.direct_servers[0];c.saveNetworkPolicy();take('save_network_settings')[2]({ok:true,saved:true,applied:false,msg:'Saved without starting'});
 assert.equal(c.networkPending,true);take('network_settings')[2]({...state,revision:'revision-2'});
 assert.equal(c.networkPending,true,'apply stays busy through authoritative runtime read');take('status')[2]({running:false});
@@ -27,3 +30,15 @@ c.loadNetworkPolicy();const stale=take('network_settings');c.networkPolicyEdited
 assert.equal(el('dns-direct').value,dns.direct_servers[0],'stale read does not overwrite edited form');
 for(const id of ['network','ipv6-mode','dns-direct','dns-proxy','dns-bootstrap','dns-strategy','dns-test-result']) assert.ok(source.includes('id="sr-'+(id==='network'?'page-network':id)+'"'));
 console.log('PASS: DNS defaults, required fields, stopped saves, stale edits, apply locking, error recovery and diagnostic privacy');
+
+el('dns-direct').value = 'udp://192.0.2.88:53';
+c.networkPolicyEdited();
+c.confirm = () => false;
+c.reloadNetworkPolicy();
+assert.equal(requests.length, 0, 'cancelled reload keeps the DNS draft');
+assert.equal(el('dns-direct').value, 'udp://192.0.2.88:53');
+c.confirm = () => true;
+c.reloadNetworkPolicy();
+take('network_settings')[2](state);
+assert.equal(c.dnsPolicyDirty, false);
+assert.equal(el('dns-direct').value, dns.direct_servers[0]);

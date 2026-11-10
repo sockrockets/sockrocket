@@ -239,7 +239,7 @@ async fn async_main() -> Result<()> {
         set_route_journal_path(dir.join("tun-routes.yaml"));
         sockrocket_core::emergency_restore_routes();
     }
-    let config = load_config(&config_path)
+    let (config, loaded_hash) = load_config(&config_path)
         .await
         .with_context(|| format!("failed to load config from {}", config_path))?;
 
@@ -541,10 +541,11 @@ async fn async_main() -> Result<()> {
 
     // Hot-reload: poll config.yaml for edits and apply the runtime-changeable
     // parts without rebinding the listeners.
-    let mut config_watcher = ConfigWatcher::spawn(
+    let mut config_watcher = ConfigWatcher::spawn_with_hash(
         &config_path,
         &config,
         std::time::Duration::from_millis(2500),
+        loaded_hash,
     );
 
     let diagnostic_stats = service.stats().clone();
@@ -1075,7 +1076,7 @@ fn init_config(path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn load_config(path: &str) -> Result<AppConfig> {
+async fn load_config(path: &str) -> Result<(AppConfig, u64)> {
     let content = fs::read_to_string(path)?;
     let parsed =
         AppConfig::from_yaml_str(&content).with_context(|| format!("parse config {}", path))?;
@@ -1116,7 +1117,7 @@ async fn load_config(path: &str) -> Result<AppConfig> {
         normalize_node_names(&mut config.nodes);
         config
     };
-    Ok(config)
+    Ok((config, sockrocket_core::config_content_hash(&content)))
 }
 
 /// Merge subscription-fetched nodes into the config and normalize names.

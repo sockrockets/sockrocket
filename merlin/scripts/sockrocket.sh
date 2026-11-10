@@ -1134,6 +1134,10 @@ restore_direct_network() {
         iptables -X SOCKROCKET_UDP_GUARD 2>/dev/null || true
         iptables -t mangle -F SOCKROCKET_DEVICES 2>/dev/null || true
         iptables -t mangle -X SOCKROCKET_DEVICES 2>/dev/null || true
+        iptables -t mangle -F SOCKROCKET_CN_FLOW 2>/dev/null || true
+        iptables -t mangle -X SOCKROCKET_CN_FLOW 2>/dev/null || true
+        ipset destroy sockrocket_cn_sources 2>/dev/null || true
+        ipset destroy sockrocket_cn 2>/dev/null || true
         iptables -t nat -D PREROUTING -j SOCKROCKET_DNS 2>/dev/null || true
         iptables -t nat -F SOCKROCKET_DNS 2>/dev/null || true
         iptables -t nat -X SOCKROCKET_DNS 2>/dev/null || true
@@ -2240,6 +2244,10 @@ do_watchdog() {
         fi
     fi
 
+    if [ -f "$SOCKROCKET_DIR/.rule_sources_pending" ]; then
+        do_refresh_rule_sources || log_warn "Device scopes for CN acceleration are still pending"
+    fi
+
     # After any fail-open, try to put the proxy path back once healthy.
     try_recover_lan_proxy
 
@@ -2248,6 +2256,15 @@ do_watchdog() {
 
 do_api_restart() { do_api_stop && do_api_start; }
 do_network_restore() { restore_direct_network || return 1; ok "Direct network restored"; }
+
+do_refresh_rule_sources() {
+    # Startup/recovery installs the latest set when LAN capture resumes.
+    if [ ! -f "$SOCKROCKET_DIR/stopped" ] && [ ! -f "$DEGRADED_FILE" ] && is_running &&
+        [ "$(conf_bool transparent_proxy true)" = true ] && [ "$(conf_bool cn_ipset_direct false)" = true ]; then
+        "$SOCKROCKET_DIR/scripts/iptables.sh" refresh-rule-sources || return 1
+    fi
+    rm -f "$SOCKROCKET_DIR/.rule_sources_pending"
+}
 
 # Rebuild transparent proxy and DNS hijack for a new ipv6_mode while the
 # proxy process keeps running. A process exit is reserved for crashes: the
@@ -2357,6 +2374,12 @@ case "$1" in
         # running daemon. Guarantees direct LAN connectivity.
         run_locked 15 do_network_restore
         ;;
+    refresh-rule-sources)
+        run_locked 15 do_refresh_rule_sources || {
+            touch "$SOCKROCKET_DIR/.rule_sources_pending"
+            exit 1
+        }
+        ;;
     reapply-policy)
         run_locked 15 do_reapply_policy
         ;;
@@ -2377,7 +2400,7 @@ case "$1" in
         ;;
     diagnose)  cmd_diagnose ;;
     *)
-        echo "Usage: $0 {boot|start|stop|restart|reload|status|software-center-status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|ensure-sshd|dns-on|dns-off|pin-dns|proxy-off|network-restore|reapply-policy|recover|firewall-restore|nat-restore|kill-half-dead}"
+        echo "Usage: $0 {boot|start|stop|restart|reload|status|software-center-status|log|diagnose|update-subs|watchdog|api-start|api-stop|api-restart|ensure-tun|ensure-sshd|dns-on|dns-off|pin-dns|proxy-off|network-restore|refresh-rule-sources|reapply-policy|recover|firewall-restore|nat-restore|kill-half-dead}"
         exit 1
         ;;
 esac

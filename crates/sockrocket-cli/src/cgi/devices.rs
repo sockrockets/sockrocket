@@ -355,12 +355,12 @@ pub(super) fn save_alias(post: &J) -> J {
             },
         );
     }
-    if let Ok(mut map) = load_conf() {
-        if let Some(Y::Sequence(removed)) = map.get_mut(ykey("removed_device_sources")) {
-            removed.retain(|v| v.as_str() != Some(&source));
-            if save_conf(&map).is_err() {
-                return err_msg("设备名称恢复失败");
-            }
+    if let Ok(mut map) = load_conf()
+        && let Some(Y::Sequence(removed)) = map.get_mut(ykey("removed_device_sources"))
+    {
+        removed.retain(|v| v.as_str() != Some(&source));
+        if save_conf(&map).is_err() {
+            return err_msg("设备名称恢复失败");
         }
     }
     let path = sockrocket_dir().join("device-aliases.json");
