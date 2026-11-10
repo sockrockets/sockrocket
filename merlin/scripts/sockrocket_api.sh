@@ -10,7 +10,7 @@ ACTION="${2:-$1}"
 SEQ="$3"
 ENCODING=raw
 respond() {
-    curl --max-time 3 -fsS -X POST --data "$ID" "http://127.0.0.1:3030/_resp/$ID" >/dev/null 2>&1 || true
+    curl --max-time 3 -fsS -X POST --data "${1:-$ID}" "http://127.0.0.1:3030/_resp/$ID" >/dev/null 2>&1 || true
 }
 # New clients pass a cryptographic nonce; retain compatibility with old pages.
 if [ -n "$SEQ" ]; then
@@ -36,6 +36,30 @@ fi
 case "$ACTION" in ''|*[!a-z_]* ) respond; exit 1 ;; esac
 mkdir -p "$UPLOAD_DIR" "$RUNTIME_DIR" || exit 1
 RESULT="$UPLOAD_DIR/sockrocket_rpc_${SEQ}.json"
+BODY="$RUNTIME_DIR/rule-body-$SEQ"
+# Abandoned page loads never apply partial rules. Expire their private files.
+for pending in "$RUNTIME_DIR"/rule-body-*; do
+    [ -f "$pending" ] || break
+    # Merlin BusyBox find lacks -mmin. Skip the active transfer.
+    [ "$pending" != "$BODY" ] || continue
+    modified=$(date -r "$pending" +%s 2>/dev/null) || continue
+    [ "$(( $(date +%s) - modified ))" -le 120 ] || rm -f "$pending"
+done
+if [ "$ACTION" = rpc_rule_part ]; then
+    reject_part() { respond 0; exit 1; }
+    offset=$4
+    case "$offset" in ''|*[!0-9]*) reject_part ;; esac
+    [ "${#SEQ}" = 32 ] && [ "${#offset}" -le 7 ] && [ "$offset" -lt 1398104 ] || reject_part
+    [ "$ENCODING" = base64 ] && [ -n "$ARGS" ] && [ "${#ARGS}" -le 2048 ] || reject_part
+    [ "$offset" -le "$((1398104 - ${#ARGS}))" ] || reject_part
+    if [ "$offset" = 0 ]; then
+        (set -C; : > "$BODY") || reject_part
+    fi
+    [ -f "$BODY" ] && [ "$(wc -c < "$BODY")" -eq "$offset" ] || reject_part
+    printf '%s' "$ARGS" >> "$BODY" || reject_part
+    respond
+    exit 0
+fi
 if [ "$ACTION" = rpc_ack ]; then
     rm -f "$RESULT"
     respond
@@ -46,8 +70,15 @@ find "$UPLOAD_DIR" -maxdepth 1 -name 'sockrocket_rpc_*.json' -mmin +2 -exec rm -
 RAW="$RUNTIME_DIR/response-$SEQ.$$"
 TEMP="$RUNTIME_DIR/result-$SEQ.$$"
 SLOT=""
-[ -n "$ARGS" ] || ARGS="{}"
-cleanup() { rm -f "$RAW" "$TEMP"; [ -z "$SLOT" ] || rm -rf "$SLOT"; }
+missing_body=false
+[ -n "$ARGS" ] || { missing_body=true; ARGS="{}"; }
+staged=""
+if [ "$ACTION" = batch_add_rules ] && [ -n "$4" ]; then
+    # Only one final request can claim the complete preview for this nonce.
+    staged="$RUNTIME_DIR/rule-body-$SEQ.claimed.$$"
+    mv "$BODY" "$staged" 2>/dev/null || :
+fi
+cleanup() { [ -z "$staged" ] || rm -f "$staged"; rm -f "$RAW" "$TEMP"; [ -z "$SLOT" ] || rm -rf "$SLOT"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -71,11 +102,24 @@ for n in $slots; do
 done
 # The dbus body is a new request; inherited HTTP CONTENT_LENGTH must not
 # truncate its JSON when forwarding to the CGI backend.
-if [ -z "$SLOT" ]; then
+request_body() {
+    if [ -n "$staged" ]; then cat "$staged"; else printf '%s' "$ARGS"; fi
+}
+valid_staged_body() {
+    case "$4" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#4}" -le 7 ] && [ "$4" -gt 0 ] && [ "$4" -le 1398104 ] &&
+        [ -f "$staged" ] && [ "$(wc -c < "$staged")" -eq "$4" ]
+}
+if [ -n "$staged" ]; then ENCODING=base64; fi
+if [ -n "$staged" ] && ! valid_staged_body "$@"; then
+    printf '{"ok":false,"msg":"规则预览未完整传送，请保留预览并重试。"}' > "$TEMP"
+elif [ "$ACTION" = batch_add_rules ] && [ -z "$staged" ] && [ "$missing_body" = true ]; then
+    printf '{"ok":false,"msg":"规则内容未传到路由器，请刷新插件页面后重新导入。"}' > "$TEMP"
+elif [ -z "$SLOT" ]; then
     printf '{"error":"Router busy; retry shortly","error_code":"busy"}' > "$TEMP"
 elif [ ! -x "$SOCKROCKET_BIN" ]; then
     printf '{"ok":false,"error":"Backend executable unavailable","error_code":"backend_unavailable","stage":"invoke_backend","cause":"NotFound","hint":"通过软件中心重新安装适配机型的完整插件包。"}' > "$TEMP"
-elif printf '%s' "$ARGS" | SOCKROCKET_LOCAL_RPC=1 SOCKROCKET_RPC_ENCODING="$ENCODING" REQUEST_METHOD=POST CONTENT_LENGTH= QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi > "$RAW" 2>/dev/null; then
+elif request_body | SOCKROCKET_LOCAL_RPC=1 SOCKROCKET_RPC_ENCODING="$ENCODING" REQUEST_METHOD=POST CONTENT_LENGTH= QUERY_STRING="action=$ACTION" "$SOCKROCKET_BIN" cgi > "$RAW" 2>/dev/null; then
     sed '1,3d' "$RAW" > "$TEMP"
     [ -s "$TEMP" ] || printf '{"ok":false,"error":"Empty backend response","error_code":"backend_empty_response","stage":"invoke_backend","hint":"通过软件中心重新安装完整插件包，并刷新页面。"}' > "$TEMP"
 else

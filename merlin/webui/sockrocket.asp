@@ -598,7 +598,7 @@ body.bg {min-width:0!important}
             <div id="sr-rule-input-fields">
             <div id="sr-rule-import-panel" hidden>
               <div class="fg"><label for="sr-rule-import-url">规则列表链接</label><input type="url" id="sr-rule-import-url" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="https://example.com/rules.list"></div>
-              <div class="toolbar" style="margin-top:8px"><button class="btn btn-sm" id="sr-rule-import-fetch" onclick="fetchRuleList()">读取并预览</button><span class="hint" id="sr-rule-import-state" role="status" aria-live="polite"></span></div>
+              <div class="toolbar" style="margin-top:8px"><button type="button" class="btn btn-accent" id="sr-rule-import-fetch" onclick="fetchRuleList()">读取并预览</button><span class="hint" id="sr-rule-import-state" role="status" aria-live="polite"></span></div>
               <p class="hint">读取后可修改并预览，再追加到当前组。未指定出口的规则使用下方所选出口；注释和空行忽略，重复规则跳过。仅导入本次内容，不自动更新。</p>
             </div>
           <div class="form-grid adaptive-form" id="sr-rule-default-fields">
@@ -804,7 +804,7 @@ body.bg {min-width:0!important}
 
 
 <dialog id="sr-rule-dialog" aria-labelledby="sr-rule-dialog-title"><h2 id="sr-rule-dialog-title">规则详情</h2><pre id="sr-rule-detail-text" class="rule-preview"></pre><div class="dialog-actions"><button class="btn" onclick="srElement('rule-dialog').close()">关闭</button></div></dialog>
-<dialog id="sr-rule-preview-dialog" aria-labelledby="sr-rule-preview-title"><h2 id="sr-rule-preview-title">确认规则更改</h2><p class="hint" id="sr-rule-preview-summary"></p><pre id="sr-rule-preview-text" class="rule-preview"></pre><p class="hint">确认后由路由器校验并保存；任一行格式有误将不保存。运行中的服务会重启以应用规则，可能短暂影响连接。</p><div class="dialog-actions"><button class="btn" onclick="srElement('rule-preview-dialog').close()">返回编辑</button><button class="btn btn-accent" id="sr-rule-preview-apply" onclick="applyRulePreview()">确认应用</button></div></dialog>
+<dialog id="sr-rule-preview-dialog" aria-labelledby="sr-rule-preview-title"><h2 id="sr-rule-preview-title">确认规则更改</h2><p class="hint" id="sr-rule-preview-summary"></p><pre id="sr-rule-preview-text" class="rule-preview"></pre><p class="hint">确认后由路由器校验并保存；任一行格式有误将不保存。运行中的服务会重启以应用规则，可能短暂影响连接。</p><div class="dialog-actions"><button class="btn" onclick="srElement('rule-preview-dialog').close()">返回编辑</button><button type="button" class="btn btn-accent" id="sr-rule-preview-apply" onclick="applyRulePreview()">确认应用</button></div></dialog>
 
 <dialog id="sr-rule-export-dialog" aria-labelledby="sr-rule-export-title"><h2 id="sr-rule-export-title">导出规则</h2><p class="hint" id="sr-rule-export-count"></p><textarea id="sr-rule-export-text" readonly aria-label="导出的规则" spellcheck="false"></textarea><div class="dialog-actions"><button class="btn" onclick="srElement('rule-export-dialog').close()">关闭</button><button class="btn btn-accent" onclick="srCopyText(srElement('rule-export-text').value)">复制规则</button></div></dialog>
 
@@ -961,43 +961,71 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
   var fields = {};
   // Softcenter may shell-escape JSON quotes stored in fields. Encode UTF-8
   // before dispatch so Chinese names, URLs and rule text arrive byte-for-byte.
-  fields['sockrocket_rpc_b64_' + seq] = utf8b64(JSON.stringify(data || {}));
+  var encoded = utf8b64(JSON.stringify(data || {}));
+  var chunked = action === 'batch_add_rules' && encoded.length > 2048;
+  if (chunked && encoded.length > 1398104) {
+    srShowMsg('单次导入内容超过 1 MiB，请减少规则后重试。','err');
+    if (errCb) errCb({error_code:'request_body_too_large'});
+    return;
+  }
+  if (!chunked) fields['sockrocket_rpc_b64_' + seq] = encoded;
   var job = {
     id: Math.floor(Math.random() * 999999) + 1,
     method: 'sockrocket_api.sh',
     params: [action, seq],
     fields: fields
   };
-  var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/_api/', true);
-  xhr.setRequestHeader('X-Sockrocket-Request', '1');
-  xhr.setRequestHeader('Content-Type', 'application/json');
-  xhr.timeout = timeoutMs || 45000;
-  xhr.onload = function () {
-    if (xhr.status !== 200) {
-      srShowMsg('路由器接口请求失败（' + xhr.status + ')', 'err');
-      if (errCb) errCb({ error_code: 'http_error' });
-      return;
-    }
-    try {
-      var ack = JSON.parse(xhr.responseText);
-      if (String(ack.result) !== String(job.id)) throw new Error('dispatch rejected');
-    } catch (e) {
-      srShowMsg('路由器拒绝了接口请求', 'err');
-      if (errCb) errCb({ error_code: 'dispatch_error' });
-      return;
-    }
-    pollKscResult(seq, 0, cb, errCb, Date.now() + (timeoutMs || 80000));
-  };
-  xhr.ontimeout = function () {
-    srShowMsg('路由器接口请求超时', 'err');
-    if (errCb) errCb({ error_code: 'timeout' });
-  };
-  xhr.onerror = function () {
-    srShowMsg('无法连接路由器接口', 'err');
-    if (errCb) errCb({ error_code: 'network_error' });
-  };
-  xhr.send(JSON.stringify(job));
+  var deadline = Date.now() + (timeoutMs || 45000) + (chunked ? Math.ceil(encoded.length / 2048) * 1000 : 0);
+  function sendPacket(packet, done) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/_api/', true);
+    xhr.setRequestHeader('X-Sockrocket-Request', '1');
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.timeout = chunked ? Math.max(1, deadline - Date.now()) : (timeoutMs || 45000);
+    xhr.onload = function () {
+      if (xhr.status !== 200) {
+        srShowMsg('路由器接口请求失败（' + xhr.status + ')', 'err');
+        if (errCb) errCb({ error_code: 'http_error' });
+        return;
+      }
+      try {
+        var ack = JSON.parse(xhr.responseText);
+        if (String(ack.result) !== String(packet.id)) throw new Error('dispatch rejected');
+      } catch (e) {
+        srShowMsg('路由器拒绝了接口请求', 'err');
+        if (errCb) errCb({ error_code: 'dispatch_error' });
+        return;
+      }
+      done();
+    };
+    xhr.ontimeout = function () {
+      srShowMsg('路由器接口请求超时', 'err');
+      if (errCb) errCb({ error_code: 'timeout' });
+    };
+    xhr.onerror = function () {
+      srShowMsg('无法连接路由器接口', 'err');
+      if (errCb) errCb({ error_code: 'network_error' });
+    };
+    xhr.send(JSON.stringify(packet));
+  }
+  function commit() {
+    sendPacket(job, function () { pollKscResult(seq, 0, cb, errCb, Date.now() + (timeoutMs || 80000)); });
+  }
+  if (!chunked) { commit(); return; }
+  // Small firmware requests stage the exact edited preview. Only the final
+  // request can apply rules, keeping the batch atomic across all chunks.
+  job.params.push(String(encoded.length));
+  function stage(offset) {
+    if (offset === encoded.length) { commit(); return; }
+    if (Date.now() >= deadline) { if (errCb) errCb({error_code:'timeout'}); return; }
+    var part = encoded.slice(offset, offset + 2048);
+    var values = {};
+    values['sockrocket_rpc_b64_' + seq] = part;
+    sendPacket({id:Math.floor(Math.random()*999999)+1, method:job.method,
+      params:['rpc_rule_part',seq,String(offset)], fields:values},
+      function () { stage(offset + part.length); });
+  }
+  stage(0);
 }
 
 function pollKscResult(seq, tries, cb, errCb, deadline) {

@@ -59,3 +59,20 @@ const encoded=JSON.parse(requests.at(-1).body).fields;
 const stored=Object.values(encoded)[0].replace(/\\/g,'\\\\').replace(/"/g,'\\"');
 assert.deepEqual(JSON.parse(Buffer.from(stored,'base64').toString('utf8')),payload);
 console.log('PASS: UTF-8 JSON survives Softcenter field escaping');
+
+const preview={text:'DOMAIN,edited.invalid,DIRECT\n'.repeat(185),group:'测试'};
+context.apiKscRequest('batch_add_rules',preview,()=>{});
+let staged='',packet=JSON.parse(requests.at(-1).body);
+const transfer=packet.params[1];
+while(packet.params[0]==='rpc_rule_part'){
+  assert.deepEqual(packet.params,['rpc_rule_part',transfer,String(staged.length)]);
+  const part=packet.fields['sockrocket_rpc_b64_'+transfer];
+  assert.ok(part.length>0 && part.length<=2048);
+  staged+=part;
+  requests.at(-1).reply(200,JSON.stringify({result:packet.id}));
+  packet=JSON.parse(requests.at(-1).body);
+}
+assert.deepEqual(JSON.parse(Buffer.from(staged,'base64').toString()),preview);
+assert.deepEqual(packet.params,['batch_add_rules',transfer,String(staged.length)]);
+assert.deepEqual(packet.fields,{});
+console.log('PASS: edited URL preview is staged in order and committed once');
