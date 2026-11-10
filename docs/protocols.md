@@ -47,6 +47,27 @@ VLESS Vision, AnyTLS, Hysteria2 and WireGuard. The Xray cases exercise VLESS
 XHTTP and Trojan gRPC TunMulti. The cases in `reference_protocols` import a sing-box outbound,
 establish a TCP stream and check two UDP request/reply pairs of different lengths.
 
+The ARM64 Merlin run used sing-box 1.14.3, Mihomo 1.19.31 and Xray
+26.10.31 on the router with loopback echo destinations. All 29 reference
+cases passed. The table records coverage of that run. An empty cell indicates
+that this suite did not run that client/server pairing.
+
+| Native outbound | sing-box peer | Mihomo peer | Xray peer |
+| --- | --- | --- | --- |
+| Shadowsocks | AES-128-GCM | | |
+| VMess | Auto, AES, ChaCha, none, zero, padding and authenticated length | | |
+| VLESS | Vision, TCP and XUDP | | XHTTP, TLS and REALITY |
+| Trojan | TLS, gRPC Tun, HTTPUpgrade | | gRPC TunMulti |
+| TUIC v5 | Native, reliable QUIC, UoT v1/v2 | All four UDP modes | |
+| Hysteria2 | Plain, Salamander, Gecko, two-port hopping | | |
+| AnyTLS | TCP, UoT, idle-session reuse | | |
+| WireGuard | TCP, UDP, reserved bytes | | |
+
+Two additional tests on Merlin verified TUIC transmission before completion
+of a resumed handshake and WireGuard longest-prefix routing across overlapping
+peers. The WireGuard test also checked the configured source port and reserved
+bytes on outgoing packets.
+
 The HTTPUpgrade client passes raw bytes after a validated HTTP 101. The gRPC
 client opens one flow-controlled HTTP/2 connection per stream and supports
 `service_name`, `authority` and Xray's `multiMode`. Connection reuse and
