@@ -99,6 +99,7 @@ type Registry = Arc<Mutex<HashMap<u32, Channel>>>;
 pub(super) struct Hub {
     connection: quinn::Connection,
     protocol: Protocol,
+    reliable: bool,
     sessions: Registry,
     next: AtomicU32,
     task: tokio::task::JoinHandle<()>,
@@ -110,24 +111,45 @@ impl Drop for Hub {
 }
 impl Hub {
     pub fn new(connection: quinn::Connection, protocol: Protocol) -> Arc<Self> {
+        Self::with_relay(connection, protocol, false)
+    }
+    pub fn with_relay(
+        connection: quinn::Connection,
+        protocol: Protocol,
+        reliable: bool,
+    ) -> Arc<Self> {
         let sessions: Registry = Arc::new(Mutex::new(HashMap::new()));
         let registry = sessions.clone();
         let conn = connection.clone();
         let task = tokio::spawn(async move {
-            let mut batch = 0;
-            while let Ok(packet) = conn.read_datagram().await {
-                if let Ok(fragment) = decode(protocol, &packet) {
-                    let mut channels = registry.lock().unwrap();
-                    if let Some(channel) = channels.get_mut(&fragment.session)
-                        && let Ok(Some(packet)) = channel.assembly.assemble(fragment)
-                    {
-                        channel.deliver(packet);
+            if reliable {
+                // A slow or incomplete stream must not block other associations.
+                let mut reads = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        stream = conn.accept_uni(), if reads.len() < 16 => {
+                            let Ok(mut stream) = stream else { break };
+                            reads.spawn(async move {
+                                tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(65535 + 269)).await
+                            });
+                        }
+                        packet = reads.join_next(), if !reads.is_empty() => {
+                            if let Some(Ok(Ok(Ok(bytes)))) = packet {
+                                deliver(&registry, protocol, &bytes);
+                            }
+                        }
+                        _ = conn.closed() => break,
                     }
                 }
-                batch += 1;
-                if batch == 16 {
-                    batch = 0;
-                    tokio::task::yield_now().await;
+            } else {
+                let mut batch = 0;
+                while let Ok(packet) = conn.read_datagram().await {
+                    deliver(&registry, protocol, &packet);
+                    batch += 1;
+                    if batch == 16 {
+                        batch = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
             registry.lock().unwrap().clear();
@@ -135,6 +157,7 @@ impl Hub {
         Arc::new(Self {
             connection,
             protocol,
+            reliable,
             sessions,
             next: AtomicU32::new(rand::random()),
             task,
@@ -146,7 +169,7 @@ impl Hub {
     }
     pub fn associate(self: &Arc<Self>, host: &str, port: u16) -> Result<BoxDatagram> {
         ensure!(
-            self.connection.max_datagram_size().is_some(),
+            self.reliable || self.connection.max_datagram_size().is_some(),
             "Server did not enable QUIC datagrams"
         );
         let address = address(self.protocol, host, port)?;
@@ -170,6 +193,16 @@ impl Hub {
             packet: AtomicU16::new(rand::random()),
             received: tokio::sync::Mutex::new(rx),
         }))
+    }
+}
+fn deliver(registry: &Registry, protocol: Protocol, bytes: &[u8]) {
+    if let Ok(fragment) = decode(protocol, bytes) {
+        let mut channels = registry.lock().unwrap();
+        if let Some(channel) = channels.get_mut(&fragment.session)
+            && let Ok(Some(packet)) = channel.assembly.assemble(fragment)
+        {
+            channel.deliver(packet);
+        }
     }
 }
 struct Session {
@@ -247,6 +280,23 @@ impl Datagram for Session {
     fn send<'a>(&'a self, packet: &'a [u8]) -> DatagramFuture<'a, ()> {
         Box::pin(async move {
             ensure!(packet.len() <= 65535, "UDP payload too large");
+            if self.hub.reliable {
+                let id = self.packet.fetch_add(1, Ordering::Relaxed);
+                let prefix = header(
+                    self.hub.protocol,
+                    self.id,
+                    id,
+                    0,
+                    1,
+                    &self.address,
+                    packet.len(),
+                );
+                let mut stream = self.hub.connection.open_uni().await?;
+                stream.write_all(&prefix).await?;
+                stream.write_all(packet).await?;
+                stream.finish()?;
+                return Ok(());
+            }
             let max = self
                 .hub
                 .connection
@@ -268,7 +318,11 @@ impl Datagram for Session {
                     id,
                     index as u8,
                     total as u8,
-                    &self.address,
+                    if index > 0 && matches!(self.hub.protocol, Protocol::Tuic) {
+                        &[0xff]
+                    } else {
+                        &self.address
+                    },
                     data.len(),
                 );
                 frame.extend_from_slice(data);
@@ -397,6 +451,7 @@ fn decode(protocol: Protocol, frame: &[u8]) -> Result<Fragment<'_>> {
                 }
                 1 => 17,
                 2 => 29,
+                0xff if frame[7] > 0 => 11,
                 _ => bail!("Invalid TUIC address"),
             };
             (frame[7], frame[6], end, Some(len))

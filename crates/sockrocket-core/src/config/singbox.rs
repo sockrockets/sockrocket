@@ -38,18 +38,39 @@ struct SingBoxOutbound {
     method: Option<String>, // SS cipher
     flow: Option<String>,   // VLESS
 
+    #[serde(default)]
+    global_padding: bool,
+    #[serde(default)]
+    authenticated_length: bool,
+    security: Option<String>,
+    alter_id: Option<u32>,
+    obfs: Option<serde_json::Value>,
+    server_ports: Option<serde_json::Value>,
+    hop_interval: Option<String>,
+    hop_interval_max: Option<String>,
+    up_mbps: Option<u64>,
+    down_mbps: Option<u64>,
+
     // TUIC
     congestion_control: Option<String>,
     udp_relay_mode: Option<String>,
     #[serde(default)]
+    udp_over_stream: bool,
+    #[serde(default)]
     zero_rtt_handshake: bool,
     heartbeat: Option<String>,
+    idle_session_check_interval: Option<String>,
+    idle_session_timeout: Option<String>,
+    #[serde(default)]
+    min_idle_session: usize,
 
     // TLS
     tls: Option<SingBoxTls>,
 
     // Transport
     transport: Option<SingBoxTransport>,
+
+    network: Option<String>,
 
     // UDP
     #[serde(default)]
@@ -100,7 +121,8 @@ struct SingBoxTransport {
 
 /// Check if JSON content looks like a sing-box config.
 pub fn is_singbox_config(content: &str) -> bool {
-    (content.contains("\"outbounds\"") && content.contains("\"server_port\""))
+    (content.contains("\"outbounds\"")
+        && (content.contains("\"server_port\"") || content.contains("\"server_ports\"")))
         || content.contains("\"endpoints\"")
 }
 
@@ -146,13 +168,68 @@ pub fn parse_singbox_outbound(json_str: &str) -> Result<Option<Node>> {
     convert_singbox_outbound(&outbound)
 }
 
+// sing-box accepts Go duration strings, including compound and fractional units.
+// The timer and Mihomo's corresponding field have millisecond resolution.
+fn duration_millis(value: &str) -> Result<u64> {
+    let mut rest = value.strip_prefix('+').unwrap_or(value);
+    if rest == "0" {
+        return Ok(0);
+    }
+    anyhow::ensure!(!rest.is_empty(), "Empty duration");
+    let mut nanos = 0.0_f64;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .context("Missing heartbeat time unit")?;
+        let number: f64 = rest[..end].parse().context("Invalid duration")?;
+        rest = &rest[end..];
+        let (unit, scale) = [
+            ("ns", 1.),
+            ("us", 1e3),
+            ("µs", 1e3),
+            ("μs", 1e3),
+            ("ms", 1e6),
+            ("s", 1e9),
+            ("m", 60e9),
+            ("h", 3600e9),
+        ]
+        .into_iter()
+        .find(|(u, _)| rest.starts_with(u))
+        .context("Invalid heartbeat time unit")?;
+        nanos += number * scale;
+        rest = &rest[unit.len()..];
+    }
+    anyhow::ensure!(nanos <= i64::MAX as f64, "duration exceeds duration range");
+    Ok((nanos / 1e6).ceil() as u64)
+}
+
 fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
-    let udp = ob.udp.unwrap_or(false);
+    let udp = match ob.network.as_deref() {
+        None | Some("") => ob.udp.unwrap_or(true),
+        Some("tcp") => false,
+        Some("udp") if ob.outbound_type == "trojan" && ob.udp != Some(false) => true,
+        Some(_) => anyhow::bail!("Unsupported outbound network restriction"),
+    };
 
     let protocol = match ob.outbound_type.as_str() {
         "anytls" => ProxyProtocol::AnyTls {
             password: ob.password.clone().context("AnyTLS missing password")?,
-            udp: ob.udp.unwrap_or(true),
+            pool: AnyTlsPool {
+                check_interval_ms: ob
+                    .idle_session_check_interval
+                    .as_deref()
+                    .map(duration_millis)
+                    .transpose()?,
+                idle_timeout_ms: ob
+                    .idle_session_timeout
+                    .as_deref()
+                    .map(duration_millis)
+                    .transpose()?,
+                min_idle: ob.min_idle_session,
+                disable_reuse: false,
+            }
+            .checked()?,
+            udp,
         },
         "tuic" => {
             let uuid = ob.uuid.as_ref().context("TUIC missing uuid")?.clone();
@@ -164,11 +241,16 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
             let congestion_control = ob
                 .congestion_control
                 .clone()
-                .unwrap_or_else(|| "bbr".to_string());
+                .unwrap_or_else(|| "cubic".to_string());
             ProxyProtocol::Tuic {
                 uuid,
                 password,
                 congestion_control,
+                heartbeat_ms: ob.heartbeat.as_deref().map(duration_millis).transpose()?,
+                relay: TuicRelay::parse(
+                    ob.udp_relay_mode.as_deref(),
+                    ob.udp_over_stream.then_some(2),
+                )?,
                 udp,
             }
         }
@@ -178,7 +260,15 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
                 .as_ref()
                 .context("Hysteria2 missing password")?
                 .clone();
-            ProxyProtocol::Hysteria2 { password, udp }
+            let obfs: Option<Hy2Obfs> = ob.obfs.clone().map(serde_json::from_value).transpose()?;
+            if let Some(o) = &obfs {
+                o.validate()?;
+            }
+            ProxyProtocol::Hysteria2 {
+                password,
+                udp,
+                obfs,
+            }
         }
         "vless" => {
             let uuid = ob.uuid.as_ref().context("VLESS missing uuid")?.clone();
@@ -192,8 +282,8 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
             let uuid = ob.uuid.as_ref().context("VMess missing uuid")?.clone();
             ProxyProtocol::VMess {
                 uuid,
-                alter_id: 0,
-                cipher: "auto".to_string(),
+                alter_id: ob.alter_id.unwrap_or(0),
+                cipher: ob.security.clone().unwrap_or_else(|| "auto".into()),
                 udp,
             }
         }
@@ -237,7 +327,56 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
         );
     }
     let transport = build_singbox_transport(ob)?;
+    let mut extra = HashMap::new();
+    if ob.network.as_deref() == Some("udp") {
+        extra.insert(super::v2ray::UDP_ONLY.into(), "true".into());
+    }
+    if ob.outbound_type == "vmess" {
+        super::v2ray::vmess_framing_options(&mut extra, ob.global_padding, ob.authenticated_length);
+    }
+    let mut port = ob.server_port;
     if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
+        if let Some(list) = &ob.server_ports {
+            let items = match list {
+                serde_json::Value::Array(a) => a.as_slice(),
+                v => std::slice::from_ref(v),
+            };
+            let ports = items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(|p| p.replace(':', "-"))
+                        .context("Invalid Hysteria2 server port range")
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join(",");
+            port = ports
+                .split(['-', ','])
+                .next()
+                .context("Missing Hysteria2 port")?
+                .parse()?;
+            super::v2ray::validate_hysteria2_mport(&ports, port)?;
+            extra.insert(super::v2ray::HY2_MPORT.into(), ports);
+        }
+        for (value, field) in [
+            (&ob.hop_interval, super::v2ray::HY2_HOP_INTERVAL),
+            (&ob.hop_interval_max, super::v2ray::HY2_HOP_MAX),
+        ] {
+            if let Some(v) = value {
+                extra.insert(field.into(), duration_millis(v)?.to_string());
+            }
+        }
+        for (rate, key) in [
+            (ob.up_mbps, super::v2ray::HY2_UP),
+            (ob.down_mbps, super::v2ray::HY2_DOWN),
+        ] {
+            if let Some(rate) = rate {
+                extra.insert(
+                    key.into(),
+                    super::bandwidth::canonical_mbps(&rate.to_string())?,
+                );
+            }
+        }
         super::v2ray::validate_hysteria2_profile(transport.as_ref().and_then(|t| t.tls.as_ref()))?;
     }
 
@@ -250,12 +389,12 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
     Ok(Some(Node {
         name,
         server: ob.server.clone(),
-        port: ob.server_port,
+        port,
         protocol,
         transport,
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     }))
 }
 
@@ -282,8 +421,10 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
         && let Some(reality) = tls.reality.as_ref().filter(|r| r.enabled)
     {
         anyhow::ensure!(
-            tls.enabled && ob.transport.is_none() && ob.outbound_type == "vless",
-            "REALITY requires VLESS over raw TCP with TLS enabled"
+            tls.enabled
+                && ob.transport.is_none()
+                && matches!(ob.outbound_type.as_str(), "vless" | "trojan"),
+            "REALITY requires VLESS or Trojan over raw TCP with TLS enabled"
         );
         let public_key = reality
             .public_key
@@ -422,6 +563,39 @@ mod tests {
     }
 
     #[test]
+    fn anytls_idle_options_survive_import_save_and_export() {
+        let json = serde_json::json!({"type":"anytls","server":"example.invalid","server_port":443,"password":"local","idle_session_check_interval":"1m2s","idle_session_timeout":"8s","min_idle_session":6});
+        let node = parse_singbox_outbound(&json.to_string()).unwrap().unwrap();
+        let ProxyProtocol::AnyTls { pool, .. } = &node.protocol else {
+            panic!("expected AnyTLS")
+        };
+        assert_eq!(pool.check_interval_ms, Some(62000));
+        assert_eq!(pool.idle_timeout_ms, Some(8000));
+        assert_eq!(pool.min_idle, 6);
+        let yaml = crate::config::export::nodes_to_clash_yaml(std::slice::from_ref(&node)).unwrap();
+        let restored = crate::parse_clash_config(&yaml).unwrap().pop().unwrap();
+        let uri = crate::node_to_share_uri(&restored);
+        let from_uri = super::super::v2ray::parse_anytls_uri(&uri).unwrap();
+        assert_eq!(
+            serde_json::to_value(node.protocol).unwrap(),
+            serde_json::to_value(from_uri.protocol).unwrap()
+        );
+    }
+    #[test]
+    fn tuic_relay_modes_and_heartbeat_validate_on_import() {
+        assert_eq!(duration_millis("1m0.125s").unwrap(), 60125);
+        assert_eq!(duration_millis("250us").unwrap(), 1);
+        for invalid in ["", "30", "1hour", "-2s", "1.2.3s"] {
+            assert!(duration_millis(invalid).is_err());
+        }
+        let mut value = serde_json::json!({"type":"tuic","server":"example.invalid","server_port":443,"uuid":"00000000-0000-4000-8000-000000000001","password":"local","udp_relay_mode":"quic","udp_over_stream":true});
+        assert!(parse_singbox_outbound(&value.to_string()).is_err());
+        value["udp_over_stream"] = false.into();
+        value["udp_relay_mode"] = "invalid".into();
+        assert!(parse_singbox_outbound(&value.to_string()).is_err());
+    }
+
+    #[test]
     fn test_parse_singbox_tuic() {
         let json = r#"{
             "outbounds": [{
@@ -478,6 +652,8 @@ mod tests {
             "outbounds": [{
                 "type": "hysteria2",
                 "tag": "HY2-SG",
+                "up_mbps": 17,
+                "down_mbps": 83,
                 "server": "1.2.3.4",
                 "server_port": 443,
                 "password": "secret",
@@ -493,6 +669,8 @@ mod tests {
         let nodes = parse_singbox_config(json).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "HY2-SG");
+        assert_eq!(nodes[0].extra[super::super::v2ray::HY2_UP], "17");
+        assert_eq!(nodes[0].extra[super::super::v2ray::HY2_DOWN], "83");
         let tls = nodes[0].transport.as_ref().unwrap().tls.as_ref().unwrap();
         assert_eq!(tls.sni.as_deref(), Some("example.com"));
         assert!(!tls.skip_cert_verify);
@@ -532,6 +710,9 @@ mod tests {
         }"#;
         let node = parse_singbox_outbound(json).unwrap().unwrap();
         assert_eq!(node.name, "MY-1");
+        assert!(
+            matches!(&node.protocol, ProxyProtocol::Tuic { congestion_control, .. } if congestion_control == "cubic")
+        );
         let tls = node.transport.as_ref().unwrap().tls.as_ref().unwrap();
         assert_eq!(tls.sni.as_deref(), Some("sni.test.com"));
     }

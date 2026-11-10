@@ -61,20 +61,73 @@ fn finish(name: String, server: String, port: u16, config: WireguardConfig) -> R
         extra: Default::default(),
     })
 }
-fn reject_reserved(v: &Value) -> Result<()> {
-    if let Some(value) = v.get("reserved") {
-        ensure!(
-            value
-                .as_array()
-                .is_some_and(|a| a.len() == 3 && a.iter().all(|b| b.as_u64() == Some(0))),
-            "Non-standard WireGuard reserved bytes are not supported"
-        );
+fn reserved(value: &Value) -> Result<[u8; 3]> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    if let Some(encoded) = value.as_str() {
+        return STANDARD
+            .decode(encoded)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Expected three WireGuard reserved bytes"));
     }
-    Ok(())
+    serde_json::from_value(value.clone()).context("Expected three WireGuard reserved bytes")
+}
+// The primary peer remains in the original node fields for saved-config compatibility.
+fn import_peers(peers: &[Value], mut parse: impl FnMut(&Value) -> Result<Node>) -> Result<Node> {
+    ensure!(
+        (1..=64).contains(&peers.len()),
+        "Expected 1–64 WireGuard peers"
+    );
+    let mut node = parse(&peers[0])?;
+    let ProxyProtocol::Wireguard { config } = &mut node.protocol else {
+        unreachable!()
+    };
+    for peer in &peers[1..] {
+        let other = parse(peer)?;
+        let ProxyProtocol::Wireguard { config: c } = other.protocol else {
+            unreachable!()
+        };
+        config.additional_peers.push(WireguardPeer {
+            server: other.server,
+            port: other.port,
+            public_key: c.public_key,
+            preshared_key: c.preshared_key,
+            allowed_ips: c.allowed_ips,
+            persistent_keepalive: c.persistent_keepalive,
+            reserved: c.reserved,
+        });
+    }
+    crate::proxy::wireguard::WireguardOutbound::new(&node.server, node.port, config)?;
+    Ok(node)
 }
 pub(crate) fn from_clash(value: &serde_yaml::Value) -> Result<Node> {
-    let v = serde_json::to_value(value)?;
-    reject_reserved(&v)?;
+    let mut v = serde_json::to_value(value)?;
+    if let Some(list) = v.as_object_mut().and_then(|m| m.remove("peers")) {
+        return import_peers(
+            list.as_array().context("Invalid WireGuard peers")?,
+            |peer| {
+                let mut entry = v.clone();
+                for (k, v) in peer.as_object().context("Invalid WireGuard peer")? {
+                    if matches!(
+                        k.as_str(),
+                        "server"
+                            | "port"
+                            | "public-key"
+                            | "reserved"
+                            | "pre-shared-key"
+                            | "preshared-key"
+                            | "allowed-ips"
+                            | "persistent-keepalive"
+                    ) {
+                        entry[k] = v.clone();
+                    }
+                }
+                clash_entry(&entry)
+            },
+        );
+    }
+    clash_entry(&v)
+}
+fn clash_entry(v: &Value) -> Result<Node> {
     ensure!(
         v.get("amnezia-wg-option").is_none(),
         "AmneziaWG is not standard WireGuard"
@@ -109,7 +162,6 @@ pub(crate) fn from_clash(value: &serde_yaml::Value) -> Result<Node> {
     )
 }
 pub(crate) fn from_singbox(v: &Value) -> Result<Node> {
-    reject_reserved(v)?;
     ensure!(
         !v.get("system")
             .or_else(|| v.get("system_interface"))
@@ -123,18 +175,15 @@ pub(crate) fn from_singbox(v: &Value) -> Result<Node> {
             "WireGuard requires the userspace endpoint"
         );
     }
-    ensure!(
-        number(v, &["listen_port"])?.unwrap_or(0) == 0,
-        "A fixed local WireGuard listen port is not supported"
-    );
-    let peer = if let Some(peers) = v.get("peers") {
-        let peers = peers.as_array().context("Invalid WireGuard peers")?;
-        ensure!(peers.len() == 1, "Import one WireGuard peer per node");
-        &peers[0]
-    } else {
-        v
-    };
-    reject_reserved(peer)?;
+    if let Some(peers) = v.get("peers") {
+        return import_peers(
+            peers.as_array().context("Invalid WireGuard peers")?,
+            |peer| singbox_entry(v, peer),
+        );
+    }
+    singbox_entry(v, v)
+}
+fn singbox_entry(v: &Value, peer: &Value) -> Result<Node> {
     let config = WireguardConfig {
         private_key: required(v, &["private_key"])?,
         public_key: required(peer, &["public_key", "peer_public_key"])?,
@@ -157,11 +206,76 @@ pub(crate) fn from_singbox(v: &Value) -> Result<Node> {
         config,
     )
 }
+fn split_endpoint(endpoint: &str) -> Result<(String, u16)> {
+    let endpoint = url::Url::parse(&format!("wireguard://{endpoint}"))
+        .map_err(|_| anyhow::anyhow!("Invalid WireGuard peer endpoint"))?;
+    ensure!(
+        endpoint.username().is_empty()
+            && endpoint.password().is_none()
+            && endpoint.query().is_none()
+            && endpoint.fragment().is_none()
+            && matches!(endpoint.path(), "" | "/"),
+        "Invalid WireGuard peer endpoint fields"
+    );
+    let host = endpoint.host_str().context("Missing WireGuard host")?;
+    Ok((
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned(),
+        endpoint.port().context("Missing WireGuard port")?,
+    ))
+}
+
+pub(crate) fn from_xray(settings: &Value, tag: Option<&str>) -> Result<Node> {
+    let peers = settings
+        .get("peers")
+        .and_then(Value::as_array)
+        .context("Missing WireGuard peers")?;
+    import_peers(peers, |peer| xray_entry(settings, tag, peer))
+}
+fn xray_entry(settings: &Value, tag: Option<&str>, peer: &Value) -> Result<Node> {
+    let (host, port) = split_endpoint(&required(peer, &["endpoint"])?)?;
+    let mut addresses = strings(settings, &["address"])?
+        .unwrap_or_else(|| vec!["10.0.0.1".into(), "fd59:7153:2388:b5fd::1".into()]);
+    for address in &mut addresses {
+        if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+            address.push_str(if ip.is_ipv4() { "/32" } else { "/128" });
+        }
+    }
+    let mut config = WireguardConfig {
+        private_key: required(settings, &["secretKey"])?,
+        public_key: required(peer, &["publicKey"])?,
+        preshared_key: text(peer, &["preSharedKey"]),
+        local_addresses: addresses,
+        mtu: 1420,
+        dns: [
+            "1.1.1.1",
+            "1.0.0.1",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1001",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect(),
+        ..Default::default()
+    };
+    common(settings, &mut config)?;
+    common(peer, &mut config)?;
+    finish(tag.unwrap_or("WireGuard").into(), host, port, config)
+}
+
 fn common(v: &Value, c: &mut WireguardConfig) -> Result<()> {
-    if let Some(allowed) = strings(v, &["allowed_ips", "allowed-ips"])? {
+    if let Some(value) = v.get("reserved") {
+        c.reserved = Some(reserved(value)?).filter(|bytes| *bytes != [0; 3]);
+    }
+    if let Some(port) = number(v, &["listen_port", "listen-port"])? {
+        c.listen_port =
+            Some(u16::try_from(port).context("Invalid WireGuard listen port")?).filter(|p| *p != 0);
+    }
+    if let Some(allowed) = strings(v, &["allowed_ips", "allowed-ips", "allowedIPs"])? {
         c.allowed_ips = allowed;
     }
-    if let Some(dns) = strings(v, &["dns"])? {
+    if let Some(dns) = strings(v, &["dns", "remoteDNS"])? {
         c.dns = dns
             .iter()
             .map(|s| {
@@ -179,6 +293,7 @@ fn common(v: &Value, c: &mut WireguardConfig) -> Result<()> {
             "persistent_keepalive_interval",
             "persistent_keepalive",
             "persistent-keepalive",
+            "keepAlive",
         ],
     )? {
         c.persistent_keepalive = u16::try_from(keepalive).context("Invalid WireGuard keepalive")?;
@@ -207,6 +322,9 @@ pub fn parse_uri(uri: &str) -> Result<Node> {
                     | "allowedips"
                     | "dns"
                     | "mtu"
+                    | "peers"
+                    | "listenport"
+                    | "reserved"
                     | "keepalive"
                     | "udp"
             ),
@@ -249,6 +367,16 @@ pub fn parse_uri(uri: &str) -> Result<Node> {
                     .map_err(|_| anyhow::anyhow!("Invalid WireGuard DNS"))
             })
             .collect::<Result<_>>()?;
+    }
+    if let Some(value) = params.get("peers") {
+        config.additional_peers =
+            serde_json::from_str(value).context("Invalid WireGuard peer list")?;
+    }
+    if let Some(value) = params.get("listenport") {
+        config.listen_port = Some(value.parse()?).filter(|p| *p != 0);
+    }
+    if let Some(value) = params.get("reserved") {
+        config.reserved = Some(reserved(&json!(value))?);
     }
     if let Some(v) = params.get("mtu") {
         config.mtu = v.parse().context("Invalid WireGuard MTU")?;
@@ -295,6 +423,22 @@ pub fn share_uri(node: &Node, c: &WireguardConfig) -> String {
         ("keepalive", c.persistent_keepalive.to_string()),
         ("udp", if c.udp { "1" } else { "0" }.into()),
     ];
+    if !c.additional_peers.is_empty() {
+        params.push((
+            "peers",
+            serde_json::to_string(&c.additional_peers).expect("serializable peers"),
+        ));
+    }
+    if let Some(port) = c.listen_port {
+        params.push(("listenport", port.to_string()));
+    }
+    if let Some(bytes) = c.reserved {
+        use base64::Engine;
+        params.push((
+            "reserved",
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        ));
+    }
     if let Some(key) = &c.preshared_key {
         params.push(("presharedkey", key.clone()));
     }
@@ -313,7 +457,7 @@ pub fn parse_profile(text: &str) -> Result<Node> {
     let mut section = "";
     let mut interface = serde_json::Map::new();
     let mut peer = serde_json::Map::new();
-    let mut saw_peer = false;
+    let mut peers = Vec::new();
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -329,10 +473,12 @@ pub fn parse_profile(text: &str) -> Result<Node> {
         }
         if line == "[Peer]" {
             ensure!(
-                section == "interface" && !saw_peer,
-                "Import one WireGuard peer per profile"
+                section == "interface" || section == "peer",
+                "WireGuard peer requires a preceding Interface"
             );
-            saw_peer = true;
+            if section == "peer" {
+                peers.push(std::mem::take(&mut peer));
+            }
             section = "peer";
             continue;
         }
@@ -345,6 +491,7 @@ pub fn parse_profile(text: &str) -> Result<Node> {
             ("interface", "PrivateKey") => (&mut interface, "private_key"),
             ("interface", "Address") => (&mut interface, "local_address"),
             ("interface", "DNS") => (&mut interface, "dns"),
+            ("interface", "ListenPort") => (&mut interface, "listen_port"),
             ("interface", "MTU") => (&mut interface, "mtu"),
             ("peer", "PublicKey") => (&mut peer, "public_key"),
             ("peer", "PresharedKey") => (&mut peer, "pre_shared_key"),
@@ -360,34 +507,17 @@ pub fn parse_profile(text: &str) -> Result<Node> {
             "Duplicate WireGuard profile field"
         );
     }
-    let endpoint = peer
-        .remove("endpoint")
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .context("WireGuard peer endpoint is required")?;
-    let endpoint = url::Url::parse(&format!("wireguard://{endpoint}"))
-        .map_err(|_| anyhow::anyhow!("Invalid WireGuard peer endpoint"))?;
-    ensure!(
-        endpoint.username().is_empty()
-            && endpoint.query().is_none()
-            && endpoint.fragment().is_none()
-            && matches!(endpoint.path(), "" | "/"),
-        "Invalid WireGuard peer endpoint fields"
-    );
-    peer.insert(
-        "address".into(),
-        json!(
-            endpoint
-                .host_str()
-                .context("Missing WireGuard host")?
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-        ),
-    );
-    peer.insert(
-        "port".into(),
-        json!(endpoint.port().context("Missing WireGuard port")?),
-    );
-    interface.insert("peers".into(), json!([peer]));
+    peers.push(peer);
+    for peer in &mut peers {
+        let endpoint = peer
+            .remove("endpoint")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .context("WireGuard peer endpoint is required")?;
+        let (host, port) = split_endpoint(&endpoint)?;
+        peer.insert("address".into(), json!(host));
+        peer.insert("port".into(), json!(port));
+    }
+    interface.insert("peers".into(), json!(peers));
     from_singbox(&Value::Object(interface))
 }
 
@@ -438,6 +568,36 @@ mod tests {
         assert!(!format!("{config:?}").contains(&config.private_key));
     }
     #[test]
+    fn multi_peer_config_survives_share_and_clash_export() {
+        let mut node = node();
+        let ProxyProtocol::Wireguard { config } = &mut node.protocol else {
+            unreachable!()
+        };
+        config.listen_port = Some(43210);
+        config.reserved = Some([1, 2, 3]);
+        config.additional_peers.push(WireguardPeer {
+            server: "second.example.invalid".into(),
+            port: 12345,
+            public_key: STANDARD.encode([77; 32]),
+            preshared_key: None,
+            allowed_ips: vec!["198.51.100.0/24".into()],
+            persistent_keepalive: 17,
+            reserved: Some([4, 5, 6]),
+        });
+        let ProxyProtocol::Wireguard { config } = &node.protocol else {
+            unreachable!()
+        };
+        let share = parse_uri(&share_uri(&node, config)).unwrap();
+        let yaml = super::super::export::nodes_to_clash_yaml(std::slice::from_ref(&node)).unwrap();
+        let clash = super::super::clash::parse_clash_config(&yaml).unwrap();
+        for imported in [&share, &clash[0]] {
+            assert_eq!(
+                serde_json::to_value(&node.protocol).unwrap(),
+                serde_json::to_value(&imported.protocol).unwrap()
+            );
+        }
+    }
+    #[test]
     fn profile_and_singbox_endpoint_import_without_system_changes() {
         let node = node();
         let ProxyProtocol::Wireguard { config } = node.protocol else {
@@ -465,14 +625,14 @@ mod tests {
         assert!(from_singbox(&invalid).is_err());
     }
     #[test]
-    fn duplicate_parameters_and_nonstandard_reserved_bytes_fail_closed() {
+    fn duplicate_parameters_and_invalid_reserved_bytes_fail_closed() {
         let node = node();
         let ProxyProtocol::Wireguard { config } = &node.protocol else {
             unreachable!()
         };
         let uri = share_uri(&node, config).replace("#", "&mtu=1280#");
         assert!(parse_uri(&uri).is_err());
-        assert!(reject_reserved(&json!({"reserved":[1,0,0]})).is_err());
-        assert!(reject_reserved(&json!({"reserved":[0,0,0]})).is_ok());
+        assert!(reserved(&json!([256, 0, 0])).is_err());
+        assert!(reserved(&json!([1, 2, 3])).is_ok());
     }
 }

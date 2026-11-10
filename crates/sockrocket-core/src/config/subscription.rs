@@ -94,7 +94,7 @@ pub async fn fetch_subscription_report_with(
             continue;
         }
         if node.extra.contains_key(v2ray::HY2_MPORT) {
-            compatibility_notes.push("hysteria2_mport_fixed_port");
+            compatibility_notes.push("hysteria2_port_hopping");
         }
         let note = match v2ray::hysteria2_fingerprint(node) {
             Some("chrome" | "chrome115") => "hysteria2_chrome_quic_profile",

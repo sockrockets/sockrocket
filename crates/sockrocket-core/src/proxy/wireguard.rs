@@ -3,7 +3,7 @@ use super::{
     connector::{BoxProxyStream, Outbound},
     datagram::{BoxDatagram, Datagram, DatagramFuture},
 };
-use crate::config::model::WireguardConfig;
+use crate::config::model::{WireguardConfig, WireguardPeer};
 use anyhow::{Context as _, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
@@ -89,7 +89,23 @@ impl WireguardOutbound {
             "WireGuard requires 1–64 allowed networks"
         );
         // Parse into the library's peer type without exposing key material in errors.
-        let _ = Self::peer(config, None)?;
+        ensure!(
+            config.additional_peers.len() < 64,
+            "WireGuard peer limit exceeded"
+        );
+        let mut keys = std::collections::HashSet::new();
+        for peer in Self::peer_configs(server, port, config) {
+            ensure!(
+                !peer.server.is_empty() && peer.port != 0,
+                "Invalid WireGuard peer endpoint"
+            );
+            let parsed = Self::peer(&peer)?;
+            ensure!(
+                *parsed.public_key.as_bytes() != [0; 32]
+                    && keys.insert(*parsed.public_key.as_bytes()),
+                "Invalid or duplicate WireGuard peer key"
+            );
+        }
         ensure!(
             config.dns.len() <= 4
                 && config
@@ -105,9 +121,30 @@ impl WireguardOutbound {
             state: Mutex::new(Weak::new()),
         })
     }
-    fn peer(config: &WireguardConfig, endpoint: Option<SocketAddr>) -> Result<Peer> {
+    fn peer_configs<'a>(
+        server: &str,
+        port: u16,
+        c: &'a WireguardConfig,
+    ) -> impl Iterator<Item = WireguardPeer> + 'a {
+        let primary = WireguardPeer {
+            server: server.into(),
+            port,
+            public_key: c.public_key.clone(),
+            preshared_key: c.preshared_key.clone(),
+            allowed_ips: c.allowed_ips.clone(),
+            persistent_keepalive: c.persistent_keepalive,
+            reserved: c.reserved,
+        };
+        std::iter::once(primary).chain(c.additional_peers.iter().cloned())
+    }
+    fn peer(config: &WireguardPeer) -> Result<Peer> {
+        ensure!(
+            !config.allowed_ips.is_empty() && config.allowed_ips.len() <= 64,
+            "WireGuard requires 1–64 allowed networks per peer"
+        );
         Ok(Peer {
-            endpoint,
+            reserved: config.reserved.unwrap_or_default(),
+            endpoint: None,
             public_key: PublicKey::from(key(&config.public_key)?),
             preshared_key: config.preshared_key.as_deref().map(key).transpose()?,
             allowed_ips: config
@@ -136,21 +173,45 @@ impl WireguardOutbound {
             .clone()
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("WireGuard endpoint capacity reached"))?;
-        let peer_ip = match self.server.trim_matches(['[', ']']).parse::<IpAddr>() {
-            Ok(ip) => ip,
-            Err(_) => *super::transport::resolve_server_ips(&self.server)
-                .await
-                .context("WireGuard peer resolution failed")?
-                .first()
-                .context("WireGuard peer has no address")?,
-        };
-        let endpoint = SocketAddr::new(peer_ip, self.port);
-        let socket = std::net::UdpSocket::bind(if peer_ip.is_ipv4() {
-            "0.0.0.0:0"
+        let mut peers = Vec::with_capacity(self.config.additional_peers.len() + 1);
+        let mut allowed = Vec::new();
+        let mut v4 = false;
+        let mut v6 = false;
+        for spec in Self::peer_configs(&self.server, self.port, &self.config) {
+            let ip = match spec.server.trim_matches(['[', ']']).parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(_) => *super::transport::resolve_server_ips(&spec.server)
+                    .await
+                    .context("WireGuard peer resolution failed")?
+                    .first()
+                    .context("WireGuard peer has no address")?,
+            };
+            let mut peer = Self::peer(&spec)?;
+            peer.endpoint = Some(SocketAddr::new(ip, spec.port));
+            allowed.extend_from_slice(&peer.allowed_ips);
+            peers.push(peer);
+            v4 |= ip.is_ipv4();
+            v6 |= ip.is_ipv6();
+        }
+        let port = self.config.listen_port.unwrap_or(0);
+        let socket = if v6 {
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            socket.set_only_v6(!v4)?;
+            socket.bind(&SocketAddr::from(([0u16; 8], port)).into())?;
+            std::net::UdpSocket::from(socket)
         } else {
-            "[::]:0"
-        })?;
-        super::outbound_bind::apply_to_std_udp_socket(&socket, peer_ip.is_ipv6())?;
+            std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))?
+        };
+        if v4 {
+            super::outbound_bind::apply_to_std_udp_socket(&socket, false)?;
+        }
+        if v6 {
+            super::outbound_bind::apply_to_std_udp_socket(&socket, true)?;
+        }
         socket.set_nonblocking(true)?;
         let address = self
             .config
@@ -165,7 +226,7 @@ impl WireguardOutbound {
                 private_key: StaticSecret::from(key(&self.config.private_key)?),
                 mtu: Some(self.config.mtu),
             },
-            peers: vec![Self::peer(&self.config, Some(endpoint))?],
+            peers,
         };
         let mut options = Options::default();
         options.tcp.connect_timeout = CONNECT_TIMEOUT;
@@ -181,7 +242,7 @@ impl WireguardOutbound {
             flows: Arc::new(Semaphore::new(128)),
             dns: self.config.dns.clone(),
             mtu: self.config.mtu,
-            allowed: Self::peer(&self.config, None)?.allowed_ips,
+            allowed,
         });
         *cached = Arc::downgrade(&state);
         Ok(state)
@@ -411,7 +472,10 @@ mod tests {
         }
     }
     fn pair() -> (Server, WireguardOutbound) {
-        let server_private = StaticSecret::from([11; 32]);
+        test_peer(11, "203.0.113.2/32")
+    }
+    fn test_peer(key_byte: u8, local: &str) -> (Server, WireguardOutbound) {
+        let server_private = StaticSecret::from([key_byte; 32]);
         let client_private = StaticSecret::from([22; 32]);
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
@@ -422,11 +486,12 @@ mod tests {
             Config {
                 interface: tokio_wireguard::config::Interface {
                     private_key: server_private.clone(),
-                    address: "203.0.113.2/32".parse().unwrap(),
+                    address: local.parse().unwrap(),
                     listen_port: None,
                     mtu: Some(1280),
                 },
                 peers: vec![Peer {
+                    reserved: [0; 3],
                     public_key: PublicKey::from(&client_private),
                     preshared_key: Some([33; 32]),
                     endpoint: None,
@@ -450,6 +515,67 @@ mod tests {
             Server(interface),
             WireguardOutbound::new("127.0.0.1", port, &config).unwrap(),
         )
+    }
+    #[tokio::test]
+    async fn multi_peer_routes_use_longest_prefix_and_preserve_port_and_reserved_bytes() {
+        let (first, mut out) = pair();
+        let (second, other) = test_peer(44, "203.0.113.3/32");
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        out.config.listen_port = Some(client_port);
+        out.config.allowed_ips = vec!["0.0.0.0/0".into()];
+        out.config.additional_peers.push(WireguardPeer {
+            server: other.server,
+            port: other.port,
+            public_key: other.config.public_key,
+            preshared_key: other.config.preshared_key,
+            allowed_ips: vec!["203.0.113.3/32".into()],
+            reserved: Some([9, 8, 7]),
+            persistent_keepalive: 0,
+        });
+        let second_port = out.config.additional_peers[0].port;
+        out.config.additional_peers[0].port = probe.local_addr().unwrap().port();
+        let relay = tokio::spawn(async move {
+            let mut buf = [0; 2048];
+            loop {
+                let (n, source) = probe.recv_from(&mut buf).await.unwrap();
+                if source.port() == client_port {
+                    assert_eq!(&buf[1..4], &[9, 8, 7]);
+                    probe
+                        .send_to(&buf[..n], ("127.0.0.1", second_port))
+                        .await
+                        .unwrap();
+                } else {
+                    assert_eq!(source.port(), second_port);
+                    probe
+                        .send_to(&buf[..n], ("127.0.0.1", client_port))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let _state = out.endpoint().await.unwrap();
+        for (server, addr) in [(&first, "203.0.113.2"), (&second, "203.0.113.3")] {
+            let socket = UdpSocket::bind(format!("{addr}:8053").as_str(), &server.0)
+                .await
+                .unwrap();
+            let tunnel = out.udp(addr, 8053).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tunnel.send(b"test").await.unwrap();
+                let mut buf = [0; 32];
+                let (len, peer) = socket.recv_from(&mut buf[..]).await.unwrap();
+                socket.send_to(&buf[..len], peer).await.unwrap();
+                let len = tunnel.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"test");
+            })
+            .await
+            .unwrap();
+        }
+        relay.abort();
     }
     #[tokio::test]
     #[ignore = "requires checksum-verified SOCKROCKET_REFERENCE_SING_BOX test server"]
@@ -480,7 +606,7 @@ mod tests {
         let config = serde_json::json!({
             "log":{"level":"error"},
             "endpoints":[{"type":"wireguard","tag":"wg","system":false,"address":["203.0.113.2/32"],"private_key":STANDARD.encode(server_key.to_bytes()),"listen_port":port,"mtu":1280,"workers":1,
-                "peers":[{"public_key":STANDARD.encode(PublicKey::from(&client_key).as_bytes()),"pre_shared_key":STANDARD.encode([33;32]),"allowed_ips":["10.200.0.2/32"]}]}],
+                "peers":[{"public_key":STANDARD.encode(PublicKey::from(&client_key).as_bytes()),"pre_shared_key":STANDARD.encode([33;32]),"reserved":[7,8,9],"allowed_ips":["10.200.0.2/32"]}]}],
             "outbounds":[{"type":"direct","tag":"direct"}], "route":{"rules":[{"inbound":["wg"],"action":"route","outbound":"direct","override_address":"127.0.0.1"}],"final":"direct"}
         });
         let path = dir.join("server.json");
@@ -501,18 +627,19 @@ mod tests {
             reference.0.try_wait().unwrap().is_none(),
             "reference server exited"
         );
-        let out = WireguardOutbound::new(
-            "127.0.0.1",
-            port,
-            &WireguardConfig {
-                private_key: STANDARD.encode(client_key.to_bytes()),
-                public_key: STANDARD.encode(PublicKey::from(&server_key).as_bytes()),
-                preshared_key: Some(STANDARD.encode([33; 32])),
-                local_addresses: vec!["10.200.0.2/32".into()],
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let client = serde_json::json!({"outbounds":[{"protocol":"wireguard","settings":{
+            "secretKey": STANDARD.encode(client_key.to_bytes()), "address": ["10.200.0.2"],
+            "mtu": 1280, "reserved":[7,8,9], "remoteDNS": ["1.1.1.1"],
+            "peers":[{"endpoint":format!("127.0.0.1:{port}"), "publicKey":STANDARD.encode(PublicKey::from(&server_key).as_bytes()),
+                "preSharedKey":STANDARD.encode([33;32]), "allowedIPs":["203.0.113.2/32"], "keepAlive":10}]
+        }}]});
+        let nodes = crate::parse_v2ray_config(&client.to_string()).unwrap();
+        let node = &nodes[0];
+        let crate::ProxyProtocol::Wireguard { config } = &node.protocol else {
+            panic!("expected WireGuard")
+        };
+        assert_eq!(config.persistent_keepalive, 10);
+        let out = WireguardOutbound::new(&node.server, node.port, config).unwrap();
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = tcp.local_addr().unwrap();
         let task = tokio::spawn(async move {

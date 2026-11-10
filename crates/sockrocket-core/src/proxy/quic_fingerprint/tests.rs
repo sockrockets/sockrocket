@@ -337,6 +337,28 @@ fn profile_rejects_incompatible_alpn_and_malformed_parameters() {
 #[tokio::test]
 #[ignore = "requires an independent sing-box executable"]
 async fn chrome_hysteria2_reference_tcp_and_udp() {
+    hysteria2_reference(None, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an independent sing-box executable"]
+async fn salamander_hysteria2_reference_tcp_and_udp() {
+    hysteria2_reference(Some("salamander"), false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an independent sing-box executable"]
+async fn gecko_hysteria2_reference_tcp_and_udp() {
+    hysteria2_reference(Some("gecko"), false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an independent sing-box executable"]
+async fn hopping_hysteria2_reference_tcp_and_udp() {
+    hysteria2_reference(Some("salamander"), true).await;
+}
+
+async fn hysteria2_reference(obfs: Option<&str>, hopping: bool) {
     use base64::Engine;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     struct Reference {
@@ -386,7 +408,12 @@ async fn chrome_hysteria2_reference_tcp_and_udp() {
         .local_addr()
         .unwrap()
         .port();
-    let server = serde_json::json!({"log":{"level":"error"},"inbounds":[{"type":"hysteria2","listen":"127.0.0.1","listen_port":port,"users":[{"name":"synthetic","password":"integration-only"}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":dir.join("cert.pem"),"key_path":dir.join("key.pem")}}],"outbounds":[{"type":"direct"}]});
+    let mut server = serde_json::json!({"log":{"level":"error"},"inbounds":[{"type":"hysteria2","listen":"127.0.0.1","listen_port":port,"users":[{"name":"synthetic","password":"integration-only"}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":dir.join("cert.pem"),"key_path":dir.join("key.pem")}}],"outbounds":[{"type":"direct"}]});
+    let mut query = String::new();
+    if let Some(kind) = obfs {
+        server["inbounds"][0]["obfs"] = serde_json::json!({"type":kind,"password":"fixture-obfs"});
+        query = format!("&obfs={kind}&obfs-password=fixture-obfs");
+    }
     let path = dir.join("server.json");
     std::fs::write(&path, serde_json::to_vec(&server).unwrap()).unwrap();
     let child = std::process::Command::new(executable)
@@ -404,6 +431,39 @@ async fn chrome_hysteria2_reference_tcp_and_udp() {
         reference.child.try_wait().unwrap().is_none(),
         "reference server failed to start"
     );
+    let mut authority_port = port.to_string();
+    let counts = Arc::new([
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ]);
+    let mut relays = Vec::new();
+    if hopping {
+        let mut ports = Vec::new();
+        for index in 0..2 {
+            let counts = counts.clone();
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            ports.push(socket.local_addr().unwrap().port().to_string());
+            relays.push(tokio::spawn(async move {
+                let mut remote = None;
+                let server = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                let mut buffer = [0u8; 65535];
+                loop {
+                    let (n, source) = socket.recv_from(&mut buffer).await.unwrap();
+                    let target = if source == server {
+                        let Some(addr) = remote else { continue };
+                        addr
+                    } else {
+                        remote = Some(source);
+                        counts[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        server
+                    };
+                    socket.send_to(&buffer[..n], target).await.unwrap();
+                }
+            }));
+        }
+        authority_port = ports.join(",");
+        query.push_str("&hop_interval_ms=75&hop_interval_max_ms=75");
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tcp_address = listener.local_addr().unwrap();
     let echo = tokio::spawn(async move {
@@ -432,7 +492,7 @@ async fn chrome_hysteria2_reference_tcp_and_udp() {
     });
     tokio::time::timeout(Duration::from_secs(15), async {
         let node = crate::config::v2ray::parse_hysteria2_uri(&format!(
-            "hy2://integration-only@127.0.0.1:{port}?insecure=1&sni=localhost&alpn=h3&fp=chrome"
+            "hy2://integration-only@127.0.0.1:{authority_port}?insecure=1&sni=localhost&alpn=h3&fp=chrome{query}"
         ))
         .unwrap();
         let outbound = crate::proxy::factory::create_outbound(&node).unwrap();
@@ -442,6 +502,7 @@ async fn chrome_hysteria2_reference_tcp_and_udp() {
             .await
             .unwrap();
         for i in 0..8u8 {
+            if hopping { tokio::time::sleep(Duration::from_millis(90)).await; }
             let mut stream = outbound
                 .connect("127.0.0.1", tcp_address.port())
                 .await
@@ -463,4 +524,14 @@ async fn chrome_hysteria2_reference_tcp_and_udp() {
     })
     .await
     .expect("Hysteria2 independent-server deadline");
+    if hopping {
+        assert!(
+            counts
+                .iter()
+                .all(|count| count.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        );
+    }
+    for task in relays {
+        task.abort();
+    }
 }

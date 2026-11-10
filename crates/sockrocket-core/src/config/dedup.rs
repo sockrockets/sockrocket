@@ -573,6 +573,7 @@ mod tests {
             trojan("trojan", "3.3.3.3", 443, "shared-pw"),
             Node {
                 protocol: ProxyProtocol::Hysteria2 {
+                    obfs: None,
                     password: "shared-pw".to_string(),
                     udp: true,
                 },

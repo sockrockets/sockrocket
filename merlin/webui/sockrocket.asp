@@ -1885,6 +1885,7 @@ function renderSubscriptionNotes(result) {
   var chrome = Array.isArray(notes) && notes.indexOf('hysteria2_chrome_quic_profile') >= 0;
   var fixedPort = Array.isArray(notes) && notes.indexOf('hysteria2_mport_fixed_port') >= 0;
   var text = [];
+  if (Array.isArray(notes) && notes.indexOf('hysteria2_port_hopping') >= 0) text.push('已启用 Hysteria2 端口跳跃，将按节点设置切换 UDP 目标端口。');
   if (fixedPort) text.push('部分 Hysteria2 节点带有多端口跳跃配置，已按订阅地址中的固定端口导入；当前版本不会定期切换端口。若网络限制持续使用同一 UDP 端口，这些节点仍可能无法连接。');
   if (chrome) text.push('已启用 Chrome 115 基线 QUIC 握手模拟（fp=chrome / chrome115，ALPN h3），包含 TLS 指纹、连接 ID 和传输参数。此基线不模拟 ALPS、浏览器 HTTP/3 请求及首包分帧；证书校验保持原样。');
   if (hint) text.push('其他浏览器指纹提示已保留，但不用于模拟对应浏览器的 QUIC 指纹；证书校验保持原样。');

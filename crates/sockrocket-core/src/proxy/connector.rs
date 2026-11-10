@@ -253,6 +253,24 @@ impl Outbound for RetryOutbound {
 #[derive(Clone)]
 pub struct SharedOutbound(pub Arc<dyn Outbound>);
 
+/// Restrict application traffic while allowing the protocol's own TCP control stream.
+pub(super) struct DatagramOnlyOutbound(pub SharedOutbound);
+impl Outbound for DatagramOnlyOutbound {
+    fn connect(
+        &self,
+        _: &str,
+        _: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
+        Box::pin(async { anyhow::bail!("Node permits UDP traffic only") })
+    }
+    fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
+        self.0.0.connect_datagram(host, port)
+    }
+    fn name(&self) -> &str {
+        self.0.0.name()
+    }
+}
+
 /// Enforce a node's explicit UDP-disabled setting at the transport boundary.
 pub struct StreamOnlyOutbound(pub SharedOutbound);
 impl Outbound for StreamOnlyOutbound {

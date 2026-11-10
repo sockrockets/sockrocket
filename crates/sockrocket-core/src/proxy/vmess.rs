@@ -30,15 +30,15 @@ pub enum VMessSecurity {
 }
 
 impl VMessSecurity {
-    fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s.to_lowercase().as_str() {
             "aes-128-gcm" => Self::Aes128Gcm,
             "chacha20-poly1305" | "chacha20-ietf-poly1305" => Self::Chacha20Poly1305,
             "auto" => Self::Aes128Gcm,
             "none" => Self::None,
             "zero" => Self::Zero,
-            _ => Self::Aes128Gcm,
-        }
+            _ => anyhow::bail!("Unsupported VMess security"),
+        })
     }
 
     fn byte(&self) -> u8 {
@@ -47,7 +47,27 @@ impl VMessSecurity {
             Self::Chacha20Poly1305 => 0x04,
             Self::Auto => 0x03,
             Self::None => 0x05,
-            Self::Zero => 0x06,
+            Self::Zero => 0x05,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Framing {
+    pub padding: bool,
+    pub authenticated_length: bool,
+}
+
+impl Framing {
+    fn flags(self, security: VMessSecurity) -> u8 {
+        match security {
+            VMessSecurity::Zero => 0,
+            VMessSecurity::None => 1,
+            _ => {
+                1 | (u8::from(self.padding || self.authenticated_length) << 2)
+                    | (u8::from(self.padding) << 3)
+                    | (u8::from(self.authenticated_length) << 4)
+            }
         }
     }
 }
@@ -59,6 +79,7 @@ pub struct VMessOutbound {
     uuid: [u8; 16],
     security: VMessSecurity,
     pool: ConnPool,
+    pub(super) framing: Framing,
 }
 
 impl VMessOutbound {
@@ -94,6 +115,7 @@ impl VMessOutbound {
         warm_pool: bool,
     ) -> Result<Self> {
         let parsed_uuid = uuid::Uuid::parse_str(uuid_str)?;
+        let security = VMessSecurity::from_str(cipher)?;
 
         let factory = Arc::new(TlsConnFactory::from_transport(
             server, port, transport, false,
@@ -108,8 +130,9 @@ impl VMessOutbound {
             server: server.to_string(),
             port,
             uuid: *parsed_uuid.as_bytes(),
-            security: VMessSecurity::from_str(cipher),
+            security,
             pool,
+            framing: Framing::default(),
         })
     }
 }
@@ -128,6 +151,13 @@ impl VMessOutbound {
             )
         })?;
 
+        // Zero uses an unframed TCP body. UDP still needs chunk boundaries.
+        let security = if command == 2 && self.security == VMessSecurity::Zero {
+            VMessSecurity::None
+        } else {
+            self.security
+        };
+
         // Generate session keys (in a block so rng drops before await)
         let (req_body_key, req_body_iv, resp_auth, header) = {
             let mut rng = rand::rng();
@@ -140,10 +170,11 @@ impl VMessOutbound {
                 &req_body_key,
                 &req_body_iv,
                 resp_auth,
-                self.security,
+                security,
                 &target_host,
                 port,
                 command,
+                self.framing,
             )?;
 
             (req_body_key, req_body_iv, resp_auth, header)
@@ -154,7 +185,7 @@ impl VMessOutbound {
         let resp_body_iv_full = sha256_bytes(&req_body_iv);
 
         // Wrap in VMess AEAD stream
-        let vmess_stream = VMessStream::new(
+        let mut vmess_stream = VMessStream::new(
             stream,
             header,
             req_body_key,
@@ -166,10 +197,13 @@ impl VMessOutbound {
                 .try_into()
                 .expect("sha256 output is 32 bytes, first 16 is always valid"),
             resp_auth,
-            self.security,
+            security,
         )
         .await?;
 
+        if !matches!(security, VMessSecurity::None | VMessSecurity::Zero) {
+            vmess_stream.configure_framing(self.framing, security, &req_body_key, &req_body_iv);
+        }
         Ok(vmess_stream)
     }
 }
@@ -377,7 +411,17 @@ fn build_vmess_header(
     host: &str,
     port: u16,
 ) -> Result<Vec<u8>> {
-    build_vmess_header_command(uuid, body_key, body_iv, resp_auth, security, host, port, 1)
+    build_vmess_header_command(
+        uuid,
+        body_key,
+        body_iv,
+        resp_auth,
+        security,
+        host,
+        port,
+        1,
+        Framing::default(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // Protocol fields share one authenticated header.
@@ -390,6 +434,7 @@ fn build_vmess_header_command(
     host: &str,
     port: u16,
     command: u8,
+    framing: Framing,
 ) -> Result<Vec<u8>> {
     let cmd_key = vmess_cmd_key(uuid);
     let timestamp = SystemTime::now()
@@ -412,11 +457,7 @@ fn build_vmess_header_command(
     header.extend_from_slice(body_key);
     // Response Auth
     header.push(resp_auth);
-    // Option: standard chunk stream (0x01) only. Do NOT set 0x04 (chunk
-    // masking): that makes the server Shake128-mask chunk lengths, which
-    // VMessChunkCipher does not implement — the server would misparse the
-    // length and wait forever (observed as a silent hang).
-    header.push(0x01);
+    header.push(framing.flags(security));
     // Padding length (4 bits) + Security (4 bits)
     let padding_len: u8 = rng.random::<u8>() % 16;
     header.push((padding_len << 4) | security.byte());
@@ -558,6 +599,7 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 /// the chunk is fully written (`write_in_flight`).
 struct VMessStream {
     inner: BoxProxyStream,
+    unframed: bool,
 
     // -- read side --
     read_cipher: VMessChunkCipher,
@@ -571,7 +613,12 @@ struct VMessStream {
     resp_iv: [u8; 16],
     resp_auth: u8,
     /// 2-byte chunk length prefix assembly.
-    len_buf: [u8; 2],
+    len_buf: [u8; 18],
+    length_cipher: Option<Box<VMessChunkCipher>>,
+    length_scratch: Vec<u8>,
+    read_mask: Option<Box<sha3::Shake128Reader>>,
+    write_mask: Option<Box<sha3::Shake128Reader>>,
+    read_padding: usize,
     len_pos: usize,
     /// Length (ciphertext + tag) of the chunk being assembled.
     chunk_len: usize,
@@ -615,6 +662,7 @@ enum ReadState {
     RespHeaderLen,
     /// Assembling the response-header payload block into `resp_buf`.
     RespHeaderPayload,
+    Raw,
     /// Assembling the 2-byte chunk length prefix into `len_buf`.
     ChunkLen,
     /// Assembling a chunk's ciphertext+tag into `chunk`.
@@ -771,6 +819,12 @@ fn generate_chacha_key(key: &[u8; 16]) -> [u8; 32] {
     key32
 }
 
+fn next_mask(mask: &mut sha3::Shake128Reader) -> u16 {
+    let mut bytes = [0; 2];
+    sha3::digest::XofReader::read(mask, &mut bytes);
+    u16::from_be_bytes(bytes)
+}
+
 impl VMessStream {
     #[allow(clippy::too_many_arguments)]
     async fn new(
@@ -792,8 +846,10 @@ impl VMessStream {
         // failure surfaces as an error on the first read (see `fatal`).
         let write_cipher = VMessChunkCipher::new(security, &req_key, &req_iv);
         let max_chunk = 16384 - write_cipher.overhead();
+        let unframed = security == VMessSecurity::Zero;
         Ok(Self {
             inner,
+            unframed,
             read_cipher: VMessChunkCipher::new(security, &resp_key, &resp_iv),
             state: ReadState::RespHeaderLen,
             resp_buf: Vec::with_capacity(18),
@@ -801,22 +857,54 @@ impl VMessStream {
             resp_key,
             resp_iv,
             resp_auth,
-            len_buf: [0; 2],
+            len_buf: [0; 18],
+            length_cipher: None,
+            length_scratch: Vec::new(),
+            read_mask: None,
+            write_mask: None,
+            read_padding: 0,
             len_pos: 0,
             chunk_len: 0,
-            chunk: Vec::with_capacity(16384 + 16),
+            chunk: Vec::with_capacity(if unframed { 0 } else { 16384 + 16 }),
             plain_pos: 0,
             read_count: 0,
             fatal: None,
             read_eof: false,
             write_cipher,
             max_chunk,
-            out: Vec::with_capacity(2 + 16384),
+            out: Vec::with_capacity(if unframed { 0 } else { 2 + 16384 }),
             out_pos: 0,
             write_in_flight: None,
             write_count: 0,
             write_closed: false,
         })
+    }
+
+    fn configure_framing(
+        &mut self,
+        framing: Framing,
+        security: VMessSecurity,
+        request_key: &[u8; 16],
+        request_iv: &[u8; 16],
+    ) {
+        if framing.padding {
+            fn mask(iv: &[u8; 16]) -> Box<sha3::Shake128Reader> {
+                use sha3::digest::{ExtendableOutput, Update};
+                Box::new(sha3::Shake128::default().chain(iv).finalize_xof())
+            }
+            self.read_mask = Some(mask(&self.resp_iv));
+            self.write_mask = Some(mask(request_iv));
+            self.max_chunk -= 63;
+        }
+        if framing.authenticated_length {
+            let key = kdf(request_key, &[b"auth_len"]);
+            self.length_cipher = Some(Box::new(VMessChunkCipher::new(
+                security,
+                key[..16].try_into().unwrap(),
+                request_iv,
+            )));
+            self.length_scratch.reserve_exact(18);
+        }
     }
 
     /// Drain `out` (one chunk: length prefix + ciphertext + tag) into the
@@ -954,6 +1042,7 @@ impl AsyncRead for VMessStream {
                 return Poll::Ready(Err(e));
             }
             match this.state {
+                ReadState::Raw => return Pin::new(&mut this.inner).poll_read(cx, buf),
                 ReadState::Plain => {
                     // Deliver decrypted plaintext; a leftover larger than the
                     // caller's buffer stays for the next poll.
@@ -1014,7 +1103,11 @@ impl AsyncRead for VMessStream {
                     ) {
                         Ok(()) => {
                             this.resp_buf.clear();
-                            this.state = ReadState::ChunkLen;
+                            this.state = if this.unframed {
+                                ReadState::Raw
+                            } else {
+                                ReadState::ChunkLen
+                            };
                         }
                         Err(e) => {
                             tracing::error!("VMess response header verification failed: {e:#}");
@@ -1024,8 +1117,9 @@ impl AsyncRead for VMessStream {
                     }
                 }
                 ReadState::ChunkLen => {
-                    while this.len_pos < 2 {
-                        let mut rb = ReadBuf::new(&mut this.len_buf[this.len_pos..]);
+                    let prefix = if this.length_cipher.is_some() { 18 } else { 2 };
+                    while this.len_pos < prefix {
+                        let mut rb = ReadBuf::new(&mut this.len_buf[this.len_pos..prefix]);
                         match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
                             Poll::Pending => return Poll::Pending,
                             // Old read task: ANY failure of the length read
@@ -1046,7 +1140,38 @@ impl AsyncRead for VMessStream {
                         }
                     }
                     this.len_pos = 0;
-                    let chunk_len = u16::from_be_bytes(this.len_buf) as usize;
+                    this.read_padding = this
+                        .read_mask
+                        .as_deref_mut()
+                        .map_or(0, |m| usize::from(next_mask(m) % 64));
+                    let chunk_len = if let Some(cipher) = &this.length_cipher {
+                        this.length_scratch.clear();
+                        this.length_scratch.extend_from_slice(&this.len_buf);
+                        if cipher
+                            .decrypt_in_place(this.read_count, &mut this.length_scratch)
+                            .is_err()
+                        {
+                            this.read_eof = true;
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid VMess length tag",
+                            )));
+                        }
+                        usize::from(u16::from_be_bytes([
+                            this.length_scratch[0],
+                            this.length_scratch[1],
+                        ])) + 16
+                    } else {
+                        let mask = this.read_mask.as_deref_mut().map_or(0, next_mask);
+                        usize::from(u16::from_be_bytes([this.len_buf[0], this.len_buf[1]]) ^ mask)
+                    };
+                    if chunk_len < this.read_padding {
+                        this.read_eof = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid VMess padded length",
+                        )));
+                    }
                     if chunk_len == 0 {
                         // Zero-length chunk: clean EOF (the old read task
                         // broke its loop here).
@@ -1068,6 +1193,7 @@ impl AsyncRead for VMessStream {
                         }
                         Poll::Ready(Ok(())) => {}
                     }
+                    this.chunk.truncate(this.chunk_len - this.read_padding);
                     // Decrypt in place; `chunk` is truncated to the plaintext.
                     match this
                         .read_cipher
@@ -1111,6 +1237,9 @@ impl AsyncWrite for VMessStream {
                 "VMess stream is closed",
             )));
         }
+        if self.unframed {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
         // A previous chunk may still be draining; finish it before taking
         // new bytes.
         if self.write_in_flight.is_some() || self.out_pos < self.out.len() {
@@ -1135,17 +1264,41 @@ impl AsyncWrite for VMessStream {
         // One poll_write = one AEAD chunk, capped at max_chunk.
         let this = &mut *self;
         let n = buf.len().min(this.max_chunk);
-        this.out.extend_from_slice(&[0, 0]); // length prefix placeholder
+        let prefix = if this.length_cipher.is_some() { 18 } else { 2 };
+        this.out.resize(prefix, 0);
         this.out.extend_from_slice(&buf[..n]);
         if let Err(e) =
             this.write_cipher
-                .encrypt_payload_in_place(this.write_count, &mut this.out, 2)
+                .encrypt_payload_in_place(this.write_count, &mut this.out, prefix)
         {
             this.out.clear();
             return Poll::Ready(Err(io::Error::other(format!("{e:#}"))));
         }
-        let chunk_len = (this.out.len() - 2) as u16;
-        this.out[..2].copy_from_slice(&chunk_len.to_be_bytes());
+        let padding = this
+            .write_mask
+            .as_deref_mut()
+            .map_or(0, |m| usize::from(next_mask(m) % 64));
+        let end = this.out.len();
+        this.out.resize(end + padding, 0);
+        if padding > 0 {
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut this.out[end..]);
+        }
+        let chunk_len = (this.out.len() - prefix) as u16;
+        if let Some(cipher) = &this.length_cipher {
+            this.length_scratch.clear();
+            this.length_scratch
+                .extend_from_slice(&(chunk_len - 16).to_be_bytes());
+            if let Err(e) =
+                cipher.encrypt_payload_in_place(this.write_count, &mut this.length_scratch, 0)
+            {
+                this.out.clear();
+                return Poll::Ready(Err(io::Error::other(e)));
+            }
+            this.out[..prefix].copy_from_slice(&this.length_scratch);
+        } else {
+            let mask = this.write_mask.as_deref_mut().map_or(0, next_mask);
+            this.out[..2].copy_from_slice(&(chunk_len ^ mask).to_be_bytes());
+        }
         this.write_in_flight = Some(n);
         match this.poll_flush_out(cx) {
             Poll::Pending => Poll::Pending,
@@ -1358,17 +1511,27 @@ mod tests {
     #[test]
     fn test_security_from_str() {
         assert_eq!(
-            VMessSecurity::from_str("aes-128-gcm"),
+            VMessSecurity::from_str("aes-128-gcm").unwrap(),
             VMessSecurity::Aes128Gcm
         );
         assert_eq!(
-            VMessSecurity::from_str("chacha20-poly1305"),
+            VMessSecurity::from_str("chacha20-poly1305").unwrap(),
             VMessSecurity::Chacha20Poly1305
         );
         // "auto" resolves to Aes128Gcm at parse time
-        assert_eq!(VMessSecurity::from_str("auto"), VMessSecurity::Aes128Gcm);
-        assert_eq!(VMessSecurity::from_str("none"), VMessSecurity::None);
-        assert_eq!(VMessSecurity::from_str("zero"), VMessSecurity::Zero);
+        assert_eq!(
+            VMessSecurity::from_str("auto").unwrap(),
+            VMessSecurity::Aes128Gcm
+        );
+        assert_eq!(
+            VMessSecurity::from_str("none").unwrap(),
+            VMessSecurity::None
+        );
+        assert_eq!(
+            VMessSecurity::from_str("zero").unwrap(),
+            VMessSecurity::Zero
+        );
+        assert!(VMessSecurity::from_str("invalid").is_err());
         // Auto resolves to AES-128-GCM byte
         assert_eq!(VMessSecurity::Auto.byte(), VMessSecurity::Aes128Gcm.byte());
     }

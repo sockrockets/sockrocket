@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use anyhow::{Result, bail};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::config::model::TlsConfig;
+use crate::config::model::{TlsConfig, TuicRelay};
 
 use super::connector::{BoxProxyStream, Outbound};
 use super::quic_conn::{
@@ -55,6 +55,9 @@ pub struct TuicOutbound {
     skip_cert_verify: bool,
     certificate_pin: Option<[u8; 32]>,
     congestion: CongestionControl,
+    pub(super) relay: TuicRelay,
+    pub(super) heartbeat: std::time::Duration,
+    heartbeat_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// ALPN candidates tried in order. TUIC v5 specifies "tuic", but many
     /// servers are deployed with "h3" — a working candidate is remembered to
     /// skip the search on reconnects.
@@ -197,6 +200,9 @@ impl TuicOutbound {
             skip_cert_verify,
             certificate_pin,
             congestion,
+            relay: TuicRelay::Native,
+            heartbeat: std::time::Duration::from_secs(10),
+            heartbeat_task: Default::default(),
             alpn_candidates,
             working_alpn: std::sync::Mutex::new(None),
             quic_client_config,
@@ -227,9 +233,32 @@ impl TuicOutbound {
             .get_or_connect(|| async {
                 let (endpoint, conn) = self.create_connection().await?;
                 self.authenticate(&conn).await?;
+                self.start_heartbeat(&conn);
                 Ok((endpoint, conn))
             })
             .await
+    }
+
+    fn start_heartbeat(&self, conn: &quinn::Connection) {
+        let mut task = self.heartbeat_task.lock().unwrap();
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        if conn.max_datagram_size().is_none() {
+            return;
+        }
+        let conn = conn.clone();
+        let interval = self.heartbeat;
+        *task = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = conn.closed() => break,
+                    _ = tokio::time::sleep(interval) => {
+                        if conn.send_datagram(bytes::Bytes::from_static(&[TUIC_VERSION, CMD_HEARTBEAT])).is_err() { break; }
+                    }
+                }
+            }
+        }));
     }
 
     async fn create_connection(&self) -> Result<(quinn::Endpoint, quinn::Connection)> {
@@ -449,7 +478,7 @@ impl TuicOutbound {
             }
         }
         // Keep-alive for long-lived connections
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+        transport.keep_alive_interval(Some(self.heartbeat));
         // Max idle timeout to detect dead connections
         transport.max_idle_timeout(Some(
             quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).unwrap(),
@@ -473,6 +502,14 @@ impl TuicOutbound {
         tracing::info!("TUIC authentication sent");
 
         Ok(())
+    }
+}
+
+impl Drop for TuicOutbound {
+    fn drop(&mut self) {
+        if let Some(task) = self.heartbeat_task.get_mut().unwrap().take() {
+            task.abort();
+        }
     }
 }
 
@@ -524,12 +561,32 @@ impl Outbound for TuicOutbound {
     ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
         let host = host.to_owned();
         Box::pin(async move {
+            if matches!(self.relay, TuicRelay::UotV1 | TuicRelay::UotV2) {
+                use super::stream_datagram::{Framing, StreamDatagram};
+                let mut address = super::anytls::socks_address(&host, port)?;
+                if self.relay == TuicRelay::UotV1 {
+                    address[0] = match address[0] {
+                        1 => 0,
+                        4 => 1,
+                        3 => 2,
+                        _ => unreachable!(),
+                    };
+                    let stream = self.connect("sp.udp-over-tcp.arpa", 0).await?;
+                    return Ok(StreamDatagram::boxed(stream, Framing::UotLegacy(address)));
+                }
+                let mut stream = self.connect("sp.v2.udp-over-tcp.arpa", 0).await?;
+                stream.write_u8(1).await?;
+                stream.write_all(&address).await?;
+                stream.flush().await?;
+                return Ok(StreamDatagram::boxed(stream, Framing::Length16));
+            }
             let connection = self.get_connection().await?;
             let mut hub = self.udp_hub.lock().await;
             if hub.as_ref().is_none_or(|hub| !hub.matches(&connection)) {
-                *hub = Some(super::quic_datagram::Hub::new(
+                *hub = Some(super::quic_datagram::Hub::with_relay(
                     connection,
                     super::quic_datagram::Protocol::Tuic,
+                    self.relay == TuicRelay::Quic,
                 ));
             }
             hub.as_ref().unwrap().associate(&host, port)
@@ -642,10 +699,8 @@ fn export_auth_token(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn stalled_readers_share_a_connection_receive_budget() {
+    fn local_server() -> quinn::Endpoint {
         use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-        use std::time::Duration;
         super::super::quic_conn::ensure_quic_crypto_provider();
         let cert = CertificateDer::from(include_bytes!("testdata/localhost-cert.der").to_vec());
         let key = PrivatePkcs8KeyDer::from(include_bytes!("testdata/localhost-key.der").to_vec());
@@ -659,7 +714,48 @@ mod tests {
         Arc::get_mut(&mut config.transport)
             .unwrap()
             .send_window(64 * 1024 * 1024);
-        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn configured_heartbeat_reaches_authenticated_connection() {
+        let server = local_server();
+        let tls = TlsConfig {
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            alpn: Some(vec!["tuic".into()]),
+            fingerprint: None,
+        };
+        let mut outbound = TuicOutbound::new(
+            "127.0.0.1",
+            server.local_addr().unwrap().port(),
+            "00000000-0000-0000-0000-000000000001",
+            "test",
+            "cubic",
+            Some(&tls),
+        )
+        .unwrap();
+        outbound.heartbeat = std::time::Duration::from_millis(25);
+        let (client, peer) = tokio::join!(outbound.get_connection(), async {
+            server.accept().await.unwrap().await.unwrap()
+        });
+        let _connection = client.unwrap();
+        let mut auth = peer.accept_uni().await.unwrap();
+        let bytes = auth.read_to_end(64).await.unwrap();
+        assert_eq!(&bytes[..2], &[TUIC_VERSION, CMD_AUTHENTICATE]);
+        for _ in 0..2 {
+            let packet =
+                tokio::time::timeout(std::time::Duration::from_secs(1), peer.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&packet[..], &[TUIC_VERSION, CMD_HEARTBEAT]);
+        }
+    }
+    #[tokio::test]
+    async fn stalled_readers_share_a_connection_receive_budget() {
+        use std::time::Duration;
+        let server = local_server();
         let tls = TlsConfig {
             sni: Some("localhost".into()),
             skip_cert_verify: true,

@@ -42,6 +42,7 @@ struct Hysteria2Attempt {
     port: u16,
     sni: String,
     chrome_fingerprint: bool,
+    socket_options: Option<Arc<super::hysteria2_socket::Options>>,
 }
 
 impl Hysteria2Attempt {
@@ -56,14 +57,15 @@ impl Hysteria2Attempt {
         } else {
             "[::]:0".parse()?
         };
-        let mut endpoint = super::quic_conn::client_endpoint_with_config(
-            bind_addr,
-            if self.chrome_fingerprint {
-                super::quic_fingerprint::endpoint_config()
-            } else {
-                quinn::EndpointConfig::default()
-            },
-        )?;
+        let config = if self.chrome_fingerprint {
+            super::quic_fingerprint::endpoint_config()
+        } else {
+            quinn::EndpointConfig::default()
+        };
+        let mut endpoint = match &self.socket_options {
+            Some(options) => options.endpoint(bind_addr, addr, config)?,
+            None => super::quic_conn::client_endpoint_with_config(bind_addr, config)?,
+        };
         endpoint.set_default_client_config(client_config.clone());
 
         let connecting = endpoint
@@ -108,6 +110,7 @@ pub struct Hysteria2Outbound {
     skip_cert_verify: bool,
     certificate_pin: Option<[u8; 32]>,
     chrome_fingerprint: bool,
+    socket_options: Option<Arc<super::hysteria2_socket::Options>>,
     down_bps: u64,
     upload: Option<Arc<super::hysteria2_bandwidth::Budget>>,
     fast_open: bool,
@@ -190,6 +193,7 @@ impl Hysteria2Outbound {
             sni,
             skip_cert_verify,
             chrome_fingerprint,
+            socket_options: None,
             certificate_pin: extra
                 .get(TLS_CERT_PIN)
                 .map(|p| parse_tuic_certificate_pin(p))
@@ -204,6 +208,30 @@ impl Hysteria2Outbound {
         })
     }
 
+    pub(super) fn configure_socket(
+        &mut self,
+        obfs: Option<&crate::config::model::Hy2Obfs>,
+        extra: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        use crate::config::v2ray::{HY2_HOP_INTERVAL, HY2_HOP_MAX, HY2_MPORT};
+        let interval = extra
+            .get(HY2_HOP_INTERVAL)
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(30_000);
+        let max = extra
+            .get(HY2_HOP_MAX)
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(interval);
+        self.socket_options = super::hysteria2_socket::Options::new(
+            obfs,
+            extra.get(HY2_MPORT).map(String::as_str),
+            interval,
+            max,
+        )?;
+        Ok(())
+    }
     /// Build a QUIC client config (TLS + transport) for a given ALPN.
     fn build_client_config(&self, alpn: &str) -> Result<quinn::ClientConfig> {
         let config_builder = if self.chrome_fingerprint {
@@ -288,6 +316,7 @@ impl Hysteria2Outbound {
             port: self.port,
             sni: self.sni.clone(),
             chrome_fingerprint: self.chrome_fingerprint,
+            socket_options: self.socket_options.clone(),
         };
         attempt.try_addr(addr, client_config, alpn).await
     }
@@ -351,6 +380,7 @@ impl Hysteria2Outbound {
                     port: self.port,
                     sni: self.sni.clone(),
                     chrome_fingerprint: self.chrome_fingerprint,
+                    socket_options: self.socket_options.clone(),
                 };
                 let alpn = alpn.clone();
                 set.spawn(async move {
@@ -420,6 +450,7 @@ impl Hysteria2Outbound {
                 port: self.port,
                 sni: self.sni.clone(),
                 chrome_fingerprint: self.chrome_fingerprint,
+                socket_options: self.socket_options.clone(),
             };
             let cfg = client_config.clone();
             let alpn = alpn.to_string();

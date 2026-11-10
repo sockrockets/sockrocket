@@ -35,6 +35,7 @@
 //!         mtu: None,
 //!     },
 //!     peers: vec![Peer {
+//!         reserved: [0; 3],
 //!         public_key: remote_public_key,
 //!         // This is where the tunneled WireGuard traffic will be sent
 //!         endpoint: Some("198.51.100.30:51820".parse().unwrap()),

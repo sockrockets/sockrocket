@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::model::*;
 
-fn deserialize_bandwidth<'de, D: serde::Deserializer<'de>>(
+fn deserialize_scalar<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
     let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
@@ -19,9 +19,18 @@ fn deserialize_bandwidth<'de, D: serde::Deserializer<'de>>(
                     ));
                 }
             };
-            super::bandwidth::canonical_mbps(&text).map_err(serde::de::Error::custom)
+            Ok(text)
         })
         .transpose()
+}
+
+fn deserialize_bandwidth<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    deserialize_scalar(deserializer)?
+        .map(|s| super::bandwidth::canonical_mbps(&s))
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 /// Clash YAML configuration top-level structure
@@ -39,6 +48,12 @@ struct ClashConfig {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ClashProxy {
+    #[serde(default, rename = "sockrocket-udp-only")]
+    udp_only: bool,
+    #[serde(default, rename = "global-padding")]
+    global_padding: bool,
+    #[serde(default, rename = "authenticated-length")]
+    authenticated_length: bool,
     name: String,
     #[serde(rename = "type")]
     proxy_type: String,
@@ -49,6 +64,12 @@ struct ClashProxy {
     /// Hysteria2 port-hopping range, e.g. "40001-50000".
     #[serde(default)]
     ports: Option<String>,
+    #[serde(
+        rename = "hop-interval",
+        default,
+        deserialize_with = "deserialize_scalar"
+    )]
+    hop_interval: Option<String>,
     // Shadowsocks fields
     cipher: Option<String>,
     password: Option<String>,
@@ -75,9 +96,25 @@ struct ClashProxy {
     ws_opts: Option<ClashWsOpts>,
     #[serde(rename = "xhttp-opts")]
     xhttp_opts: Option<XhttpConfig>,
+    #[serde(rename = "idle-session-check-interval")]
+    idle_check_secs: Option<u64>,
+    #[serde(rename = "idle-session-timeout")]
+    idle_timeout_secs: Option<u64>,
+    #[serde(default, rename = "min-idle-session")]
+    min_idle: usize,
+    #[serde(default, rename = "disable-reuse")]
+    disable_reuse: bool,
     // TUIC
     #[serde(rename = "congestion-controller")]
     congestion_controller: Option<String>,
+    #[serde(rename = "udp-relay-mode")]
+    udp_relay_mode: Option<String>,
+    #[serde(rename = "heartbeat-interval")]
+    heartbeat_ms: Option<u64>,
+    #[serde(default, rename = "udp-over-stream")]
+    udp_over_stream: bool,
+    #[serde(rename = "udp-over-stream-version")]
+    udp_over_stream_version: Option<u8>,
     // Reality
     #[serde(rename = "reality-opts")]
     reality_opts: Option<ClashRealityOpts>,
@@ -95,12 +132,13 @@ struct ClashProxy {
     down: Option<String>,
     #[serde(rename = "fast-open")]
     fast_open: Option<bool>,
-    // Hysteria2 obfuscation (salamander). Parsed so we can *reject* obfs
-    // nodes explicitly instead of silently importing a node that cannot
-    // connect.
     obfs: Option<String>,
     #[serde(rename = "obfs-password")]
     obfs_password: Option<String>,
+    #[serde(rename = "obfs-min-packet-size")]
+    min_packet_size: Option<u16>,
+    #[serde(rename = "obfs-max-packet-size")]
+    max_packet_size: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +292,22 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
     let protocol = match proxy.proxy_type.as_str() {
         "anytls" => ProxyProtocol::AnyTls {
             password: proxy.password.clone().context("AnyTLS missing password")?,
+            pool: AnyTlsPool {
+                check_interval_ms: proxy
+                    .idle_check_secs
+                    .map(|v| {
+                        v.checked_mul(1000)
+                            .context("AnyTLS check interval exceeds range")
+                    })
+                    .transpose()?,
+                idle_timeout_ms: proxy
+                    .idle_timeout_secs
+                    .map(|v| v.checked_mul(1000).context("AnyTLS timeout exceeds range"))
+                    .transpose()?,
+                min_idle: proxy.min_idle,
+                disable_reuse: proxy.disable_reuse,
+            }
+            .checked()?,
             udp: proxy.udp.unwrap_or(true),
         },
         "ss" => {
@@ -305,6 +359,20 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
                 uuid,
                 password,
                 congestion_control,
+                heartbeat_ms: proxy.heartbeat_ms,
+                relay: TuicRelay::parse(
+                    if proxy.udp_over_stream {
+                        None
+                    } else {
+                        proxy.udp_relay_mode.as_deref()
+                    },
+                    proxy
+                        .udp_over_stream
+                        .then_some(match proxy.udp_over_stream_version {
+                            None | Some(0) => 1,
+                            Some(v) => v,
+                        }),
+                )?,
                 udp,
             }
         }
@@ -317,21 +385,41 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
             ProxyProtocol::Trojan { password, udp }
         }
         "hysteria2" | "hy2" => {
-            if proxy.obfs.is_some() {
-                anyhow::bail!("Hysteria2 obfuscation is not supported");
-            }
             let password = proxy
                 .password
                 .as_ref()
                 .context("Hysteria2 missing password")?
                 .clone();
-            ProxyProtocol::Hysteria2 { password, udp }
+            ProxyProtocol::Hysteria2 {
+                password,
+                udp,
+                obfs: Hy2Obfs::from_parts(
+                    proxy.obfs.as_deref(),
+                    proxy.obfs_password.as_deref(),
+                    proxy.min_packet_size,
+                    proxy.max_packet_size,
+                )?,
+            }
         }
         other => anyhow::bail!("Unsupported proxy type: {}", other),
     };
 
     let port = resolve_port(proxy)?;
     let mut extra = HashMap::new();
+    if proxy.udp_only {
+        anyhow::ensure!(
+            proxy.proxy_type == "trojan" && udp,
+            "Invalid UDP-only restriction"
+        );
+        extra.insert(super::v2ray::UDP_ONLY.into(), "true".into());
+    }
+    if proxy.proxy_type == "vmess" {
+        super::v2ray::vmess_framing_options(
+            &mut extra,
+            proxy.global_padding,
+            proxy.authenticated_length,
+        );
+    }
     if let Some(pin) = &proxy.fingerprint {
         let key = match proxy.proxy_type.as_str() {
             "tuic" => super::v2ray::TUIC_CERT_PIN,
@@ -342,6 +430,23 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
         extra.insert(key.into(), pin.iter().map(|b| format!("{b:02x}")).collect());
     }
     if matches!(proxy.proxy_type.as_str(), "hysteria2" | "hy2") {
+        if let Some(v) = &proxy.hop_interval {
+            let (start, end) = v.split_once('-').unwrap_or((v, v));
+            let lo = start.parse::<u64>()?;
+            let lo = if lo == 0 { 30 } else { lo.max(5) };
+            let hi = end.parse::<u64>()?.max(lo);
+            for (n, k) in [
+                (lo, super::v2ray::HY2_HOP_INTERVAL),
+                (hi, super::v2ray::HY2_HOP_MAX),
+            ] {
+                extra.insert(
+                    k.into(),
+                    n.checked_mul(1000)
+                        .context("Hysteria2 hop interval out of range")?
+                        .to_string(),
+                );
+            }
+        }
         if let Some(ports) = &proxy.ports {
             super::v2ray::validate_hysteria2_mport(ports, port)?;
             extra.insert(super::v2ray::HY2_MPORT.into(), ports.clone());
@@ -433,8 +538,8 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     // Reality transport
     if let Some(ref reality) = proxy.reality_opts {
         anyhow::ensure!(
-            proxy_type == "vless" && network == "tcp",
-            "REALITY requires VLESS over raw TCP"
+            matches!(proxy_type, "vless" | "trojan") && network == "tcp",
+            "REALITY requires VLESS or Trojan over raw TCP"
         );
         let pk = reality
             .public_key
@@ -803,16 +908,14 @@ proxies:
     }
 
     #[test]
-    fn test_hysteria2_obfs_is_rejected() {
-        // Obfuscated Hy2 nodes cannot work without obfs support; importing
-        // them silently would yield a dead node.
+    fn test_hysteria2_obfs_is_imported() {
         let yaml = r#"
 proxies:
   - { name: "Hy2-Plain", type: hysteria2, server: a.example.com, port: 443, password: pw }
   - { name: "Hy2-Obfs", type: hysteria2, server: b.example.com, port: 443, password: pw, obfs: salamander, obfs-password: secret }
 "#;
         let nodes = parse_clash_config(yaml).unwrap();
-        assert_eq!(nodes.len(), 1, "obfs node must be skipped");
+        assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].name, "Hy2-Plain");
     }
 
