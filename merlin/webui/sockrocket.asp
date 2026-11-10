@@ -908,7 +908,7 @@ function apiXhr(base, action, data, cb, errCb, timeoutMs) {
     try {
       var d = JSON.parse(xhr.responseText);
       if (d.error_code || d.error) {
-        if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.error || d.error_code), 'err');
+        if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.msg || d.error || d.error_code), 'err');
         if (errCb) errCb(d);
       } else { cb(d); }
     } catch (e) {
@@ -1052,7 +1052,7 @@ function pollKscResult(seq, tries, cb, errCb, deadline) {
         var d = JSON.parse(t);
         acknowledgeKscResult(seq);
         if (d.error_code || d.error) {
-          if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.error || d.error_code), 'err');
+          if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.msg || d.error || d.error_code), 'err');
           if (errCb) errCb(d);
         } else { cb(d); }
         return;
