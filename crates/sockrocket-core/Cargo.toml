@@ -46,6 +46,7 @@ qrcode = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
 http = { workspace = true }
+tokio-util = { version = "0.7", features = ["codec","io","io-util"] }
 h2 = "0.4.13"
 hyper = { version = "1.9", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

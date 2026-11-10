@@ -383,6 +383,7 @@ mod tests {
     async fn vision_latency_probe_does_not_preconnect() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let transport = TransportConfig {
+            grpc: None,
             transport_type: crate::config::model::TransportType::Tls,
             tls: Some(crate::config::model::TlsConfig {
                 sni: Some("localhost".into()),

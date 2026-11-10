@@ -648,3 +648,6 @@ pub mod wireguard;
 
 mod server_dns;
 pub(crate) mod xhttp;
+
+mod grpc;
+mod h2_stream;

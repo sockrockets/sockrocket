@@ -5915,6 +5915,7 @@ pub(crate) fn transport_summary(transport: Option<&TransportConfig>) -> String {
                 TransportType::WebSocket => "WebSocket",
                 TransportType::Xhttp => "XHTTP",
                 TransportType::Quic => "QUIC",
+                TransportType::Grpc => "gRPC",
                 TransportType::HttpUpgrade => "httpupgrade",
                 TransportType::Reality => "Reality",
             };

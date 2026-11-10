@@ -94,6 +94,8 @@ struct ClashProxy {
     network: Option<String>,
     #[serde(rename = "ws-opts")]
     ws_opts: Option<ClashWsOpts>,
+    #[serde(rename = "grpc-opts")]
+    grpc_opts: Option<GrpcConfig>,
     #[serde(rename = "xhttp-opts")]
     xhttp_opts: Option<XhttpConfig>,
     #[serde(rename = "idle-session-check-interval")]
@@ -490,7 +492,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     // (grpc/h2/http/httpupgrade/...) must be rejected loudly — silently
     // downgrading to bare TCP/TLS produces a node that imports fine but can
     // never connect.
-    if !matches!(network, "tcp" | "ws" | "httpupgrade" | "xhttp") {
+    if !matches!(network, "tcp" | "ws" | "grpc" | "httpupgrade" | "xhttp") {
         anyhow::bail!("Unsupported Clash transport; expected TCP, WebSocket or VLESS XHTTP");
     }
 
@@ -515,6 +517,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
             "Unsupported XHTTP ALPN"
         );
         return Ok(Some(TransportConfig {
+            grpc: None,
             transport_type: TransportType::Xhttp,
             tls: proxy.tls.then(|| TlsConfig {
                 sni: proxy.servername.clone().or_else(|| proxy.sni.clone()),
@@ -549,6 +552,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
             .filter(|s| !s.is_empty())
             .context("REALITY public key is required")?;
         return Ok(Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Reality,
             tls: None,
@@ -566,7 +570,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     let has_tls = proxy.tls || force_tls;
     let has_ws = matches!(network, "ws" | "httpupgrade");
 
-    if !has_tls && !has_ws {
+    if !has_tls && !has_ws && network != "grpc" {
         return Ok(None);
     }
 
@@ -595,6 +599,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     };
 
     let transport_type = match (has_ws, has_tls) {
+        _ if network == "grpc" => TransportType::Grpc,
         (true, _)
             if network == "httpupgrade"
                 || proxy.ws_opts.as_ref().is_some_and(|o| o.http_upgrade) =>
@@ -607,6 +612,7 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     };
 
     Ok(Some(TransportConfig {
+        grpc: (network == "grpc").then(|| proxy.grpc_opts.clone().unwrap_or_default()),
         xhttp: None,
         transport_type,
         tls,
@@ -897,7 +903,7 @@ proxies:
     fn test_unknown_network_is_rejected_not_downgraded() {
         // grpc/h2/httpupgrade/... used to be silently downgraded to bare
         // TLS/TCP, producing a node that imports but can never connect.
-        for network in ["grpc", "h2", "http", "xhttp"] {
+        for network in ["kcp", "h2", "http", "xhttp"] {
             let yaml = format!(
                 r#"
 proxies:

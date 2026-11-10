@@ -61,6 +61,16 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
             server["tls"] = json!({"enabled":true,"alpn":[alpn],"certificate":pem("CERTIFICATE",include_bytes!("../src/proxy/testdata/localhost-cert.der")),"key":pem("PRIVATE KEY",include_bytes!("../src/proxy/testdata/localhost-key.der"))});
             client["tls"] =
                 json!({"enabled":true,"insecure":true,"server_name":"localhost","alpn":[alpn]});
+            if matches!(option, Some("grpc" | "xray_grpc_multi")) {
+                let transport = json!({"type":"grpc","service_name":"fixture.Service"});
+                server["transport"] = transport.clone();
+                client["transport"] = transport;
+                if option == Some("xray_grpc_multi") {
+                    client["transport"]["multi_mode"] = true.into();
+                }
+                server["tls"]["alpn"] = json!(["h2"]);
+                client["tls"]["alpn"] = json!(["h2"]);
+            }
             if option == Some("httpupgrade") {
                 let transport = json!({"type":"httpupgrade","host":"echo.example.invalid","path":"/synthetic","headers":{"X-Example":"fixture"}});
                 server["transport"] = transport.clone();
@@ -99,13 +109,35 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
         }
         Server(child?, Some(dir))
     } else {
-        let conf =
-            json!({"log":{"level":"error"},"inbounds":[server],"outbounds":[{"type":"direct"}]});
-        let cmd = std::env::var_os("SOCKROCKET_REFERENCE_SING_BOX")
-            .context("sing-box executable required")?;
+        let (conf, cmd, args) = if option == Some("xray_grpc_multi") {
+            let cert = server["tls"]["certificate"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>();
+            let key = server["tls"]["key"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>();
+            let config = json!({"log":{"loglevel":"error"},"inbounds":[{"listen":host,"port":port,"protocol":"trojan","settings":{"clients":[{"password":pw}]},"streamSettings":{"network":"grpc","security":"tls","tlsSettings":{"certificates":[{"certificate":cert,"key":key}]},"grpcSettings":{"serviceName":"fixture.Service","multiMode":true}}}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1"]}]}}]});
+            (
+                config,
+                std::env::var_os("SOCKROCKET_REFERENCE_XRAY")
+                    .context("Xray executable required")?,
+                ["run", "-config", "stdin:"],
+            )
+        } else {
+            (
+                json!({"log":{"level":"error"},"inbounds":[server],"outbounds":[{"type":"direct"}]}),
+                std::env::var_os("SOCKROCKET_REFERENCE_SING_BOX")
+                    .context("sing-box executable required")?,
+                ["run", "-c", "stdin"],
+            )
+        };
         let mut proc = Server(
             Command::new(cmd)
-                .args(["run", "-c", "stdin"])
+                .args(args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .spawn()?,
@@ -117,7 +149,12 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     if kind == "tuic" {
         tokio::time::sleep(Duration::from_millis(400)).await;
     } else {
+        let listening_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::net::TcpStream::connect((host, port)).await.is_err() {
+            ensure!(
+                tokio::time::Instant::now() < listening_deadline,
+                "reference did not listen"
+            );
             ensure!(proc.0.try_wait()?.is_none(), "server exited");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -174,11 +211,15 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
         peer.read_exact(&mut data).await?;
         peer.write_all(&data).await
     });
-    let mut stream = outbound.connect(host, port).await?;
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), outbound.connect(host, port))
+        .await
+        .context("reference TCP handshake timeout")??;
     stream.write_all(&[0x42; 256]).await?;
     stream.flush().await?;
     let mut reply = [0; 256];
-    stream.read_exact(&mut reply).await?;
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
+        .await
+        .context("reference TCP reply timeout")??;
     ensure!(reply == [0x42; 256], "TCP payload mismatch");
     echo.await??;
     let udp = UdpSocket::bind((host, 0)).await?;
@@ -197,7 +238,9 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     ] {
         tunnel.send(payload).await?;
         let mut buf = [0; 8192];
-        let (n, peer) = udp.recv_from(&mut buf).await?;
+        let (n, peer) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut buf))
+            .await
+            .context("reference UDP send timeout")??;
         ensure!(&buf[..n] == payload, "UDP request mismatch");
         udp.send_to(&buf[..n], peer).await?;
         let n = tunnel.recv(&mut buf).await?;
@@ -247,6 +290,17 @@ reference!(
     "trojan",
     Some("httpupgrade")
 );
+reference!(reference_trojan_grpc_tcp_udp, "trojan", Some("grpc"));
+#[tokio::test]
+#[ignore = "requires SOCKROCKET_REFERENCE_XRAY"]
+async fn reference_xray_trojan_grpc_multi_tcp_udp() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        check("trojan", Some("xray_grpc_multi"), false),
+    )
+    .await??;
+    Ok(())
+}
 reference!(reference_trojan_tcp_udp, "trojan", None);
 reference!(reference_tuic_tcp_udp, "tuic", None);
 reference!(reference_vmess_aes_tcp_udp, "vmess", Some("aes-128-gcm"));

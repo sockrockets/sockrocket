@@ -1537,6 +1537,7 @@ mod tests {
                 shadow_tls: None,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Tcp,
                 tls: None,

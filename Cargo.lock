@@ -6449,6 +6449,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.25.0",
  "tokio-rustls 0.26.4",
+ "tokio-util",
  "tokio-wireguard",
  "tracing",
  "tun",

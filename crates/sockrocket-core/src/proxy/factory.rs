@@ -318,6 +318,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Tls,
                 tls: Some(TlsConfig {
@@ -349,6 +350,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Tls,
                 tls: Some(TlsConfig {

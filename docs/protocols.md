@@ -23,8 +23,8 @@ UDP availability also depends on the node's `udp` option. Certificate verificati
 | --- | --- |
 | Shadowsocks | The current Mihomo plugin importer handles ShadowTLS. Other SIP003 plugin configurations need their own implementation and wire tests. |
 | VMess | AES-GCM and ChaCha20-Poly1305 support global padding and authenticated chunk lengths. Legacy nonzero alterId is outstanding. |
-| VLESS | Xray VLESS Encryption and gRPC transport are outstanding. |
-| Trojan | REALITY is limited to raw TCP. sing-box UDP-only outbound policy is enforced. gRPC is outstanding. |
+| VLESS | Xray VLESS Encryption is outstanding. |
+| Trojan | REALITY is limited to raw TCP. sing-box UDP-only outbound policy is enforced. TLS gRPC and HTTPUpgrade carry TCP and UDP in sing-box interoperability tests. Xray TunMulti is also tested. |
 | TUIC v5 | Native, reliable QUIC-stream and UDP-over-stream v1/v2 are covered. Heartbeat timing is configurable. 0-RTT remains outstanding. |
 | Hysteria2 | Salamander and Gecko are tested against sing-box. Hopping changes the UDP destination port. |
 | AnyTLS | Configurable idle check intervals, timeouts, minimum idle counts and disabled reuse are supported. Minimum idle count is bounded by the 64-session per-node capacity. |
@@ -44,8 +44,16 @@ cargo test --locked -p sockrocket-core --lib --test reference_protocols referenc
 
 The sing-box cases cover SS AES-128-GCM, VMess AEAD, Trojan/TLS, TUIC v5,
 VLESS Vision, AnyTLS, Hysteria2 and WireGuard. The Xray cases exercise VLESS
-XHTTP. The cases in `reference_protocols` import a sing-box outbound,
+XHTTP and Trojan gRPC TunMulti. The cases in `reference_protocols` import a sing-box outbound,
 establish a TCP stream and check two UDP request/reply pairs of different lengths.
+
+The HTTPUpgrade client passes raw bytes after a validated HTTP 101. The gRPC
+client opens one flow-controlled HTTP/2 connection per stream and supports
+`service_name`, `authority` and Xray's `multiMode`. Connection reuse and
+gRPC idle-ping configuration are outstanding. VMess padding and authenticated
+lengths have independent sing-box TCP and UDP cases, including both settings
+together. The Hysteria2 hopping case forwards through two UDP ports and checks
+that the same application connection carries traffic through both.
 
 TUIC relay tests run with sing-box and Mihomo. Each mode exchanges TCP
 data and both short and 8 KiB UDP payloads. Native TUIC fragments large
@@ -128,9 +136,9 @@ Limits: up to 64 peers per node, at most two local addresses (one per family), f
 
 ## Transport boundaries and remaining work
 
-Raw TCP, TLS, WebSocket, HTTPUpgrade and VLESS REALITY are implemented. Requested gRPC and other unsupported transports are rejected during conversion; they are never silently changed to raw TCP. VLESS `xtls-rprx-vision` is implemented natively over TLS 1.3 or REALITY/TCP: padding, fragmented frames, independent read/write raw-copy transitions, half-close and XUDP. The standard flow rejects UDP/443 to permit client TCP fallback. Other flows and Vision over WebSocket are rejected; the flow is never silently removed. Legacy VMess with nonzero `alterId` is also rejected.
+Raw TCP, TLS, WebSocket, HTTPUpgrade, gRPC and VLESS REALITY are implemented. Unsupported transports are rejected during conversion; they are never silently changed to raw TCP. VLESS `xtls-rprx-vision` is implemented natively over TLS 1.3 or REALITY/TCP: padding, fragmented frames, independent read/write raw-copy transitions, half-close and XUDP. The standard flow rejects UDP/443 to permit client TCP fallback. Other flows and Vision over WebSocket are rejected; the flow is never silently removed. Legacy VMess with nonzero `alterId` is also rejected.
 
-Further protocol work must retain the native Rust core and pass independent interoperability tests before being listed as supported. Current remaining candidates include gRPC and broader WireGuard profile compatibility.
+Further protocol work must retain the native Rust core and pass independent interoperability tests before being listed as supported. Current remaining candidates include gRPC connection reuse and broader WireGuard profile compatibility.
 
 ## Validation
 

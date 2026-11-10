@@ -113,6 +113,8 @@ struct SingBoxUtls {
 
 #[derive(Debug, Deserialize)]
 struct SingBoxTransport {
+    #[serde(flatten)]
+    grpc: GrpcConfig,
     host: Option<String>,
     #[serde(rename = "type")]
     transport_type: Option<String>,
@@ -404,7 +406,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
         anyhow::ensure!(
             matches!(
                 transport.transport_type.as_deref(),
-                Some("ws" | "httpupgrade")
+                Some("ws" | "httpupgrade" | "grpc")
             ),
             "Unsupported sing-box transport; configuration was not downgraded"
         );
@@ -436,6 +438,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
             .filter(|s| !s.is_empty())
             .context("REALITY public key is required")?;
         return Ok(Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Reality,
             tls: None,
@@ -467,7 +470,12 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
         .map(|t| matches!(t, "ws" | "httpupgrade"))
         .unwrap_or(false);
 
-    if !has_tls && !has_ws {
+    let grpc = ob
+        .transport
+        .as_ref()
+        .filter(|t| t.transport_type.as_deref() == Some("grpc"))
+        .map(|t| t.grpc.clone());
+    if !has_tls && !has_ws && grpc.is_none() {
         return Ok(None);
     }
 
@@ -501,6 +509,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
     };
 
     let transport_type = match (has_ws, has_tls) {
+        _ if grpc.is_some() => TransportType::Grpc,
         (true, _)
             if ob
                 .transport
@@ -516,6 +525,7 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
     };
 
     Ok(Some(TransportConfig {
+        grpc,
         xhttp: None,
         transport_type,
         tls,

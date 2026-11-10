@@ -1167,6 +1167,7 @@ pub struct TlsConnFactory {
     /// handshake runs on top of TCP/TLS/Reality inside `create()`.
     ws: Option<WsConfig>,
     http_upgrade: bool,
+    grpc: Option<crate::config::model::GrpcConfig>,
     xhttp: Option<Arc<super::xhttp::Factory>>,
     xhttp_error: Option<String>,
 }
@@ -1213,6 +1214,11 @@ impl TlsConnFactory {
             _ => None,
         };
         let mut tls_config = tls_config;
+        if transport.is_some_and(|t| t.transport_type == TransportType::Grpc)
+            && let Some(tls) = tls_config.as_mut()
+        {
+            tls.alpn = Some(vec!["h2".into()]);
+        }
         if transport.is_some_and(|t| t.transport_type == TransportType::Xhttp)
             && let Some(tls) = tls_config.as_mut()
         {
@@ -1235,6 +1241,9 @@ impl TlsConnFactory {
             transport.and_then(|t| t.reality.as_ref()),
             ws,
         );
+        if let Some(t) = transport.filter(|t| t.transport_type == TransportType::Grpc) {
+            factory.grpc = Some(t.grpc.clone().unwrap_or_default());
+        }
         factory.http_upgrade =
             transport.is_some_and(|t| t.transport_type == TransportType::HttpUpgrade);
         if let Some(t) = transport.filter(|t| t.transport_type == TransportType::Xhttp) {
@@ -1355,6 +1364,7 @@ impl TlsConnFactory {
             reality_error,
             ws,
             http_upgrade: false,
+            grpc: None,
             xhttp: None,
             xhttp_error: None,
         }
@@ -1446,6 +1456,9 @@ impl ConnFactory for TlsConnFactory {
             // fine with the default share, so no classic entry is recorded.
             if let Some(guard) = probe_guard.take() {
                 guard.finish(false);
+            }
+            if let Some(grpc) = &self.grpc {
+                return super::grpc::connect(stream, &self.sni, self.use_tls, grpc).await;
             }
             if let Some(ws) = &self.ws {
                 if self.http_upgrade {
@@ -1689,6 +1702,7 @@ mod tests {
         // ws+tls node: type=websocket plus an explicit tls config must NOT
         // be silently downgraded to plaintext TCP.
         let t = TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: Some(TlsConfig {
@@ -1708,6 +1722,7 @@ mod tests {
     #[test]
     fn resolve_transport_tls_ws_without_tls_stays_plaintext() {
         let t = TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
@@ -1788,6 +1803,7 @@ mod tests {
         });
 
         let transport = TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,

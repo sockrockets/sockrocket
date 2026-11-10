@@ -28,6 +28,7 @@ async fn vmess_ws_local_capture() {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
@@ -77,6 +78,7 @@ async fn vmess_ws_remote_connectivity() {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: if use_tls {
@@ -154,6 +156,7 @@ async fn vmess_ws_against_local_xray() {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,

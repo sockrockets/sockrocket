@@ -31,6 +31,8 @@ struct V2RayStreamSettings {
     tls_settings: Option<V2RayTlsSettings>,
     #[serde(rename = "httpupgradeSettings")]
     http_upgrade_settings: Option<V2RayWsSettings>,
+    #[serde(rename = "grpcSettings")]
+    grpc_settings: Option<GrpcConfig>,
     #[serde(rename = "wsSettings")]
     ws_settings: Option<V2RayWsSettings>,
     #[serde(rename = "xhttpSettings")]
@@ -182,7 +184,7 @@ pub fn parse_vmess_uri(uri: &str) -> Result<Node> {
     let network = link.net.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "ws" | "httpupgrade"),
+        matches!(network, "tcp" | "ws" | "grpc" | "httpupgrade"),
         "Unsupported VMess URI transport; configuration was not downgraded"
     );
     let transport = build_vmess_transport(network, has_tls, &link);
@@ -486,6 +488,7 @@ pub fn parse_tuic_uri(uri: &str) -> Result<Node> {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Quic,
             tls: Some(TlsConfig {
@@ -778,6 +781,7 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
@@ -885,6 +889,7 @@ pub fn parse_anytls_uri(uri: &str) -> Result<Node> {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
@@ -1219,7 +1224,10 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     let network = ss.network.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "raw" | "ws" | "httpupgrade" | "xhttp"),
+        matches!(
+            network,
+            "tcp" | "raw" | "ws" | "grpc" | "httpupgrade" | "xhttp"
+        ),
         "Unsupported Xray transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -1247,6 +1255,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
         && let Some(ref rs) = ss.reality_settings
     {
         return Ok(Some(TransportConfig {
+            grpc: None,
             xhttp: if network == "xhttp" {
                 Some(ss.xhttp_settings.clone().unwrap_or_default())
             } else {
@@ -1320,12 +1329,14 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
         "httpupgrade" => TransportType::HttpUpgrade,
+        "grpc" => TransportType::Grpc,
         "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Ok(Some(TransportConfig {
+        grpc: (network == "grpc").then(|| ss.grpc_settings.clone().unwrap_or_default()),
         xhttp,
         transport_type,
         tls,
@@ -1370,11 +1381,17 @@ fn build_vmess_transport(
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
         "httpupgrade" => TransportType::HttpUpgrade,
+        "grpc" => TransportType::Grpc,
         _ if has_tls => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Some(TransportConfig {
+        grpc: (network == "grpc").then(|| GrpcConfig {
+            service_name: link.path.clone().unwrap_or_default(),
+            multi_mode: link.header_type.as_deref() == Some("multi"),
+            authority: link.host.clone(),
+        }),
         xhttp: None,
         transport_type,
         tls,
@@ -1391,7 +1408,7 @@ fn build_uri_transport(
     anyhow::ensure!(
         matches!(
             transport_type_str,
-            "tcp" | "raw" | "ws" | "httpupgrade" | "xhttp"
+            "tcp" | "raw" | "ws" | "grpc" | "httpupgrade" | "xhttp"
         ),
         "Unsupported URI transport; configuration was not downgraded"
     );
@@ -1411,6 +1428,7 @@ fn build_uri_transport(
 
     if security == "reality" {
         return Ok(Some(TransportConfig {
+            grpc: None,
             xhttp: if transport_type_str == "xhttp" {
                 Some(uri_xhttp(params)?)
             } else {
@@ -1484,12 +1502,18 @@ fn build_uri_transport(
     let transport_type = match transport_type_str {
         "ws" => TransportType::WebSocket,
         "httpupgrade" => TransportType::HttpUpgrade,
+        "grpc" => TransportType::Grpc,
         "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Ok(Some(TransportConfig {
+        grpc: (transport_type_str == "grpc").then(|| GrpcConfig {
+            service_name: params.get("serviceName").cloned().unwrap_or_default(),
+            multi_mode: params.get("mode").is_some_and(|v| v == "multi"),
+            authority: params.get("authority").cloned(),
+        }),
         xhttp,
         transport_type,
         tls,
@@ -1510,11 +1534,24 @@ pub fn node_to_share_uri(node: &Node) -> String {
             Tls => "tcp",
             WebSocket => "ws",
             HttpUpgrade => "httpupgrade",
+            Grpc => "grpc",
             Xhttp => "xhttp",
             Quic => "quic",
             Reality => "tcp",
         };
         qparams.push(format!("type={}", net));
+        if let Some(grpc) = &tc.grpc {
+            qparams.push(format!(
+                "serviceName={}",
+                urlencoding::encode(&grpc.service_name)
+            ));
+            if grpc.multi_mode {
+                qparams.push("mode=multi".into());
+            }
+            if let Some(host) = &grpc.authority {
+                qparams.push(format!("authority={}", urlencoding::encode(host)));
+            }
+        }
 
         let security = if tc.reality.is_some() {
             "reality"
@@ -1653,6 +1690,7 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 let n = match tc.transport_type {
                     TransportType::WebSocket => "ws",
                     TransportType::HttpUpgrade => "httpupgrade",
+                    TransportType::Grpc => "grpc",
                     TransportType::Quic => "quic",
                     _ => "tcp",
                 };
@@ -1692,6 +1730,13 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 "tls": tls_str,
                 "sni": sni,
             });
+            if let Some(grpc) = node.transport.as_ref().and_then(|t| t.grpc.as_ref()) {
+                json["path"] = grpc.service_name.clone().into();
+                json["type"] = if grpc.multi_mode { "multi" } else { "gun" }.into();
+                if let Some(host) = &grpc.authority {
+                    json["host"] = host.clone().into();
+                }
+            }
             for (key, name) in [
                 (VMESS_PADDING, "global_padding"),
                 (VMESS_AUTH_LEN, "authenticated_length"),
@@ -2325,7 +2370,7 @@ mod native_protocol_regressions {
     }
     #[test]
     fn unsupported_uri_transports_fail_closed() {
-        for transport in ["grpc", "kcp"] {
+        for transport in ["h2", "kcp"] {
             assert!(parse_vless_uri(&format!("vless://00000000-0000-0000-0000-000000000001@vpn.example.invalid:443?security=tls&type={transport}")).is_err());
         }
     }

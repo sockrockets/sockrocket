@@ -496,6 +496,19 @@ fn apply_ws_and_tls(m: &mut Mapping, node: &Node, sni_key: &str) {
             );
         }
     }
+    if tc.transport_type == TransportType::Grpc {
+        put(m, "network", s("grpc"));
+        let grpc = tc.grpc.clone().unwrap_or_default();
+        let mut opts = Mapping::new();
+        put(&mut opts, "grpc-service-name", s(&grpc.service_name));
+        if grpc.multi_mode {
+            put(&mut opts, "multiMode", Value::Bool(true));
+        }
+        if let Some(host) = grpc.authority {
+            put(&mut opts, "authority", s(&host));
+        }
+        m.insert(s("grpc-opts"), Value::Mapping(opts));
+    }
     if matches!(
         tc.transport_type,
         TransportType::WebSocket | TransportType::HttpUpgrade
@@ -612,6 +625,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::WebSocket,
                 tls: Some(TlsConfig {
@@ -644,6 +658,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Reality,
                 tls: None,
@@ -676,6 +691,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Quic,
                 tls: Some(TlsConfig {
@@ -720,6 +736,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Quic,
                 tls: Some(TlsConfig {

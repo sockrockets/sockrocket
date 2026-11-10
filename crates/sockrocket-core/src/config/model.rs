@@ -588,6 +588,8 @@ fn default_congestion() -> String {
 /// Transport layer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<GrpcConfig>,
     /// Transport type
     #[serde(rename = "type")]
     pub transport_type: TransportType,
@@ -610,9 +612,19 @@ pub enum TransportType {
     Tls,
     WebSocket,
     HttpUpgrade,
+    Grpc,
     Xhttp,
     Quic,
     Reality,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GrpcConfig {
+    #[serde(default, alias = "serviceName", alias = "grpc-service-name")]
+    pub service_name: String,
+    #[serde(default, alias = "multiMode")]
+    pub multi_mode: bool,
+    pub authority: Option<String>,
 }
 
 /// TLS configuration
