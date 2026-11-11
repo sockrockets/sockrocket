@@ -21,9 +21,12 @@ Object.assign(translations.en, {
  wireguardDetail:'No additional OS interface; UDP payloads must fit the tunnel MTU.',
  protocolLimits:'Compatibility: VLESS Vision supports TLS 1.3 / REALITY over TCP and XUDP (standard flow excludes UDP/443). gRPC / XHTTP remain unsupported and fail explicitly. WireGuard does not yet support multiple peers, IP fragmentation or profile scripts.',
  protocolGuide:'Protocol and transport guide →',
- heroLabel:'Router plugin for AsusWRT-Merlin',
- heroTitle:'Open-source Rust<br>Small download<br>Low memory use',
- heroDescription:'Sample Merlin installers were about 6.4 MiB, and the proxy used 29–37 MiB of RAM in an RT-AX86U Pro test. Install once to share nodes, rules and DNS across your home.',
+ heroLabel:'Small download · Low memory use · Open-source Rust',
+ desktopShortcut:'Download for desktop',
+ heroTitle:'One router for<br>all your devices',
+ heroDescription:'Phones, tablets and computers connected to your Merlin router share nodes, rules and DNS.',
+ heroPackage:'ARM64 installer', heroMemory:'Proxy process RAM', heroSource:'Open-source engine',
+ heroBenchmark:'RAM measured on an RT-AX86U Pro with 153–172 active sessions.',
  heroDownload:'Download the router plugin',
  heroGuide:'Read the install guide',
  heroPlatforms:'Match the firmware platform · hnd_v8 / hnd / arm / qca / mtk',
@@ -102,9 +105,12 @@ Object.assign(translations.vi, {
  wireguardDetail:'Không tạo thêm giao diện mạng hệ thống; gói UDP phải nằm trong MTU của đường hầm.',
  protocolLimits:'Giới hạn: VLESS Vision hỗ trợ TLS 1.3 / REALITY qua TCP và XUDP (flow tiêu chuẩn chặn UDP/443). gRPC / XHTTP chưa được triển khai và sẽ bị từ chối rõ ràng. WireGuard chưa hỗ trợ nhiều peer, phân mảnh IP hoặc script cấu hình.',
  protocolGuide:'Hướng dẫn giao thức và transport →',
- heroLabel:'Plugin cho router AsusWRT-Merlin',
- heroTitle:'Rust mã nguồn mở<br>Gói cài nhỏ<br>Dùng ít RAM',
- heroDescription:'Gói cài đặt thử nghiệm khoảng 6.4 MiB. Trên RT-AX86U Pro, tiến trình proxy dùng 29–37 MiB RAM trong thử nghiệm. Cài một lần để cả nhà dùng chung node, quy tắc và DNS.',
+ heroLabel:'Gói cài nhỏ · Ít tốn RAM · Lõi Rust mã nguồn mở',
+ desktopShortcut:'Tải ứng dụng máy tính',
+ heroTitle:'Một router cho<br>mọi thiết bị',
+ heroDescription:'Điện thoại, máy tính bảng và máy tính kết nối với router Merlin dùng chung node, quy tắc và DNS.',
+ heroPackage:'Gói cài ARM64', heroMemory:'RAM của proxy', heroSource:'Lõi mã nguồn mở',
+ heroBenchmark:'RAM đo trên RT-AX86U Pro với 153–172 phiên hoạt động.',
  heroDownload:'Tải plugin cho router',
  heroGuide:'Đọc hướng dẫn cài đặt',
  heroPlatforms:'Chọn đúng nền tảng firmware · hnd_v8 / hnd / arm / qca / mtk',
@@ -170,6 +176,14 @@ Object.assign(translations.vi, {
  faqSixQ:'Vì sao tổng của subscription không khớp một node?',
  faqSixA:'Tổng cộng các node hiện thuộc subscription đó. Lưu lượng Direct và node không thuộc subscription chỉ nằm trong bảng node. Trang không hiện địa chỉ subscription.'
 });
+Object.assign(translations.en, {
+ traceChoose:'Choose a sample request to trace its route', traceTitle:'Request routing demo', traceLan:'Access LAN', traceMedia:'Play video', traceAds:'Load an ad',
+ trace_direct:'Connect directly', trace_proxy:'Connect via proxy', trace_reject:'Block the connection', traceDoc:'Explore routing rules →'
+});
+Object.assign(translations.vi, {
+ traceChoose:'Chọn yêu cầu mẫu để xem đường đi', traceTitle:'Mô phỏng định tuyến', traceLan:'Truy cập LAN', traceMedia:'Phát video', traceAds:'Tải quảng cáo',
+ trace_direct:'Kết nối trực tiếp', trace_proxy:'Kết nối qua proxy', trace_reject:'Chặn kết nối', traceDoc:'Tìm hiểu quy tắc định tuyến →'
+});
 const elements = [...document.querySelectorAll('[data-t]')];
 translations.zh = Object.fromEntries(elements.map(el => [el.dataset.t, el.innerHTML]));
 Object.assign(translations.zh,{copied:'已复制',copyFailed:'请选中命令后手动复制'});
@@ -179,7 +193,7 @@ function setLanguage(value) {
  elements.forEach(el => { el.innerHTML = translations[locale][el.dataset.t] ?? translations.zh[el.dataset.t]; });
  document.documentElement.lang = {zh:'zh-CN',en:'en',vi:'vi'}[locale];
  document.title = 'Sockrocket · ' + document.querySelector('[data-t="heroTitle"]').innerHTML.split('<br>').join(' · ');
- document.querySelector('meta[name="description"]').content = document.querySelector('[data-t="heroDescription"]').textContent;
+ document.querySelector('meta[name="description"]').content = document.querySelector('[data-t="heroLabel"]').textContent + '. ' + document.querySelector('[data-t="heroDescription"]').textContent;
  document.getElementById('language').value = locale;
  try { localStorage.setItem('sockrocket-language',locale); } catch {}
 }
