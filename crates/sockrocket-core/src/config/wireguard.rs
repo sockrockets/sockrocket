@@ -134,7 +134,7 @@ fn clash_entry(v: &Value) -> Result<Node> {
     );
     let mut local_addresses = Vec::new();
     for (field, prefix) in [("ip", 32), ("ipv6", 128)] {
-        if let Some(ip) = text(&v, &[field]) {
+        if let Some(ip) = text(v, &[field]) {
             local_addresses.push(if ip.contains('/') {
                 ip
             } else {
@@ -143,20 +143,20 @@ fn clash_entry(v: &Value) -> Result<Node> {
         }
     }
     let mut config = WireguardConfig {
-        private_key: required(&v, &["private-key"])?,
-        public_key: required(&v, &["public-key"])?,
-        preshared_key: text(&v, &["pre-shared-key", "preshared-key"]),
+        private_key: required(v, &["private-key"])?,
+        public_key: required(v, &["public-key"])?,
+        preshared_key: text(v, &["pre-shared-key", "preshared-key"]),
         local_addresses,
         ..Default::default()
     };
-    common(&v, &mut config)?;
-    let port = u16::try_from(number(&v, &["port"])?.context("Missing WireGuard port")?)
+    common(v, &mut config)?;
+    let port = u16::try_from(number(v, &["port"])?.context("Missing WireGuard port")?)
         .context("Invalid WireGuard port")?;
     finish(
-        text(&v, &["name"])
+        text(v, &["name"])
             .map(|s| decode_display_name(&s))
             .unwrap_or_else(|| "WireGuard".into()),
-        required(&v, &["server"])?,
+        required(v, &["server"])?,
         port,
         config,
     )

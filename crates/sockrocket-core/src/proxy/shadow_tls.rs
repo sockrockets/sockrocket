@@ -652,9 +652,7 @@ impl ShadowTlsConnFactory {
                 addr
             );
         }
-        let state = tap
-            .state
-            .expect("authorized implies handshake state");
+        let state = tap.state.expect("authorized implies handshake state");
         let mut relay = ShadowTlsIo::new(
             tap.inner,
             &self.tls_password,
