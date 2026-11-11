@@ -145,42 +145,29 @@ health_check:
 # Types: domain | domain-suffix | domain-keyword | ip-cidr | geoip | dst-port | final
 # Built-in geoip:CN covers mainland China IPv4 CIDRs (refresh: scripts/update-china-cidrs.sh).
 # User non-final rules first, then built-in China-direct, then final → proxy.
+# Global bindings are installed once with a fresh configuration. Selecting a
+# different node only changes active_node. The final proxy action follows it.
+explicit_group_bindings: true
+device_rule_groups:
+  - {source: "", group: "内网直连", target: direct, priority: 0}
+  - {source: "", group: "GEO 直连", target: direct, priority: 0}
+  - {source: "", group: "CN 直连", target: direct, priority: 0}
 rules:
-  # Private addresses direct
-  - rule_type: "ip-cidr"
-    pattern: "10.0.0.0/8"
-    target: "direct"
-    priority: 50
-  - rule_type: "ip-cidr"
-    pattern: "172.16.0.0/12"
-    target: "direct"
-    priority: 50
-  - rule_type: "ip-cidr"
-    pattern: "192.168.0.0/16"
-    target: "direct"
-    priority: 50
-  - rule_type: "ip-cidr"
-    pattern: "100.64.0.0/10"
-    target: "direct"
-    priority: 50
-
-  # Mainland China IPs direct (expanded built-in GeoIP DB)
-  - rule_type: "geoip"
-    pattern: "CN"
-    target: "direct"
-    priority: 40
-
-  # Example: force HTTPS direct for a lab host (uncomment to use)
-  # - rule_type: "dst-port"
-  #   pattern: "443"
-  #   target: "direct"
-  #   priority: 30
-
-  # Catch-all → proxy (optional; omitted rules default to proxy)
-  - rule_type: "final"
-    pattern: "*"
-    target: "proxy"
-    priority: 0
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "10.0.0.0/8", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "172.16.0.0/12", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "192.168.0.0/16", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "100.64.0.0/10", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "127.0.0.0/8", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "169.254.0.0/16", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "::1/128", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "fc00::/7", target: direct, priority: 50}
+  - {group: "内网直连", rule_type: ip-cidr, pattern: "fe80::/10", target: direct, priority: 50}
+  - {group: "GEO 直连", rule_type: geoip, pattern: CN, target: direct, priority: 40}
+  - {group: "CN 直连", rule_type: domain-suffix, pattern: cn, target: direct, priority: 60}
+  - {group: "CN 直连", rule_type: domain-suffix, pattern: xn--fiqs8s, target: direct, priority: 60}
+  - {group: "CN 直连", rule_type: domain-suffix, pattern: xn--55qx5d, target: direct, priority: 60}
+  - {group: "CN 直连", rule_type: domain-suffix, pattern: xn--io0a7i, target: direct, priority: 60}
+  - {name: "全局设备兜底", rule_type: final, pattern: "*", target: proxy, priority: 0}
 
 # -- Logging -------------------------------------------------------------------
 # log_level: "info"   # error | warn | info | debug

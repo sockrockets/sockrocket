@@ -8,7 +8,8 @@ vm.runInContext(source.slice(source.indexOf('function setRuleGroupEnabled'),sour
 const presets=[{id:'ai',title:'AI 服务',description:'示例 AI 域名',group:'预设 · AI 服务',target:'proxy',domains:['example.com','api.example.net']},{id:'domestic',title:'国内常用网站',description:'国内直连',group:'预设 · 国内常用网站',target:'direct',domains:['example.cn']}];
 const request=action=>{const at=requests.findIndex(r=>r[0]===action);assert.ok(at>=0,action);return requests.splice(at,1)[0];};
 const refresh=(rules,revision='current')=>request('get_rules')[2]({ok:true,rules,revision,presets});
-c.srLoadRules();refresh([]);
+c.srLoadRules();refresh([{index:0,group:presets[0].group,rule_type:'FINAL',enabled:true,pattern:'*',target:'direct'}]);
+assert.equal(element('rule-preset-view').hidden,true,'a saved fallback alone is not a preset group');
 assert.equal(requests.length,0,'loading the default catalog must not add or enable anything');
 assert.equal(element('rule-preset').value,'ai');
 assert.equal(element('rule-preset-enable').hidden,true);assert.equal(element('rule-preset-add').disabled,false);

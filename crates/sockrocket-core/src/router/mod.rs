@@ -10,5 +10,6 @@ pub use engine::{
 };
 pub use geoip::GeoIpDb;
 pub use rule_mode::{
-    device_policy_sources, rule_mode_ruleset, rule_mode_with_bindings, rule_mode_with_devices,
+    device_policy_sources, rule_mode_ruleset, rule_mode_with_bindings, rule_mode_with_builtin,
+    rule_mode_with_devices,
 };

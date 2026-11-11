@@ -157,6 +157,7 @@ pub struct AppState {
     pub(crate) rules: Vec<RoutingRule>,
     router_rules: Vec<(usize, RoutingRule)>,
     explicit_group_bindings: bool,
+    builtin_route: sockrocket_core::config::model::BuiltinRoute,
     device_rule_groups: Vec<sockrocket_core::config::model::DeviceRuleGroup>,
     pub(crate) rule_group_input: Entity<InputState>,
     pub(crate) rule_pattern_input: Entity<InputState>,
@@ -450,10 +451,11 @@ impl AppState {
             .filter(|link| link.source.is_empty())
             .cloned()
             .collect();
-        sockrocket_core::router::rule_mode_with_bindings(
+        sockrocket_core::router::rule_mode_with_builtin(
             &self.rules,
             &shared,
             self.explicit_group_bindings,
+            self.builtin_route,
         )
     }
     pub fn new(
@@ -769,6 +771,7 @@ impl AppState {
             rules,
             router_rules,
             explicit_group_bindings: persisted.explicit_group_bindings,
+            builtin_route: persisted.builtin_route,
             device_rule_groups: persisted.device_rule_groups.clone(),
             rule_group_input,
             rule_pattern_input,
@@ -3581,6 +3584,7 @@ impl AppState {
             subscriptions: self.subscriptions.clone(),
             rules: sockrocket_gui::desktop_rules::for_storage(&self.rules, &self.router_rules),
             explicit_group_bindings: self.explicit_group_bindings,
+            builtin_route: self.builtin_route,
             device_rule_groups: self.device_rule_groups.clone(),
             auto_connect: self.proxy_running,
             tun_was_enabled: self.tun_enabled,
@@ -3986,6 +3990,7 @@ impl AppState {
                 (self.rules, self.router_rules) =
                     sockrocket_gui::desktop_rules::split(new_config.rules.clone());
                 self.explicit_group_bindings = new_config.explicit_group_bindings;
+                self.builtin_route = new_config.builtin_route;
                 self.device_rule_groups = new_config.device_rule_groups.clone();
                 self.dns = new_config.dns.clone();
                 self.ipv6_mode = new_config.ipv6_mode;

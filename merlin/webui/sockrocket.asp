@@ -544,7 +544,7 @@ body.bg {min-width:0!important}
 
       <!-- ── Page: Routing rules ─────────────────────────────────────── -->
       <div class="page" id="sr-page-dns" role="tabpanel" aria-labelledby="sr-nav-dns">
-        <div class="page-title">分流规则</div><p class="page-intro">在规则模式下，已指定设备策略的来源使用自己的规则；其余来源使用全局设备的规则。随后检查国内直连及默认出口。</p>
+        <div class="page-title">分流规则</div><p class="page-intro">在规则模式下，已指定设备策略的来源使用自己的规则；其余来源使用全局设备的规则。随后检查内置分组及默认出口。</p>
         <section class="card" aria-labelledby="sr-rule-flow-title">
           <div class="rule-flow-head"><h3 id="sr-rule-flow-title">流量去向</h3><span class="flow-state" id="sr-rule-flow-state">等待状态</span><button type="button" class="btn btn-sm" id="sr-rule-flow-toggle" aria-expanded="true" aria-controls="sr-rule-flow" onclick="toggleRuleFlow()">收起概览</button></div>
           <p class="hint">设备和网段只连接各自配置的规则。共用规则从「全局设备」连出。选择设备并输入目标，可查看实际命中的路径。</p>
@@ -559,6 +559,11 @@ body.bg {min-width:0!important}
           <p class="hint" id="sr-rule-flow-query-state" role="status" aria-live="polite">连线表示可能的出口，每次匹配只选一个。输入目的地址可检查命中路径；点击规则组可查看规则。</p>
           <div id="sr-rule-flow" aria-label="分流配置路径"><p class="hint">正在加载规则…</p></div>
         </section>
+        <details class="card" id="sr-builtin-route-settings"><summary>内置国内 / 局域网分流</summary>
+          <label for="sr-builtin-route-target">命中时的处理方式</label>
+          <select id="sr-builtin-route-target" disabled onchange="saveBuiltinRoute(this.value)"><option value="direct">直连</option><option value="proxy">代理</option><option value="reject">拒绝</option></select>
+          <p class="hint">适用于国内域名、国内 IP 和局域网地址。选择代理或拒绝会关闭国内 IP 直连加速。</p>
+        </details>
         <section class="card" id="sr-rule-workspace" aria-labelledby="sr-rule-workspace-title">
           <div class="toolbar"><h3 id="sr-rule-workspace-title">规则组维护</h3><div class="spacer"></div></div>
           <div class="toolbar" id="sr-rule-workspace-tabs" role="tablist" aria-label="规则组维护">
@@ -617,7 +622,6 @@ body.bg {min-width:0!important}
                 <option value="ip-cidr">IP 网段</option>
                 <option value="geoip">地区</option>
                 <option value="dst-port">端口</option>
-                <option value="final">最终规则</option>
               </select>
             </div>
             <div class="fg"><label id="sr-rule-target-label" for="sr-rule-target">处理方式</label>
@@ -645,7 +649,7 @@ body.bg {min-width:0!important}
             </div>
           </div>
           <div id="sr-rule-bulk-wrap">
-            <textarea id="sr-rule-batch" aria-label="待导入或批量编辑的规则" rows="5" spellcheck="false" placeholder="DOMAIN-SUFFIX,example.invalid,PROXY&#10;GEOIP,CN,DIRECT&#10;MATCH,PROXY"></textarea>
+            <textarea id="sr-rule-batch" aria-label="待导入或批量编辑的规则" rows="5" spellcheck="false" placeholder="DOMAIN-SUFFIX,example.invalid,PROXY&#10;GEOIP,CN,DIRECT"></textarea>
             <div class="toolbar" style="margin-top:8px">
               <div class="spacer"></div>
               <span class="hint">域名、网段、地区可每行一个值；混合规则使用 TYPE,内容,ACTION。</span>
@@ -654,13 +658,13 @@ body.bg {min-width:0!important}
           </div>
           </div>
           </div>
-<section hidden class="rule-inline-editor" id="sr-rule-edit-panel" aria-labelledby="sr-rule-edit-title"><h3 id="sr-rule-edit-title">编辑规则</h3><p class="hint">可直接修改优先级，数字越大越先匹配；改为最终规则时会在国内直连之后匹配。运行中的服务会重启以应用规则。</p><div class="form-grid"><div class="fg"><label for="sr-edit-rule-group">分组</label><input type="text" id="sr-edit-rule-group" list="sr-rule-group-list"></div><div class="fg"><label for="sr-edit-rule-type">类型</label><select id="sr-edit-rule-type" onchange="editRuleTypeChanged()"><option value="domain">完整域名</option><option value="domain-suffix">域名后缀</option><option value="domain-keyword">域名关键词</option><option value="ip-cidr">IP 网段</option><option value="geoip">地区</option><option value="dst-port">端口</option><option value="final">最终规则</option></select></div><div class="fg"><label for="sr-edit-rule-pattern">匹配内容</label><input type="text" id="sr-edit-rule-pattern" spellcheck="false"></div><div class="fg"><label for="sr-edit-rule-source">设备来源 IP / 网段</label><input id="sr-edit-rule-source" type="text" placeholder="留空作为组内规则" autocomplete="off"></div><div class="fg"><label for="sr-edit-rule-priority">优先级（数字越大越先匹配）</label><input type="number" id="sr-edit-rule-priority" step="1" min="-2147483648" max="2147483647"></div><div class="fg"><label for="sr-edit-rule-target">处理方式</label><select id="sr-edit-rule-target"><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select></div></div><label><input type="checkbox" id="sr-edit-rule-enabled"> 启用此规则</label><div class="dialog-actions"><button class="btn" onclick="cancelRuleRowEditor()">取消</button><button class="btn btn-accent" id="sr-rule-edit-save" onclick="saveRuleEdit()">保存修改</button></div></section>
+<section hidden class="rule-inline-editor" id="sr-rule-edit-panel" aria-labelledby="sr-rule-edit-title"><h3 id="sr-rule-edit-title">编辑规则</h3><p class="hint">可直接修改优先级，数字越大越先匹配。运行中的服务会重启以应用规则。</p><div class="form-grid"><div class="fg"><label for="sr-edit-rule-group">分组</label><input type="text" id="sr-edit-rule-group" list="sr-rule-group-list"></div><div class="fg"><label for="sr-edit-rule-type">类型</label><select id="sr-edit-rule-type" onchange="editRuleTypeChanged()"><option value="domain">完整域名</option><option value="domain-suffix">域名后缀</option><option value="domain-keyword">域名关键词</option><option value="ip-cidr">IP 网段</option><option value="geoip">地区</option><option value="dst-port">端口</option></select></div><div class="fg"><label for="sr-edit-rule-pattern">匹配内容</label><input type="text" id="sr-edit-rule-pattern" spellcheck="false"></div><div class="fg"><label for="sr-edit-rule-source">设备来源 IP / 网段</label><input id="sr-edit-rule-source" type="text" placeholder="留空作为组内规则" autocomplete="off"></div><div class="fg"><label for="sr-edit-rule-priority">优先级（数字越大越先匹配）</label><input type="number" id="sr-edit-rule-priority" step="1" min="-2147483648" max="2147483647"></div><div class="fg"><label for="sr-edit-rule-target">处理方式</label><select id="sr-edit-rule-target"><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select></div></div><label><input type="checkbox" id="sr-edit-rule-enabled"> 启用此规则</label><div class="dialog-actions"><button class="btn" onclick="cancelRuleRowEditor()">取消</button><button class="btn btn-accent" id="sr-rule-edit-save" onclick="saveRuleEdit()">保存修改</button></div></section>
           <div id="sr-rule-list-panel">
           <input type="text" id="sr-rule-search" autocomplete="off" spellcheck="false" aria-label="搜索规则" placeholder="查找组内规则（域名、IP 或名称）" oninput="renderRules()">
           <details id="sr-rule-filter-panel"><summary>更多筛选</summary><div class="rule-filters"><select id="sr-rule-filter-target" aria-label="筛选处理方式" onchange="renderRules()"><option value="">全部处理方式</option><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select><select id="sr-rule-filter-scope" aria-label="筛选规则来源" onchange="renderRules()"><option value="">全部来源</option><option value="global">全局规则</option><option value="device">设备专属规则</option></select><select id="sr-rule-filter-state" aria-label="筛选状态" onchange="renderRules()"><option value="">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></div><button class="btn btn-sm" onclick="changeRuleGroup(RULE_SELECTED_GROUP)">清除筛选</button></details><p class="hint" id="sr-rule-count" aria-live="polite"></p>
           <div class="rows" id="sr-rule-list"><div class="hint">正在加载…</div></div>
           <div class="toolbar" id="sr-rule-pager" hidden><span class="hint" id="sr-rule-page-label"></span><div class="spacer"></div><button class="btn btn-sm" id="sr-rule-page-prev" onclick="changeRulePage(-1)">上一页</button><button class="btn btn-sm" id="sr-rule-page-next" onclick="changeRulePage(1)">下一页</button></div>
-          <details><summary>匹配顺序说明</summary><p class="hint">每个分组可以指定自己的代理节点。直连和拒绝的规则保持不变。按优先级从高到低匹配；相同优先级按配置顺序匹配。已指定策略的设备依次检查专属规则、关联组、内置国内直连，再走设备默认出口（默认为代理）。其余设备检查全局设备的规则、内置国内直连和全局设备的默认出口。上下移动仅限同一匹配阶段，会更新规则优先级，并针对完整列表操作，不受筛选或分页影响。</p></details>
+          <details><summary>匹配顺序说明</summary><p class="hint">每个分组可以指定自己的代理节点。直连和拒绝的规则保持不变。按优先级从高到低匹配；相同优先级按配置顺序匹配。已指定策略的设备依次检查专属规则、关联组、内置国内 / 局域网分组，再走设备默认出口（默认为代理）。其余设备检查全局设备的规则、内置国内 / 局域网分组和全局设备的默认出口。上下移动仅限同一匹配阶段，会更新规则优先级，并针对完整列表操作，不受筛选或分页影响。</p></details>
           </div>
         </section>
         <section class="card" aria-labelledby="sr-rule-application-title">
@@ -671,7 +675,9 @@ body.bg {min-width:0!important}
               <div class="fg" id="sr-device-manual" hidden><label for="sr-device-source">来源 IP / 网段</label><input id="sr-device-source" placeholder="例如 192.168.50.20" oninput="updateDevicePolicySelection()" onchange="syncEditorToMap()"></div>
             </div>
             <div id="sr-device-settings" hidden>
-              <div class="toolbar"><h4 id="sr-device-binding-title">使用的规则组</h4><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="switchDevicePanel('add')">关联规则组</button><button type="button" class="btn btn-sm" onclick="switchDevicePanel('fallback')">默认出口</button></div>
+              <div class="toolbar"><h4 id="sr-device-fallback-scope">设备默认出口</h4><span class="hint" id="sr-device-fallback-label"></span><div class="spacer"></div><button type="button" class="btn btn-sm" aria-controls="sr-device-fallback" onclick="switchDevicePanel('fallback')">修改默认出口</button></div>
+              <div id="sr-device-fallback" class="rule-inline-editor" hidden><div class="toolbar"><strong>修改未命中规则时的处理方式</strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div><div class="toolbar"><div class="fg"><label for="sr-device-target">处理方式</label><select id="sr-device-target" aria-describedby="sr-device-fallback-help sr-device-effective-policy"></select><span class="hint" id="sr-device-fallback-help">规则模式下，只有前面的规则都未匹配（包括内置国内 / 局域网分组规则），才使用这里的选择。例如选「代理」，未匹配的连接就走代理。</span><span class="hint" id="sr-device-effective-policy" hidden></span></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存</button></div></div>
+              <div class="toolbar"><h4 id="sr-device-binding-title">使用的规则组</h4><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="switchDevicePanel('add')">关联规则组</button></div>
               <div id="sr-device-bindings" class="rows"></div>
               <details id="sr-device-inherited" hidden><summary id="sr-device-inherited-title"></summary><ul id="sr-device-inherited-list"></ul><button type="button" class="btn btn-sm" onclick="srElement('device-picker').value='global';selectPolicyDevice();syncEditorToMap()">查看全局设备策略</button></details>
                 <div id="sr-device-bound-editor" class="rule-inline-editor" hidden>
@@ -689,7 +695,6 @@ body.bg {min-width:0!important}
                   <div class="pg-member-list" id="sr-device-available-groups" onchange="updateDeviceAddCount()"></div>
                   <div class="toolbar"><div class="fg"><label for="sr-device-add-target">命中规则时的出口</label><select id="sr-device-add-target"><option value="">请选择出口（必填）</option></select></div><div class="fg"><label for="sr-device-add-priority">新关联优先级（数字越大越先匹配）</label><input id="sr-device-add-priority" type="number" min="0" max="65535" step="1" value="0"></div><button type="button" id="sr-device-add-selected" class="btn btn-accent btn-sm" disabled onclick="addDeviceGroups()">关联所选组</button></div>
                 </div>
-              <div id="sr-device-fallback" class="rule-inline-editor" hidden><div class="toolbar"><strong id="sr-device-fallback-label">未命中规则时的处理方式</strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div><div class="toolbar"><div class="fg"><label for="sr-device-target">处理方式</label><select id="sr-device-target" aria-describedby="sr-device-effective-policy"></select><span class="hint" id="sr-device-effective-policy" hidden></span></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存</button></div></div>
               <div id="sr-device-specific">
                 <div class="toolbar"><button type="button" class="btn btn-sm" id="sr-device-trace" onclick="inspectDeviceTraffic()">检查这台设备的分流</button><button type="button" class="btn btn-danger btn-sm" onclick="deletePolicyDevice()">删除设备配置</button></div>
                 <button type="button" class="btn btn-sm" onclick="switchDevicePanel('alias')">修改设备名称</button><div id="sr-device-alias-panel" class="rule-inline-editor" hidden><div class="toolbar"><input id="sr-device-alias" aria-label="自定义设备名称" maxlength="48" placeholder="例如 客厅电视"><button class="btn btn-sm" onclick="saveDeviceAlias()">保存名称</button><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div></div>
@@ -1471,7 +1476,7 @@ function setProxyModeUi(mode) {
       ? '全局：全部流量经过当前节点'
       : (m === 'direct'
           ? '直连：流量直接访问'
-          : '规则：自定义规则、内置国内直连、最终规则依次匹配');
+          : '规则：自定义规则、内置国内 / 局域网分组、最终规则依次匹配');
   }
 }
 function setProxyMode(mode) {
@@ -1682,6 +1687,7 @@ function setNode(i) {
     complete(); toastResp(d);
     if (d.ok === false) return;
     srLoadNodes(); refreshStatus(true);
+    if(SR_STATE.page==='dns')srLoadRules();
     // Selection and connectivity testing are separate user actions.
   }, complete);
 }
@@ -2085,7 +2091,7 @@ function setProxyGroupTargets(groups) {
   SR_PROXY_GROUPS.forEach(function(g){RULE_TARGET_LABEL['group:'+g.name]='分组 · '+g.name;});
   ['rule-target','edit-rule-target','rule-filter-target','device-target','device-add-target','preset-route-target'].forEach(function(id){
     var el=srElement(id);if(!el)return;var old=el.value;
-    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除自定义默认出口</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
+    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除单独设置</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
     el.innerHTML=prefix+['proxy','direct','reject'].concat(SR_PROXY_GROUPS.map(function(g){return 'group:'+g.name;})).map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
     if(Array.from(el.options).some(function(o){return o.value===old;}))el.value=old;
     else if(old && old.indexOf('group:')===0){var o=document.createElement('option');o.value=old;o.textContent='已失效 · '+old;el.appendChild(o);el.value=old;}
@@ -2300,7 +2306,7 @@ function updateDevicePolicySelection() {
   var editor=srElement('device-bound-editor');
   if(!valid || editor._source!==source){
     editor.hidden=true;
-    srElement('device-fallback').open=false;
+    srElement('device-fallback').hidden=true;
   }
   editor._source=source;
   if(!valid)return;
@@ -2316,7 +2322,8 @@ function updateDevicePolicySelection() {
   restoreDeviceField('device-target',current,pendingTarget,activeDraftScope);
   var bindings=(SR_STATE.deviceBindings||[]).filter(function(b){return sameDeviceSource(source,b.source);}).sort(byBindingPriority);
   var inherited=(SR_STATE.globalBindings||[]).slice().sort(byBindingPriority);
-  srElement('device-binding-title').textContent='使用的规则组'+(bindings.length?' · '+bindings.length+' 组':'');
+  var groupCount=bindings.length;
+  srElement('device-binding-title').textContent='使用的规则组'+(groupCount?' · '+groupCount+' 组':'');
   srElement('device-inherited').hidden=global || hasDeviceAssignment(source) || !inherited.length;
   srElement('device-inherited-title').textContent='当前使用全局设备规则 · '+inherited.length+' 组';
   srElement('device-inherited-list').innerHTML=inherited.map(function(b){
@@ -2330,14 +2337,16 @@ function updateDevicePolicySelection() {
   effectiveNote.textContent=effectiveNote.hidden?'':'当前按匹配顺序使用网段 '+matchingFinal.source+' 的出口。';
   var fallback=matchingFinal?matchingFinal.target:!assigned && globalFinal?globalFinal.target:'proxy';
   var action={proxy:'走代理',direct:'直连',reject:'拒绝连接'}[fallback] || '使用'+(RULE_TARGET_LABEL[fallback]||fallback);
+  srElement('device-fallback-scope').textContent=global?'全局设备兜底':'设备默认出口';
   srElement('device-fallback-label').textContent='未命中规则时'+action;
   var automatic=Array.from(exit.options).find(function(o){return o.value==='inherit';});
-  if(automatic)automatic.textContent=policy?'清除自定义默认出口':'未单独设置';
-  srElement('device-bindings').innerHTML=bindings.map(function(binding){
+  if(automatic)automatic.textContent=policy?'清除单独设置':'未单独设置';
+  var bindingRows=bindings.map(function(binding){
     var target=binding.target?(RULE_TARGET_LABEL[binding.target]||binding.target):'尚未指定出口（请编辑）';
     return '<div class="row"><div class="r-name"><strong>'+srEsc(binding.group)+'</strong><span class="r-sub">优先级 '+Number(binding.priority||0)+' · '+srEsc(target)+'</span></div>'+
       '<button type="button" class="btn btn-sm" data-group="'+srEsc(binding.group)+'" onclick="editDeviceBinding(this.dataset.group)">编辑</button></div>';
-  }).join('') || '<p class="hint">尚未关联规则组</p>';
+  });
+  srElement('device-bindings').innerHTML=bindingRows.join('') || '<p class="hint">尚未关联规则组</p>';
   srElement('device-add-priority').value=draft?draft.priority:'0';
   var network=sourceNetwork(source);
   srElement('device-trace').hidden=!network || network.prefix!==network.width;
@@ -2461,8 +2470,9 @@ function saveDevicePolicy() {
   if(target!=='inherit' && !Object.prototype.hasOwnProperty.call(RULE_TARGET_LABEL,target)){
     srShowMsg('所选出口已失效，请重新选择。','err');return;
   }
-  var field=srElement('device-target'), warning=field._draftBase===field._savedValue?'':'默认出口已被修改。';
-  if(!confirm(warning+'将「'+who+'」的默认出口设为「'+(RULE_TARGET_LABEL[target]||'恢复默认')+'」？'))return;
+  var field=srElement('device-target'), warning=field._draftBase===field._savedValue?'':'未命中规则时的处理方式已更新。';
+  var question=target==='inherit'?'清除「'+who+'」单独设置的未命中规则处理方式？':'「'+who+'」未命中任何规则时，使用「'+RULE_TARGET_LABEL[target]+'」？';
+  if(!confirm(warning+question))return;
   ruleApi('save_device_policy',{revision:RULE_RULE_REVISION,source:source,all_devices:picker==='global',target:target},toastResp);
 }
 
@@ -2518,7 +2528,7 @@ function ruleTypeChanged() {
   var hint = srElement('rule-input-hint');
   if (hint) {
     hint.textContent = bulk
-      ? (RULE_EDIT_GROUP !== null ? '编辑整个分组：每行 TYPE,内容,ACTION；设备规则保留 SOURCE,来源, 前缀。每行 ACTION 决定出口，未填写时使用上方默认处理。失效出口请在对应行中修正。' : ((RULE_BULK_HINT[t] || '每行一条 TYPE,内容,ACTION；最终规则为 MATCH,ACTION。') + ' 也可粘贴混合类型的完整规则。'))
+      ? (RULE_EDIT_GROUP !== null ? '编辑整个分组：每行 TYPE,内容,ACTION；设备规则保留 SOURCE,来源, 前缀。每行 ACTION 决定出口，未填写时使用上方默认处理。失效出口请在对应行中修正。' : ((RULE_BULK_HINT[t] || '每行一条 TYPE,内容,ACTION。') + ' 也可粘贴混合类型的完整规则。'))
       : (t === 'final'
           ? '处理未命中的流量，无需填写匹配内容'
           : (t === 'geoip'
@@ -2539,8 +2549,13 @@ var RULE_SELECTED_GROUP = null, RULE_LOCAL_GROUPS = [], RULE_WORKSPACE_MODE = 'l
 var RULE_ADD_BASELINE = null, RULE_ROW_BASELINE = null;
 var RULE_PRESET_GROUP = null;
 var RULE_IMPORT_MODE = false, RULE_IMPORT_PENDING = false, RULE_IMPORT_GENERATION = 0;
+function saveBuiltinRoute(target) {
+  if(ruleWorkspaceLocked() || !SR_STATE.builtinRoute)return;
+  if(!confirm('修改内置国内 / 局域网的处理方式？')){renderRules(false);return;}
+  ruleApi('save_builtin_route',{revision:RULE_RULE_REVISION,target:target},toastResp);
+}
 function ruleGroupMembers(key) {
-  return (SR_STATE.ruleRows || []).filter(function(r){return (r.group || '').trim() === key;});
+  return (SR_STATE.ruleRows || []).filter(function(r){return !isFinalRule(r) && (r.group || '').trim() === key;});
 }
 function ruleRowSnapshot() {
   return JSON.stringify(['source','group','type','pattern','target','priority'].map(function(k){return srElement('edit-rule-'+k).value;}).concat([srElement('edit-rule-enabled').checked]));
@@ -2554,7 +2569,7 @@ function ruleWorkspaceLocked() {return rulePending || RULE_READ_PENDING || RULE_
 function syncRuleWorkspace() {
   syncWorkspaceTabs();
   var names=[];
-  (SR_STATE.ruleRows || []).forEach(function(r){var name=(r.group || '').trim();if(names.indexOf(name)<0)names.push(name);});
+  (SR_STATE.ruleRows || []).forEach(function(r){if(isFinalRule(r))return;var name=(r.group || '').trim();if(names.indexOf(name)<0)names.push(name);});
   RULE_LOCAL_GROUPS=RULE_LOCAL_GROUPS.filter(function(name){return names.indexOf(name)<0;});
   names=names.concat(RULE_LOCAL_GROUPS);
   // A refresh must not replace a draft whose group was removed elsewhere.
@@ -2562,7 +2577,11 @@ function syncRuleWorkspace() {
   if(names.indexOf(RULE_SELECTED_GROUP)<0)RULE_SELECTED_GROUP=names.length?names[0]:null;
   var picker=srElement('rule-group-select'), members=ruleGroupMembers(RULE_SELECTED_GROUP), locked=ruleWorkspaceLocked();
   picker.innerHTML=names.length?names.map(function(name){return '<option value="'+srEsc(name)+'">'+srEsc(name || '未分组')+' · '+ruleGroupMembers(name).length+' 条</option>';}).join(''):'<option value="">暂无分组，请新建</option>';
-  picker.value=RULE_SELECTED_GROUP === null?'':RULE_SELECTED_GROUP;picker.disabled=locked || !names.length;
+  picker.value=RULE_SELECTED_GROUP === null?'':RULE_SELECTED_GROUP;
+  picker.disabled=locked || !names.length;
+  var builtin=srElement('builtin-route-target');
+  builtin.value=SR_STATE.builtinRoute || 'direct';
+  builtin.disabled=locked || !SR_STATE.builtinRoute;
   srElement('rule-bulk-edit').disabled=locked || RULE_SELECTED_GROUP === null;
   var editing=RULE_ADD_BASELINE !== null || RULE_ROW_BASELINE !== null;
   ['enable','disable','delete'].forEach(function(action){srElement('rule-group-'+action).disabled=locked || editing || !members.length;});
@@ -2693,6 +2712,12 @@ function cancelRuleRowEditor() {if(discardRuleDraft()){resetRuleEditor();renderR
 
 var RULE_COLLAPSED = Object.create(null);
 var SR_RULE_NODES = SR_RULE_NODES || [];
+function ruleActiveNodeName() {
+  if(SR_STATE.ruleActiveNodeName!==undefined)return SR_STATE.ruleActiveNodeName;
+  var i=(SR_STATE.status||{}).active_node;
+  var node=(SR_STATE.nodes||[])[i] || SR_RULE_NODES[i];
+  return node?node.name:'';
+}
 function setRuleNodes(nodes) {
   SR_RULE_NODES = Array.isArray(nodes) ? nodes.filter(function(n){return n && typeof n.id==='string' && /^[0-9a-f]{64}$/.test(n.id) && typeof n.name==='string';}) : [];
   rebuildRuleTargets();
@@ -2704,7 +2729,7 @@ function rebuildRuleTargets() {
   var values=['proxy','direct','reject'].concat(SR_RULE_NODES.map(function(n){return 'node:'+n.id;})).concat((SR_PROXY_GROUPS||[]).map(function(g){return 'group:'+g.name;}));
   ['rule-target','edit-rule-target','rule-filter-target','device-target','device-add-target','preset-route-target'].forEach(function(id){
     var el=srElement(id);if(!el)return;var old=el.value;
-    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除自定义默认出口</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
+    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除单独设置</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
     el.innerHTML=prefix+values.map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
     var current=el.options?Array.from(el.options):[];
     if(current.some(function(o){return o.value===old;}))el.value=old;
@@ -2731,7 +2756,7 @@ function renderRulePreset() {
   ['view','enable','disable'].forEach(function(id){srElement('rule-preset-'+id).hidden=true;srElement('rule-preset-'+id).disabled=unavailable||busy;});
   if(unavailable){srElement('rule-preset-state').textContent=RULE_FLOW_ERROR?'规则加载失败，请先刷新。':'预设尚不可用，请加载规则或通过软件中心安装完整新版插件。';srElement('rule-preset-domains').textContent='';srElement('rule-preset-target').textContent='';srElement('rule-preset-description').textContent='';return;}
   var destination=rulePresetGroup(p);
-  var rows=SR_STATE.ruleRows||[],members=rows.filter(function(r){return (r.group||'').trim()===destination;}),enabled=members.filter(function(r){return r.enabled!==false;}).length;
+  var rows=SR_STATE.ruleRows||[],members=ruleGroupMembers(destination),enabled=members.filter(function(r){return r.enabled!==false;}).length;
   var ruleType=p.rule_type||'domain-suffix';
   var missing=p.domains.filter(function(d){return !rows.some(function(r){return (RULE_PRESET_GROUP!==null ? (r.group||'')===destination : (ruleType!=='domain' || r.group===destination)) && !r.source && r.rule_type===ruleType && String(r.pattern).replace(/^\.+/,'').toLowerCase()===d.toLowerCase();});}).length;
   srElement('rule-preset-target').textContent='默认：'+RULE_TARGET_LABEL[p.target];
@@ -2910,9 +2935,23 @@ function syncEditorToMap() {
   else if(sourceNetwork(source))pickMapSource(source);
   else resetDeviceFlow();
 }
+function openMapGlobalFallback() {
+  if(ruleWorkspaceLocked())return;
+  openDeviceFallback('');
+}
+function openDeviceFallback(source) {
+  setFlowEditorSource(source);
+  switchDevicePanel('fallback');
+  srElement('device-target').focus();
+}
+function openBuiltinSettings() {
+  srElement('builtin-route-settings').open=true;
+  srElement('builtin-route-target').focus();
+}
 function openMapGroup(index) {
   var rule=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(index);});
   if(!rule)return;
+  if(isFinalRule(rule)){openDeviceFallback(rule.source || '');return;}
   var name=(rule.group||'').trim(), source=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT;
   FLOW_EDIT_GROUP=null;
   if((source || srElement('device-picker').value==='global') && name && (SR_STATE.ruleRows||[]).some(function(r){return !r.source && !isFinalRule(r) && (r.group||'').trim()===name;})){
@@ -2947,7 +2986,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   var choice=srElement('rule-flow-device').value;
   var selected=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT||(choice==='global'?'':null);
   // Router status polls reuse the topology until a snapshot or selection changes.
-  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.globalBindings,SR_STATE.compiledTargets,SR_STATE.nodes,(SR_STATE.status||{}).active_node,SR_PROXY_GROUPS,SR_RULE_NODES];
+  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.globalBindings,SR_STATE.compiledTargets,SR_STATE.builtinRoute,ruleActiveNodeName(),SR_PROXY_GROUPS,SR_RULE_NODES];
   if(sharedMapCache && inputs.every(function(value,i){return sharedMapCache.inputs[i]===value;}))return sharedMapCache.html;
   var names=new Map(),scopes=new Map([['','']]),groups=new Map(),exits=new Map(),edges=new Map();
   (SR_STATE.devices||[]).forEach(function(d){
@@ -2962,6 +3001,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   function groupKey(stage,scope){
     if(!stage.indices)return 'stage:'+stage.kind;
     var name=String(original.get(stage.indices[0]).group||'').trim();
+    if(stage.kind==='global_final' && name==='设备默认策略')return 'stage:global_final';
     // Unnamed rules have no shared group identity across sources or matching phases.
     return name?'group:'+name:'unnamed:'+stage.kind+':'+flowSourceKey(scope);
   }
@@ -2986,7 +3026,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
     stages.forEach(function(stage){
       var key=groupKey(stage,scope),g=groups.get(key);
       var unnamedFinal=key.indexOf('unnamed:')===0 && (stage.kind==='global_final'||stage.kind==='device_final');
-      if(!g){g={index:groups.size,title:unnamedFinal?stage.phaseLabel:stage.title,ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
+      if(!g){g={index:groups.size,title:key==='stage:global_final'?'全局设备兜底':unnamedFinal?stage.phaseLabel:stage.title,kind:stage.kind,globalFallback:stage.kind==='global_final' && (unnamedFinal || key==='stage:global_final'),ruleIndex:stage.indices?stage.indices[0]:null,phases:new Set(),enabled:false,selected:false};groups.set(key,g);}
       g.phases.add(unnamedFinal?'前序规则均未命中时使用':stage.phaseLabel||stage.title);
       if(scope===selected && stage.bindingPriority!=null)g.bindingPriority=stage.bindingPriority;
       if(stage.disabled)return;
@@ -3018,11 +3058,11 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
     return box('source',center(i,sources.length),name||scope||'全局设备',scope?(name?scope:'配置此来源'):'全局规则',scope===selected?' selected':'','data-source="'+srEsc(scope)+'" onclick="pickMapSource(this.dataset.source)"');
   }).join('');
   groups.forEach(function(g){
-    nodes+=box('group',center(g.index,groups.size),g.title,g.enabled?(g.bindingPriority!=null?'关联优先级 '+g.bindingPriority+' · ':'')+Array.from(g.phases).join(' / '):'已停用',g.selected?' selected':g.enabled?'':' inactive',g.ruleIndex==null?'':'data-index="'+g.ruleIndex+'" onclick="openMapGroup(this.dataset.index)"');
+    nodes+=box('group',center(g.index,groups.size),g.title,g.enabled?(g.bindingPriority!=null?'关联优先级 '+g.bindingPriority+' · ':'')+Array.from(g.phases).join(' / '):'已停用',g.selected?' selected':g.enabled?'':' inactive',g.globalFallback?'onclick="openMapGlobalFallback()"':g.kind==='builtin'?'onclick="openBuiltinSettings()"':g.ruleIndex==null?'':'data-index="'+g.ruleIndex+'" onclick="openMapGroup(this.dataset.index)"');
   });
   exits.forEach(function(i,action){
     var sub='';
-    if(action==='proxy'){var node=(SR_STATE.nodes||[])[(SR_STATE.status||{}).active_node];sub=node?node.name:'当前所选节点';}
+    if(action==='proxy')sub=ruleActiveNodeName()||'当前所选节点';
     else if(action.indexOf('group:')===0){var g=(SR_PROXY_GROUPS||[]).find(function(g){return g.name===action.slice(6);});sub=g&&g.selected_node||'';}
     nodes+=box('outlet',center(i,exits.size),RULE_TARGET_LABEL[action]||action,sub,matched && RULE_TRACE.trace.action===action?' selected':'',FLOW_EDIT_GROUP===null?'':'data-target="'+srEsc(action)+'" onclick="pickMapExit(this.dataset.target)"');
   });
@@ -3142,7 +3182,7 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
       }).sort(function(a,b){return b.bindingPriority-a.bindingPriority;});
     }
     if(!hasDeviceAssignment(client))group('global_rule','全局自定义规则',shared);
-    result.push({kind:'builtin',title:'内置国内 / 局域网',note:'核心内置国内域名、私有 IP 与 GeoIP 直连；独立于自定义规则，停用自定义 CN 规则不会关闭此层。',targets:['direct']});
+    result.push({kind:'builtin',title:'内置国内 / 局域网',note:'匹配国内域名、国内 IP 和局域网地址',targets:[SR_STATE.builtinRoute||'direct']});
   }
   function reachableFinals(rules) {
     var first=rules.findIndex(function(r){return r.enabled!==false;});
@@ -3155,13 +3195,13 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
     return result;
   }
   if(deviceConfig)return result;
-  var finals=reachableFinals(ordered.filter(function(r){return !r.source&&isFinalRule(r);}));group('global_final','全局兜底',finals);
-  if(!finals.some(function(r){return r.enabled!==false;}))result.push({kind:'global_final',defaultFallback:true,title:'全局兜底',note:'没有启用的全局最终规则，未命中时代理',targets:['proxy']});
+  var finals=reachableFinals(ordered.filter(function(r){return !r.source&&isFinalRule(r);}));group('global_final','全局设备兜底',finals);
+  if(!finals.some(function(r){return r.enabled!==false;}))result.push({kind:'global_final',defaultFallback:true,title:'全局设备兜底',note:'没有启用的全局最终规则，未命中时代理',targets:['proxy']});
   return result;
 }
 function selectRuleFlow(index) {
   var row=ruleFlowModel(SR_STATE.ruleRows||[],RULE_SNAPSHOT_MODE||'rule',RULE_FLOW_CLIENT)[index];
-  if(row && row.indices){var member=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(row.indices[0]);});if(member && !changeRuleGroup((member.group||'').trim()))return false;}
+  if(row && row.indices){var member=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(row.indices[0]);});if(member && !isFinalRule(member) && !changeRuleGroup((member.group||'').trim()))return false;}
   RULE_FLOW_SELECTED=index;renderRuleFlow();var button=srElement('rule-flow-step-'+index);if(button)button.focus();return true;
 }
 function toggleRuleFlow() {
@@ -3184,13 +3224,16 @@ function flowMatchedRule(edit) {
   if(!rule || !expected || RULE_TRACE.revision!==RULE_RULE_REVISION || ['source','name','group','rule_type','pattern','target','priority','enabled'].some(function(k){return rule[k]!==expected[k];})){
     invalidateRuleTrace('规则已变化，请重新检查后编辑。');srLoadRules();return;
   }
-  if(edit)editRule(index);else inspectRule(index);
+  if(!edit)inspectRule(index);
+  else if(isFinalRule(rule))openDeviceFallback(rule.source || '');
+  else editRule(index);
 }
 function flowTraceHtml(data) {
   if(!data)return '';
   var t=data.trace, row=t.matched_rule==null?null:(SR_STATE.ruleRows||[]).filter(function(r){return Number(r.index)===Number(t.matched_rule);})[0];
   var title=(t.definitive?'判定：':'待验证：')+(RULE_TARGET_LABEL[t.action]||t.action);
-  var reason=data.mode!=='rule' ? '当前模式跳过分流规则。' : row ? '命中配置 #'+(Number(t.matched_rule)+1)+' · '+(row.name||row.group||RULE_TYPE_LABEL[row.rule_type]||row.rule_type)+' · '+row.pattern+' · 优先级 '+Number(row.priority||0) : t.matched_builtin ? '命中核心内置规则。' : hasDeviceAssignment(data.source)?'使用设备默认出口。':'使用全局兜底。';
+  var builtinMatch=t.matched_builtin && t.steps.some(function(step){return step.outcome==='matched' && step.rule_type!=='final';});
+  var reason=data.mode!=='rule' ? '当前模式跳过分流规则。' : row ? '命中配置 #'+(Number(t.matched_rule)+1)+' · '+(row.name||row.group||RULE_TYPE_LABEL[row.rule_type]||row.rule_type)+' · '+row.pattern+' · 优先级 '+Number(row.priority||0) : builtinMatch ? '命中内置国内 / 局域网分组。' : hasDeviceAssignment(data.source)?'使用设备默认出口。':'使用全局设备兜底。';
   var dns={literal:'目的地址为 IP',provided:'使用填写的真实目的 IP',resolved:'按需 DNS 解析成功',not_needed:'命中前无需 DNS 解析',failed:'DNS 解析失败，IP 规则尚未验证',skipped:'未查询 DNS，IP 规则尚未验证'};
   var warnings=[];
   if(!data.running)warnings.push('代理已停止：以下仅为保存配置的判定。');
@@ -3250,7 +3293,7 @@ function refreshRuleGroupList(rules) {
   var opts = [];
   (rules || []).forEach(function (r) {
     var g = (r.group || '').trim();
-    if (g && !seen[g]) { seen[g] = 1; opts.push('<option value="' + srEsc(g) + '">'); }
+    if (!isFinalRule(r) && g && !seen[g]) { seen[g] = 1; opts.push('<option value="' + srEsc(g) + '">'); }
   });
   dl.innerHTML = opts.join('');
 }
@@ -3309,6 +3352,8 @@ function srLoadRules(after) {
     SR_STATE.devices = d.devices || [];
     SR_STATE.globalBindings = d.global_rule_groups || null;
     SR_STATE.deviceBindings = (d.device_rule_groups || []).concat(SR_STATE.globalBindings || []);
+    SR_STATE.builtinRoute=d.builtin_route||null;
+    SR_STATE.ruleActiveNodeName=d.active_node_name;
     SR_STATE.compiledTargets = Array.isArray(d.compiled_targets)?d.compiled_targets:null;
     SR_STATE.ruleRows = rules; RULE_FLOW_ERROR = false;RULE_READ_PENDING=false;
     RULE_SNAPSHOT_MODE=typeof d.proxy_mode==='string'?d.proxy_mode:(SR_STATE.status||{}).proxy_mode||'rule';
@@ -3335,7 +3380,7 @@ function renderRules(resetPage) {
   var el=srElement('rule-list'),members=ruleGroupMembers(RULE_SELECTED_GROUP),sorted=orderedRules(SR_STATE.ruleRows||[]),positions=Object.create(null);
   sorted.forEach(function(r,i){positions[r.index]=i;});
   var query=srElement('rule-search').value.trim().toLowerCase(),target=srElement('rule-filter-target').value,state=srElement('rule-filter-state').value,scope=srElement('rule-filter-scope').value;
-  var rules=sorted.filter(function(r){return (r.group||'').trim()===RULE_SELECTED_GROUP &&
+  var rules=sorted.filter(function(r){return !isFinalRule(r) && (r.group||'').trim()===RULE_SELECTED_GROUP &&
     (!scope || (scope==='global' ? !r.source : !!r.source)) &&
     (!query || query===(RULE_SELECTED_GROUP||'').toLowerCase() || [r.pattern,r.source,r.name,RULE_TYPE_LABEL[r.rule_type]].join(' ').toLowerCase().indexOf(query)>=0) &&
     (!target || r.target===target) && (!state || (state==='disabled'?r.enabled===false:r.enabled!==false));});
@@ -3346,40 +3391,17 @@ function renderRules(resetPage) {
   srElement('rule-page-label').textContent='第 '+(RULE_PAGE+1)+' / '+pages+' 页 · 每页最多 '+RULE_PAGE_SIZE+' 条';
   srElement('rule-page-prev').disabled=RULE_PAGE===0;srElement('rule-page-next').disabled=RULE_PAGE===pages-1;
   rules=rules.slice(RULE_PAGE*RULE_PAGE_SIZE,(RULE_PAGE+1)*RULE_PAGE_SIZE);
-  var phase=-1,labels=['设备目的规则','组内或未分组目的规则','设备兜底（内置国内直连之后）','全局兜底'];
-  el.innerHTML=rules.length?rules.map(function(r){var next=rulePhase(r),head=next!==phase?'<div class="rule-phase">'+labels[next]+'</div>':'';phase=next;return head+ruleRowHtml(r,positions[r.index],sorted);}).join(''):'<div class="hint">'+(members.length?'没有匹配的规则，请调整筛选条件。':'本组还没有规则，点击「添加规则」开始。')+'</div>';
+  var phase=-1,labels=['设备目的规则','组内或未分组目的规则','设备兜底（内置国内 / 局域网分组之后）','全局设备兜底'];
+  el.innerHTML=rules.length?rules.map(function(r){var next=rulePhase(r),head=next!==phase?'<div class="rule-phase">'+labels[next]+'</div>':'';phase=next;return head+ruleRowHtml(r,positions[r.index],sorted);}).join(''):'<div class="hint">'+(members.length?'没有匹配的规则，请调整筛选条件。':RULE_SELECTED_GROUP===null?'暂无规则组。':'本组还没有规则，点击「添加规则」开始。')+'</div>';
   if(ruleWorkspaceLocked()){if(el.querySelectorAll)Array.prototype.forEach.call(el.querySelectorAll('.rule-actions button'),function(button){button.disabled=true;});}
 }
 
 function proxyLikeTarget(target) {
   return target==='proxy' || (typeof target==='string' && (target.indexOf('group:')===0 || target.indexOf('node:')===0));
 }
-function groupOutletSelect(enc, members) {
-  var nodes=SR_RULE_NODES||[];
-  var proxyLike=members.filter(function(r){return proxyLikeTarget(r.target);});
-  var shared=proxyLike.length && proxyLike.every(function(r){return r.target===proxyLike[0].target;}) ? proxyLike[0].target : '';
-  var options=[{value:'proxy',label:'全局节点'}].concat(nodes.map(function(n){return {value:'node:'+n.id,label:'节点 · '+n.name};})).concat((SR_PROXY_GROUPS||[]).map(function(g){return {value:'group:'+g.name,label:'分组 · '+g.name};}));
-  var known=options.some(function(o){return o.value===shared;});
-  var blank=proxyLike.length ? (shared&&known?'':'<option value="">出口不一致</option>') : '<option value="">选择出口</option>';
-  if(shared && !known)options.push({value:shared,label:'已失效'});
-  return '<select id="sr-rule-group-outlet-select" aria-label="分组出口"'+(ruleWorkspaceLocked() || RULE_ADD_BASELINE!==null || RULE_ROW_BASELINE!==null || !proxyLike.length?' disabled':'')+' onchange="setRuleGroupOutlet(\''+enc+'\',this.value)">'+blank+options.map(function(o){return '<option value="'+srEsc(o.value)+'"'+(o.value===shared?' selected':'')+'>'+srEsc(o.label)+'</option>';}).join('')+'</select>';
-}
-function useRuleGroup(enc) {
-  changeRuleGroup(decodeURIComponent(enc));
-}
-function toggleRuleGroup(enc) {
-  var key = decodeURIComponent(enc);
-  RULE_COLLAPSED[key] = !RULE_COLLAPSED[key];
-  renderRules(false);
-}
-function setRuleGroupOutlet(enc, target) {
-  if(!target){renderRules(false);return;}
-  var group=decodeURIComponent(enc),members=(SR_STATE.ruleRows||[]).filter(function(r){return (r.group||'').trim()===group.trim();}).map(function(r){var expected=Object.assign({},r);delete expected.index;return expected;});
-  ruleApi('set_rule_group_target', { group: group, target: target, expected_rules: members }, function (d) { toastResp(d); });
-}
 function setRuleGroupEnabled(enc, enabled) {
-  var group=decodeURIComponent(enc),members=(SR_STATE.ruleRows||[]).filter(function(r){return (r.group||'').trim()===group.trim();}).map(function(r){var expected=Object.assign({},r);delete expected.index;return expected;});
-  ruleApi('set_rule_group_enabled', { group: group, enabled: !!enabled, expected_rules:members }, function (d) {
+  var group=decodeURIComponent(enc),members=ruleGroupMembers(group.trim()).map(function(r){var expected=Object.assign({},r);delete expected.index;return expected;});
+  ruleApi('set_rule_group_enabled', { destinations_only:true, group: group, enabled: !!enabled, expected_rules:members }, function (d) {
     toastResp(d);
   });
 }
@@ -3392,7 +3414,7 @@ function deleteRuleGroup(enc) {
   var scopes=new Set(links.map(function(link){return link.source||'';}));
   var impact=scopes.size?'，并解除 '+scopes.size+' 个设备或全局策略与该组的关联':'';
   if (!confirm('删除「'+(group||'未分组')+'」内的 '+members.length+' 条规则'+impact+'？'))return;
-  ruleApi('delete_rule_group', {group:group, expected_revision:revision}, function (d) {
+  ruleApi('delete_rule_group', {destinations_only:true,group:group, expected_revision:revision}, function (d) {
     toastResp(d);
   });
 }
@@ -3405,7 +3427,7 @@ function inspectRule(index) {
 var RULE_EDIT_ROW = null;
 function editRule(index) {
   var r = (SR_STATE.ruleRows || []).filter(function(r) { return Number(r.index) === Number(index); })[0];
-  if (!r || ruleWorkspaceLocked() || !discardRuleDraft()) return;
+  if (!r || isFinalRule(r) || ruleWorkspaceLocked() || !discardRuleDraft()) return;
   resetRuleEditor();RULE_SELECTED_GROUP=(r.group||'').trim();
   RULE_EDIT_ROW = JSON.parse(JSON.stringify(r));
   ['source','group','pattern','target','priority'].forEach(function(k) { srElement('edit-rule-' + k).value = r[k] == null ? '' : r[k]; });
@@ -3479,9 +3501,7 @@ var RULE_EDIT_GROUP = null;
 var RULE_EDIT_MEMBERS = null;
 function editRuleGroup(enc) {
   var key = decodeURIComponent(enc);
-  var members = (SR_STATE.ruleRows || []).filter(function (r) {
-    return (r.group || '').trim() === key;
-  });
+  var members = ruleGroupMembers(key);
   if (!members.length || ruleWorkspaceLocked() || !discardRuleDraft()) return;
   resetRuleEditor();RULE_SELECTED_GROUP=key;RULE_WORKSPACE_MODE='bulk';srElement('rule-add-panel').hidden=false;
   srElement('rule-priority').value = '';
@@ -3531,7 +3551,7 @@ function addRule() {
     if (t !== 'final' && !editText) { srShowMsg('请先粘贴该分组的规则', 'err'); return; }
     var oldGroup = RULE_EDIT_GROUP, draft = ruleEditorSnapshot();
     ruleApi('replace_rule_group', withPriority({
-      group: oldGroup, new_group: grp, rule_type: t, target: g, text: editText, expected_rules: RULE_EDIT_MEMBERS
+      destinations_only:true, group: oldGroup, new_group: grp, rule_type: t, target: g, text: editText, expected_rules: RULE_EDIT_MEMBERS
     }), function (d) {
       toastResp(d);
       if (d.ok !== false) {
@@ -3544,7 +3564,7 @@ function addRule() {
   if (srElement('rule-entry-mode').value === 'bulk') {
     var text = srElement('rule-batch').value, batchDraft=ruleEditorSnapshot();
     if (!text.trim()) { srShowMsg('请先粘贴至少一条规则', 'err'); return; }
-    ruleApi('batch_add_rules', withPriority({ text: text, target: g, group: grp, rule_type: t, replace: RULE_IMPORT_MODE ? false : replace, group_only: RULE_IMPORT_MODE }), function (d) {
+    ruleApi('batch_add_rules', withPriority({ destinations_only:true, text: text, target: g, group: grp, rule_type: t, replace: RULE_IMPORT_MODE ? false : replace, group_only: RULE_IMPORT_MODE }), function (d) {
       toastResp(d);
       if (d.ok !== false) {
         if (ruleEditorSnapshot() === batchDraft) {resetRuleEditor();renderRules(false);}

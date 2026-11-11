@@ -202,6 +202,33 @@ pub(super) fn delete(post: &J) -> J {
     map.insert(ykey("groups"), serde_yaml::to_value(gs).unwrap());
     applied(&map)
 }
+pub(super) fn builtin_route(map: &Mapping) -> Result<sockrocket_core::config::model::BuiltinRoute> {
+    Ok(map
+        .get(ykey("builtin_route"))
+        .cloned()
+        .map(serde_yaml::from_value)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+pub(super) fn save_builtin_route(post: &J) -> J {
+    use sockrocket_core::config::model::BuiltinRoute;
+    let Ok(mut map) = load_conf() else {
+        return err_msg("配置读取失败");
+    };
+    if !readable(&map) || !check_revision(&map, post) {
+        return err_msg("配置已变化或无效，请刷新后重试");
+    }
+    let Ok(target) = serde_json::from_value::<BuiltinRoute>(post["target"].clone()) else {
+        return err_msg("请选择直连、代理或拒绝");
+    };
+    map.insert(ykey("builtin_route"), serde_yaml::to_value(target).unwrap());
+    if target != BuiltinRoute::Direct {
+        map.insert(ykey("cn_ipset_direct"), Y::Bool(false));
+    }
+    applied(&map)
+}
+
 pub(super) fn device(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("配置读取失败");
@@ -226,18 +253,31 @@ pub(super) fn device(post: &J) -> J {
     let mut rules = load_routing_rules(&map);
     // This editor owns the final policy for exactly this source. Destination
     // exceptions stay intact. Reset removes only the final for this source.
-    rules.retain(|r| {
-        !(sockrocket_core::router::normalize_rule_source(&r.source)
+    let same_final = |r: &sockrocket_core::RoutingRule| {
+        sockrocket_core::router::normalize_rule_source(&r.source)
             .ok()
             .as_deref()
             == Some(source.as_str())
-            && matches!(rule_kind(&r.rule_type), "final" | "match"))
-    });
-    if target != "inherit" {
+            && matches!(rule_kind(&r.rule_type), "final" | "match")
+    };
+    if target == "inherit" {
+        rules.retain(|r| !same_final(r));
+    } else if let Some(rule) = rules
+        .iter_mut()
+        .filter(|r| r.enabled && same_final(r))
+        .min_by_key(|r| std::cmp::Reverse(r.priority))
+    {
+        rule.target = target.into();
+    } else {
+        let (name, group) = if source.is_empty() {
+            ("全局设备兜底", "")
+        } else {
+            ("默认出口", "设备默认策略")
+        };
         rules.push(sockrocket_core::RoutingRule {
             source,
-            name: "默认出口".into(),
-            group: "设备默认策略".into(),
+            name: name.into(),
+            group: group.into(),
             rule_type: "final".into(),
             pattern: "*".into(),
             target: target.into(),

@@ -8,8 +8,8 @@ vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexO
 const rule=(index,group,type,pattern,extra={})=>({index,group,rule_type:type,pattern,target:'proxy',source:'',priority:0,enabled:true,...extra});
 let rows=[rule(0,'Services','domain-suffix','example.invalid',{priority:30}),rule(1,'Other','domain','other.invalid',{priority:20}),rule(2,'Services','ip-cidr','192.0.2.0/24'),rule(3,'Services','dst-port','443',{source:'192.0.2.4',target:'direct'}),rule(4,'Services','final','*',{enabled:false}),rule(5,'','geoip','CN')];
 c.SR_STATE.ruleRows=rows;c.RULE_RULE_REVISION='v1';c.renderRules();
-assert.equal(c.RULE_SELECTED_GROUP,'Services');assert.match(element('rule-count').textContent,/本组共 4 条/);
-for(const i of [0,2,3,4])assert.match(element('rule-list').innerHTML,new RegExp('editRule\\('+i+'\\)'));
+assert.equal(c.RULE_SELECTED_GROUP,'Services');assert.match(element('rule-count').textContent,/本组共 3 条/);
+for(const i of [0,2,3])assert.match(element('rule-list').innerHTML,new RegExp('editRule\\('+i+'\\)'));
 assert.doesNotMatch(element('rule-list').innerHTML,/other.invalid/);
 assert.equal(c.changeRuleGroup('Services','global'),true);
 assert.doesNotMatch(element('rule-list').innerHTML,/editRule\(3\)/,'a mixed group can show only the rules shared by all devices');
@@ -18,14 +18,14 @@ assert.equal(c.changeRuleGroup('Services'),true);
 assert.match(element('rule-list').innerHTML,/editRule\(3\)/,'normal group navigation restores all sources');
 
 vm.runInContext(source.slice(source.indexOf('function keepRulePickerPosition('),source.indexOf('function renderDevicePolicies()')),c);
-element('rule-search').value='SERVICES';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 4 条/);
-element('rule-search').value='192.0.2.0';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 1 条/);assert.match(element('rule-group-summary').textContent,/共 4 条/);
-c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_MEMBERS.length,4);assert.equal(element('rule-list-panel').hidden,true);
-assert.match(element('rule-batch').value,/DOMAIN-SUFFIX,example.invalid,PROXY/);assert.match(element('rule-batch').value,/SOURCE,192.0.2.4,DST-PORT,443,DIRECT/);assert.match(element('rule-batch').value,/MATCH,PROXY/);
+element('rule-search').value='SERVICES';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 3 条/);
+element('rule-search').value='192.0.2.0';c.renderRules();assert.match(element('rule-count').textContent,/当前显示 1 条/);assert.match(element('rule-group-summary').textContent,/共 3 条/);
+c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_MEMBERS.length,3);assert.equal(element('rule-list-panel').hidden,true);
+assert.match(element('rule-batch').value,/DOMAIN-SUFFIX,example.invalid,PROXY/);assert.match(element('rule-batch').value,/SOURCE,192.0.2.4,DST-PORT,443,DIRECT/);assert.doesNotMatch(element('rule-batch').value,/MATCH/);
 assert.equal(c.ruleWorkspaceDirty(),false);element('rule-batch').value+='\nDOMAIN,new.invalid,PROXY';allowDiscard=false;
 assert.equal(c.changeRuleGroup('Other'),false);assert.equal(c.RULE_SELECTED_GROUP,'Services');c.changeRuleWorkspaceMode('list');assert.equal(c.RULE_WORKSPACE_MODE,'bulk');
 c.previewRuleChanges();element('rule-batch').value+='\nDOMAIN,late.invalid,PROXY';c.applyRulePreview();assert.equal(requests.length,0,'a changed preview cannot be applied');
-c.previewRuleChanges();c.applyRulePreview();let req=requests.shift();assert.equal(req[0],'replace_rule_group');assert.equal(req[1].expected_rules.length,4);assert.equal(req[1].priority,undefined,'preserve each original priority');assert.equal(req[1].expected_rules[3].enabled,false);
+c.previewRuleChanges();c.applyRulePreview();let req=requests.shift();assert.equal(req[0],'replace_rule_group');assert.equal(req[1].expected_rules.length,3);assert.equal(req[1].priority,undefined,'preserve each original priority');assert.equal(req[1].destinations_only,true);
 req[2]({ok:false,msg:'conflict'});requests.shift()[2]({ok:true,rules:rows,revision:'v2'});assert.equal(c.ruleWorkspaceDirty(),true,'failed save preserves draft');assert.equal(c.rulePending,false);
 allowDiscard=true;c.changeRuleGroup('Other');assert.equal(c.RULE_WORKSPACE_MODE,'list');assert.equal(element('rule-search').value,'');
 c.startRuleAddition();element('rule-type').value='domain-keyword';element('rule-pattern').value='media';c.addRule();req=requests.shift();assert.equal(req[0],'add_rule');assert.equal(req[1].group,'Other');
@@ -63,7 +63,7 @@ for(const [name,view] of [
   assert.equal(c.RULE_WORKSPACE_MODE,'list');assert.equal(element('rule-list-panel').hidden,false);
   assert.equal(element('rule-add-panel').hidden,true);assert.equal(element('rule-edit-panel').hidden,true);
   for(const id of ['rule-search','rule-filter-target','rule-filter-state'])assert.equal(element(id).value,'',name+' clears '+id);
-  assert.match(element('rule-count').textContent,/当前显示 4 条/);
+  assert.match(element('rule-count').textContent,/当前显示 3 条/);
 }
 // Cancellation also protects an inline row draft in the same group.
 c.editRule(2);element('edit-rule-pattern').value='203.0.113.0/24';allowDiscard=false;c.viewRulePreset();
@@ -140,3 +140,20 @@ const waiting = '规则已保存，代理将在后台热加载，新连接使用
 deletion[2]({ok:true,saved:true,reload_pending:true,msg:waiting});
 requests.shift()[2]({ok:true,rules:[],revision:'deleted'});
 assert.equal(element('rule-operation-state').textContent,waiting);
+
+
+c.RULE_LOCAL_GROUPS=[];c.SR_STATE.ruleRows=[];c.SR_STATE.builtinRoute='direct';c.RULE_RULE_REVISION='defaults';
+c.renderRules();
+assert.match(element('rule-group-select').innerHTML,/暂无分组/);
+c.SR_STATE.ruleRows=[rule(0,'设备默认策略','match','*',{source:'192.0.2.1'}),rule(1,'','final','*')];
+c.renderRules();
+assert.equal(c.RULE_SELECTED_GROUP,null);
+assert.doesNotMatch(element('rule-group-select').innerHTML,/设备默认策略|全局设备兜底|未分组/);
+assert.equal(element('rule-group-delete').disabled,true);
+assert.equal(element('builtin-route-target').value,'direct');
+const writes=[];
+c.ruleApi=(action,body)=>writes.push([action,body]);
+c.saveBuiltinRoute('reject');
+assert.equal(writes[0][0],'save_builtin_route');
+assert.equal(writes[0][1].target,'reject');
+console.log('PASS: fallback policies stay outside rule groups');

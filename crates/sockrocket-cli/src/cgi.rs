@@ -558,6 +558,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "save_device_binding" => devices::save_binding(post),
         "save_device_alias" => devices::save_alias(post),
         "delete_device" => devices::delete(post),
+        "save_builtin_route" => proxy_groups::save_builtin_route(post),
         "save_device_policy" => proxy_groups::device(post),
         "network_settings" => network_settings::get(),
         "save_network_settings" => network_settings::save(post),
@@ -857,6 +858,13 @@ fn validate_advanced_config(text: &str) -> Result<()> {
         );
     }
     let raw: Y = serde_yaml::from_str(text)?;
+    anyhow::ensure!(
+        config.builtin_route == sockrocket_core::config::model::BuiltinRoute::Direct
+            || !raw
+                .as_mapping()
+                .is_some_and(|map| conf_bool(map, "cn_ipset_direct", false)),
+        "国内 IP 直连加速与内置分组出口冲突"
+    );
     let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
     let transparent = raw
         .as_mapping()
@@ -1756,6 +1764,12 @@ fn act_set_toggles(post: &J) -> J {
         return err_msg("全局模式下不能开启国内 IP 绕过 TUN");
     }
     let (cur_proxy, mut cur_dns) = effective_toggles(&map);
+    if want_cn == Some(true)
+        && proxy_groups::builtin_route(&map).ok()
+            != Some(sockrocket_core::config::model::BuiltinRoute::Direct)
+    {
+        return err_msg("内置国内 / 局域网分组使用直连时才能开启国内直连加速");
+    }
     let cur_cn = conf_bool(&map, "cn_ipset_direct", false);
 
     // Apply transparent_proxy first: dns_hijack verification depends on the
@@ -2512,7 +2526,11 @@ fn load_routing_rules(map: &Mapping) -> Vec<sockrocket_core::RoutingRule> {
 
 fn prune_device_links(map: &mut Mapping, rules: &[sockrocket_core::RoutingRule]) {
     if let Ok(mut links) = devices::links(map) {
-        links.retain(|b| rules.iter().any(|r| r.group.trim() == b.group));
+        links.retain(|b| {
+            rules
+                .iter()
+                .any(|r| r.is_global_destination() && r.group.trim() == b.group)
+        });
         devices::store_links(map, &links);
     }
 }
@@ -2530,11 +2548,17 @@ fn same_rule_group(rule_group: &str, want: &str) -> bool {
 }
 
 fn rule_kind(rule_type: &str) -> &str {
-    if matches!(rule_type, "match" | "final") {
+    if rule_type.eq_ignore_ascii_case("match") || rule_type.eq_ignore_ascii_case("final") {
         "final"
     } else {
         rule_type
     }
+}
+
+// The Merlin group editor manages destination rules. Older API callers can
+// still edit complete groups, including final rules.
+fn includes_group_rule(post: &J, rule: &sockrocket_core::RoutingRule) -> bool {
+    post["destinations_only"].as_bool() != Some(true) || rule_kind(&rule.rule_type) != "final"
 }
 
 fn requested_rule_source(post: &J, default: &str) -> std::result::Result<String, String> {
@@ -2608,7 +2632,15 @@ fn act_get_rules() -> J {
     let Ok(links) = devices::links(&map) else {
         return err_msg("设备规则组关联配置无效");
     };
-    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    let Ok(builtin_route) = proxy_groups::builtin_route(&map) else {
+        return err_msg("内置分组出口配置无效");
+    };
+    let active_node_name = conf_seq(&map, "nodes")
+        .get(conf_usize(&map, "active_node").unwrap_or(0))
+        .and_then(|node| node.get("name"))
+        .and_then(Y::as_str)
+        .map(str::to_owned);
+    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -3027,6 +3059,9 @@ fn act_batch_add_rules(post: &J) -> J {
     };
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
+        if !includes_group_rule(post, rule) {
+            return err_msg("默认出口请在设备分流策略中设置");
+        }
         if group_only {
             if group.is_empty() || !source.is_empty() || !rule.is_global_destination() {
                 return err_msg("请选择具名规则组并导入目的规则；设备来源和默认出口请在绑定处配置");
@@ -3248,7 +3283,7 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     if let Some(expected) = post.get("expected_rules") {
         let current: Vec<_> = rules
             .iter()
-            .filter(|r| same_rule_group(&r.group, &group))
+            .filter(|r| includes_group_rule(post, r) && same_rule_group(&r.group, &group))
             .map(rule_edit_snapshot)
             .collect();
         if expected != &json!(current) {
@@ -3258,7 +3293,7 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     let mut n = 0usize;
     let mut changed = false;
     for r in &mut rules {
-        if same_rule_group(&r.group, &group) {
+        if includes_group_rule(post, r) && same_rule_group(&r.group, &group) {
             changed |= r.enabled != enabled;
             r.enabled = enabled;
             n += 1;
@@ -3369,6 +3404,9 @@ fn act_replace_rule_group(post: &J) -> J {
             incoming.push(rule);
         }
     }
+    if incoming.iter().any(|r| !includes_group_rule(post, r)) {
+        return err_msg("默认出口请在设备分流策略中设置");
+    }
     if incoming.is_empty() {
         return err_msg("No valid patterns in the group");
     }
@@ -3379,7 +3417,7 @@ fn act_replace_rule_group(post: &J) -> J {
     let mut rules = load_routing_rules(&map);
     let members: Vec<_> = rules
         .iter()
-        .filter(|r| same_rule_group(&r.group, &old_group))
+        .filter(|r| includes_group_rule(post, r) && same_rule_group(&r.group, &old_group))
         .collect();
     if members.is_empty() {
         return err_msg("分组已不存在，请刷新后重试");
@@ -3420,7 +3458,12 @@ fn act_replace_rule_group(post: &J) -> J {
             rule.name.clone_from(&previous.name);
         }
     }
-    if let Err(e) = sockrocket_core::replace_rule_group(&mut rules, &old_group, incoming) {
+    if let Err(e) = sockrocket_core::config::rule_groups::replace_rule_group_where(
+        &mut rules,
+        &old_group,
+        incoming,
+        |r| includes_group_rule(post, r),
+    ) {
         return err_msg(&e);
     }
     let previous_sources = accelerated_rule_sources(&map);
@@ -3458,10 +3501,11 @@ fn act_delete_rule_group(post: &J) -> J {
     }
     let before = rows.len();
     rows.retain(|row| {
-        !same_rule_group(
-            row.get(ykey("group")).and_then(Y::as_str).unwrap_or(""),
-            group,
-        )
+        !includes_group_rule(post, &yaml_to_routing_rule(row).unwrap())
+            || !same_rule_group(
+                row.get(ykey("group")).and_then(Y::as_str).unwrap_or(""),
+                group,
+            )
     });
     let removed = before - rows.len();
     if removed == 0 {
@@ -4134,6 +4178,53 @@ mod tests {
     }
 
     #[test]
+    fn default_groups_save_independently_and_route_after_reload() {
+        let _env = TestEnv::new(&SAMPLE.replace("rules: []", "cn_ipset_direct: true\nrules:\n  - {rule_type: final, pattern: '*', target: direct, group: Original}\n  - {rule_type: final, pattern: '*', target: reject, enabled: false, group: Backup}"));
+        let before = act_get_rules();
+        assert_eq!(before["builtin_route"], "direct");
+        let save = |action, body: J| dispatch(action, &body);
+        let revision = || route_trace::rules_revision(&load_conf().unwrap());
+        let trace = |host| {
+            dispatch(
+                "trace_route",
+                &json!({"destination":host,"resolve_dns":false}),
+            )["trace"]["action"]
+                .clone()
+        };
+        assert_eq!(
+            save(
+                "save_builtin_route",
+                json!({"target":"reject","revision":revision()})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            save(
+                "save_builtin_route",
+                json!({"target":"direct","revision":before["revision"]})
+            )["ok"],
+            false
+        );
+        assert_eq!(act_get_rules()["builtin_route"], "reject");
+        assert_eq!(act_get_rules()["rules"], before["rules"]);
+        assert!(!conf_bool(&load_conf().unwrap(), "cn_ipset_direct", true));
+        assert_eq!(trace("baidu.com"), "reject");
+        assert_eq!(trace("192.0.2.1"), "direct");
+        assert_eq!(
+            save(
+                "save_device_policy",
+                json!({"target":"proxy","all_devices":true,"revision":revision()})
+            )["ok"],
+            true
+        );
+        assert_eq!(trace("192.0.2.1"), "proxy");
+        assert_eq!(trace("baidu.com"), "reject");
+        let after = act_get_rules();
+        assert_eq!(after["rules"][0]["group"], "Original");
+        assert_eq!(after["rules"][1], before["rules"][1]);
+    }
+
+    #[test]
     fn saving_fallback_requires_an_explicit_scope() {
         let env = TestEnv::new(SAMPLE);
         let revision = route_trace::rules_revision(&load_conf().unwrap());
@@ -4153,6 +4244,9 @@ mod tests {
             )["ok"],
             true
         );
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert_eq!(rules[0].name, "全局设备兜底");
+        assert!(rules[0].group.is_empty());
     }
 
     #[test]
@@ -4710,6 +4804,60 @@ dns_direct_domains:
         assert_eq!(nodes[0]["server"], J::from("a.example.com"));
         assert_eq!(nodes[0]["port"], J::from(443));
         assert_eq!(nodes[1]["protocol"], J::from("hysteria2"));
+    }
+
+    #[test]
+    fn fresh_merlin_global_routes_follow_selected_node() {
+        let _env = TestEnv::new(include_str!("../../../merlin/config.yaml.template"));
+        let add_node = |name| {
+            dispatch(
+                "add_node",
+                &json!({"name":name,"server":"server.example.invalid","port":443,"protocol":"vless","uuid":"00000000-0000-4000-8000-000000000001"}),
+            )
+        };
+        let trace = |host| {
+            dispatch(
+                "trace_route",
+                &json!({"destination":host,"resolve_dns":false}),
+            )
+        };
+        assert_eq!(add_node("First")["ok"], true);
+        assert_eq!(dispatch("set_node", &json!({"index":0}))["ok"], true);
+        let before = act_get_rules();
+        let links = before["global_rule_groups"].as_array().unwrap();
+        assert_eq!(
+            links
+                .iter()
+                .map(|b| b["group"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["内网直连", "GEO 直连", "CN 直连"]
+        );
+        for (host, group) in [
+            ("192.168.1.2", "内网直连"),
+            ("223.5.5.5", "GEO 直连"),
+            ("sample.cn", "CN 直连"),
+        ] {
+            let decision = trace(host);
+            assert_eq!(decision["trace"]["action"], "direct");
+            let index = decision["trace"]["matched_rule"].as_u64().unwrap() as usize;
+            assert_eq!(before["rules"][index]["group"], group);
+        }
+        let destination = "203.0.113.44";
+        let first = trace(destination);
+        assert_eq!(first["trace"]["action"], "proxy");
+        assert_eq!(first["node_name"], "First");
+        assert_eq!(
+            before["rules"][first["trace"]["matched_rule"].as_u64().unwrap() as usize]["name"],
+            "全局设备兜底"
+        );
+        assert_eq!(add_node("Second")["ok"], true);
+        assert_eq!(dispatch("set_node", &json!({"index":1}))["ok"], true);
+        assert_eq!(trace(destination)["node_name"], "Second");
+        let after = act_get_rules();
+        assert_eq!(before["active_node_name"], "First");
+        assert_eq!(after["active_node_name"], "Second");
+        assert_eq!(before["rules"], after["rules"]);
+        assert_eq!(before["global_rule_groups"], after["global_rule_groups"]);
     }
 
     #[test]
@@ -5606,6 +5754,33 @@ dns_direct_domains:
             true
         );
         assert_eq!(winner(tv), (json!(0), json!("direct")));
+    }
+
+    #[test]
+    fn group_editor_preserves_device_and_global_fallbacks() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Mixed, pattern: tv.invalid, target: proxy}\n  - {rule_type: final, group: Mixed, pattern: '*', target: direct}\n  - {rule_type: MATCH, group: Mixed, source: 192.0.2.8/32, pattern: '*', target: reject}",
+        ));
+        let fallbacks = || {
+            load_routing_rules(&load_conf().unwrap())
+                .into_iter()
+                .filter(|r| rule_kind(&r.rule_type) == "final")
+                .map(|r| rule_edit_snapshot(&r))
+                .collect::<Vec<_>>()
+        };
+        let original = fallbacks();
+        assert_eq!(original.len(), 2);
+        let mut request = json!({"group":"Mixed","destinations_only":true,"enabled":false});
+        assert_eq!(act_set_rule_group_enabled(&request)["ok"], true);
+        request["text"] = json!("MATCH,PROXY");
+        assert_eq!(act_batch_add_rules(&request)["ok"], false);
+        assert_eq!(act_replace_rule_group(&request)["ok"], false);
+        request["text"] = json!("DOMAIN,new.invalid,DIRECT");
+        assert_eq!(act_replace_rule_group(&request)["ok"], true);
+        request["expected_revision"] = json!(route_trace::rules_revision(&load_conf().unwrap()));
+        assert_eq!(act_delete_rule_group(&request)["ok"], true);
+        assert_eq!(fallbacks(), original);
     }
 
     #[test]
