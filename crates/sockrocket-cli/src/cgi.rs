@@ -558,6 +558,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "save_device_binding" => devices::save_binding(post),
         "save_device_alias" => devices::save_alias(post),
         "delete_device" => devices::delete(post),
+        "save_builtin_route" => proxy_groups::save_builtin_route(post),
         "save_device_policy" => proxy_groups::device(post),
         "network_settings" => network_settings::get(),
         "save_network_settings" => network_settings::save(post),
@@ -857,6 +858,13 @@ fn validate_advanced_config(text: &str) -> Result<()> {
         );
     }
     let raw: Y = serde_yaml::from_str(text)?;
+    anyhow::ensure!(
+        config.builtin_route == sockrocket_core::config::model::BuiltinRoute::Direct
+            || !raw
+                .as_mapping()
+                .is_some_and(|map| conf_bool(map, "cn_ipset_direct", false)),
+        "国内 IP 直连加速与内置分组出口冲突"
+    );
     let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
     let transparent = raw
         .as_mapping()
@@ -1756,6 +1764,12 @@ fn act_set_toggles(post: &J) -> J {
         return err_msg("全局模式下不能开启国内 IP 绕过 TUN");
     }
     let (cur_proxy, mut cur_dns) = effective_toggles(&map);
+    if want_cn == Some(true)
+        && proxy_groups::builtin_route(&map).ok()
+            != Some(sockrocket_core::config::model::BuiltinRoute::Direct)
+    {
+        return err_msg("内置国内 / 局域网分组使用直连时才能开启国内直连加速");
+    }
     let cur_cn = conf_bool(&map, "cn_ipset_direct", false);
 
     // Apply transparent_proxy first: dns_hijack verification depends on the
@@ -2608,7 +2622,15 @@ fn act_get_rules() -> J {
     let Ok(links) = devices::links(&map) else {
         return err_msg("设备规则组关联配置无效");
     };
-    json!({"ok": true, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    let Ok(builtin_route) = proxy_groups::builtin_route(&map) else {
+        return err_msg("内置分组出口配置无效");
+    };
+    let active_node_name = conf_seq(&map, "nodes")
+        .get(conf_usize(&map, "active_node").unwrap_or(0))
+        .and_then(|node| node.get("name"))
+        .and_then(Y::as_str)
+        .map(str::to_owned);
+    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -4134,6 +4156,53 @@ mod tests {
     }
 
     #[test]
+    fn default_groups_save_independently_and_route_after_reload() {
+        let _env = TestEnv::new(&SAMPLE.replace("rules: []", "cn_ipset_direct: true\nrules:\n  - {rule_type: final, pattern: '*', target: direct, group: Original}\n  - {rule_type: final, pattern: '*', target: reject, enabled: false, group: Backup}"));
+        let before = act_get_rules();
+        assert_eq!(before["builtin_route"], "direct");
+        let save = |action, body: J| dispatch(action, &body);
+        let revision = || route_trace::rules_revision(&load_conf().unwrap());
+        let trace = |host| {
+            dispatch(
+                "trace_route",
+                &json!({"destination":host,"resolve_dns":false}),
+            )["trace"]["action"]
+                .clone()
+        };
+        assert_eq!(
+            save(
+                "save_builtin_route",
+                json!({"target":"reject","revision":revision()})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            save(
+                "save_builtin_route",
+                json!({"target":"direct","revision":before["revision"]})
+            )["ok"],
+            false
+        );
+        assert_eq!(act_get_rules()["builtin_route"], "reject");
+        assert_eq!(act_get_rules()["rules"], before["rules"]);
+        assert!(!conf_bool(&load_conf().unwrap(), "cn_ipset_direct", true));
+        assert_eq!(trace("baidu.com"), "reject");
+        assert_eq!(trace("192.0.2.1"), "direct");
+        assert_eq!(
+            save(
+                "save_device_policy",
+                json!({"target":"proxy","all_devices":true,"revision":revision()})
+            )["ok"],
+            true
+        );
+        assert_eq!(trace("192.0.2.1"), "proxy");
+        assert_eq!(trace("baidu.com"), "reject");
+        let after = act_get_rules();
+        assert_eq!(after["rules"][0]["group"], "Original");
+        assert_eq!(after["rules"][1], before["rules"][1]);
+    }
+
+    #[test]
     fn saving_fallback_requires_an_explicit_scope() {
         let env = TestEnv::new(SAMPLE);
         let revision = route_trace::rules_revision(&load_conf().unwrap());
@@ -4153,6 +4222,9 @@ mod tests {
             )["ok"],
             true
         );
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert_eq!(rules[0].name, "全局设备兜底");
+        assert!(rules[0].group.is_empty());
     }
 
     #[test]
@@ -4727,6 +4799,60 @@ dns_direct_domains:
         // Out-of-range rejected.
         let r = act_set_node(&json!({"index": 5}));
         assert_eq!(r["ok"], J::Bool(false));
+    }
+
+    #[test]
+    fn fresh_merlin_global_routes_follow_selected_node() {
+        let _env = TestEnv::new(include_str!("../../../merlin/config.yaml.template"));
+        let add_node = |name| {
+            dispatch(
+                "add_node",
+                &json!({"name":name,"server":"server.example.invalid","port":443,"protocol":"vless","uuid":"00000000-0000-4000-8000-000000000001"}),
+            )
+        };
+        let trace = |host| {
+            dispatch(
+                "trace_route",
+                &json!({"destination":host,"resolve_dns":false}),
+            )
+        };
+        assert_eq!(add_node("First")["ok"], true);
+        assert_eq!(dispatch("set_node", &json!({"index":0}))["ok"], true);
+        let before = act_get_rules();
+        let links = before["global_rule_groups"].as_array().unwrap();
+        assert_eq!(
+            links
+                .iter()
+                .map(|b| b["group"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["内网直连", "GEO 直连", "CN 直连"]
+        );
+        for (host, group) in [
+            ("192.168.1.2", "内网直连"),
+            ("223.5.5.5", "GEO 直连"),
+            ("sample.cn", "CN 直连"),
+        ] {
+            let decision = trace(host);
+            assert_eq!(decision["trace"]["action"], "direct");
+            let index = decision["trace"]["matched_rule"].as_u64().unwrap() as usize;
+            assert_eq!(before["rules"][index]["group"], group);
+        }
+        let destination = "203.0.113.44";
+        let first = trace(destination);
+        assert_eq!(first["trace"]["action"], "proxy");
+        assert_eq!(first["node_name"], "First");
+        assert_eq!(
+            before["rules"][first["trace"]["matched_rule"].as_u64().unwrap() as usize]["name"],
+            "全局设备兜底"
+        );
+        assert_eq!(add_node("Second")["ok"], true);
+        assert_eq!(dispatch("set_node", &json!({"index":1}))["ok"], true);
+        assert_eq!(trace(destination)["node_name"], "Second");
+        let after = act_get_rules();
+        assert_eq!(before["active_node_name"], "First");
+        assert_eq!(after["active_node_name"], "Second");
+        assert_eq!(before["rules"], after["rules"]);
+        assert_eq!(before["global_rule_groups"], after["global_rule_groups"]);
     }
 
     #[test]

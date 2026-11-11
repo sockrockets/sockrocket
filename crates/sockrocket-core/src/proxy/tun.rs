@@ -1221,7 +1221,7 @@ fn tun_dial_target(
             }
             // Device policy must also override domestic-CDN direct shortcuts.
             // Keep the domain so source-scoped domain/catch-all rules can match.
-            if router.is_some_and(|r| r.has_client_rules()) {
+            if router.is_some_and(|r| r.route_domestic_hints || r.has_client_rules()) {
                 return Ok((domain, addr.port(), false));
             }
             if let Some(action) = router.and_then(|r| r.route_domain_only(&domain)) {
@@ -3621,6 +3621,29 @@ mod tests {
         assert_eq!(tun_tcp_mss(1500), 1440);
         assert_eq!(tun_tcp_mss(1400), 1340);
         assert_eq!(tun_tcp_mss(1280), 1220);
+    }
+
+    #[test]
+    fn domestic_dns_mapping_respects_the_builtin_group_exit() {
+        use crate::config::model::BuiltinRoute;
+        let addr: SocketAddr = "203.0.113.44:443".parse().unwrap();
+        let pool = FakeIpPool::new();
+        pool.record_domestic(addr.ip(), "cdn.example.invalid");
+        let pool = Some(pool);
+        for (exit, direct) in [
+            (BuiltinRoute::Direct, true),
+            (BuiltinRoute::Proxy, false),
+            (BuiltinRoute::Reject, false),
+        ] {
+            let router = Arc::new(Router::new(crate::router::rule_mode_with_builtin(
+                &[],
+                &[],
+                true,
+                exit,
+            )));
+            let (_, _, force_direct) = tun_dial_target(&addr, &pool, Some(&router)).unwrap();
+            assert_eq!(force_direct, direct);
+        }
     }
 
     #[test]

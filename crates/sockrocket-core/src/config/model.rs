@@ -44,6 +44,16 @@ pub fn normalize_node_names(nodes: &mut [Node]) -> bool {
     changed
 }
 
+/// Exit for the built-in domestic and local-network matches in rule mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuiltinRoute {
+    #[default]
+    Direct,
+    Proxy,
+    Reject,
+}
+
 /// Unified application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -73,6 +83,8 @@ pub struct AppConfig {
     pub device_rule_groups: Vec<DeviceRuleGroup>,
     #[serde(default)]
     pub explicit_group_bindings: bool,
+    #[serde(default)]
+    pub builtin_route: BuiltinRoute,
     /// Whether the proxy was running when the app was last closed (auto-reconnect on next start)
     #[serde(default)]
     pub auto_connect: bool,
@@ -113,6 +125,7 @@ impl Default for AppConfig {
             rules: Vec::new(),
             device_rule_groups: Vec::new(),
             explicit_group_bindings: false,
+            builtin_route: BuiltinRoute::default(),
             auto_connect: false,
             tun_was_enabled: false,
             tun_mtu: None,

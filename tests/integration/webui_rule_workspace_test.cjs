@@ -140,3 +140,23 @@ const waiting = '规则已保存，代理将在后台热加载，新连接使用
 deletion[2]({ok:true,saved:true,reload_pending:true,msg:waiting});
 requests.shift()[2]({ok:true,rules:[],revision:'deleted'});
 assert.equal(element('rule-operation-state').textContent,waiting);
+
+
+c.RULE_LOCAL_GROUPS=[];c.SR_STATE.ruleRows=[];c.SR_STATE.builtinRoute='direct';c.RULE_RULE_REVISION='defaults';
+c.renderRules();
+assert.match(element('rule-group-select').innerHTML, /默认分组.*内置国内 \/ 局域网.*全局设备兜底/);
+assert.equal(c.chooseDefaultGroup('builtin'),true);
+assert.equal(element('default-group-target').value,'direct');
+assert.equal(element('rule-group-delete').disabled,true);
+const writes=[];
+c.ruleApi=(action,body)=>writes.push([action,body]);
+c.saveDefaultGroupTarget('reject');
+assert.equal(writes[0][0],'save_builtin_route');
+assert.equal(writes[0][1].target,'reject');
+assert.equal(c.chooseDefaultGroup('global'),true);
+assert.equal(element('default-group-target').value,'proxy');
+c.saveDefaultGroupTarget('direct');
+assert.equal(writes[1][0],'save_device_policy');
+assert.equal(writes[1][1].all_devices,true);
+assert.equal(writes[1][1].source,'');
+console.log('PASS: default groups appear without custom rules and save to their own routing scopes');

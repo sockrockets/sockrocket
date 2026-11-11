@@ -299,6 +299,7 @@ fn client_cache_key(host: &str, port: u16) -> RouteCacheKey {
 /// Router evaluates rules against connection targets.
 pub struct Router {
     rules: RuleSet,
+    pub(crate) route_domestic_hints: bool,
     geoip: Option<Arc<GeoIpDb>>,
     /// LRU route cache: evicts least-recently-used entries when full (avoids thundering-herd on full flush).
     /// Keyed by lowercased host, port, and the complete client/TUN context.
@@ -307,7 +308,11 @@ pub struct Router {
 
 impl Router {
     pub fn new(rules: RuleSet) -> Self {
+        let route_domestic_hints = rules.rules().iter().any(|entry| {
+            matches!(entry.rule, MatchRule::DomesticHint) && entry.action != RouteAction::Direct
+        });
         Self {
+            route_domestic_hints,
             rules,
             geoip: None,
             cache: RwLock::new(LruCache::new(NonZeroUsize::new(ROUTE_CACHE_CAP).unwrap())),
