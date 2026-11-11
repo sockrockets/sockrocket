@@ -251,10 +251,10 @@ impl ClientInstance {
                 stream.write_all(&rest[..take]).await?;
                 rest = &rest[take..];
             }
-            if let Some(gap) = padding_gaps.get(i) {
-                if !gap.is_zero() {
-                    tokio::time::sleep(*gap).await;
-                }
+            if let Some(gap) = padding_gaps.get(i)
+                && !gap.is_zero()
+            {
+                tokio::time::sleep(*gap).await;
             }
         }
         if !rest.is_empty() {
