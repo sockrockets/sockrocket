@@ -10,18 +10,22 @@ import unittest
 WORKER = pathlib.Path(__file__).resolve().parents[2] / 'merlin/scripts/update.sh'
 
 class RecoveryTest(unittest.TestCase):
-    def run_recovery(self, root, unhealthy=False):
+    def run_recovery(self, root, unhealthy=False, offline=False):
         tools = root / '.test-tools'
         tools.mkdir(exist_ok=True)
         for name, body in {'curl': "echo '{\"version\":\"test-version\"}'", 'nslookup': 'exit 0'}.items():
             path = tools / name
-            path.write_text('#!/bin/sh\n' + ('exit 7' if unhealthy else body) + '\n')
+            if unhealthy:
+                body = 'exit 7'
+            elif offline and name == 'curl':
+                body = 'case "$*" in *--socks5-hostname*) exit 7;; esac\n' + body
+            path.write_text('#!/bin/sh\n' + body + '\n')
             path.chmod(0o755)
         if not (root / 'config.yaml').exists(): (root / 'config.yaml').write_text('socks_port: 1080\n')
         (root / 'api-token').write_text('test-token')
         (root / 'sockrocket.pid').write_text(str(os.getpid()))
         return subprocess.run(['sh', str(WORKER), '--recover'],
-            env={**os.environ, 'SOCKROCKET_DIR': str(root),
+            env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH']}, capture_output=True, timeout=15)
 
     def test_interrupted_publish_restores_by_rename(self):
@@ -40,6 +44,22 @@ class RecoveryTest(unittest.TestCase):
             self.assertEqual((root / 'sockrocket-cli').read_text(), 'old')
             self.assertFalse(tx.exists())
             self.assertEqual(self.run_recovery(root).returncode, 0)
+
+    def test_offline_rollback_after_reboot_releases_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            tx = root / '.update-transaction'
+            (tx / 'old/scripts').mkdir(parents=True)
+            (tx / 'old/scripts/sockrocket.sh').write_text('#!/bin/sh\nexit 0\n')
+            (tx / 'old/version').write_text('test-version')
+            (tx / 'prepared').touch()
+            (tx / 'running').write_text('1')
+            # A previous boot left the legacy persistent recovery lock behind.
+            (root / '.update-restore-lock').mkdir()
+            result = self.run_recovery(root, offline=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(tx.exists())
+            self.assertTrue((root / 'update-status').read_text().startswith('failed: 已恢复旧版'))
 
     def test_compressed_backup_recovers_and_can_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -77,7 +97,7 @@ class RecoveryTest(unittest.TestCase):
             tx = root / '.update-transaction'
             tx.mkdir()
             (tx / 'prepared').touch()
-            (root / '.update-restore-lock').mkdir()
+            (root / 'runtime/.update-restore-lock').mkdir(parents=True)
             (root / 'sockrocket-cli').write_text('running installation')
             result = self.run_recovery(root)
             self.assertNotEqual(result.returncode, 0)
@@ -97,7 +117,7 @@ class RecoveryTest(unittest.TestCase):
             result = self.run_recovery(root, unhealthy=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(tx.exists())
-            self.assertFalse((root / '.update-restore-lock').exists())
+            self.assertFalse((root / 'runtime/.update-restore-lock').exists())
 
     def test_corrupt_backup_does_not_delete_installed_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,7 +174,7 @@ class RecoveryTest(unittest.TestCase):
             df.write_text('#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted\\nmock 10000 5000 5000 50%% /\\n"\n')
             df.chmod(0o755)
             result = subprocess.run(['sh', str(WORKER), str(pkg), str(work), '--check-space'],
-                env={**os.environ, 'SOCKROCKET_DIR': str(root),
+                env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
                      'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             message = result.stderr.decode()
@@ -182,7 +202,7 @@ class RecoveryTest(unittest.TestCase):
             df.write_text('#!/bin/sh\nprintf "Filesystem blocks Used Available Capacity Mounted\\nmock 1000000 0 1000000 0%% /\\n"\n')
             df.chmod(0o755)
             result = subprocess.run(['sh', str(WORKER), str(pkg), str(work)],
-                env={**os.environ, 'SOCKROCKET_DIR': str(root),
+                env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
                      'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('不兼容', result.stderr.decode())
@@ -226,7 +246,7 @@ class RecoveryTest(unittest.TestCase):
             attempt = base / 'attempt'
             attempt.mkdir()
             failed = subprocess.run(['sh', str(WORKER), str(pkg), str(attempt)],
-                env={**os.environ, 'SOCKROCKET_DIR': str(root),
+                env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
                      'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True)
             self.assertNotEqual(failed.returncode, 0)
             message = (root / 'update-status').read_text()
@@ -239,7 +259,7 @@ class RecoveryTest(unittest.TestCase):
             self.assertEqual((root / 'config.yaml').read_text(), 'original config')
             df.write_text(success_df)
             result = subprocess.run(['sh', str(WORKER), str(pkg), str(work)],
-                env={**os.environ, 'SOCKROCKET_DIR': str(root),
+                env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
                      'PATH': str(commands) + os.pathsep + os.environ['PATH']}, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((root / 'scripts/dnsmasq.conf.template').read_text(), 'server=127.0.0.1#5300\n')

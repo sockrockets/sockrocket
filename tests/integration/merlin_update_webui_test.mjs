@@ -17,6 +17,7 @@ function poll(response, disconnected = false) {
 }
 assert.match(poll({active:false,status:'success: plugin updated'}).text, /更新成功/);
 assert.match(poll({active:false,status:'rolled-back: health-check'}).text, /已恢复旧版/);
+assert.match(poll({active:false,status:'failed: 已恢复旧版，可以修改设置。网络检查失败，请检查 DNS 和代理节点。'}).text, /已恢复旧版.*网络检查失败/);
 assert.match(poll({active:false,status:'rollback-failed: retained'}).text, /备份已保留/);
 assert.match(poll({active:false,status:'failed: preparation'}).text, /更新失败/);
 const pending = poll({active:true,status:'queued',stage:'replacing'});
