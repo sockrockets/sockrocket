@@ -10,7 +10,7 @@ Transparent proxy integration for **AsusWRT-Merlin** routers.
 
 主说明已迁移到中文 [项目首页](../README.md)，包含型号对应安装包、首次启动、设备绑定及常见问题。
 
-在软件中心安装对应型号的离线包后，导入订阅或节点，选择出口并启动。进入「分流规则」，先创建规则组或添加预设，再启用规则并绑定到「全部设备」或具体设备。预设现有 20 组，覆盖 AI、视频、音乐、游戏、开发工具、国内网站与 Emby。支持按规则组从 HTTP(S) 链接读取规则、预览并追加。
+在软件中心安装对应型号的离线包后，导入订阅或节点，选择出口并启动。新安装使用规则模式时，「全局设备」已关联内网直连、GEO 直连和 CN 直连。未匹配流量通过「全局设备兜底」走当前选中的全局节点。切换节点后兜底自动跟随。需要例外时，可在「分流规则」中创建规则组或添加预设，再绑定到全局或具体设备。预设现有 20 组，覆盖 AI、视频、音乐、游戏、开发工具、国内网站与 Emby。支持按规则组从 HTTP(S) 链接读取规则、预览并追加。
 
 设备可关联多个组，每条绑定独立指定优先级和出口。删除设备配置会清理该来源的绑定、专属规则、默认出口和自定义名称，在线设备仍可从固件的 DHCP 和邻居表重新发现。使用「检查分流」核对当前设备命中的规则与出口。
 
@@ -132,7 +132,7 @@ The downloader races three direct workers and three local SOCKS workers (at most
 
 Hysteria2 share links support `security=tls`, `sni`, `insecure`, `alpn`, `pinSHA256` (or `pcs`), `upmbps`, `downmbps`, and `fastopen`. Bandwidth values accept non-negative decimal numbers (Mbps by default) and `bps`/`Kbps`/`Mbps`/`Gbps` suffixes; Clash numeric YAML fields are accepted too. Values round up to whole bytes per second and are bounded to 1,000,000 Mbps; 0 selects automatic/unlimited behavior. Upload payloads share one budget across TCP/UDP sessions using a token bucket with up to 16 KiB of initial credit and cancellation refunds. A UDP packet larger than the bucket charges debt that subsequent sends must repay. QUIC uses BBR, and download capacity is advertised to the server using `Hysteria-CC-RX`. Fast Open permits writes before the destination response; reads still validate that response and its timeout.
 
-AnyTLS accepts `security=tls` and SHA-256 certificate pins through `pcs` or `pinSHA256`. A pin always checks the leaf certificate, including when `insecure=1`; a mismatch fails closed. Pins, Hysteria2 bandwidth and Fast Open settings survive saved configuration, share-link and Clash export/import. Conflicting pins and malformed parameters are rejected. Hysteria2 obfuscation and port hopping remain unsupported.
+AnyTLS accepts `security=tls` and SHA-256 certificate pins through `pcs` or `pinSHA256`. A pin always checks the leaf certificate, including when `insecure=1`; a mismatch fails closed. Pins, Hysteria2 bandwidth and Fast Open settings survive saved configuration, share-link and Clash export/import. Conflicting pins and malformed parameters are rejected. Hysteria2 supports Salamander, Gecko and UDP destination port hopping.
 
 sing-box TLS settings that cannot yet be enforced, including `certificate_public_key_sha256` (SPKI pins), custom trust certificates, client certificates, ECH and version constraints, cause the node to be rejected. They are never silently dropped, including with `insecure=true`. This differs from the supported leaf-certificate pins in URI/Clash imports.
 

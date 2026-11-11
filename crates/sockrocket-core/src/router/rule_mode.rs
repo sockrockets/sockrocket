@@ -10,7 +10,7 @@
 //!
 //! Priorities descend within each phase; ties keep configuration order.
 
-use crate::config::model::RoutingRule;
+use crate::config::model::{BuiltinRoute, RoutingRule};
 use crate::router::{MatchRule, RouteAction, RuleSet, china_direct_ruleset};
 
 fn is_catch_all(rule_type: &str) -> bool {
@@ -57,12 +57,29 @@ pub fn rule_mode_with_bindings(
     links: &[crate::config::model::DeviceRuleGroup],
     explicit: bool,
 ) -> RuleSet {
+    rule_mode_with_builtin(rules, links, explicit, BuiltinRoute::Direct)
+}
+
+pub fn rule_mode_with_builtin(
+    rules: &[RoutingRule],
+    links: &[crate::config::model::DeviceRuleGroup],
+    explicit: bool,
+    builtin: BuiltinRoute,
+) -> RuleSet {
+    let builtin_action = match builtin {
+        BuiltinRoute::Direct => RouteAction::Direct,
+        BuiltinRoute::Proxy => RouteAction::Proxy,
+        BuiltinRoute::Reject => RouteAction::Reject,
+    };
     let enabled: Vec<_> = rules
         .iter()
         .enumerate()
         .filter(|(_, r)| r.enabled)
         .collect();
-    if enabled.is_empty() && !links.iter().any(|link| !link.source.is_empty()) {
+    if builtin == BuiltinRoute::Direct
+        && enabled.is_empty()
+        && !links.iter().any(|link| !link.source.is_empty())
+    {
         return china_direct_ruleset();
     }
 
@@ -137,7 +154,7 @@ pub fn rule_mode_with_bindings(
         if matches!(entry.rule, MatchRule::MatchAll) {
             continue;
         }
-        set.add_rule(entry.rule.clone(), entry.action.clone());
+        set.add_rule(entry.rule.clone(), builtin_action.clone());
     }
 
     set.extend(RuleSet::from_indexed_config(device_finals));

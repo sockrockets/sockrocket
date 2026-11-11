@@ -207,6 +207,7 @@ async fn reference_case(
     .await
     .unwrap();
     let mut transport = TransportConfig {
+        grpc: None,
         transport_type: TransportType::Xhttp,
         tls: Some(TlsConfig {
             sni: Some("localhost".into()),

@@ -227,6 +227,15 @@ pub(super) fn build_quic_client_config_pinned(
     alpn: &[String],
     pin: Option<[u8; 32]>,
 ) -> Result<quinn::ClientConfig> {
+    build_quic_client_config_with_early_data(skip_cert_verify, alpn, pin, false)
+}
+
+pub(super) fn build_quic_client_config_with_early_data(
+    skip_cert_verify: bool,
+    alpn: &[String],
+    pin: Option<[u8; 32]>,
+    early: bool,
+) -> Result<quinn::ClientConfig> {
     let mut rustls_config = if let Some(pin) = pin {
         rustls::ClientConfig::builder()
             .dangerous()
@@ -243,6 +252,7 @@ pub(super) fn build_quic_client_config_pinned(
             .with_no_client_auth()
     };
 
+    rustls_config.enable_early_data = early;
     if !alpn.is_empty() {
         rustls_config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
     }

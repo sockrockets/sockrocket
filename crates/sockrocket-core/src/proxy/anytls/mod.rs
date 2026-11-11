@@ -6,7 +6,7 @@ use super::{
     connector::{BoxProxyStream, Outbound},
     transport,
 };
-use crate::config::model::TlsConfig;
+use crate::config::model::{AnyTlsPool, TlsConfig};
 use anyhow::{Result, ensure};
 use padding::Padding;
 use sha2::{Digest, Sha256};
@@ -39,6 +39,9 @@ struct Client {
     idle: Mutex<Vec<Session>>,
     slots: Arc<Semaphore>,
     keep_idle: bool,
+    check_interval: Duration,
+    idle_timeout: Duration,
+    min_idle: usize,
     sequence: AtomicU64,
     idle_changed: Arc<tokio::sync::Notify>,
     reaper: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -61,7 +64,15 @@ impl AnyTlsOutbound {
         tls: Option<&TlsConfig>,
         keep_idle: bool,
     ) -> Result<Self> {
-        Self::new_pinned(server, port, password, tls, keep_idle, None)
+        Self::new_pinned(
+            server,
+            port,
+            password,
+            tls,
+            keep_idle,
+            &AnyTlsPool::default(),
+            None,
+        )
     }
     pub(crate) fn new_pinned(
         server: &str,
@@ -69,12 +80,20 @@ impl AnyTlsOutbound {
         password: &str,
         tls: Option<&TlsConfig>,
         keep_idle: bool,
+        pool: &AnyTlsPool,
         pin: Option<[u8; 32]>,
     ) -> Result<Self> {
         ensure!(
             !server.is_empty() && port != 0 && !password.is_empty(),
             "AnyTLS requires an endpoint and password"
         );
+        pool.validate()?;
+        // Match the reference client for intervals of five seconds or less.
+        let duration = |ms: Option<u64>| {
+            ms.filter(|n| *n > 5000)
+                .map(Duration::from_millis)
+                .unwrap_or(IDLE_TTL)
+        };
         let tls = tls.cloned().unwrap_or(TlsConfig {
             sni: None,
             skip_cert_verify: false,
@@ -91,7 +110,10 @@ impl AnyTlsOutbound {
                 padding: Arc::new(Mutex::new(Padding::default())),
                 idle: Mutex::new(Vec::new()),
                 slots: Arc::new(Semaphore::new(64)),
-                keep_idle,
+                keep_idle: keep_idle && !pool.disable_reuse,
+                check_interval: duration(pool.check_interval_ms),
+                idle_timeout: duration(pool.idle_timeout_ms),
+                min_idle: pool.min_idle,
                 sequence: AtomicU64::new(0),
                 idle_changed: Arc::new(tokio::sync::Notify::new()),
                 reaper: Mutex::new(None),
@@ -175,11 +197,17 @@ impl Client {
         }
         let weak = Arc::downgrade(self);
         let changed = self.idle_changed.clone();
+        let period = self.check_interval;
         *reaper = Some(tokio::spawn(async move {
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = changed.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    _ = ticks.tick() => {
+                        let Some(client) = weak.upgrade() else {break};
+                        client.expire_idle();
+                    },
                     _ = std::future::poll_fn(|cx| {
                         let Some(client) = weak.upgrade() else {
                             return Poll::Ready(());
@@ -209,25 +237,22 @@ impl Client {
                         Poll::Pending
                     }) => {},
                 }
-                let Some(client) = weak.upgrade() else {
-                    break;
-                };
-                client
-                    .idle
-                    .lock()
-                    .unwrap()
-                    .retain(|s| s.idle_since.elapsed() < IDLE_TTL);
             }
         }));
     }
-    fn take_idle(&self) -> Option<Session> {
+    fn expire_idle(&self) {
         let mut idle = self.idle.lock().unwrap();
-        while let Some(session) = idle.pop() {
-            if session.idle_since.elapsed() < IDLE_TTL {
-                return Some(session);
-            }
-        }
-        None
+        // Reuse is newest-first. Preserve the newest minimum and evict expired surplus.
+        let protected = idle.len().saturating_sub(self.min_idle);
+        let mut index = 0;
+        idle.retain(|s| {
+            let keep = index >= protected || s.idle_since.elapsed() < self.idle_timeout;
+            index += 1;
+            keep
+        });
+    }
+    fn take_idle(&self) -> Option<Session> {
+        self.idle.lock().unwrap().pop()
     }
     async fn create_session(&self) -> Result<Session> {
         static GLOBAL: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -300,7 +325,7 @@ impl Client {
         let mut idle = self.idle.lock().unwrap();
         idle.push(session);
         idle.sort_by_key(|session| session.sequence);
-        if idle.len() > IDLE_LIMIT {
+        if idle.len() > IDLE_LIMIT.max(self.min_idle) {
             idle.remove(0);
         }
         // Wake the receiver when a newly idle socket has not registered a waker.
@@ -864,6 +889,42 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn configured_idle_pool_expires_surplus_and_disable_reuse_discards_sessions() {
+        let mut options = AnyTlsPool {
+            check_interval_ms: Some(7000),
+            idle_timeout_ms: Some(9000),
+            min_idle: 2,
+            disable_reuse: false,
+        };
+        let client =
+            AnyTlsOutbound::new_pinned("localhost", 443, "test", None, true, &options, None)
+                .unwrap()
+                .client;
+        assert_eq!(client.check_interval, Duration::from_secs(7));
+        assert_eq!(client.idle_timeout, Duration::from_secs(9));
+        for sequence in 1..=4 {
+            let (io, _) = tokio::io::duplex(64);
+            let mut s = session(Box::new(io));
+            s.sequence = sequence;
+            client.recycle(s);
+        }
+        for s in client.idle.lock().unwrap().iter_mut() {
+            s.idle_since -= Duration::from_secs(10);
+        }
+        client.expire_idle();
+        assert_eq!(client.take_idle().unwrap().sequence, 4);
+        assert_eq!(client.take_idle().unwrap().sequence, 3);
+        assert!(client.take_idle().is_none());
+        options.disable_reuse = true;
+        let client =
+            AnyTlsOutbound::new_pinned("localhost", 443, "test", None, true, &options, None)
+                .unwrap()
+                .client;
+        let (io, _) = tokio::io::duplex(64);
+        client.recycle(session(Box::new(io)));
+        assert!(client.take_idle().is_none());
+    }
     #[test]
     fn reuse_prefers_creation_sequence_over_return_order() {
         let c = AnyTlsOutbound::new("localhost", 443, "synthetic", None, true).unwrap();

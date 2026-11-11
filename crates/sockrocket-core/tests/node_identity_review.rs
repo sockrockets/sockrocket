@@ -12,6 +12,7 @@ fn node() -> Node {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
                 sni: Some("one.example".into()),

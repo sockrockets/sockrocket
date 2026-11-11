@@ -405,10 +405,7 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
     assert_eq!(finished["result"]["node_count"], 1);
     assert_eq!(
         finished["result"]["compatibility_notes"],
-        json!([
-            "hysteria2_chrome_quic_profile",
-            "hysteria2_mport_fixed_port"
-        ])
+        json!(["hysteria2_chrome_quic_profile", "hysteria2_port_hopping"])
     );
     assert!(
         !finished["result"]["msg"]

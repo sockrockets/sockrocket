@@ -8,6 +8,7 @@ pub mod http;
 mod http_forward;
 pub mod hysteria2;
 mod hysteria2_bandwidth;
+mod hysteria2_socket;
 pub mod outbound_bind;
 pub mod pool;
 pub mod quic_conn;
@@ -647,3 +648,6 @@ pub mod wireguard;
 
 mod server_dns;
 pub(crate) mod xhttp;
+
+mod grpc;
+mod h2_stream;

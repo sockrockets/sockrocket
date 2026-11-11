@@ -28,6 +28,7 @@ async fn vmess_ws_local_capture() {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,
@@ -77,6 +78,7 @@ async fn vmess_ws_remote_connectivity() {
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: if use_tls {
@@ -150,10 +152,12 @@ async fn vmess_ws_against_local_xray() {
         protocol: ProxyProtocol::VMess {
             uuid,
             alter_id: 0,
-            cipher: "none".into(),
+            cipher: common::optional(&env, "LIVE_XRAY_VMESS_CIPHER")
+                .unwrap_or_else(|| "aes-128-gcm".into()),
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::WebSocket,
             tls: None,

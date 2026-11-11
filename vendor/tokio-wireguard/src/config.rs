@@ -44,6 +44,8 @@ pub struct Interface {
 /// Remote peer configuration
 #[derive(Clone)]
 pub struct Peer {
+    /// Outbound WireGuard header reserved bytes. Standard peers use zeroes.
+    pub reserved: [u8; 3],
     /// Endpoint of the remote peer
     ///
     /// If not specified, the endpoint will be automatically populated when

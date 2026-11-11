@@ -89,6 +89,10 @@ impl Tunnel {
         } = self;
 
         let (len, source) = socket.try_recv_from(&mut buffers.0).ok()?;
+        if len < 4 {
+            return None;
+        }
+        buffers.0[1..4].fill(0);
         let packet = Tunn::parse_incoming_packet(&buffers.0[..len]).ok()?;
 
         let peer = match packet {
@@ -116,6 +120,7 @@ impl Tunnel {
                 TunnResult::Err(..) => return None,
                 TunnResult::Done => None,
                 TunnResult::WriteToNetwork(mut datagram) => loop {
+                    datagram[1..4].copy_from_slice(&peer.config.reserved);
                     tokio::time::timeout(
                         std::time::Duration::from_secs(1),
                         socket.send_to(datagram, source),
@@ -127,14 +132,17 @@ impl Tunnel {
                         _ => break None,
                     }
                 },
-                TunnResult::WriteToTunnelV4(p, a) if peer.is_allowed_ip(a) => Some(p),
-                TunnResult::WriteToTunnelV6(p, a) if peer.is_allowed_ip(a) => Some(p),
-                _ => None,
+                TunnResult::WriteToTunnelV4(p, a) => Some((p, IpAddr::V4(a))),
+                TunnResult::WriteToTunnelV6(p, a) => Some((p, IpAddr::V6(a))),
             };
 
+        let authenticated_peer = peer.index;
         peer.config.endpoint = Some(source);
         match packet {
-            Some(packet_out) => {
+            Some((packet_out, source_ip)) => {
+                if peers[route_peer(peers, source_ip)?].index != authenticated_peer {
+                    return None;
+                }
                 let len = packet_out.len();
                 buffers.0[..len].copy_from_slice(packet_out);
 
@@ -171,14 +179,8 @@ impl Tunnel {
             return None;
         }
 
-        let peer = peers.iter_mut().find(|p| {
-            p.active
-                && p.config
-                    .allowed_ips
-                    .iter()
-                    .any(|net| net.contains(&destination))
-        })?;
-
+        let route = route_peer(peers, destination)?;
+        let peer = &mut peers[route];
         let endpoint = match peer.config.endpoint? {
             SocketAddr::V4(addr) if socket.local_addr().ok().is_some_and(|a| a.is_ipv6()) => {
                 SocketAddr::V6(SocketAddrV6::new(
@@ -192,6 +194,7 @@ impl Tunnel {
         };
         let packet = peer.tunnel.encapsulate(packet, &mut buffers.1);
         if let TunnResult::WriteToNetwork(packet) = packet {
+            packet[1..4].copy_from_slice(&peer.config.reserved);
             tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 socket.send_to(packet, endpoint),
@@ -216,11 +219,22 @@ impl Tunnel {
 
         for peer in peers.iter_mut() {
             let endpoint = match (peer.active, peer.config.endpoint) {
+                (true, Some(SocketAddr::V4(addr)))
+                    if socket.local_addr().ok().is_some_and(|a| a.is_ipv6()) =>
+                {
+                    SocketAddr::V6(SocketAddrV6::new(
+                        addr.ip().to_ipv6_mapped(),
+                        addr.port(),
+                        0,
+                        0,
+                    ))
+                }
                 (true, Some(endpoint)) => endpoint,
                 _ => continue,
             };
             let packet = peer.tunnel.update_timers(&mut buffers.0);
             if let TunnResult::WriteToNetwork(packet) = packet {
+                packet[1..4].copy_from_slice(&peer.config.reserved);
                 tokio::time::timeout(
                     std::time::Duration::from_secs(1),
                     socket.send_to(packet, endpoint),
@@ -295,12 +309,22 @@ struct Peer {
     active: bool,
 }
 
-impl Peer {
-    fn is_allowed_ip(&self, address: impl Into<IpAddr>) -> bool {
-        let address = address.into();
-        self.config
-            .allowed_ips
-            .iter()
-            .any(|net| net.contains(&address))
-    }
+// Use the same longest-prefix owner for sending and authenticating a source.
+// The most recently configured peer wins an identical prefix.
+fn route_peer(peers: &[Peer], address: IpAddr) -> Option<usize> {
+    peers
+        .iter()
+        .enumerate()
+        .filter(|(_, peer)| peer.active)
+        .filter_map(|(idx, peer)| {
+            peer.config
+                .allowed_ips
+                .iter()
+                .filter(|net| net.contains(&address))
+                .map(|net| net.prefix_len())
+                .max()
+                .map(|prefix| (prefix, idx))
+        })
+        .max()
+        .map(|(_, idx)| idx)
 }

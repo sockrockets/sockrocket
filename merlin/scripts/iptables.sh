@@ -189,6 +189,13 @@ install_cn_flow() {
 # just before the first MARK rule. Idempotent: safe to call standalone
 # (`ipset-on`) while the chain is live, or from do_start on a fresh chain.
 do_ipset_start() {
+    case "$(get_conf builtin_route)" in
+        proxy|reject)
+            do_ipset_stop || return 1
+            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
+            return $?
+            ;;
+    esac
     # NOTE: probe ipset by invoking it — this router's minimal busybox sh
     # (as spawned by the API bridge) lacks the `command` builtin, so the
     # usual `command -v ipset` guard fails with 127 even when ipset exists.

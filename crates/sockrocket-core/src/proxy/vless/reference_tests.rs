@@ -86,6 +86,7 @@ async fn reference_vision(warm: bool) {
     .await
     .unwrap();
     let transport = TransportConfig {
+        grpc: None,
         xhttp: None,
         transport_type: TransportType::Tls,
         tls: Some(TlsConfig {

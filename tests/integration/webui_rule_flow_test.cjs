@@ -74,9 +74,12 @@ assert.deepEqual(Array.from(grouped.element('rule-flow').innerHTML.matchAll(/<pa
 g.SR_STATE.status={...g.SR_STATE.status,active_node:0,node_count:1};g.renderRuleFlow();
 assert.notEqual(g.RULE_TRACE,null,'normal status polling must preserve a valid trace on the default node');
 g.srLoadRules();const oldRead=grouped.request('get_rules');g.srLoadRules();
-grouped.request('get_rules')[2]({ok:true,rules:[rule(0,{group:'Fresh'})],revision:'fresh',proxy_mode:'direct'});
+grouped.request('get_rules')[2]({ok:true,rules:[rule(0,{group:'Fresh'})],revision:'fresh',proxy_mode:'direct',active_node_name:'Snapshot B'});
 oldRead[2]({ok:true,rules:[rule(0,{group:'Stale'})],revision:'stale',proxy_mode:'rule'});
 assert.equal(g.SR_STATE.ruleRows[0].group,'Fresh');assert.equal(g.RULE_SNAPSHOT_MODE,'direct');
+assert.equal(g.ruleActiveNodeName(),'Snapshot B','rule snapshot wins over an older status response');
+g.SR_STATE.status.active_node=1;
+assert.equal(g.ruleActiveNodeName(),'Snapshot B','a subsequent status response cannot mix snapshot revisions');
 oldRead[3]();assert.equal(g.RULE_FLOW_ERROR,false,'stale failures cannot replace the fresh snapshot');
 assert.match(grouped.element('rule-flow').innerHTML,/全部直连/);
 console.log('PASS: diagram/list group identity, disabled groups, priority segments, exact winner and out-of-order reads');
@@ -242,7 +245,7 @@ function deviceConnections(html, source, hitsOnly=false) {
  refresh();
  const graph=()=>f.element('rule-flow').innerHTML;
  assert.deepEqual(deviceConnections(graph(),host),['Imported','设备默认出口']);
- assert.deepEqual(deviceConnections(graph(),''),['Legacy','全局兜底','内置国内 / 局域网']);
+ assert.deepEqual(deviceConnections(graph(),''),['Legacy','全局设备兜底','内置国内 / 局域网']);
  bindings.push({source:'',group:'Imported',target:'proxy',priority:10});refresh();
  assert.equal(c.ruleFlowModel(rules,'rule',host).some(s=>s.kind==='global_rule'),false);
  const globals=c.ruleFlowModel(rules,'rule','198.51.100.9').filter(s=>s.kind==='global_rule');
@@ -257,15 +260,23 @@ function deviceConnections(html, source, hitsOnly=false) {
  c.SR_STATE.status.transparent_proxy=true;
  const graph=()=>f.element('rule-flow').innerHTML;
  c.renderRuleFlow();
- assert.deepEqual(deviceConnections(graph(),''),['全局兜底','内置国内 / 局域网','未分组'].sort());
+ assert.deepEqual(deviceConnections(graph(),''),['全局设备兜底','内置国内 / 局域网','未分组'].sort());
  assert.match(graph(), /data-from="g0" data-to="e0"/);
  assert.doesNotMatch(graph(), /data-from="g0" data-to="e1"/,'fallback proxy is not an outlet of the direct rule');
  assert.match(graph(), /data-from="g2" data-to="e1"/);
- for(const [i,group,outlet] of [[0,'未分组','直连'],[1,'全局兜底','代理']]){
+ for(const [i,group,outlet] of [[0,'未分组','直连'],[1,'全局设备兜底','代理']]){
    c.RULE_TRACE=result(rows[i]);c.renderRuleFlow();
    assert.deepEqual(deviceConnections(graph(),'',true),[group]);
    assert.match(graph(), new RegExp('class="map-node outlet selected"[^>]*><strong>'+outlet+'</strong>'));
    assert.equal((graph().match(/<path[^>]*class="selected"/g)||[]).length,2);
  }
+ for(const finals of [[],[rule(0,{rule_type:'final',group:'设备默认策略',target:'direct'})]]){
+   c.SR_STATE.ruleRows=finals;c.RULE_TRACE=null;c.renderRuleFlow();
+   assert.match(graph(), /<button[^>]*onclick="openMapGlobalFallback\(\)"[^>]*><strong>全局设备兜底<\/strong>/);
+ }
+ const edits=[];
+ c.chooseDefaultGroup=kind=>edits.push(kind);
+ c.openMapGlobalFallback();
+ assert.deepEqual(edits,['global'],'the fallback editor must always target global settings');
  console.log('PASS: unnamed destination rule and global fallback have separate outlets and exclusive trace paths');
 }

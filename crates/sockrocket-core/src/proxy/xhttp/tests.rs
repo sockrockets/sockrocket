@@ -35,6 +35,7 @@ fn factory(port: u16, options: serde_json::Value) -> Arc<Factory> {
         "127.0.0.1",
         port,
         &TransportConfig {
+            grpc: None,
             transport_type: TransportType::Xhttp,
             tls: None,
             ws: None,

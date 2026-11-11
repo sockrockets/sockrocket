@@ -13,6 +13,7 @@ use tokio::{
 #[derive(Clone)]
 pub(super) enum Framing {
     Length16,
+    UotLegacy(Vec<u8>),
     Xudp(Vec<u8>),
     Trojan(Vec<u8>),
     NativeChunks(usize),
@@ -82,6 +83,10 @@ impl Datagram for StreamDatagram {
                     writer.write_all(address).await?;
                     writer.write_u16(packet.len() as u16).await?;
                 }
+                Framing::UotLegacy(address) => {
+                    writer.write_all(address).await?;
+                    writer.write_u16(packet.len() as u16).await?;
+                }
                 Framing::Trojan(address) => {
                     writer.write_all(address).await?;
                     writer.write_u16(packet.len() as u16).await?;
@@ -112,21 +117,27 @@ impl Datagram for StreamDatagram {
 }
 async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R, frame: &Framing) -> Result<Vec<u8>> {
     // The generic path below uses the same bounded address parser as SOCKS.
-    if matches!(frame, Framing::Trojan(_)) {
-        let count = match reader.read_u8().await? {
-            1 => 4,
-            4 => 16,
-            3 => reader.read_u8().await? as usize,
-            _ => bail!("Invalid Trojan UDP address"),
+    if matches!(frame, Framing::Trojan(_) | Framing::UotLegacy(_)) {
+        let count = match (frame, reader.read_u8().await?) {
+            (Framing::Trojan(_), 1) | (Framing::UotLegacy(_), 0) => 4,
+            (Framing::Trojan(_), 4) | (Framing::UotLegacy(_), 1) => 16,
+            (Framing::Trojan(_), 3) | (Framing::UotLegacy(_), 2) => {
+                reader.read_u8().await? as usize
+            }
+            _ => bail!("Invalid UDP address"),
         };
-        reader.read_exact(&mut vec![0; count + 2]).await?;
+        let mut address_and_port = [0; 255 + 2];
+        reader
+            .read_exact(&mut address_and_port[..count + 2])
+            .await?;
     }
     if let Framing::Xudp(_) = frame {
         loop {
             let size = reader.read_u16().await? as usize;
             ensure!((4..=512).contains(&size), "Invalid XUDP header length");
-            let mut header = vec![0; size];
-            reader.read_exact(&mut header).await?;
+            let mut storage = [0; 512];
+            let header = &mut storage[..size];
+            reader.read_exact(header).await?;
             ensure!(header[..2] == [0, 0], "Unexpected XUDP session");
             ensure!(
                 matches!(header[2], 2..=4) && header[3] & !3 == 0 && header[3] & 2 == 0,

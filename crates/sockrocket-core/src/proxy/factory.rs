@@ -53,7 +53,19 @@ fn create_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound>
     } else {
         build_outbound_inner(node, warm_pool)?
     };
-    if node.protocol.supports_udp() {
+    if node
+        .extra
+        .get(crate::config::v2ray::UDP_ONLY)
+        .is_some_and(|v| v == "true")
+    {
+        anyhow::ensure!(
+            node.protocol.supports_udp(),
+            "UDP-only node has UDP disabled"
+        );
+        Ok(SharedOutbound(Arc::new(
+            super::connector::DatagramOnlyOutbound(outbound),
+        )))
+    } else if node.protocol.supports_udp() {
         Ok(outbound)
     } else {
         Ok(SharedOutbound(Arc::new(
@@ -81,7 +93,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                 super::wireguard::WireguardOutbound::new(&node.server, node.port, config)?,
             )))
         }
-        ProxyProtocol::AnyTls { password, .. } => {
+        ProxyProtocol::AnyTls { password, pool, .. } => {
             if let Some(t) = &node.transport {
                 anyhow::ensure!(
                     matches!(
@@ -100,6 +112,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     password,
                     node.transport.as_ref().and_then(|t| t.tls.as_ref()),
                     warm_pool,
+                    pool,
                     node.extra
                         .get(crate::config::v2ray::TLS_CERT_PIN)
                         .map(|p| crate::config::v2ray::parse_tuic_certificate_pin(p))
@@ -108,7 +121,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             )))
         }
         ProxyProtocol::VLess { uuid, flow, .. } => {
-            let out = match flow.as_deref().filter(|value| !value.is_empty()) {
+            let mut out = match flow.as_deref().filter(|value| !value.is_empty()) {
                 Some(super::vision::FLOW) => VlessOutbound::new_vision(
                     &node.server,
                     node.port,
@@ -127,6 +140,14 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     node.transport.as_ref(),
                 )?,
             };
+            if let Some(value) = node.extra.get(crate::config::v2ray::VLESS_ENCRYPTION) {
+                out.encryption = super::vless::encryption::parse_client_encryption(value)
+                    .map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    out.encryption.is_none() || flow.as_deref().unwrap_or("").is_empty(),
+                    "VLESS Encryption with Vision direct copy is not supported"
+                );
+            }
             Ok(SharedOutbound(Arc::new(out)).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }
 
@@ -176,10 +197,13 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     };
                     Arc::new(st_out) as Arc<dyn Outbound>
                 }
-                None => Arc::new(
-                    SsOutbound::new(&node.server, node.port, normalized_cipher, password)?
-                        .with_udp(*udp),
-                ) as Arc<dyn Outbound>,
+                None => {
+                    let mut out =
+                        SsOutbound::new(&node.server, node.port, normalized_cipher, password)?
+                            .with_udp(*udp);
+                    out.plugin = crate::config::ss_plugin::Plugin::load(&node.extra)?;
+                    Arc::new(out) as Arc<dyn Outbound>
+                }
             };
             Ok(SharedOutbound(out).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }
@@ -190,8 +214,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             alter_id,
             ..
         } => {
-            anyhow::ensure!(*alter_id == 0, "Only VMess AEAD (alterId=0) is supported");
-            let out = if warm_pool {
+            let mut out = if warm_pool {
                 VMessOutbound::new(
                     &node.server,
                     node.port,
@@ -208,6 +231,17 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     node.transport.as_ref(),
                 )?
             };
+            out.set_alter_id(*alter_id)?;
+            out.framing = super::vmess::Framing {
+                padding: node
+                    .extra
+                    .get(crate::config::v2ray::VMESS_PADDING)
+                    .is_some_and(|v| v == "true"),
+                authenticated_length: node
+                    .extra
+                    .get(crate::config::v2ray::VMESS_AUTH_LEN)
+                    .is_some_and(|v| v == "true"),
+            };
             Ok(SharedOutbound(Arc::new(out)).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }
 
@@ -219,6 +253,8 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             uuid,
             password,
             congestion_control,
+            relay,
+            heartbeat_ms,
             ..
         } => {
             let tls_config = node.transport.as_ref().and_then(|t| t.tls.as_ref());
@@ -227,27 +263,38 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                 .get(crate::config::v2ray::TUIC_CERT_PIN)
                 .map(|p| crate::config::v2ray::parse_tuic_certificate_pin(p))
                 .transpose()?;
-            let out = TuicOutbound::new_pinned(
-                &node.server,
-                node.port,
+            let mut out = TuicOutbound::new_pinned(
+                (&node.server, node.port),
                 uuid,
                 password,
                 congestion_control,
                 tls_config,
                 pin,
+                node.extra
+                    .get(crate::config::v2ray::TUIC_ZERO_RTT)
+                    .is_some_and(|v| v == "true"),
             )?;
+            out.relay = *relay;
+            if let Some(ms) = heartbeat_ms.filter(|ms| *ms > 0) {
+                anyhow::ensure!(
+                    ms <= i64::MAX as u64 / 1_000_000 + 1,
+                    "TUIC heartbeat exceeds duration range"
+                );
+                out.heartbeat = std::time::Duration::from_millis(ms);
+            }
             Ok(SharedOutbound(Arc::new(out)))
         }
 
-        ProxyProtocol::Hysteria2 { password, .. } => {
+        ProxyProtocol::Hysteria2 { password, obfs, .. } => {
             let tls_config = node.transport.as_ref().and_then(|t| t.tls.as_ref());
-            let out = Hysteria2Outbound::new_options(
+            let mut out = Hysteria2Outbound::new_options(
                 &node.server,
                 node.port,
                 password,
                 tls_config,
                 &node.extra,
             )?;
+            out.configure_socket(obfs.as_ref(), &node.extra)?;
             Ok(SharedOutbound(Arc::new(out)))
         }
     }
@@ -284,6 +331,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Tls,
                 tls: Some(TlsConfig {
@@ -315,6 +363,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Tls,
                 tls: Some(TlsConfig {

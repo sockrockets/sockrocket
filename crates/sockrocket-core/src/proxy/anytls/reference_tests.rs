@@ -95,8 +95,21 @@ async fn reference_anytls_tcp_udp_reuse_and_shutdown() {
         alpn: None,
         fingerprint: None,
     };
-    let outbound =
-        AnyTlsOutbound::new("127.0.0.1", port, "integration-only", Some(&tls), true).unwrap();
+    let outbound = AnyTlsOutbound::new_pinned(
+        "127.0.0.1",
+        port,
+        "integration-only",
+        Some(&tls),
+        true,
+        &AnyTlsPool {
+            check_interval_ms: Some(8000),
+            idle_timeout_ms: Some(12000),
+            min_idle: 2,
+            disable_reuse: false,
+        },
+        None,
+    )
+    .unwrap();
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = echo.local_addr().unwrap();
     let task = tokio::spawn(async move {

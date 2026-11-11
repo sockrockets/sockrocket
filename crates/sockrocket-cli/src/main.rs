@@ -1369,10 +1369,11 @@ fn build_outbound(
 fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
     match config.proxy_mode {
         ProxyMode::Rule => Some(Arc::new(
-            Router::new(sockrocket_core::router::rule_mode_with_bindings(
+            Router::new(sockrocket_core::router::rule_mode_with_builtin(
                 &config.rules,
                 &config.device_rule_groups,
                 config.explicit_group_bindings,
+                config.builtin_route,
             ))
             .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
         )),
@@ -1537,6 +1538,7 @@ mod tests {
                 shadow_tls: None,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Tcp,
                 tls: None,

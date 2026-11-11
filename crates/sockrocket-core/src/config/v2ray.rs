@@ -29,6 +29,10 @@ struct V2RayStreamSettings {
     security: Option<String>,
     #[serde(rename = "tlsSettings")]
     tls_settings: Option<V2RayTlsSettings>,
+    #[serde(rename = "httpupgradeSettings")]
+    http_upgrade_settings: Option<V2RayWsSettings>,
+    #[serde(rename = "grpcSettings")]
+    grpc_settings: Option<GrpcConfig>,
     #[serde(rename = "wsSettings")]
     ws_settings: Option<V2RayWsSettings>,
     #[serde(rename = "xhttpSettings")]
@@ -50,6 +54,7 @@ struct V2RayTlsSettings {
 
 #[derive(Debug, Deserialize)]
 struct V2RayWsSettings {
+    host: Option<String>,
     path: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
@@ -57,7 +62,7 @@ struct V2RayWsSettings {
 
 #[derive(Debug, Deserialize)]
 struct V2RayRealitySettings {
-    #[serde(rename = "publicKey")]
+    #[serde(rename = "publicKey", alias = "password")]
     public_key: Option<String>,
     #[serde(rename = "shortId")]
     short_id: Option<String>,
@@ -70,6 +75,10 @@ struct V2RayRealitySettings {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct VMessShareLink {
+    #[serde(default, alias = "global-padding")]
+    global_padding: bool,
+    #[serde(default, alias = "authenticated-length")]
+    authenticated_length: bool,
     #[serde(default = "default_v")]
     v: String,
     ps: Option<String>,
@@ -122,6 +131,21 @@ pub fn parse_v2ray_config(json_str: &str) -> Result<Vec<Node>> {
     Ok(nodes)
 }
 
+pub(crate) const UDP_ONLY: &str = "udp_only";
+pub(crate) const VMESS_PADDING: &str = "vmess_global_padding";
+pub(crate) const VMESS_AUTH_LEN: &str = "vmess_authenticated_length";
+pub(crate) fn vmess_framing_options(
+    extra: &mut HashMap<String, String>,
+    padding: bool,
+    auth_len: bool,
+) {
+    for (key, enabled) in [(VMESS_PADDING, padding), (VMESS_AUTH_LEN, auth_len)] {
+        if enabled {
+            extra.insert(key.into(), "true".into());
+        }
+    }
+}
+
 /// Parse a vmess:// share link
 pub fn parse_vmess_uri(uri: &str) -> Result<Node> {
     let encoded = uri.strip_prefix("vmess://").context("Not a vmess:// URI")?;
@@ -160,11 +184,13 @@ pub fn parse_vmess_uri(uri: &str) -> Result<Node> {
     let network = link.net.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "ws"),
+        matches!(network, "tcp" | "ws" | "grpc" | "httpupgrade"),
         "Unsupported VMess URI transport; configuration was not downgraded"
     );
     let transport = build_vmess_transport(network, has_tls, &link);
 
+    let mut extra = HashMap::new();
+    vmess_framing_options(&mut extra, link.global_padding, link.authenticated_length);
     Ok(Node {
         name,
         server: link.add,
@@ -178,7 +204,7 @@ pub fn parse_vmess_uri(uri: &str) -> Result<Node> {
         transport,
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
@@ -200,6 +226,8 @@ pub fn parse_vless_uri(uri: &str) -> Result<Node> {
 
     let params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
 
+    let mut extra = HashMap::new();
+    set_vless_encryption(&mut extra, params.get("encryption").map(String::as_str))?;
     let flow = params.get("flow").cloned();
     let security = params.get("security").map(|s| s.as_str()).unwrap_or("none");
     let transport_type_str = params.get("type").map(|s| s.as_str()).unwrap_or("tcp");
@@ -218,102 +246,31 @@ pub fn parse_vless_uri(uri: &str) -> Result<Node> {
         transport,
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
-/// Parse a ss:// share link
-pub fn parse_ss_uri(uri: &str) -> Result<Node> {
-    let without_scheme = uri.strip_prefix("ss://").context("Not a ss:// URI")?;
+pub use super::ss_uri::parse_ss_uri;
 
-    // Extract name from fragment
-    let (main, fragment) = match without_scheme.split_once('#') {
-        Some((m, f)) => (m, Some(super::model::decode_display_name(f))),
-        None => (without_scheme, None),
-    };
+pub(crate) const VLESS_ENCRYPTION: &str = "vless_encryption";
 
-    // Format 1: ss://base64(method:password)@host:port
-    // Format 2: ss://method:password@host:port (SIP002)
-    if let Some((userinfo, hostport)) = main.split_once('@') {
-        let decoded = general_purpose::STANDARD
-            .decode(userinfo.trim())
-            .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(userinfo.trim()))
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_else(|_| userinfo.to_string());
-
-        let (cipher, password) = decoded
-            .split_once(':')
-            .context("Invalid SS userinfo format")?;
-
-        let parsed = url::Url::parse(&format!("scheme://user@{}", hostport))
-            .context("Failed to parse SS host:port")?;
-        let server = parsed
-            .host_str()
-            .context("Missing server host")?
-            .to_string();
-        let port = parsed.port().unwrap_or(8388);
-        let name = fragment.unwrap_or_else(|| format!("SS-{}", server));
-
-        return Ok(Node {
-            name,
-            server,
-            port,
-            protocol: ProxyProtocol::Shadowsocks {
-                cipher: cipher.to_string(),
-                password: password.to_string(),
-                udp: true,
-                shadow_tls: None,
-            },
-            transport: None,
-            latency_ms: None,
-            tags: vec![],
-            extra: HashMap::new(),
-        });
+pub(crate) fn set_vless_encryption(
+    extra: &mut HashMap<String, String>,
+    value: Option<&str>,
+) -> Result<()> {
+    if let Some(value) = value.filter(|v| !v.is_empty() && *v != "none") {
+        crate::proxy::vless::encryption::parse_client_encryption(value)
+            .map_err(anyhow::Error::msg)?;
+        extra.insert(VLESS_ENCRYPTION.into(), value.into());
     }
-
-    // Format 3: ss://base64(method:password@host:port)
-    let decoded = general_purpose::STANDARD
-        .decode(main.trim())
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(main.trim()))
-        .context("Failed to decode SS base64")?;
-    let decoded_str = String::from_utf8(decoded).context("Invalid UTF-8")?;
-
-    let (method_pass, hostport) = decoded_str.split_once('@').context("Invalid SS format")?;
-    let (cipher, password) = method_pass
-        .split_once(':')
-        .context("Invalid SS method:password")?;
-
-    let parsed = url::Url::parse(&format!("scheme://user@{}", hostport))
-        .context("Failed to parse SS host:port")?;
-    let server = parsed
-        .host_str()
-        .context("Missing server host")?
-        .to_string();
-    let port = parsed.port().unwrap_or(8388);
-    let name = fragment.unwrap_or_else(|| format!("SS-{}", server));
-
-    Ok(Node {
-        name,
-        server,
-        port,
-        protocol: ProxyProtocol::Shadowsocks {
-            cipher: cipher.to_string(),
-            password: password.to_string(),
-            udp: true,
-            shadow_tls: None,
-        },
-        transport: None,
-        latency_ms: None,
-        tags: vec![],
-        extra: HashMap::new(),
-    })
+    Ok(())
 }
-
 pub(crate) const TLS_CERT_PIN: &str = "tls_certificate_sha256";
 pub(crate) const HY2_UP: &str = "hysteria2_up_mbps";
 pub(crate) const HY2_DOWN: &str = "hysteria2_down_mbps";
 pub(crate) const HY2_FAST_OPEN: &str = "hysteria2_fast_open";
-/// Preserved for export; Sockrocket currently connects on the URI's fixed port.
+pub(crate) const HY2_HOP_INTERVAL: &str = "hysteria2_hop_interval_ms";
+pub(crate) const HY2_HOP_MAX: &str = "hysteria2_hop_interval_max_ms";
 pub(crate) const HY2_MPORT: &str = "hysteria2_mport";
 // Legacy storage key: keep reading it so saved imports gain the implementation.
 pub(crate) const HY2_CLIENT_FP_HINT: &str = "hysteria2_client_fingerprint_hint";
@@ -366,6 +323,7 @@ fn import_tls_pin(
     Ok(())
 }
 
+pub(crate) const TUIC_ZERO_RTT: &str = "tuic_zero_rtt";
 pub(crate) const TUIC_CERT_PIN: &str = "tuic_certificate_sha256";
 
 pub(crate) fn parse_tuic_certificate_pin(value: &str) -> Result<[u8; 32]> {
@@ -420,6 +378,9 @@ pub fn parse_tuic_uri(uri: &str) -> Result<Node> {
         .map(str::to_string)
         .collect();
     let mut extra = HashMap::new();
+    if query_truthy(&params, "zero_rtt_handshake") {
+        extra.insert(TUIC_ZERO_RTT.into(), "true".into());
+    }
     if let Some(pin) = params.get("pcs") {
         let bytes = parse_tuic_certificate_pin(pin)?;
         extra.insert(
@@ -436,9 +397,28 @@ pub fn parse_tuic_uri(uri: &str) -> Result<Node> {
             uuid,
             password,
             congestion_control,
+            heartbeat_ms: params
+                .get("heartbeat_interval")
+                .map(|v| v.parse::<u64>())
+                .transpose()?,
+            relay: TuicRelay::parse(
+                params.get("udp_relay_mode").map(String::as_str),
+                if query_truthy(&params, "udp_over_stream") {
+                    Some(
+                        params
+                            .get("udp_over_stream_version")
+                            .map(|s| s.parse::<u8>())
+                            .transpose()?
+                            .unwrap_or(2),
+                    )
+                } else {
+                    None
+                },
+            )?,
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Quic,
             tls: Some(TlsConfig {
@@ -465,7 +445,9 @@ pub fn parse_trojan_uri(uri: &str) -> Result<Node> {
     let parsed = url::Url::parse(&format!("scheme://{}", without_scheme))
         .context("Failed to parse Trojan URI")?;
 
-    let password = parsed.username().to_string();
+    let password = urlencoding::decode(parsed.username())
+        .context("Invalid Trojan password encoding")?
+        .into_owned();
     let server = parsed
         .host_str()
         .context("Missing server host")?
@@ -483,18 +465,25 @@ pub fn parse_trojan_uri(uri: &str) -> Result<Node> {
     );
     let transport = build_uri_transport(security, transport_type_str, &params)?;
 
+    let mut extra = HashMap::new();
+    let udp = match params.get("network").map(String::as_str) {
+        None => true,
+        Some("tcp") => false,
+        Some("udp") => {
+            extra.insert(UDP_ONLY.into(), "true".into());
+            true
+        }
+        _ => anyhow::bail!("Invalid Trojan application network"),
+    };
     Ok(Node {
         name,
         server,
         port,
-        protocol: ProxyProtocol::Trojan {
-            password,
-            udp: true,
-        },
+        protocol: ProxyProtocol::Trojan { password, udp },
         transport,
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
@@ -557,7 +546,29 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         uri.starts_with("hysteria2://") || uri.starts_with("hy2://"),
         "Not a Hysteria2 URI"
     );
-    let parsed = url::Url::parse(uri).map_err(|_| anyhow::anyhow!("Invalid Hysteria2 URI"))?;
+    // The Hysteria share format permits a list in the authority's port slot.
+    // Parse the remainder with Url, which accepts only a single numeric port.
+    let (_, rest) = uri.split_once("://").unwrap();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let port_list = host_port
+        .rsplit_once(':')
+        .map(|(_, p)| p)
+        .filter(|p| p.contains([',', '-']) && !p.contains(']'));
+    let normalized;
+    let input = if let Some(list) = port_list {
+        let first = list.split([',', '-']).next().unwrap_or("");
+        let port = first
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 port range"))?;
+        validate_hysteria2_mport(list, port)?;
+        let end = uri.len() - rest.len() + authority.len();
+        normalized = format!("{}{port}{}", &uri[..end - list.len()], &uri[end..]);
+        &normalized
+    } else {
+        uri
+    };
+    let parsed = url::Url::parse(input).map_err(|_| anyhow::anyhow!("Invalid Hysteria2 URI"))?;
     anyhow::ensure!(
         matches!(parsed.path(), "" | "/"),
         "Unsupported Hysteria2 path"
@@ -587,6 +598,12 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
                     | "downmbps"
                     | "fastopen"
                     | "fp"
+                    | "obfs"
+                    | "obfs-password"
+                    | "min-packet-size"
+                    | "max-packet-size"
+                    | "hop_interval_ms"
+                    | "hop_interval_max_ms"
                     | "mport"
             ),
             "Unsupported Hysteria2 option; obfuscation and unknown extensions are not ignored"
@@ -600,6 +617,21 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
     }
     let mut extra = HashMap::new();
     let port = parsed.port().unwrap_or(443);
+    for (k, field) in [
+        ("hop_interval_ms", HY2_HOP_INTERVAL),
+        ("hop_interval_max_ms", HY2_HOP_MAX),
+    ] {
+        if let Some(v) = params.get(k) {
+            extra.insert(field.into(), v.parse::<u64>()?.to_string());
+        }
+    }
+    if let Some(list) = port_list {
+        anyhow::ensure!(
+            !params.contains_key("mport"),
+            "Duplicate Hysteria2 port range"
+        );
+        params.insert("mport".into(), list.into());
+    }
     if let Some(mport) = params.get("mport") {
         validate_hysteria2_mport(mport, port)?;
         extra.insert(HY2_MPORT.into(), mport.clone());
@@ -663,10 +695,23 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         server,
         port,
         protocol: ProxyProtocol::Hysteria2 {
+            obfs: Hy2Obfs::from_parts(
+                params.get("obfs").map(String::as_str),
+                params.get("obfs-password").map(String::as_str),
+                params
+                    .get("min-packet-size")
+                    .map(|s| s.parse())
+                    .transpose()?,
+                params
+                    .get("max-packet-size")
+                    .map(|s| s.parse())
+                    .transpose()?,
+            )?,
             password,
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
@@ -734,6 +779,10 @@ pub fn parse_anytls_uri(uri: &str) -> Result<Node> {
                     | "security"
                     | "pcs"
                     | "pinSHA256"
+                    | "idle_session_check_interval_ms"
+                    | "idle_session_timeout_ms"
+                    | "min_idle_session"
+                    | "disable_reuse"
             ),
             "Unsupported AnyTLS URI option"
         );
@@ -746,9 +795,31 @@ pub fn parse_anytls_uri(uri: &str) -> Result<Node> {
         port,
         protocol: ProxyProtocol::AnyTls {
             password,
+            pool: AnyTlsPool {
+                check_interval_ms: params
+                    .get("idle_session_check_interval_ms")
+                    .map(|s| s.parse())
+                    .transpose()?,
+                idle_timeout_ms: params
+                    .get("idle_session_timeout_ms")
+                    .map(|s| s.parse())
+                    .transpose()?,
+                min_idle: params
+                    .get("min_idle_session")
+                    .map(|s| s.parse())
+                    .transpose()?
+                    .unwrap_or(0),
+                disable_reuse: params
+                    .get("disable_reuse")
+                    .map(|s| s.parse::<bool>())
+                    .transpose()?
+                    .unwrap_or(false),
+            }
+            .checked()?,
             udp: true,
         },
         transport: Some(TransportConfig {
+            grpc: None,
             xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
@@ -812,6 +883,52 @@ fn collect_alpn_values(query_pairs: &[(String, String)]) -> Vec<String> {
     values
 }
 
+fn xray_endpoint<'a>(settings: &'a serde_json::Value, list: &str) -> Result<&'a serde_json::Value> {
+    match settings.get(list) {
+        Some(value) => {
+            let entries = value.as_array().context("Invalid Xray endpoint list")?;
+            anyhow::ensure!(entries.len() == 1, "Expected one Xray endpoint per node");
+            Ok(&entries[0])
+        }
+        None => Ok(settings),
+    }
+}
+
+fn xray_port(endpoint: &serde_json::Value, default: u16) -> Result<u16> {
+    let Some(value) = endpoint.get("port") else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|n| *n != 0)
+        .context("Invalid Xray port")
+}
+
+fn xray_user_id(user: &serde_json::Value) -> Result<String> {
+    use sha1::{Digest, Sha1};
+
+    let id = user
+        .get("id")
+        .and_then(|v| v.as_str())
+        .context("Missing user id")?;
+    if (1..=30).contains(&id.len()) {
+        // Xray maps short UTF-8 identifiers to UUIDv5 in the nil namespace.
+        let digest = Sha1::new()
+            .chain_update([0; 16])
+            .chain_update(id.as_bytes())
+            .finalize();
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        return Ok(uuid::Builder::from_sha1_bytes(bytes)
+            .into_uuid()
+            .to_string());
+    }
+    Ok(uuid::Uuid::parse_str(id)
+        .context("Invalid Xray user id")?
+        .to_string())
+}
+
 fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
     anyhow::ensure!(
         !outbound
@@ -822,33 +939,27 @@ fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
         "XHTTP is currently supported only for VLESS"
     );
     match outbound.protocol.as_str() {
+        "wireguard" => {
+            super::wireguard::from_xray(&outbound.settings, outbound.tag.as_deref()).map(Some)
+        }
         "vmess" => {
-            let vnext = outbound
-                .settings
-                .get("vnext")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .context("Missing vnext")?;
-
+            let vnext = xray_endpoint(&outbound.settings, "vnext")?;
             let server = vnext
                 .get("address")
                 .and_then(|v| v.as_str())
                 .context("Missing address")?
                 .to_string();
-            let port = vnext.get("port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
+            let port = xray_port(vnext, 443)?;
 
-            let user = vnext
-                .get("users")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .context("Missing users")?;
-
-            let uuid = user
-                .get("id")
-                .and_then(|v| v.as_str())
-                .context("Missing user id")?
-                .to_string();
-            let alter_id = user.get("alterId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let user = xray_endpoint(vnext, "users")?;
+            let uuid = xray_user_id(user)?;
+            let alter_id = match user.get("alterId") {
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .context("Invalid VMess alterId")?,
+                None => 0,
+            };
             let cipher = user
                 .get("security")
                 .and_then(|v| v.as_str())
@@ -884,31 +995,22 @@ fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
             }))
         }
         "vless" => {
-            let vnext = outbound
-                .settings
-                .get("vnext")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .context("Missing vnext")?;
-
+            let vnext = xray_endpoint(&outbound.settings, "vnext")?;
             let server = vnext
                 .get("address")
                 .and_then(|v| v.as_str())
                 .context("Missing address")?
                 .to_string();
-            let port = vnext.get("port").and_then(|v| v.as_u64()).unwrap_or(443) as u16;
+            let port = xray_port(vnext, 443)?;
 
-            let user = vnext
-                .get("users")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .context("Missing users")?;
-
-            let uuid = user
-                .get("id")
-                .and_then(|v| v.as_str())
-                .context("Missing user id")?
-                .to_string();
+            let user = xray_endpoint(vnext, "users")?;
+            let uuid = xray_user_id(user)?;
+            let mut extra = HashMap::new();
+            let encryption = user
+                .get("encryption")
+                .map(|v| v.as_str().context("Invalid VLESS encryption field"))
+                .transpose()?;
+            set_vless_encryption(&mut extra, encryption)?;
             let flow = user
                 .get("flow")
                 .and_then(|v| v.as_str())
@@ -945,23 +1047,68 @@ fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
                 transport,
                 latency_ms: None,
                 tags: vec![],
+                extra,
+            }))
+        }
+        "trojan" => {
+            let endpoint = match outbound.settings.get("servers") {
+                Some(list) => {
+                    let servers = list.as_array().context("Invalid Trojan servers")?;
+                    anyhow::ensure!(
+                        servers.len() == 1,
+                        "Expected one Trojan server per outbound"
+                    );
+                    &servers[0]
+                }
+                None => &outbound.settings,
+            };
+            let server = endpoint
+                .get("address")
+                .and_then(|v| v.as_str())
+                .context("Missing Trojan address")?;
+            let port = endpoint
+                .get("port")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v != 0)
+                .context("Invalid Trojan port")?;
+            let password = endpoint
+                .get("password")
+                .and_then(|v| v.as_str())
+                .context("Missing Trojan password")?;
+            let stream = outbound
+                .stream_settings
+                .as_ref()
+                .context("Trojan requires TLS or REALITY")?;
+            anyhow::ensure!(
+                matches!(stream.security.as_deref(), Some("tls" | "reality")),
+                "Trojan requires TLS or REALITY"
+            );
+            Ok(Some(Node {
+                name: outbound
+                    .tag
+                    .clone()
+                    .unwrap_or_else(|| format!("Trojan-{server}")),
+                server: server.into(),
+                port,
+                protocol: ProxyProtocol::Trojan {
+                    password: password.into(),
+                    udp: true,
+                },
+                transport: build_v2ray_transport(stream)?,
+                latency_ms: None,
+                tags: vec![],
                 extra: HashMap::new(),
             }))
         }
         "shadowsocks" => {
-            let servers = outbound
-                .settings
-                .get("servers")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .context("Missing servers")?;
-
+            let servers = xray_endpoint(&outbound.settings, "servers")?;
             let server = servers
                 .get("address")
                 .and_then(|v| v.as_str())
                 .context("Missing address")?
                 .to_string();
-            let port = servers.get("port").and_then(|v| v.as_u64()).unwrap_or(8388) as u16;
+            let port = xray_port(servers, 8388)?;
             let cipher = servers
                 .get("method")
                 .and_then(|v| v.as_str())
@@ -1008,7 +1155,10 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     let network = ss.network.as_deref().unwrap_or("tcp");
 
     anyhow::ensure!(
-        matches!(network, "tcp" | "raw" | "ws" | "xhttp"),
+        matches!(
+            network,
+            "tcp" | "raw" | "ws" | "grpc" | "httpupgrade" | "xhttp"
+        ),
         "Unsupported Xray transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -1036,6 +1186,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
         && let Some(ref rs) = ss.reality_settings
     {
         return Ok(Some(TransportConfig {
+            grpc: None,
             xhttp: if network == "xhttp" {
                 Some(ss.xhttp_settings.clone().unwrap_or_default())
             } else {
@@ -1088,9 +1239,14 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
     } else {
         None
     };
-    let ws = if network == "ws" {
-        ss.ws_settings.as_ref().map(|w| {
-            let host = w.headers.get("Host").cloned();
+    let ws = if matches!(network, "ws" | "httpupgrade") {
+        let settings = if network == "httpupgrade" {
+            &ss.http_upgrade_settings
+        } else {
+            &ss.ws_settings
+        };
+        settings.as_ref().map(|w| {
+            let host = w.host.clone().or_else(|| w.headers.get("Host").cloned());
             WsConfig {
                 path: w.path.clone(),
                 host,
@@ -1103,12 +1259,15 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
 
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
+        "httpupgrade" => TransportType::HttpUpgrade,
+        "grpc" => TransportType::Grpc,
         "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Ok(Some(TransportConfig {
+        grpc: (network == "grpc").then(|| ss.grpc_settings.clone().unwrap_or_default()),
         xhttp,
         transport_type,
         tls,
@@ -1140,7 +1299,7 @@ fn build_vmess_transport(
         None
     };
 
-    let ws = if network == "ws" {
+    let ws = if matches!(network, "ws" | "httpupgrade") {
         Some(WsConfig {
             path: link.path.clone(),
             host: link.host.clone(),
@@ -1152,11 +1311,18 @@ fn build_vmess_transport(
 
     let transport_type = match network {
         "ws" => TransportType::WebSocket,
+        "httpupgrade" => TransportType::HttpUpgrade,
+        "grpc" => TransportType::Grpc,
         _ if has_tls => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Some(TransportConfig {
+        grpc: (network == "grpc").then(|| GrpcConfig {
+            service_name: link.path.clone().unwrap_or_default(),
+            multi_mode: link.header_type.as_deref() == Some("multi"),
+            authority: link.host.clone(),
+        }),
         xhttp: None,
         transport_type,
         tls,
@@ -1171,7 +1337,10 @@ fn build_uri_transport(
     params: &HashMap<String, String>,
 ) -> Result<Option<TransportConfig>> {
     anyhow::ensure!(
-        matches!(transport_type_str, "tcp" | "raw" | "ws" | "xhttp"),
+        matches!(
+            transport_type_str,
+            "tcp" | "raw" | "ws" | "grpc" | "httpupgrade" | "xhttp"
+        ),
         "Unsupported URI transport; configuration was not downgraded"
     );
     anyhow::ensure!(
@@ -1190,6 +1359,7 @@ fn build_uri_transport(
 
     if security == "reality" {
         return Ok(Some(TransportConfig {
+            grpc: None,
             xhttp: if transport_type_str == "xhttp" {
                 Some(uri_xhttp(params)?)
             } else {
@@ -1231,7 +1401,7 @@ fn build_uri_transport(
         None
     };
 
-    let ws = if transport_type_str == "ws" {
+    let ws = if matches!(transport_type_str, "ws" | "httpupgrade") {
         Some(WsConfig {
             path: params.get("path").cloned(),
             host: params.get("host").cloned(),
@@ -1262,12 +1432,19 @@ fn build_uri_transport(
     };
     let transport_type = match transport_type_str {
         "ws" => TransportType::WebSocket,
+        "httpupgrade" => TransportType::HttpUpgrade,
+        "grpc" => TransportType::Grpc,
         "xhttp" => TransportType::Xhttp,
         _ if security == "tls" => TransportType::Tls,
         _ => TransportType::Tcp,
     };
 
     Ok(Some(TransportConfig {
+        grpc: (transport_type_str == "grpc").then(|| GrpcConfig {
+            service_name: params.get("serviceName").cloned().unwrap_or_default(),
+            multi_mode: params.get("mode").is_some_and(|v| v == "multi"),
+            authority: params.get("authority").cloned(),
+        }),
         xhttp,
         transport_type,
         tls,
@@ -1287,11 +1464,25 @@ pub fn node_to_share_uri(node: &Node) -> String {
             Tcp => "tcp",
             Tls => "tcp",
             WebSocket => "ws",
+            HttpUpgrade => "httpupgrade",
+            Grpc => "grpc",
             Xhttp => "xhttp",
             Quic => "quic",
             Reality => "tcp",
         };
         qparams.push(format!("type={}", net));
+        if let Some(grpc) = &tc.grpc {
+            qparams.push(format!(
+                "serviceName={}",
+                urlencoding::encode(&grpc.service_name)
+            ));
+            if grpc.multi_mode {
+                qparams.push("mode=multi".into());
+            }
+            if let Some(host) = &grpc.authority {
+                qparams.push(format!("authority={}", urlencoding::encode(host)));
+            }
+        }
 
         let security = if tc.reality.is_some() {
             "reality"
@@ -1355,6 +1546,9 @@ pub fn node_to_share_uri(node: &Node) -> String {
             }
         }
         if let Some(ref reality) = tc.reality {
+            if let Some(sni) = &reality.sni {
+                qparams.push(format!("sni={}", urlencoding::encode(sni)));
+            }
             qparams.push(format!("pbk={}", urlencoding::encode(&reality.public_key)));
             qparams.push(format!("sid={}", urlencoding::encode(&reality.short_id)));
             if let Some(ref fp) = reality.client_fingerprint {
@@ -1368,8 +1562,20 @@ pub fn node_to_share_uri(node: &Node) -> String {
 
     match &node.protocol {
         ProxyProtocol::Wireguard { config } => super::wireguard::share_uri(node, config),
-        ProxyProtocol::AnyTls { password, .. } => {
+        ProxyProtocol::AnyTls { password, pool, .. } => {
             let mut params = Vec::new();
+            if let Some(ms) = pool.check_interval_ms {
+                params.push(format!("idle_session_check_interval_ms={ms}"));
+            }
+            if let Some(ms) = pool.idle_timeout_ms {
+                params.push(format!("idle_session_timeout_ms={ms}"));
+            }
+            if pool.min_idle != 0 {
+                params.push(format!("min_idle_session={}", pool.min_idle));
+            }
+            if pool.disable_reuse {
+                params.push("disable_reuse=true".into());
+            }
             if let Some(tls) = node.transport.as_ref().and_then(|t| t.tls.as_ref()) {
                 if let Some(sni) = &tls.sni {
                     params.push(format!("peer={}", urlencoding::encode(sni)));
@@ -1396,15 +1602,11 @@ pub fn node_to_share_uri(node: &Node) -> String {
             )
         }
         ProxyProtocol::Shadowsocks {
-            cipher, password, ..
-        } => {
-            let userinfo = format!("{}:{}", cipher, password);
-            let encoded = general_purpose::STANDARD.encode(userinfo.as_bytes());
-            format!(
-                "ss://{}@{}:{}#{}",
-                encoded, node.server, node.port, name_enc
-            )
-        }
+            cipher,
+            password,
+            shadow_tls,
+            ..
+        } => super::ss_uri::share_uri(node, cipher, password, shadow_tls.as_ref(), &name_enc),
         ProxyProtocol::VMess {
             uuid,
             alter_id,
@@ -1414,6 +1616,8 @@ pub fn node_to_share_uri(node: &Node) -> String {
             let (net, tls_str, host_val, path_val) = if let Some(ref tc) = node.transport {
                 let n = match tc.transport_type {
                     TransportType::WebSocket => "ws",
+                    TransportType::HttpUpgrade => "httpupgrade",
+                    TransportType::Grpc => "grpc",
                     TransportType::Quic => "quic",
                     _ => "tcp",
                 };
@@ -1438,7 +1642,7 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 .and_then(|tc| tc.tls.as_ref())
                 .and_then(|t| t.sni.clone())
                 .unwrap_or_default();
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "v": "2",
                 "ps": node.name,
                 "add": node.server,
@@ -1453,10 +1657,28 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 "tls": tls_str,
                 "sni": sni,
             });
+            if let Some(grpc) = node.transport.as_ref().and_then(|t| t.grpc.as_ref()) {
+                json["path"] = grpc.service_name.clone().into();
+                json["type"] = if grpc.multi_mode { "multi" } else { "gun" }.into();
+                if let Some(host) = &grpc.authority {
+                    json["host"] = host.clone().into();
+                }
+            }
+            for (key, name) in [
+                (VMESS_PADDING, "global_padding"),
+                (VMESS_AUTH_LEN, "authenticated_length"),
+            ] {
+                if node.extra.get(key).is_some_and(|v| v == "true") {
+                    json[name] = true.into();
+                }
+            }
             let encoded = general_purpose::STANDARD.encode(json.to_string().as_bytes());
             format!("vmess://{}", encoded)
         }
         ProxyProtocol::VLess { uuid, flow, .. } => {
+            if let Some(value) = node.extra.get(VLESS_ENCRYPTION) {
+                qparams.push(format!("encryption={}", urlencoding::encode(value)));
+            }
             if let Some(f) = flow {
                 qparams.push(format!("flow={}", f));
             }
@@ -1474,6 +1696,8 @@ pub fn node_to_share_uri(node: &Node) -> String {
             uuid,
             password,
             congestion_control,
+            relay,
+            heartbeat_ms,
             ..
         } => {
             let sni = node
@@ -1489,6 +1713,18 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 .map(|t| t.skip_cert_verify)
                 .unwrap_or(false);
             let mut extra = format!("?congestion_control={}", congestion_control);
+            if node.extra.get(TUIC_ZERO_RTT).is_some_and(|v| v == "true") {
+                extra.push_str("&zero_rtt_handshake=1");
+            }
+            if let Some(ms) = heartbeat_ms {
+                extra.push_str(&format!("&heartbeat_interval={ms}"));
+            }
+            match relay {
+                TuicRelay::Native => {}
+                TuicRelay::Quic => extra.push_str("&udp_relay_mode=quic"),
+                TuicRelay::UotV1 => extra.push_str("&udp_over_stream=1&udp_over_stream_version=1"),
+                TuicRelay::UotV2 => extra.push_str("&udp_over_stream=1&udp_over_stream_version=2"),
+            }
             if !sni.is_empty() {
                 extra.push_str(&format!("&sni={}", urlencoding::encode(&sni)));
             }
@@ -1522,18 +1758,26 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 name_enc
             )
         }
-        ProxyProtocol::Trojan { password, .. } => {
+        ProxyProtocol::Trojan { password, udp } => {
+            if node.extra.get(UDP_ONLY).is_some_and(|v| v == "true") {
+                qparams.push("network=udp".into());
+            } else if !udp {
+                qparams.push("network=tcp".into());
+            }
             let qs = if qparams.is_empty() {
                 String::new()
             } else {
                 format!("?{}", qparams.join("&"))
             };
             format!(
-                "trojan://{}@{}:{}{}#{}",
-                password, node.server, node.port, qs, name_enc
+                "trojan://{}@{}{}#{}",
+                urlencoding::encode(password),
+                crate::proxy::transport::format_host_port(&node.server, node.port),
+                qs,
+                name_enc
             )
         }
-        ProxyProtocol::Hysteria2 { password, .. } => {
+        ProxyProtocol::Hysteria2 { password, obfs, .. } => {
             let sni = node
                 .transport
                 .as_ref()
@@ -1547,6 +1791,22 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 .map(|t| t.skip_cert_verify)
                 .unwrap_or(false);
             let mut extra_params = Vec::new();
+            if let Some(o) = obfs {
+                extra_params.push(format!("obfs={}", o.kind));
+                extra_params.push(format!(
+                    "obfs-password={}",
+                    urlencoding::encode(&o.password)
+                ));
+                for (k, v) in [
+                    ("min-packet-size", o.min_packet_size),
+                    ("max-packet-size", o.max_packet_size),
+                ] {
+                    if let Some(v) = v {
+                        extra_params.push(format!("{k}={v}"));
+                    }
+                }
+            }
+
             if !sni.is_empty() {
                 extra_params.push(format!("sni={}", urlencoding::encode(&sni)));
             }
@@ -1559,6 +1819,8 @@ pub fn node_to_share_uri(node: &Node) -> String {
                 (HY2_DOWN, "downmbps"),
                 (HY2_FAST_OPEN, "fastopen"),
                 (HY2_MPORT, "mport"),
+                (HY2_HOP_INTERVAL, "hop_interval_ms"),
+                (HY2_HOP_MAX, "hop_interval_max_ms"),
             ] {
                 if let Some(value) = node.extra.get(field) {
                     extra_params.push(format!("{query}={}", urlencoding::encode(value)));
@@ -1893,6 +2155,31 @@ mod tests {
     }
 
     #[test]
+    fn flat_xray_endpoints_preserve_user_settings() {
+        let settings = serde_json::json!({"address":"example.invalid","port":8443,"id":"我爱🍉老师1314","security":"chacha20-poly1305"});
+        for kind in ["vmess", "vless"] {
+            let config = serde_json::json!({"outbounds":[{"protocol":kind,"settings":settings}]});
+            let nodes = parse_v2ray_config(&config.to_string()).unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].port, 8443);
+            let id = match &nodes[0].protocol {
+                ProxyProtocol::VMess { uuid, cipher, .. } => {
+                    assert_eq!(cipher, "chacha20-poly1305");
+                    uuid
+                }
+                ProxyProtocol::VLess { uuid, .. } => uuid,
+                _ => panic!("unexpected protocol"),
+            };
+            assert_eq!(id, "5783a3e7-e373-51cd-8642-c83782b807c5");
+        }
+        let config = serde_json::json!({"outbounds":[{"protocol":"shadowsocks","settings":{"address":"example.invalid","port":8388,"method":"aes-128-gcm","password":"local"}}]});
+        let nodes = parse_v2ray_config(&config.to_string()).unwrap();
+        assert!(
+            matches!(&nodes[0].protocol, ProxyProtocol::Shadowsocks { cipher, .. } if cipher == "aes-128-gcm")
+        );
+    }
+
+    #[test]
     fn test_parse_v2ray_config() {
         let json = r#"{
             "outbounds": [
@@ -1980,7 +2267,7 @@ mod native_protocol_regressions {
             parse_hysteria2_uri(
                 "hy2://auth@vpn.example.invalid?obfs=salamander&obfs-password=secret"
             )
-            .is_err()
+            .is_ok()
         );
     }
     #[test]
@@ -2016,7 +2303,7 @@ mod native_protocol_regressions {
     }
     #[test]
     fn unsupported_uri_transports_fail_closed() {
-        for transport in ["grpc", "httpupgrade"] {
+        for transport in ["h2", "kcp"] {
             assert!(parse_vless_uri(&format!("vless://00000000-0000-0000-0000-000000000001@vpn.example.invalid:443?security=tls&type={transport}")).is_err());
         }
     }

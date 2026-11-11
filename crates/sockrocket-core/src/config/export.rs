@@ -196,6 +196,12 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
     match &node.protocol {
         ProxyProtocol::Wireguard { config } => {
             put(&mut m, "private-key", s(&config.private_key));
+            if let Some(port) = config.listen_port {
+                put(&mut m, "listen-port", Value::Number(port.into()));
+            }
+            if let Some(bytes) = config.reserved {
+                put(&mut m, "reserved", serde_yaml::to_value(bytes).unwrap());
+            }
             put(&mut m, "public-key", s(&config.public_key));
             if let Some(psk) = &config.preshared_key {
                 put(&mut m, "pre-shared-key", s(psk));
@@ -219,9 +225,72 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
                 "persistent-keepalive",
                 Value::Number(config.persistent_keepalive.into()),
             );
+            if !config.additional_peers.is_empty() {
+                let mut primary = Mapping::new();
+                for key in [
+                    "server",
+                    "port",
+                    "public-key",
+                    "pre-shared-key",
+                    "allowed-ips",
+                    "persistent-keepalive",
+                    "reserved",
+                ] {
+                    if let Some(value) = m.remove(s(key)) {
+                        put(&mut primary, key, value);
+                    }
+                }
+                let mut peers = vec![Value::Mapping(primary)];
+                for peer in &config.additional_peers {
+                    let mut entry = Mapping::new();
+                    put(&mut entry, "server", s(&peer.server));
+                    put(&mut entry, "port", Value::Number(peer.port.into()));
+                    put(&mut entry, "public-key", s(&peer.public_key));
+                    if let Some(key) = &peer.preshared_key {
+                        put(&mut entry, "pre-shared-key", s(key));
+                    }
+                    if let Some(bytes) = peer.reserved {
+                        put(&mut entry, "reserved", serde_yaml::to_value(bytes).unwrap());
+                    }
+                    put(
+                        &mut entry,
+                        "allowed-ips",
+                        serde_yaml::to_value(&peer.allowed_ips).unwrap(),
+                    );
+                    put(
+                        &mut entry,
+                        "persistent-keepalive",
+                        Value::Number(peer.persistent_keepalive.into()),
+                    );
+                    peers.push(Value::Mapping(entry));
+                }
+                put(&mut m, "peers", Value::Sequence(peers));
+            }
             put(&mut m, "udp", Value::Bool(config.udp));
         }
-        ProxyProtocol::AnyTls { password, udp } => {
+        ProxyProtocol::AnyTls {
+            password,
+            udp,
+            pool,
+        } => {
+            for (name, ms) in [
+                ("idle-session-check-interval", pool.check_interval_ms),
+                ("idle-session-timeout", pool.idle_timeout_ms),
+            ] {
+                if let Some(ms) = ms {
+                    put(&mut m, name, Value::Number(ms.div_ceil(1000).into()));
+                }
+            }
+            if pool.min_idle != 0 {
+                put(
+                    &mut m,
+                    "min-idle-session",
+                    Value::Number((pool.min_idle as u64).into()),
+                );
+            }
+            if pool.disable_reuse {
+                put(&mut m, "disable-reuse", Value::Bool(true));
+            }
             if let Some(pin) = node.extra.get(super::v2ray::TLS_CERT_PIN) {
                 put(&mut m, "fingerprint", s(pin));
             }
@@ -242,9 +311,13 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             // mihomo defaults `udp` to true for most protocols; always write
             // it explicitly so importing clients see the intended value.
             put(&mut m, "udp", Value::Bool(*udp));
-            // shadow-tls cannot be expressed in an ss:// URI (which keeps
-            // exporting as plain SS), but Clash YAML carries it via the
-            // plugin fields — our own parser reads these back.
+            if let Ok(Some(plugin)) = super::ss_plugin::Plugin::load(&node.extra) {
+                put(&mut m, "plugin", s(plugin.name()));
+                m.insert(
+                    s("plugin-opts"),
+                    serde_yaml::to_value(plugin.options()).expect("serializable plugin options"),
+                );
+            }
             if let Some(st) = shadow_tls {
                 put(&mut m, "plugin", s("shadow-tls"));
                 let mut opts = Mapping::new();
@@ -264,6 +337,14 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             udp,
         } => {
             put(&mut m, "uuid", s(uuid));
+            for (key, name) in [
+                (super::v2ray::VMESS_PADDING, "global-padding"),
+                (super::v2ray::VMESS_AUTH_LEN, "authenticated-length"),
+            ] {
+                if node.extra.get(key).is_some_and(|v| v == "true") {
+                    put(&mut m, name, Value::Bool(true));
+                }
+            }
             put(&mut m, "alterId", Value::Number((*alter_id).into()));
             put(&mut m, "cipher", s(cipher));
             // mihomo defaults `udp` to true for most protocols; always write
@@ -272,6 +353,9 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             apply_ws_and_tls(&mut m, node, "servername");
         }
         ProxyProtocol::VLess { uuid, flow, udp } => {
+            if let Some(value) = node.extra.get(super::v2ray::VLESS_ENCRYPTION) {
+                put(&mut m, "encryption", s(value));
+            }
             put(&mut m, "uuid", s(uuid));
             if let Some(flow) = flow {
                 put(&mut m, "flow", s(flow));
@@ -285,6 +369,8 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             uuid,
             password,
             congestion_control,
+            relay,
+            heartbeat_ms,
             udp,
         } => {
             put(&mut m, "uuid", s(uuid));
@@ -293,6 +379,29 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             }
             put(&mut m, "password", s(password));
             put(&mut m, "congestion-controller", s(congestion_control));
+            if node
+                .extra
+                .get(super::v2ray::TUIC_ZERO_RTT)
+                .is_some_and(|v| v == "true")
+            {
+                put(&mut m, "reduce-rtt", Value::Bool(true));
+            }
+            if let Some(ms) = heartbeat_ms {
+                put(&mut m, "heartbeat-interval", Value::Number((*ms).into()));
+            }
+            use super::model::TuicRelay;
+            match relay {
+                TuicRelay::Quic => put(&mut m, "udp-relay-mode", s("quic")),
+                TuicRelay::UotV1 | TuicRelay::UotV2 => {
+                    put(&mut m, "udp-over-stream", Value::Bool(true));
+                    put(
+                        &mut m,
+                        "udp-over-stream-version",
+                        Value::Number((if *relay == TuicRelay::UotV2 { 2 } else { 1 }).into()),
+                    );
+                }
+                TuicRelay::Native => {}
+            }
             // mihomo defaults `udp` to true for most protocols; always write
             // it explicitly so importing clients see the intended value.
             put(&mut m, "udp", Value::Bool(*udp));
@@ -301,13 +410,57 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             }
         }
         ProxyProtocol::Trojan { password, udp } => {
+            if node
+                .extra
+                .get(super::v2ray::UDP_ONLY)
+                .is_some_and(|v| v == "true")
+            {
+                put(&mut m, "sockrocket-udp-only", Value::Bool(true));
+            }
             put(&mut m, "password", s(password));
             // mihomo defaults `udp` to true for most protocols; always write
             // it explicitly so importing clients see the intended value.
             put(&mut m, "udp", Value::Bool(*udp));
             apply_ws_and_tls(&mut m, node, "sni");
         }
-        ProxyProtocol::Hysteria2 { password, udp } => {
+        ProxyProtocol::Hysteria2 {
+            password,
+            udp,
+            obfs,
+        } => {
+            if let Some(o) = obfs {
+                put(&mut m, "obfs", s(&o.kind));
+                put(&mut m, "obfs-password", s(&o.password));
+                for (k, v) in [
+                    ("obfs-min-packet-size", o.min_packet_size),
+                    ("obfs-max-packet-size", o.max_packet_size),
+                ] {
+                    if let Some(v) = v {
+                        put(&mut m, k, Value::Number(v.into()));
+                    }
+                }
+            }
+            if let Some(lo) = node
+                .extra
+                .get(super::v2ray::HY2_HOP_INTERVAL)
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                let hi = node
+                    .extra
+                    .get(super::v2ray::HY2_HOP_MAX)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(lo);
+                let (lo, hi) = (lo.div_ceil(1000), hi.div_ceil(1000));
+                put(
+                    &mut m,
+                    "hop-interval",
+                    s(&if lo == hi {
+                        lo.to_string()
+                    } else {
+                        format!("{lo}-{hi}")
+                    }),
+                );
+            }
             if let Some(ports) = node.extra.get(super::v2ray::HY2_MPORT) {
                 put(&mut m, "ports", s(ports));
             }
@@ -357,9 +510,28 @@ fn apply_ws_and_tls(m: &mut Mapping, node: &Node, sni_key: &str) {
             );
         }
     }
-    if tc.transport_type == TransportType::WebSocket {
+    if tc.transport_type == TransportType::Grpc {
+        put(m, "network", s("grpc"));
+        let grpc = tc.grpc.clone().unwrap_or_default();
+        let mut opts = Mapping::new();
+        put(&mut opts, "grpc-service-name", s(&grpc.service_name));
+        if grpc.multi_mode {
+            put(&mut opts, "multiMode", Value::Bool(true));
+        }
+        if let Some(host) = grpc.authority {
+            put(&mut opts, "authority", s(&host));
+        }
+        m.insert(s("grpc-opts"), Value::Mapping(opts));
+    }
+    if matches!(
+        tc.transport_type,
+        TransportType::WebSocket | TransportType::HttpUpgrade
+    ) {
         put(m, "network", s("ws"));
         let mut ws = Mapping::new();
+        if tc.transport_type == TransportType::HttpUpgrade {
+            put(&mut ws, "v2ray-http-upgrade", Value::Bool(true));
+        }
         if let Some(wsc) = &tc.ws {
             if let Some(path) = &wsc.path {
                 put(&mut ws, "path", s(path));
@@ -467,6 +639,7 @@ mod tests {
                 udp: false,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::WebSocket,
                 tls: Some(TlsConfig {
@@ -499,6 +672,7 @@ mod tests {
                 udp: true,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Reality,
                 tls: None,
@@ -526,9 +700,12 @@ mod tests {
                 uuid: "d685aef3-b3c4-4932-9a9d-d0c2f6727dfa".to_string(),
                 password: "secret".to_string(),
                 congestion_control: "bbr".to_string(),
+                relay: Default::default(),
+                heartbeat_ms: None,
                 udp: true,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Quic,
                 tls: Some(TlsConfig {
@@ -568,10 +745,12 @@ mod tests {
             server: "de.example.com".to_string(),
             port: 1443,
             protocol: ProxyProtocol::Hysteria2 {
+                obfs: None,
                 password: "hy2pass".to_string(),
                 udp: true,
             },
             transport: Some(TransportConfig {
+                grpc: None,
                 xhttp: None,
                 transport_type: TransportType::Quic,
                 tls: Some(TlsConfig {

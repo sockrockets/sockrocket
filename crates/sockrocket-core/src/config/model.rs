@@ -44,6 +44,16 @@ pub fn normalize_node_names(nodes: &mut [Node]) -> bool {
     changed
 }
 
+/// Exit for the built-in domestic and local-network matches in rule mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuiltinRoute {
+    #[default]
+    Direct,
+    Proxy,
+    Reject,
+}
+
 /// Unified application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -73,6 +83,8 @@ pub struct AppConfig {
     pub device_rule_groups: Vec<DeviceRuleGroup>,
     #[serde(default)]
     pub explicit_group_bindings: bool,
+    #[serde(default)]
+    pub builtin_route: BuiltinRoute,
     /// Whether the proxy was running when the app was last closed (auto-reconnect on next start)
     #[serde(default)]
     pub auto_connect: bool,
@@ -113,6 +125,7 @@ impl Default for AppConfig {
             rules: Vec::new(),
             device_rule_groups: Vec::new(),
             explicit_group_bindings: false,
+            builtin_route: BuiltinRoute::default(),
             auto_connect: false,
             tun_was_enabled: false,
             tun_mtu: None,
@@ -265,6 +278,130 @@ pub struct ShadowTlsConfig {
     pub skip_cert_verify: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuicRelay {
+    #[default]
+    Native,
+    Quic,
+    UotV1,
+    UotV2,
+}
+impl TuicRelay {
+    pub(crate) fn parse(mode: Option<&str>, uot: Option<u8>) -> anyhow::Result<Self> {
+        match (mode, uot) {
+            (None | Some(""), Some(1)) => Ok(Self::UotV1),
+            (None | Some(""), Some(2)) => Ok(Self::UotV2),
+            (None | Some("" | "native"), None) => Ok(Self::Native),
+            (Some("quic"), None) => Ok(Self::Quic),
+            _ => anyhow::bail!("Invalid or conflicting TUIC UDP relay options"),
+        }
+    }
+    pub(crate) fn is_native(&self) -> bool {
+        *self == Self::Native
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnyTlsPool {
+    pub check_interval_ms: Option<u64>,
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub min_idle: usize,
+    #[serde(default)]
+    pub disable_reuse: bool,
+}
+impl AnyTlsPool {
+    pub(crate) fn checked(self) -> anyhow::Result<Self> {
+        self.validate()?;
+        Ok(self)
+    }
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.min_idle <= 64,
+            "AnyTLS minimum idle sessions exceeds per-node session capacity"
+        );
+        anyhow::ensure!(
+            [self.check_interval_ms, self.idle_timeout_ms]
+                .into_iter()
+                .flatten()
+                .all(|v| v <= (i64::MAX as u64).div_ceil(1_000_000)),
+            "AnyTLS duration exceeds range"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hy2Obfs {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_packet_size: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_packet_size: Option<u16>,
+}
+impl std::fmt::Debug for Hy2Obfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hy2Obfs")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+impl Hy2Obfs {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.password.len() >= 4,
+            "Hysteria2 obfuscation needs at least four password bytes"
+        );
+        let (min, max) = self.gecko_sizes();
+        match self.kind.as_str() {
+            "salamander" => anyhow::ensure!(
+                self.min_packet_size.is_none() && self.max_packet_size.is_none(),
+                "Gecko sizes require Gecko obfuscation"
+            ),
+            "gecko" => {
+                anyhow::ensure!(min <= max && max <= 2048, "Invalid Gecko packet size range")
+            }
+            _ => anyhow::bail!("Unsupported Hysteria2 obfuscation type"),
+        }
+        Ok(())
+    }
+    pub(crate) fn gecko_sizes(&self) -> (usize, usize) {
+        (
+            self.min_packet_size.filter(|v| *v > 0).unwrap_or(512) as usize,
+            self.max_packet_size.filter(|v| *v > 0).unwrap_or(1200) as usize,
+        )
+    }
+    pub(crate) fn from_parts(
+        kind: Option<&str>,
+        password: Option<&str>,
+        min_packet_size: Option<u16>,
+        max_packet_size: Option<u16>,
+    ) -> anyhow::Result<Option<Self>> {
+        if kind.is_none()
+            && password.is_none()
+            && min_packet_size.is_none()
+            && max_packet_size.is_none()
+        {
+            return Ok(None);
+        }
+        let result = Self {
+            kind: kind.unwrap_or("").into(),
+            password: password.unwrap_or("").into(),
+            min_packet_size,
+            max_packet_size,
+        };
+        result.validate()?;
+        Ok(Some(result))
+    }
+}
+
 /// Supported proxy protocols
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -277,6 +414,8 @@ pub enum ProxyProtocol {
     /// AnyTLS v2 with bounded TLS-session reuse and UDP-over-TCP v2.
     AnyTls {
         password: String,
+        #[serde(default, skip_serializing_if = "AnyTlsPool::is_default")]
+        pool: AnyTlsPool,
         #[serde(default = "default_true")]
         udp: bool,
     },
@@ -312,6 +451,10 @@ pub enum ProxyProtocol {
         password: String,
         #[serde(default = "default_congestion")]
         congestion_control: String,
+        #[serde(default, skip_serializing_if = "TuicRelay::is_native")]
+        relay: TuicRelay,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heartbeat_ms: Option<u64>,
         #[serde(default)]
         udp: bool,
     },
@@ -324,15 +467,35 @@ pub enum ProxyProtocol {
     /// Hysteria2
     Hysteria2 {
         password: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obfs: Option<Hy2Obfs>,
         #[serde(default)]
         udp: bool,
     },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WireguardPeer {
+    pub server: String,
+    pub port: u16,
+    pub public_key: String,
+    pub preshared_key: Option<String>,
+    pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub persistent_keepalive: u16,
+    pub reserved: Option<[u8; 3]>,
 }
 
 /// WireGuard owns no OS routes or DNS settings. Target DNS travels through
 /// the encrypted endpoint; bootstrap DNS resolves only the peer hostname.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WireguardConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_peers: Vec<WireguardPeer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<[u8; 3]>,
     pub private_key: String,
     pub public_key: String,
     #[serde(default)]
@@ -352,6 +515,9 @@ pub struct WireguardConfig {
 impl Default for WireguardConfig {
     fn default() -> Self {
         Self {
+            additional_peers: vec![],
+            listen_port: None,
+            reserved: None,
             private_key: String::new(),
             public_key: String::new(),
             preshared_key: None,
@@ -435,6 +601,8 @@ fn default_congestion() -> String {
 /// Transport layer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<GrpcConfig>,
     /// Transport type
     #[serde(rename = "type")]
     pub transport_type: TransportType,
@@ -456,9 +624,20 @@ pub enum TransportType {
     Tcp,
     Tls,
     WebSocket,
+    HttpUpgrade,
+    Grpc,
     Xhttp,
     Quic,
     Reality,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GrpcConfig {
+    #[serde(default, alias = "serviceName", alias = "grpc-service-name")]
+    pub service_name: String,
+    #[serde(default, alias = "multiMode")]
+    pub multi_mode: bool,
+    pub authority: Option<String>,
 }
 
 /// TLS configuration

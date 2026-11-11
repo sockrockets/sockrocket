@@ -64,6 +64,7 @@ assert.match(el('device-picker').innerHTML,/电视/);
 assert.equal(el('device-scope-note').hidden,false);
 assert.equal(el('device-picker').options[0].value,'global');
 assert.equal(el('device-picker').value,'global');
+assert.match(el('device-bindings').innerHTML,/全局设备兜底/);
 assert.equal(requests.length,0,'default selection must not save a policy');
 const form=source.split('<fieldset id="sr-device-form"')[1].split('</fieldset>')[0];
 assert.equal(form.match(/<select id="([^"]+)"/)[1],'sr-device-picker');

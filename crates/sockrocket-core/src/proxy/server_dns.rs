@@ -167,6 +167,7 @@ mod tests {
     fn preserves_implicit_and_explicit_tls_identity_and_reuses_transport() {
         let mut n = node();
         n.protocol = ProxyProtocol::AnyTls {
+            pool: Default::default(),
             password: "synthetic".into(),
             udp: true,
         };

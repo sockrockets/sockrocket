@@ -212,10 +212,6 @@ jobs:
             cargo install cross --version 0.2.5 --locked --force
           fi
 
-      - name: Install ARM64 artifact inspection tools
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: sudo apt-get update -y && sudo apt-get install -y llvm
-
       - name: Cross-compile CLI (${{ matrix.name }})
         run: bash tools/build-merlin-cross.sh ${{ matrix.target }}
 
