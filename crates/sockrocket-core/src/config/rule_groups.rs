@@ -173,20 +173,31 @@ pub fn replace_rule_group(
     old_group: &str,
     incoming: Vec<RoutingRule>,
 ) -> Result<usize, String> {
+    replace_rule_group_where(rules, old_group, incoming, |_| true)
+}
+
+pub fn replace_rule_group_where(
+    rules: &mut Vec<RoutingRule>,
+    old_group: &str,
+    incoming: Vec<RoutingRule>,
+    include: impl Fn(&RoutingRule) -> bool,
+) -> Result<usize, String> {
     if incoming.is_empty() {
         return Err("分组里至少要有一条规则".into());
     }
     let new_name = incoming[0].group.trim().to_string();
     if !same_rule_group(&new_name, old_group)
-        && rules.iter().any(|r| same_rule_group(&r.group, &new_name))
+        && rules
+            .iter()
+            .any(|r| include(r) && same_rule_group(&r.group, &new_name))
     {
         return Err(format!("分组「{new_name}」已存在"));
     }
     let insert_at = rules
         .iter()
-        .position(|r| same_rule_group(&r.group, old_group))
+        .position(|r| include(r) && same_rule_group(&r.group, old_group))
         .unwrap_or(rules.len());
-    rules.retain(|r| !same_rule_group(&r.group, old_group));
+    rules.retain(|r| !include(r) || !same_rule_group(&r.group, old_group));
     let at = insert_at.min(rules.len());
     let n = incoming.len();
     for (i, rule) in incoming.into_iter().enumerate() {

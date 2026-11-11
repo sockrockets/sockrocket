@@ -2531,7 +2531,11 @@ fn load_routing_rules(map: &Mapping) -> Vec<sockrocket_core::RoutingRule> {
 
 fn prune_device_links(map: &mut Mapping, rules: &[sockrocket_core::RoutingRule]) {
     if let Ok(mut links) = devices::links(map) {
-        links.retain(|b| rules.iter().any(|r| r.group.trim() == b.group));
+        links.retain(|b| {
+            rules
+                .iter()
+                .any(|r| r.is_global_destination() && r.group.trim() == b.group)
+        });
         devices::store_links(map, &links);
     }
 }
@@ -2549,11 +2553,17 @@ fn same_rule_group(rule_group: &str, want: &str) -> bool {
 }
 
 fn rule_kind(rule_type: &str) -> &str {
-    if matches!(rule_type, "match" | "final") {
+    if rule_type.eq_ignore_ascii_case("match") || rule_type.eq_ignore_ascii_case("final") {
         "final"
     } else {
         rule_type
     }
+}
+
+// The Merlin group editor manages destination rules. Older API callers can
+// still edit complete groups, including final rules.
+fn includes_group_rule(post: &J, rule: &sockrocket_core::RoutingRule) -> bool {
+    post["destinations_only"].as_bool() != Some(true) || rule_kind(&rule.rule_type) != "final"
 }
 
 fn requested_rule_source(post: &J, default: &str) -> std::result::Result<String, String> {
@@ -3054,6 +3064,9 @@ fn act_batch_add_rules(post: &J) -> J {
     };
     let mut parsed = parsed;
     for rule in &mut parsed.rules {
+        if !includes_group_rule(post, rule) {
+            return err_msg("默认出口请在设备分流策略中设置");
+        }
         if group_only {
             if group.is_empty() || !source.is_empty() || !rule.is_global_destination() {
                 return err_msg("请选择具名规则组并导入目的规则；设备来源和默认出口请在绑定处配置");
@@ -3275,7 +3288,7 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     if let Some(expected) = post.get("expected_rules") {
         let current: Vec<_> = rules
             .iter()
-            .filter(|r| same_rule_group(&r.group, &group))
+            .filter(|r| includes_group_rule(post, r) && same_rule_group(&r.group, &group))
             .map(rule_edit_snapshot)
             .collect();
         if expected != &json!(current) {
@@ -3285,7 +3298,7 @@ fn act_set_rule_group_enabled(post: &J) -> J {
     let mut n = 0usize;
     let mut changed = false;
     for r in &mut rules {
-        if same_rule_group(&r.group, &group) {
+        if includes_group_rule(post, r) && same_rule_group(&r.group, &group) {
             changed |= r.enabled != enabled;
             r.enabled = enabled;
             n += 1;
@@ -3396,6 +3409,9 @@ fn act_replace_rule_group(post: &J) -> J {
             incoming.push(rule);
         }
     }
+    if incoming.iter().any(|r| !includes_group_rule(post, r)) {
+        return err_msg("默认出口请在设备分流策略中设置");
+    }
     if incoming.is_empty() {
         return err_msg("No valid patterns in the group");
     }
@@ -3406,7 +3422,7 @@ fn act_replace_rule_group(post: &J) -> J {
     let mut rules = load_routing_rules(&map);
     let members: Vec<_> = rules
         .iter()
-        .filter(|r| same_rule_group(&r.group, &old_group))
+        .filter(|r| includes_group_rule(post, r) && same_rule_group(&r.group, &old_group))
         .collect();
     if members.is_empty() {
         return err_msg("分组已不存在，请刷新后重试");
@@ -3447,7 +3463,12 @@ fn act_replace_rule_group(post: &J) -> J {
             rule.name.clone_from(&previous.name);
         }
     }
-    if let Err(e) = sockrocket_core::replace_rule_group(&mut rules, &old_group, incoming) {
+    if let Err(e) = sockrocket_core::config::rule_groups::replace_rule_group_where(
+        &mut rules,
+        &old_group,
+        incoming,
+        |r| includes_group_rule(post, r),
+    ) {
         return err_msg(&e);
     }
     let previous_sources = accelerated_rule_sources(&map);
@@ -3485,10 +3506,11 @@ fn act_delete_rule_group(post: &J) -> J {
     }
     let before = rows.len();
     rows.retain(|row| {
-        !same_rule_group(
-            row.get(ykey("group")).and_then(Y::as_str).unwrap_or(""),
-            group,
-        )
+        !includes_group_rule(post, &yaml_to_routing_rule(row).unwrap())
+            || !same_rule_group(
+                row.get(ykey("group")).and_then(Y::as_str).unwrap_or(""),
+                group,
+            )
     });
     let removed = before - rows.len();
     if removed == 0 {
@@ -5741,6 +5763,33 @@ dns_direct_domains:
             true
         );
         assert_eq!(winner(tv), (json!(0), json!("direct")));
+    }
+
+    #[test]
+    fn group_editor_preserves_device_and_global_fallbacks() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Mixed, pattern: tv.invalid, target: proxy}\n  - {rule_type: final, group: Mixed, pattern: '*', target: direct}\n  - {rule_type: MATCH, group: Mixed, source: 192.0.2.8/32, pattern: '*', target: reject}",
+        ));
+        let fallbacks = || {
+            load_routing_rules(&load_conf().unwrap())
+                .into_iter()
+                .filter(|r| rule_kind(&r.rule_type) == "final")
+                .map(|r| rule_edit_snapshot(&r))
+                .collect::<Vec<_>>()
+        };
+        let original = fallbacks();
+        assert_eq!(original.len(), 2);
+        let mut request = json!({"group":"Mixed","destinations_only":true,"enabled":false});
+        assert_eq!(act_set_rule_group_enabled(&request)["ok"], true);
+        request["text"] = json!("MATCH,PROXY");
+        assert_eq!(act_batch_add_rules(&request)["ok"], false);
+        assert_eq!(act_replace_rule_group(&request)["ok"], false);
+        request["text"] = json!("DOMAIN,new.invalid,DIRECT");
+        assert_eq!(act_replace_rule_group(&request)["ok"], true);
+        request["expected_revision"] = json!(route_trace::rules_revision(&load_conf().unwrap()));
+        assert_eq!(act_delete_rule_group(&request)["ok"], true);
+        assert_eq!(fallbacks(), original);
     }
 
     #[test]

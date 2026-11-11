@@ -40,8 +40,8 @@ assert.equal(f.element('rule-flow-check').disabled,false);
 c.traceRuleFlow();req=f.request('trace_route');c.srLoadRules();
 f.request('get_rules')[2]({ok:true,rules:c.SR_STATE.ruleRows,revision:'newest'});
 req[2](result(c.SR_STATE.ruleRows[1]));assert.equal(c.RULE_TRACE,null,'refresh while pending invalidates response');
-c.showFlowRuleList('device_final');assert.match(f.element('rule-count').textContent,/当前显示 13 条/,'same unnamed group spans all phases');
-c.showFlowRuleList();assert.match(f.element('rule-count').textContent,/当前显示 13 条/);
+c.showFlowRuleList('device_final');assert.match(f.element('rule-count').textContent,/当前显示 12 条/,'unnamed group contains only destination rules');
+c.showFlowRuleList();assert.match(f.element('rule-count').textContent,/当前显示 12 条/);
 const unsafe=rule(20,{name:'<img src=x onerror=alert(1)>'});c.SR_STATE.ruleRows=[unsafe];
 const provisional=result(unsafe);provisional.trace.definitive=false;provisional.trace.dns='failed';
 const html=c.flowTraceHtml(provisional);
@@ -275,8 +275,8 @@ function deviceConnections(html, source, hitsOnly=false) {
    assert.match(graph(), /<button[^>]*onclick="openMapGlobalFallback\(\)"[^>]*><strong>全局设备兜底<\/strong>/);
  }
  const edits=[];
- c.chooseDefaultGroup=kind=>edits.push(kind);
+ c.openDeviceFallback=source=>edits.push(source);
  c.openMapGlobalFallback();
- assert.deepEqual(edits,['global'],'the fallback editor must always target global settings');
+ assert.deepEqual(edits,[''],'the fallback editor must always target global settings');
  console.log('PASS: unnamed destination rule and global fallback have separate outlets and exclusive trace paths');
 }
