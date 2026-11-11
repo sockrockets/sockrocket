@@ -53,21 +53,7 @@ jobs:
       # ── Linux system dependencies ──────────────────────────────────────────
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libvulkan-dev \
-            libgl1-mesa-dev \
-            libasound2-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            pkg-config \
-            clang \
-            mold
+        run: bash tools/install-ci-linux-deps.sh mold
 
       # ── macOS system dependencies ──────────────────────────────────────────
       - name: Install macOS system dependencies
@@ -173,14 +159,7 @@ jobs:
         with:
           components: clippy
       - name: Install Linux system dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev \
-            libvulkan-dev libgl1-mesa-dev \
-            libasound2-dev libfontconfig1-dev \
-            libfreetype6-dev pkg-config clang
+        run: bash tools/install-ci-linux-deps.sh
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
