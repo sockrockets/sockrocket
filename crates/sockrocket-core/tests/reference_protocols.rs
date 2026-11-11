@@ -57,9 +57,16 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
             server["users"] = json!([{"uuid":id}]);
             if let Some(security) = option {
                 let mut parts = security.split('+');
+                if let Some((_, value)) = security.split_once("+alter") {
+                    let count = value.parse::<u32>()?;
+                    client["alter_id"] = json!(count);
+                    server["users"][0]["alterId"] = json!(count);
+                }
                 client["security"] = json!(parts.next().unwrap());
                 for option in parts {
-                    client[option] = json!(true);
+                    if !option.starts_with("alter") {
+                        client[option] = json!(true);
+                    }
                 }
             }
             client["uuid"] = json!(id);
@@ -333,6 +340,21 @@ macro_rules! reference {
         }
     };
 }
+reference!(
+    reference_vmess_alter1_tcp_udp,
+    "vmess",
+    Some("aes-128-gcm+alter1")
+);
+reference!(
+    reference_vmess_alter64_tcp_udp,
+    "vmess",
+    Some("chacha20-poly1305+alter64")
+);
+reference!(
+    reference_vmess_alter4_none_tcp_udp,
+    "vmess",
+    Some("none+alter4")
+);
 reference!(reference_ss_tcp_udp, "shadowsocks", None);
 reference!(
     reference_ss2022_aes128_tcp_udp,
@@ -405,6 +427,96 @@ async fn reference_tuic_mihomo_all_udp_modes() -> Result<()> {
             .await
             .context("TUIC reference timeout")?
             .with_context(|| format!("Mihomo TUIC mode {mode:?}"))?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires SOCKROCKET_REFERENCE_XRAY"]
+async fn reference_xray_vless_encryption_matrix() -> Result<()> {
+    let exe = std::env::var_os("SOCKROCKET_REFERENCE_XRAY").context("Xray executable required")?;
+    let generated = Command::new(&exe).arg("vlessenc").output()?;
+    ensure!(generated.status.success(), "Xray key generation failed");
+    let output = String::from_utf8(generated.stdout)?;
+    let keys = |label: &str| -> Vec<String> {
+        output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(label))
+            .filter_map(|line| line.split('"').nth(1))
+            .filter_map(|value| value.splitn(4, '.').nth(3))
+            .map(str::to_owned)
+            .collect()
+    };
+    let private = keys("\"decryption\":");
+    let public = keys("\"encryption\":");
+    ensure!(
+        private.len() == 2 && public.len() == 2,
+        "Xray did not generate both key types"
+    );
+    let uuid = "00000000-0000-4000-8000-000000000001";
+    for mode in ["native", "xorpub", "random"] {
+        for rtt in ["1rtt", "0rtt"] {
+            for count in [1, 2, 3] {
+                let (secret, key) = match count {
+                    1 => (private[0].clone(), public[0].clone()),
+                    2 => (private[1].clone(), public[1].clone()),
+                    _ => (private.join("."), public.join(".")),
+                };
+                let port = TcpListener::bind(("127.0.0.1", 0))
+                    .await?
+                    .local_addr()?
+                    .port();
+                let dec = format!("mlkem768x25519plus.{mode}.600s.{secret}");
+                let enc = format!("mlkem768x25519plus.{mode}.{rtt}.{key}");
+                let config = json!({"log":{"loglevel":"error"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"vless","settings":{"decryption":dec,"clients":[{"id":uuid}]}}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1"]}]}}]});
+                let mut proc = Server(
+                    Command::new(&exe)
+                        .args(["run", "-config", "stdin:"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .spawn()?,
+                    None,
+                );
+                serde_json::to_writer(proc.0.stdin.take().unwrap(), &config)?;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .await
+                        .is_err()
+                    {
+                        ensure!(proc.0.try_wait()?.is_none(), "Xray exited");
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await??;
+                let node = sockrocket_core::parse_vless_uri(&format!(
+                    "vless://{uuid}@127.0.0.1:{port}?encryption={enc}"
+                ))?;
+                let out = create_outbound_unwarmed(&node)?;
+                for _ in 0..2 {
+                    tokio::time::timeout(Duration::from_secs(10), check_tcp_echo(&out))
+                        .await?
+                        .with_context(|| {
+                            format!("VLESS Encryption {mode} {rtt} key set {count}")
+                        })?;
+                }
+                let echo = UdpSocket::bind(("127.0.0.1", 0)).await?;
+                let tunnel = out
+                    .0
+                    .connect_datagram("127.0.0.1", echo.local_addr()?.port())
+                    .await?;
+                tunnel.send(b"fixture").await?;
+                let mut buf = [0u8; 16];
+                let (n, peer) =
+                    tokio::time::timeout(Duration::from_secs(5), echo.recv_from(&mut buf))
+                        .await??;
+                ensure!(&buf[..n] == b"fixture", "UDP request mismatch");
+                echo.send_to(b"reply", peer).await?;
+                let n =
+                    tokio::time::timeout(Duration::from_secs(5), tunnel.recv(&mut buf)).await??;
+                ensure!(&buf[..n] == b"reply", "UDP response mismatch");
+            }
+        }
     }
     Ok(())
 }

@@ -80,6 +80,7 @@ struct ClashProxy {
     #[serde(rename = "alterId", default)]
     alter_id: Option<u32>,
     // VLESS fields
+    encryption: Option<String>,
     flow: Option<String>,
     // TLS
     #[serde(default)]
@@ -323,7 +324,11 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
                 .as_ref()
                 .context("SS missing password")?
                 .clone();
-            let shadow_tls = parse_shadow_tls_plugin(proxy)?;
+            let shadow_tls = if proxy.plugin.as_deref() == Some("shadow-tls") {
+                parse_shadow_tls_plugin(proxy)?
+            } else {
+                None
+            };
             ProxyProtocol::Shadowsocks {
                 cipher,
                 password,
@@ -412,6 +417,27 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
 
     let port = resolve_port(proxy)?;
     let mut extra = HashMap::new();
+    if proxy.proxy_type == "ss"
+        && let Some(name) = proxy.plugin.as_deref().filter(|v| *v != "shadow-tls")
+    {
+        let opts = proxy
+            .plugin_opts
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!({}));
+        super::ss_plugin::Plugin::parse(
+            name,
+            opts.as_object()
+                .context("Expected plugin options map")?
+                .clone(),
+            &proxy.server,
+        )?
+        .save(&mut extra)?;
+    }
+    if matches!(protocol, ProxyProtocol::VLess { .. }) {
+        super::v2ray::set_vless_encryption(&mut extra, proxy.encryption.as_deref())?;
+    }
     if proxy.proxy_type == "tuic" && proxy.reduce_rtt {
         extra.insert(super::v2ray::TUIC_ZERO_RTT.into(), "true".into());
     }
@@ -898,7 +924,7 @@ proxies:
     fn test_parse_clash_ss_unsupported_plugin_rejected() {
         let yaml = r#"
 proxies:
-  - { name: "SS-OBFS",type: ss,server: s.example.com,port: 8388,password: "p",udp: false,cipher: aes-256-gcm,plugin: obfs,plugin-opts: {mode: tls}}
+  - { name: "SS-OBFS",type: ss,server: s.example.com,port: 8388,password: "p",udp: false,cipher: aes-256-gcm,plugin: unknown-plugin,plugin-opts: {mode: tls}}
 "#;
         let nodes = parse_clash_config(yaml).unwrap();
         assert!(nodes.is_empty(), "unsupported plugin must skip the node");

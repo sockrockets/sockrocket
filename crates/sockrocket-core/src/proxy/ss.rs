@@ -1,3 +1,6 @@
+mod mux_cool;
+mod simple_obfs;
+use crate::config::ss_plugin::Plugin;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -15,6 +18,8 @@ use super::connector::{BoxProxyStream, Outbound};
 pub struct SsOutbound {
     server_config: ServerConfig,
     udp_enabled: bool,
+    pub(super) plugin: Option<Plugin>,
+    endpoint: (String, u16),
     context: shadowsocks::context::SharedContext,
 }
 
@@ -32,6 +37,8 @@ impl SsOutbound {
         Ok(Self {
             server_config,
             udp_enabled: true,
+            plugin: None,
+            endpoint: (server.into(), port),
             context,
         })
     }
@@ -60,6 +67,56 @@ impl Outbound for SsOutbound {
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>> {
         let addr = target_address(host, port);
         Box::pin(async move {
+            if let Some(plugin) = &self.plugin {
+                let (server, port) = &self.endpoint;
+                let tls = crate::config::model::TlsConfig {
+                    sni: Some(plugin.host.clone()),
+                    skip_cert_verify: plugin.skip_cert_verify,
+                    alpn: Some(vec!["http/1.1".into()]),
+                    fingerprint: None,
+                };
+                let stream = super::transport::connect_with_tls(
+                    server,
+                    *port,
+                    plugin.tls.then_some(&tls),
+                    plugin.tls,
+                )
+                .await?;
+                let wrapped: BoxProxyStream = match plugin.mode.as_str() {
+                    "http" => Box::new(simple_obfs::HttpObfs::new(
+                        stream,
+                        plugin.host.clone(),
+                        *port,
+                    )?),
+                    "tls" => Box::new(simple_obfs::TlsObfs::new(stream, plugin.host.clone())?),
+                    "websocket" => {
+                        let cfg = crate::config::model::WsConfig {
+                            host: Some(plugin.host.clone()),
+                            path: plugin.path.clone(),
+                            headers: Some(plugin.headers.clone().into_iter().collect()),
+                        };
+                        let ws = super::ws::connect_ws_timeout(
+                            stream,
+                            server,
+                            &cfg,
+                            std::time::Duration::from_secs(15),
+                        )
+                        .await?;
+                        if plugin.mux.unwrap_or(true) {
+                            Box::new(mux_cool::MuxCoolStream::new(ws))
+                        } else {
+                            ws
+                        }
+                    }
+                    _ => anyhow::bail!("Unsupported Shadowsocks transport"),
+                };
+                return Ok(Box::new(ProxyClientStream::from_stream(
+                    self.context.clone(),
+                    wrapped,
+                    &self.server_config,
+                    addr,
+                )) as BoxProxyStream);
+            }
             // Shadowsocks dials its own socket, so it never reaches
             // `tune_socket`. Keep TCP_NODELAY, and leave both buffer sizes
             // unset: pinning 64 KiB disables Linux autotune and caps the

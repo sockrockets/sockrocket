@@ -1,3 +1,4 @@
+pub(crate) mod encryption;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -30,10 +31,22 @@ pub struct VlessOutbound {
     port: u16,
     uuid: [u8; 16],
     pool: ConnPool,
+    pub(super) encryption: Option<encryption::ClientInstance>,
     vision: Option<ConnPool<VisionTlsStream>>,
 }
 
 impl VlessOutbound {
+    async fn open_stream(&self) -> Result<BoxProxyStream> {
+        let stream = self.pool.get().await?;
+        match &self.encryption {
+            Some(client) => {
+                tokio::time::timeout(std::time::Duration::from_secs(15), client.handshake(stream))
+                    .await
+                    .context("VLESS Encryption handshake timed out")?
+            }
+            None => Ok(stream),
+        }
+    }
     pub fn new(
         server: &str,
         port: u16,
@@ -84,6 +97,7 @@ impl VlessOutbound {
             port,
             uuid: *uuid::Uuid::parse_str(uuid_str)?.as_bytes(),
             pool: ConnPool::lazy(factory.clone()),
+            encryption: None,
             vision: Some(if warm_pool {
                 // Keep the concrete TLS stream: Vision later needs raw TCP access.
                 // Share the global warm budget with ordinary transport pools.
@@ -125,6 +139,7 @@ impl VlessOutbound {
             port,
             uuid: *uuid.as_bytes(),
             pool,
+            encryption: None,
             vision: None,
         })
     }
@@ -152,7 +167,7 @@ impl Outbound for VlessOutbound {
                     Box::new(super::vision::VisionStream::new(tls, self.uuid)) as BoxProxyStream
                 );
             }
-            let mut stream = self.pool.get().await.with_context(|| {
+            let mut stream = self.open_stream().await.with_context(|| {
                 format!(
                     "VLESS: failed to connect to {}:{} (target: {}:{})",
                     self.server, self.port, target_host, port
@@ -203,7 +218,7 @@ impl Outbound for VlessOutbound {
                     super::stream_datagram::Framing::Xudp(address),
                 ));
             }
-            let mut stream = self.pool.get().await?;
+            let mut stream = self.open_stream().await?;
             let mut header = build_vless_request(&self.uuid, &host, port)?;
             header[18] = 2;
             stream.write_all(&header).await?;

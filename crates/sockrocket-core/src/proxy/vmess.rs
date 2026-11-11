@@ -78,6 +78,7 @@ pub struct VMessOutbound {
     port: u16,
     uuid: [u8; 16],
     security: VMessSecurity,
+    alter_key: Option<[u8; 16]>,
     pool: ConnPool,
     pub(super) framing: Framing,
 }
@@ -131,6 +132,7 @@ impl VMessOutbound {
             port,
             uuid: *parsed_uuid.as_bytes(),
             security,
+            alter_key: None,
             pool,
             framing: Framing::default(),
         })
@@ -138,6 +140,25 @@ impl VMessOutbound {
 }
 
 impl VMessOutbound {
+    pub(super) fn set_alter_id(&mut self, count: u32) -> Result<()> {
+        anyhow::ensure!(count <= u16::MAX as u32, "VMess alterId exceeds 65535");
+        if count != 0 {
+            // Every legacy account accepts its first alter ID, independent of count.
+            let mut hash = Md5::new();
+            hash.update(self.uuid);
+            hash.update(b"16167dc8-16b6-4e6d-b8bb-65dd68113a81");
+            loop {
+                let key: [u8; 16] = hash.clone().finalize().into();
+                if key != self.uuid {
+                    self.alter_key = Some(key);
+                    break;
+                }
+                hash.update(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
+            }
+        }
+        Ok(())
+    }
+
     async fn connect_command(
         &self,
         target_host: String,
@@ -175,32 +196,35 @@ impl VMessOutbound {
                 port,
                 command,
                 self.framing,
+                self.alter_key.as_ref(),
             )?;
 
             (req_body_key, req_body_iv, resp_auth, header)
         };
 
         // Derive response keys
-        let resp_body_key_full = sha256_bytes(&req_body_key);
-        let resp_body_iv_full = sha256_bytes(&req_body_iv);
-
-        // Wrap in VMess AEAD stream
+        let response_key = |input: &[u8; 16]| -> [u8; 16] {
+            if self.alter_key.is_some() {
+                Md5::digest(input).into()
+            } else {
+                sha256_bytes(input)[..16].try_into().unwrap()
+            }
+        };
         let mut vmess_stream = VMessStream::new(
             stream,
             header,
             req_body_key,
             req_body_iv,
-            resp_body_key_full[..16]
-                .try_into()
-                .expect("sha256 output is 32 bytes, first 16 is always valid"),
-            resp_body_iv_full[..16]
-                .try_into()
-                .expect("sha256 output is 32 bytes, first 16 is always valid"),
+            response_key(&req_body_key),
+            response_key(&req_body_iv),
             resp_auth,
             security,
         )
         .await?;
 
+        if self.alter_key.is_some() {
+            vmess_stream.state = ReadState::LegacyHeader;
+        }
         if !matches!(security, VMessSecurity::None | VMessSecurity::Zero) {
             vmess_stream.configure_framing(self.framing, security, &req_body_key, &req_body_iv);
         }
@@ -421,6 +445,7 @@ fn build_vmess_header(
         port,
         1,
         Framing::default(),
+        None,
     )
 }
 
@@ -435,16 +460,15 @@ fn build_vmess_header_command(
     port: u16,
     command: u8,
     framing: Framing,
+    alter_key: Option<&[u8; 16]>,
 ) -> Result<Vec<u8>> {
     let cmd_key = vmess_cmd_key(uuid);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default() // fallback to epoch 0 on impossible clock-before-1970 error
         .as_secs();
-    let auth_id = create_auth_id(&cmd_key, timestamp);
 
     let mut rng = rand::rng();
-    let nonce: [u8; 8] = rng.random();
 
     // Build the inner header (to be encrypted)
     let mut header = Vec::with_capacity(128);
@@ -497,6 +521,27 @@ fn build_vmess_header_command(
     let check = fnv1a32(&header);
     header.extend_from_slice(&check.to_be_bytes());
 
+    if let Some(key) = alter_key {
+        use aes::cipher::BlockEncrypt;
+        use hmac::{Hmac, Mac};
+        let mut auth = <Hmac<Md5> as Mac>::new_from_slice(key).expect("HMAC accepts 16-byte keys");
+        auth.update(&timestamp.to_be_bytes());
+        let cipher = aes::Aes128::new((&cmd_key).into());
+        let mut feedback = Md5::digest(timestamp.to_be_bytes().repeat(4));
+        for chunk in header.chunks_mut(16) {
+            cipher.encrypt_block(&mut feedback);
+            for (byte, mask) in chunk.iter_mut().zip(&feedback) {
+                *byte ^= mask;
+            }
+            feedback[..chunk.len()].copy_from_slice(chunk);
+        }
+        let mut wire = Vec::with_capacity(16 + header.len());
+        wire.extend_from_slice(&auth.finalize().into_bytes());
+        wire.extend_from_slice(&header);
+        return Ok(wire);
+    }
+    let auth_id = create_auth_id(&cmd_key, timestamp);
+    let nonce: [u8; 8] = rng.random();
     // AEAD encrypt the header
 
     // Step 1: Derive header length encryption key and nonce
@@ -658,6 +703,8 @@ struct VMessStream {
 /// Read-side codec phase. Writes have no phase enum: a chunk in `out`
 /// (`out_pos < out.len()`) is drained before any new bytes are taken.
 enum ReadState {
+    LegacyHeader,
+    LegacyCommand,
     /// Assembling the 18-byte response-header length block into `resp_buf`.
     RespHeaderLen,
     /// Assembling the response-header payload block into `resp_buf`.
@@ -1055,6 +1102,38 @@ impl AsyncRead for VMessStream {
                         this.state = ReadState::ChunkLen;
                     }
                     return Poll::Ready(Ok(()));
+                }
+                ReadState::LegacyHeader => {
+                    use aes::cipher::BlockEncrypt;
+                    std::task::ready!(poll_fill_inner(&mut this.inner, cx, &mut this.resp_buf, 4))?;
+                    let mut mask = this.resp_iv.into();
+                    aes::Aes128::new((&this.resp_key).into()).encrypt_block(&mut mask);
+                    if this.resp_buf[0] ^ mask[0] != this.resp_auth {
+                        this.read_eof = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "VMess legacy response authentication failed",
+                        )));
+                    }
+                    this.resp_payload_len = usize::from(this.resp_buf[3] ^ mask[3]);
+                    this.resp_buf.clear();
+                    this.state = ReadState::LegacyCommand;
+                }
+                ReadState::LegacyCommand => {
+                    if this.resp_payload_len != 0 {
+                        std::task::ready!(poll_fill_inner(
+                            &mut this.inner,
+                            cx,
+                            &mut this.resp_buf,
+                            this.resp_payload_len
+                        ))?;
+                    }
+                    this.resp_buf.clear();
+                    this.state = if this.unframed {
+                        ReadState::Raw
+                    } else {
+                        ReadState::ChunkLen
+                    };
                 }
                 ReadState::RespHeaderLen => {
                     // 2-byte length + 16-byte AEAD tag.

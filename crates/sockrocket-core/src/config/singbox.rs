@@ -37,7 +37,9 @@ struct SingBoxOutbound {
     password: Option<String>,
     method: Option<String>, // SS cipher
     plugin: Option<String>,
+    plugin_opts: Option<String>,
     detour: Option<String>,
+    encryption: Option<String>,
     flow: Option<String>, // VLESS
 
     #[serde(default)]
@@ -380,10 +382,6 @@ fn convert_singbox_outbound(
             ProxyProtocol::Trojan { password, udp }
         }
         "shadowsocks" | "ss" => {
-            anyhow::ensure!(
-                ob.plugin.as_deref().unwrap_or("").is_empty(),
-                "Unsupported sing-box SIP003 plugin"
-            );
             let cipher = ob
                 .method
                 .as_ref()
@@ -416,6 +414,23 @@ fn convert_singbox_outbound(
     }
     let transport = build_singbox_transport(ob)?;
     let mut extra = HashMap::new();
+    if matches!(protocol, ProxyProtocol::Shadowsocks { .. })
+        && let Some(name) = ob.plugin.as_deref().filter(|v| !v.is_empty())
+    {
+        anyhow::ensure!(
+            ob.detour.as_deref().unwrap_or("").is_empty(),
+            "Conflicting Shadowsocks plugin and detour"
+        );
+        super::ss_plugin::Plugin::parse(
+            name,
+            super::ss_uri::parse_options(ob.plugin_opts.as_deref().unwrap_or(""))?,
+            &server,
+        )?
+        .save(&mut extra)?;
+    }
+    if matches!(protocol, ProxyProtocol::VLess { .. }) {
+        super::v2ray::set_vless_encryption(&mut extra, ob.encryption.as_deref())?;
+    }
     if ob.outbound_type == "tuic" && ob.zero_rtt_handshake {
         extra.insert(super::v2ray::TUIC_ZERO_RTT.into(), "true".into());
     }

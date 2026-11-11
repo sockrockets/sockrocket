@@ -311,6 +311,13 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             // mihomo defaults `udp` to true for most protocols; always write
             // it explicitly so importing clients see the intended value.
             put(&mut m, "udp", Value::Bool(*udp));
+            if let Ok(Some(plugin)) = super::ss_plugin::Plugin::load(&node.extra) {
+                put(&mut m, "plugin", s(plugin.name()));
+                m.insert(
+                    s("plugin-opts"),
+                    serde_yaml::to_value(plugin.options()).expect("serializable plugin options"),
+                );
+            }
             if let Some(st) = shadow_tls {
                 put(&mut m, "plugin", s("shadow-tls"));
                 let mut opts = Mapping::new();
@@ -346,6 +353,9 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             apply_ws_and_tls(&mut m, node, "servername");
         }
         ProxyProtocol::VLess { uuid, flow, udp } => {
+            if let Some(value) = node.extra.get(super::v2ray::VLESS_ENCRYPTION) {
+                put(&mut m, "encryption", s(value));
+            }
             put(&mut m, "uuid", s(uuid));
             if let Some(flow) = flow {
                 put(&mut m, "flow", s(flow));
