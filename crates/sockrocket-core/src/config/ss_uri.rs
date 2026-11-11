@@ -18,11 +18,9 @@ fn decode_base64(value: &str) -> Result<String> {
     anyhow::bail!("Invalid SS base64")
 }
 
-fn parse_plugin(value: &str) -> Result<ShadowTlsConfig> {
-    let (name, options) = value.split_once(';').unwrap_or((value, ""));
-    ensure!(name == "shadow-tls", "Unsupported SS plugin");
+pub(super) fn parse_options(options: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut chars = options.chars();
-    let mut fields = HashMap::new();
+    let mut fields = serde_json::Map::new();
     while !chars.as_str().is_empty() {
         let mut key = None;
         let mut field = String::new();
@@ -34,12 +32,41 @@ fn parse_plugin(value: &str) -> Result<ShadowTlsConfig> {
                 _ => field.push(c),
             }
         }
-        let key = key.context("Missing shadow-tls option value")?;
+        let Some(key) = key else {
+            ensure!(
+                matches!(field.as_str(), "tls" | "skip-cert-verify" | "mux"),
+                "Missing SS plugin option value"
+            );
+            ensure!(
+                fields.insert(field, true.into()).is_none(),
+                "Duplicate SS plugin option"
+            );
+            continue;
+        };
+        if key == "header" {
+            let (k, v) = field.split_once(':').context("Invalid plugin header")?;
+            let headers = fields
+                .entry("headers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("Invalid header map")?;
+            ensure!(
+                headers.insert(k.trim().into(), v.trim().into()).is_none(),
+                "Duplicate header"
+            );
+            continue;
+        }
         ensure!(
-            fields.insert(key, field).is_none(),
+            fields.insert(key, field.into()).is_none(),
             "Duplicate shadow-tls option"
         );
     }
+    Ok(fields)
+}
+
+fn parse_shadow(options: &str) -> Result<ShadowTlsConfig> {
+    let mut fields: HashMap<String, String> =
+        serde_json::from_value(parse_options(options)?.into())?;
     if let Some(version) = fields.remove("version") {
         ensure!(version == "3", "Only shadow-tls v3 is supported");
     }
@@ -108,10 +135,20 @@ pub fn parse_ss_uri(uri: &str) -> Result<Node> {
         .trim_matches(['[', ']'])
         .to_owned();
     let mut shadow_tls = None;
+    let mut extra = HashMap::new();
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         if key == "plugin" {
-            ensure!(shadow_tls.is_none(), "Duplicate SS plugin");
-            shadow_tls = Some(parse_plugin(&value)?);
+            ensure!(
+                shadow_tls.is_none() && extra.is_empty(),
+                "Duplicate SS plugin"
+            );
+            let (name, opts) = value.split_once(';').unwrap_or((&value, ""));
+            if name == "shadow-tls" {
+                shadow_tls = Some(parse_shadow(opts)?);
+            } else {
+                super::ss_plugin::Plugin::parse(name, parse_options(opts)?, &server)?
+                    .save(&mut extra)?;
+            }
         }
     }
     Ok(Node {
@@ -129,7 +166,7 @@ pub fn parse_ss_uri(uri: &str) -> Result<Node> {
         transport: None,
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
@@ -173,6 +210,39 @@ pub(super) fn share_uri(
         }
         uri.push_str("/?plugin=");
         uri.push_str(&urlencoding::encode(&plugin));
+    } else if let Ok(Some(plugin)) = super::ss_plugin::Plugin::load(&node.extra) {
+        let obfs = plugin.name() == "obfs";
+        let mut encoded = if obfs {
+            "obfs-local".to_string()
+        } else {
+            plugin.name().to_string()
+        };
+        for (k, v) in plugin.options() {
+            if let Some(headers) = v.as_object() {
+                for (name, value) in headers {
+                    encoded.push_str(&format!(
+                        ";header={}",
+                        escape_option(&format!("{name}:{}", value.as_str().unwrap_or_default()))
+                    ));
+                }
+            } else {
+                let key = match (obfs, k.as_str()) {
+                    (true, "mode") => "obfs",
+                    (true, "host") => "obfs-host",
+                    _ => k.as_str(),
+                };
+                let value = if key == "mux" {
+                    u8::from(v.as_bool().expect("mux option is boolean")).to_string()
+                } else {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| v.to_string())
+                };
+                encoded.push_str(&format!(";{key}={}", escape_option(&value)));
+            }
+        }
+        uri.push_str("/?plugin=");
+        uri.push_str(&urlencoding::encode(&encoded));
     }
     uri.push('#');
     uri.push_str(name);
@@ -233,9 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn sip002_exports_numeric_mux_for_v2ray_plugin() {
+        for value in ["0", "1"] {
+            let node = parse_ss_uri(&format!("ss://aes-128-gcm:test@example.invalid:8388/?plugin=v2ray-plugin%3Btls%3Bmux%3D{value}")).unwrap();
+            let uri = node_to_share_uri(&node);
+            let url = url::Url::parse(&uri).unwrap();
+            let (_, options) = url.query_pairs().find(|(key, _)| key == "plugin").unwrap();
+            assert!(
+                options
+                    .split(';')
+                    .any(|field| field == format!("mux={value}"))
+            );
+            assert_eq!(node.extra, parse_ss_uri(&uri).unwrap().extra);
+        }
+    }
+
+    #[test]
     fn unsupported_or_malformed_plugin_never_becomes_plain_ss() {
         for query in [
             "plugin=unrecognized",
+            "plugin=shadow-tls%3Bhost%3Dexample.invalid%3Bpassword",
+            "plugin=obfs-local%3Bobfs-host",
             "plugin=shadow-tls%3Bhost%3Dfoo",
             "plugin=shadow-tls%3Bhost%3Dfoo%3Bpassword%3Dbar%3Bversion%3D2",
             "plugin=shadow-tls%3Bhost%3Dfoo%3Bpassword%3Dbar&plugin=unrecognized",

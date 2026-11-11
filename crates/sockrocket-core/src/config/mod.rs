@@ -11,6 +11,7 @@ pub mod rule_list;
 pub mod rule_scenes;
 pub mod rules_batch;
 pub mod singbox;
+pub(crate) mod ss_plugin;
 mod ss_uri;
 pub mod subscription;
 pub mod v2ray;

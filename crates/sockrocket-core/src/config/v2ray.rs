@@ -226,10 +226,8 @@ pub fn parse_vless_uri(uri: &str) -> Result<Node> {
 
     let params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
 
-    anyhow::ensure!(
-        params.get("encryption").is_none_or(|s| s == "none"),
-        "Unsupported VLESS encryption"
-    );
+    let mut extra = HashMap::new();
+    set_vless_encryption(&mut extra, params.get("encryption").map(String::as_str))?;
     let flow = params.get("flow").cloned();
     let security = params.get("security").map(|s| s.as_str()).unwrap_or("none");
     let transport_type_str = params.get("type").map(|s| s.as_str()).unwrap_or("tcp");
@@ -248,12 +246,25 @@ pub fn parse_vless_uri(uri: &str) -> Result<Node> {
         transport,
         latency_ms: None,
         tags: vec![],
-        extra: HashMap::new(),
+        extra,
     })
 }
 
 pub use super::ss_uri::parse_ss_uri;
 
+pub(crate) const VLESS_ENCRYPTION: &str = "vless_encryption";
+
+pub(crate) fn set_vless_encryption(
+    extra: &mut HashMap<String, String>,
+    value: Option<&str>,
+) -> Result<()> {
+    if let Some(value) = value.filter(|v| !v.is_empty() && *v != "none") {
+        crate::proxy::vless::encryption::parse_client_encryption(value)
+            .map_err(anyhow::Error::msg)?;
+        extra.insert(VLESS_ENCRYPTION.into(), value.into());
+    }
+    Ok(())
+}
 pub(crate) const TLS_CERT_PIN: &str = "tls_certificate_sha256";
 pub(crate) const HY2_UP: &str = "hysteria2_up_mbps";
 pub(crate) const HY2_DOWN: &str = "hysteria2_down_mbps";
@@ -994,11 +1005,12 @@ fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
 
             let user = xray_endpoint(vnext, "users")?;
             let uuid = xray_user_id(user)?;
-            anyhow::ensure!(
-                user.get("encryption")
-                    .is_none_or(|v| v.as_str() == Some("none")),
-                "Unsupported VLESS encryption"
-            );
+            let mut extra = HashMap::new();
+            let encryption = user
+                .get("encryption")
+                .map(|v| v.as_str().context("Invalid VLESS encryption field"))
+                .transpose()?;
+            set_vless_encryption(&mut extra, encryption)?;
             let flow = user
                 .get("flow")
                 .and_then(|v| v.as_str())
@@ -1035,7 +1047,7 @@ fn convert_v2ray_outbound(outbound: &V2RayOutbound) -> Result<Option<Node>> {
                 transport,
                 latency_ms: None,
                 tags: vec![],
-                extra: HashMap::new(),
+                extra,
             }))
         }
         "trojan" => {
@@ -1664,6 +1676,9 @@ pub fn node_to_share_uri(node: &Node) -> String {
             format!("vmess://{}", encoded)
         }
         ProxyProtocol::VLess { uuid, flow, .. } => {
+            if let Some(value) = node.extra.get(VLESS_ENCRYPTION) {
+                qparams.push(format!("encryption={}", urlencoding::encode(value)));
+            }
             if let Some(f) = flow {
                 qparams.push(format!("flow={}", f));
             }

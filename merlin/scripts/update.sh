@@ -41,11 +41,11 @@ health_check() {
         if [ "$rc" = 0 ]; then dns_ok=1; break; fi
         sleep 2
     done
-    [ "$dns_ok" = 1 ] || return 1
+    [ "$dns_ok" = 1 ] || return 2
     local socks_port
     socks_port=$(sed -n 's/^socks_port:[[:space:]]*\([0-9]*\).*/\1/p' "$ROOT/config.yaml" | head -1)
     socks_port=${socks_port:-1080}
-    curl -fsS --connect-timeout 5 --max-time 12 --socks5-hostname "127.0.0.1:$socks_port" https://www.gstatic.com/generate_204 > /dev/null || return 1
+    curl -fsS --connect-timeout 5 --max-time 12 --socks5-hostname "127.0.0.1:$socks_port" https://www.gstatic.com/generate_204 > /dev/null || return 2
     kill -0 "$(cat "$ROOT/sockrocket.pid")"
 }
 restore_files() {
@@ -90,18 +90,31 @@ restore_files() {
     # Restore all interfaces before starting a process that can trigger hooks.
     sh "$SH" api-restart || return 1
     if [ "$(cat "$TX/running")" = 1 ]; then sh "$SH" start || return 1; fi
-    health_check || return 1
-    echo "rolled-back: $(cat "$TX/stage" 2>/dev/null || echo interrupted)" > "$ROOT/update-status"
+    local health=0
+    health_check || health=$?
+    case "$health" in
+        0) echo "rolled-back: $(cat "$TX/stage" 2>/dev/null || echo interrupted)" > "$ROOT/update-status" ;;
+        2)
+            # A broken DNS/upstream can affect both versions. Once the restored
+            # API and daemon are up, release the transaction so it can be fixed.
+            kill -0 "$(cat "$ROOT/sockrocket.pid")" || return 1
+            echo "failed: 已恢复旧版，可以修改设置。网络检查失败，请检查 DNS 和代理节点。" > "$ROOT/update-status" ;;
+        *) return 1 ;;
+    esac
     rm -rf "$TX"
 }
 # Atomic directory creation serializes all recovery entry points. A second
 # recovery never modifies files or takes ownership of the transaction.
 restore() {
     local result=0
-    mkdir "$ROOT/.update-restore-lock" 2>/dev/null || return 1
+    # Keep this lock off JFFS. A power loss during rollback must allow
+    # the next boot to claim the retained transaction.
+    local runtime="${SOCKROCKET_RUNTIME_DIR:-/tmp/sockrocket-run}"
+    mkdir -p "$runtime" || return 1
+    mkdir "$runtime/.update-restore-lock" 2>/dev/null || return 1
     claim_owner
     restore_files || result=$?
-    rmdir "$ROOT/.update-restore-lock" || return 1
+    rmdir "$runtime/.update-restore-lock" || return 1
     [ "$result" = 0 ] || echo "rollback-failed: recovery health check failed; backup retained" > "$ROOT/update-status"
     return "$result"
 }

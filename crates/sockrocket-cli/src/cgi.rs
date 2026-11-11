@@ -498,6 +498,11 @@ pub use http::{DEFAULT_API_PORT, serve_api};
 
 fn dispatch(action: &str, post: &J) -> J {
     if sockrocket_dir().join(".update-transaction").exists() && !read_only_action(action) {
+        if fs::read_to_string(sockrocket_dir().join("update-status"))
+            .is_ok_and(|status| status.starts_with("rollback-failed:"))
+        {
+            return json!({"ok":false,"error_code":"update_recovery_required","msg":"升级回滚未完成，备份已保留。请查看升级状态和诊断日志。"});
+        }
         return json!({"ok":false,"error_code":"update_in_progress","msg":"软件更新中，暂不能修改配置或服务，请稍后重试"});
     }
     let _transaction = if matches!(
@@ -4420,6 +4425,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dispatch("update_status", &json!({}))["active"], false);
+        assert_eq!(
+            dispatch("save_config", &json!({}))["error_code"],
+            "update_recovery_required"
+        );
         fs::remove_dir(root.join(".update-transaction")).unwrap();
         assert!(storage::MutationGuard::acquire().is_ok());
         fs::write(root.join("update-status"), "success: plugin updated").unwrap();
@@ -4807,6 +4816,23 @@ dns_direct_domains:
     }
 
     #[test]
+    fn set_node_edits_and_preserves_merlin_keys() {
+        let _env = TestEnv::new(SAMPLE);
+        let r = act_set_node(&json!({"index": 1}));
+        assert_eq!(r["ok"], J::Bool(true));
+        let text = fs::read_to_string(conf_path()).unwrap();
+        let map = load_conf().unwrap();
+        assert_eq!(conf_usize(&map, "active_node"), Some(1));
+        // Merlin-only keys survive a CGI edit round-trip.
+        assert_eq!(conf_str(&map, "mode").as_deref(), Some("tun"));
+        assert_eq!(conf_u16(&map, "dns_port", 0), 5300);
+        assert!(text.contains("dns_direct_domains"));
+        // Out-of-range rejected.
+        let r = act_set_node(&json!({"index": 5}));
+        assert_eq!(r["ok"], J::Bool(false));
+    }
+
+    #[test]
     fn fresh_merlin_global_routes_follow_selected_node() {
         let _env = TestEnv::new(include_str!("../../../merlin/config.yaml.template"));
         let add_node = |name| {
@@ -4858,23 +4884,6 @@ dns_direct_domains:
         assert_eq!(after["active_node_name"], "Second");
         assert_eq!(before["rules"], after["rules"]);
         assert_eq!(before["global_rule_groups"], after["global_rule_groups"]);
-    }
-
-    #[test]
-    fn set_node_edits_and_preserves_merlin_keys() {
-        let _env = TestEnv::new(SAMPLE);
-        let r = act_set_node(&json!({"index": 1}));
-        assert_eq!(r["ok"], J::Bool(true));
-        let text = fs::read_to_string(conf_path()).unwrap();
-        let map = load_conf().unwrap();
-        assert_eq!(conf_usize(&map, "active_node"), Some(1));
-        // Merlin-only keys survive a CGI edit round-trip.
-        assert_eq!(conf_str(&map, "mode").as_deref(), Some("tun"));
-        assert_eq!(conf_u16(&map, "dns_port", 0), 5300);
-        assert!(text.contains("dns_direct_domains"));
-        // Out-of-range rejected.
-        let r = act_set_node(&json!({"index": 5}));
-        assert_eq!(r["ok"], J::Bool(false));
     }
 
     #[test]

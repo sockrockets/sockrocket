@@ -6384,7 +6384,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -6403,17 +6403,19 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes",
  "aes-gcm",
  "anyhow",
  "base64",
  "blake2",
+ "blake3",
  "bytes",
  "chacha20poly1305",
  "core-foundation 0.9.4",
  "crc32fast",
+ "ctr",
  "etherparse",
  "h2",
  "h3",
@@ -6429,11 +6431,15 @@ dependencies = [
  "log 0.4.29",
  "lru",
  "md-5",
+ "ml-kem",
+ "parking_lot",
  "qrcode",
  "quinn",
  "quinn-proto",
  "rand 0.9.4",
+ "rand_core 0.6.4",
  "reqwest",
+ "ring",
  "rustls 0.23.38",
  "rustls-pki-types",
  "serde",
@@ -6458,11 +6464,12 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "winreg 0.10.1",
+ "x25519-dalek",
 ]
 
 [[package]]
 name = "sockrocket-gui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",

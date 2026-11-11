@@ -121,7 +121,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             )))
         }
         ProxyProtocol::VLess { uuid, flow, .. } => {
-            let out = match flow.as_deref().filter(|value| !value.is_empty()) {
+            let mut out = match flow.as_deref().filter(|value| !value.is_empty()) {
                 Some(super::vision::FLOW) => VlessOutbound::new_vision(
                     &node.server,
                     node.port,
@@ -140,6 +140,14 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     node.transport.as_ref(),
                 )?,
             };
+            if let Some(value) = node.extra.get(crate::config::v2ray::VLESS_ENCRYPTION) {
+                out.encryption = super::vless::encryption::parse_client_encryption(value)
+                    .map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    out.encryption.is_none() || flow.as_deref().unwrap_or("").is_empty(),
+                    "VLESS Encryption with Vision direct copy is not supported"
+                );
+            }
             Ok(SharedOutbound(Arc::new(out)).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }
 
@@ -189,10 +197,13 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     };
                     Arc::new(st_out) as Arc<dyn Outbound>
                 }
-                None => Arc::new(
-                    SsOutbound::new(&node.server, node.port, normalized_cipher, password)?
-                        .with_udp(*udp),
-                ) as Arc<dyn Outbound>,
+                None => {
+                    let mut out =
+                        SsOutbound::new(&node.server, node.port, normalized_cipher, password)?
+                            .with_udp(*udp);
+                    out.plugin = crate::config::ss_plugin::Plugin::load(&node.extra)?;
+                    Arc::new(out) as Arc<dyn Outbound>
+                }
             };
             Ok(SharedOutbound(out).with_retry(DEFAULT_RETRY_ATTEMPTS))
         }
@@ -203,7 +214,6 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             alter_id,
             ..
         } => {
-            anyhow::ensure!(*alter_id == 0, "Only VMess AEAD (alterId=0) is supported");
             let mut out = if warm_pool {
                 VMessOutbound::new(
                     &node.server,
@@ -221,6 +231,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     node.transport.as_ref(),
                 )?
             };
+            out.set_alter_id(*alter_id)?;
             out.framing = super::vmess::Framing {
                 padding: node
                     .extra
