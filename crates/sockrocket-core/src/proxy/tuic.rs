@@ -176,13 +176,18 @@ impl TuicOutbound {
         tls_config: Option<&TlsConfig>,
     ) -> Result<Self> {
         Self::new_pinned(
-            server, port, uuid_str, password, congestion, tls_config, None, false,
+            (server, port),
+            uuid_str,
+            password,
+            congestion,
+            tls_config,
+            None,
+            false,
         )
     }
 
     pub(crate) fn new_pinned(
-        server: &str,
-        port: u16,
+        (server, port): (&str, u16),
         uuid_str: &str,
         password: &str,
         congestion: &str,
@@ -789,8 +794,7 @@ mod tests {
             fingerprint: None,
         };
         let out = TuicOutbound::new_pinned(
-            "127.0.0.1",
-            server.local_addr().unwrap().port(),
+            ("127.0.0.1", server.local_addr().unwrap().port()),
             "00000000-0000-0000-0000-000000000001",
             "fixture",
             "cubic",

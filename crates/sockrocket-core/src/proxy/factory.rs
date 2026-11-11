@@ -253,8 +253,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                 .map(|p| crate::config::v2ray::parse_tuic_certificate_pin(p))
                 .transpose()?;
             let mut out = TuicOutbound::new_pinned(
-                &node.server,
-                node.port,
+                (&node.server, node.port),
                 uuid,
                 password,
                 congestion_control,
