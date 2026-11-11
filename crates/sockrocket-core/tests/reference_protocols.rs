@@ -40,9 +40,17 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     let mut client = json!({"type":kind,"server":host,"server_port":port});
     match kind {
         "shadowsocks" => {
+            let method = option.unwrap_or("aes-128-gcm");
+            let key = match method {
+                "2022-blake3-aes-128-gcm" => STANDARD.encode([0xfb; 16]),
+                "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => {
+                    STANDARD.encode([0xfb; 32])
+                }
+                _ => pw.to_owned(),
+            };
             for side in [&mut server, &mut client] {
-                side["method"] = json!("aes-128-gcm");
-                side["password"] = json!(pw);
+                side["method"] = json!(method);
+                side["password"] = json!(key);
             }
         }
         "vmess" => {
@@ -202,26 +210,13 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
             "VMess security changed during import"
         );
     }
+    let node = if kind == "shadowsocks" {
+        sockrocket_core::parse_ss_uri(&sockrocket_core::node_to_share_uri(&node))?
+    } else {
+        node
+    };
     let outbound = create_outbound_unwarmed(&node)?;
-    let tcp = TcpListener::bind((host, 0)).await?;
-    let port = tcp.local_addr()?.port();
-    let echo = tokio::spawn(async move {
-        let (mut peer, _) = tcp.accept().await?;
-        let mut data = [0; 256];
-        peer.read_exact(&mut data).await?;
-        peer.write_all(&data).await
-    });
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), outbound.connect(host, port))
-        .await
-        .context("reference TCP handshake timeout")??;
-    stream.write_all(&[0x42; 256]).await?;
-    stream.flush().await?;
-    let mut reply = [0; 256];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
-        .await
-        .context("reference TCP reply timeout")??;
-    ensure!(reply == [0x42; 256], "TCP payload mismatch");
-    echo.await??;
+    check_tcp_echo(&outbound).await?;
     let udp = UdpSocket::bind((host, 0)).await?;
     let tunnel = outbound
         .0
@@ -249,6 +244,83 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     Ok(())
 }
 
+async fn check_tcp_echo(
+    outbound: &sockrocket_core::proxy::connector::SharedOutbound,
+) -> Result<()> {
+    let host = "127.0.0.1";
+    let tcp = TcpListener::bind((host, 0)).await?;
+    let port = tcp.local_addr()?.port();
+    let echo = tokio::spawn(async move {
+        let (mut peer, _) = tcp.accept().await?;
+        let mut data = [0; 256];
+        peer.read_exact(&mut data).await?;
+        peer.write_all(&data).await
+    });
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), outbound.connect(host, port))
+        .await
+        .context("reference TCP handshake timeout")??;
+    stream.write_all(&[0x42; 256]).await?;
+    stream.flush().await?;
+    let mut reply = [0; 256];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
+        .await
+        .context("reference TCP reply timeout")??;
+    ensure!(reply == [0x42; 256], "TCP payload mismatch");
+    echo.await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires SOCKROCKET_REFERENCE_SING_BOX"]
+async fn reference_singbox_shadowtls_detour_via_share_uri() -> Result<()> {
+    let host = "127.0.0.1";
+    let listener = TcpListener::bind((host, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let camouflage = TcpListener::bind((host, 0)).await?;
+    let tls_port = camouflage.local_addr()?.port();
+    let password = STANDARD.encode([0xfb; 32]);
+    let plugin_password = r"local;fixture=with\escape";
+    let outer = json!({"type":"shadowtls","version":3,"listen":host,"listen_port":port,
+        "users":[{"password":plugin_password}],"handshake":{"server":host,"server_port":tls_port},"detour":"ss"});
+    let inner = json!({"type":"shadowsocks","tag":"ss","listen":host,"listen_port":0,
+        "method":"2022-blake3-aes-256-gcm","password":password});
+    let target = json!({"type":"trojan","listen":host,"listen_port":tls_port,"users":[{"password":"local"}],
+        "tls":{"enabled":true,"min_version":"1.3","certificate":pem("CERTIFICATE",include_bytes!("../src/proxy/testdata/localhost-cert.der")),
+        "key":pem("PRIVATE KEY",include_bytes!("../src/proxy/testdata/localhost-key.der"))}});
+    let config = json!({"log":{"level":"error"},"inbounds":[outer,inner,target],"outbounds":[{"type":"direct"}]});
+    drop((listener, camouflage));
+    let cmd = std::env::var_os("SOCKROCKET_REFERENCE_SING_BOX")
+        .context("sing-box executable required")?;
+    let mut proc = Server(
+        Command::new(cmd)
+            .args(["run", "-c", "stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()?,
+        None,
+    );
+    serde_json::to_writer(proc.0.stdin.take().unwrap(), &config)?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect((host, port)).await.is_err() {
+            ensure!(proc.0.try_wait()?.is_none(), "sing-box exited");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let client = json!({"outbounds":[{"type":"shadowsocks","tag":"wrapped","method":"2022-blake3-aes-256-gcm",
+        "password":password,"network":"tcp","detour":"outer"},{"type":"shadowtls","tag":"outer","server":host,"server_port":port,
+        "version":3,"password":plugin_password,"tls":{"enabled":true,"insecure":true,"server_name":"localhost"}}]});
+    let nodes = sockrocket_core::config::singbox::parse_singbox_config(&client.to_string())?;
+    ensure!(
+        nodes.len() == 1,
+        "ShadowTLS transport must belong to a single SS node"
+    );
+    let node = sockrocket_core::parse_ss_uri(&sockrocket_core::node_to_share_uri(&nodes[0]))?;
+    let outbound = create_outbound_unwarmed(&node)?;
+    check_tcp_echo(&outbound).await
+}
+
 macro_rules! reference {
     ($name:ident, $kind:literal, $security:expr) => {
         #[tokio::test]
@@ -262,6 +334,22 @@ macro_rules! reference {
     };
 }
 reference!(reference_ss_tcp_udp, "shadowsocks", None);
+reference!(
+    reference_ss2022_aes128_tcp_udp,
+    "shadowsocks",
+    Some("2022-blake3-aes-128-gcm")
+);
+reference!(
+    reference_ss2022_aes256_tcp_udp,
+    "shadowsocks",
+    Some("2022-blake3-aes-256-gcm")
+);
+reference!(
+    reference_ss2022_chacha_tcp_udp,
+    "shadowsocks",
+    Some("2022-blake3-chacha20-poly1305")
+);
+
 reference!(reference_vmess_tcp_udp, "vmess", None);
 reference!(
     reference_vmess_chacha_tcp_udp,

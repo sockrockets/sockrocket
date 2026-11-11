@@ -311,9 +311,6 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
             // mihomo defaults `udp` to true for most protocols; always write
             // it explicitly so importing clients see the intended value.
             put(&mut m, "udp", Value::Bool(*udp));
-            // shadow-tls cannot be expressed in an ss:// URI (which keeps
-            // exporting as plain SS), but Clash YAML carries it via the
-            // plugin fields — our own parser reads these back.
             if let Some(st) = shadow_tls {
                 put(&mut m, "plugin", s("shadow-tls"));
                 let mut opts = Mapping::new();

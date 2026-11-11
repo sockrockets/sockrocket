@@ -21,7 +21,7 @@ UDP availability also depends on the node's `udp` option. Certificate verificati
 
 | Protocol | Remaining limits or unverified settings |
 | --- | --- |
-| Shadowsocks | The current Mihomo plugin importer handles ShadowTLS. Other SIP003 plugin configurations need their own implementation and wire tests. |
+| Shadowsocks | ShadowTLS v3 works with Mihomo plugin options, SIP002 share links and a sing-box Shadowsocks outbound that references a ShadowTLS transport by tag. SIP002 export preserves plugin credentials and uses percent-encoded SS2022 keys. Other SIP003 plugins and arbitrary outbound chains remain unsupported. |
 | VMess | AES-GCM and ChaCha20-Poly1305 support global padding and authenticated chunk lengths. Legacy nonzero alterId is outstanding. |
 | VLESS | Xray VLESS Encryption is outstanding. |
 | Trojan | REALITY is limited to raw TCP. sing-box UDP-only outbound policy is enforced. TLS gRPC and HTTPUpgrade carry TCP and UDP in sing-box interoperability tests. Xray TunMulti is also tested. |
@@ -42,19 +42,18 @@ SOCKROCKET_REFERENCE_XRAY=/path/to/xray \
 cargo test --locked -p sockrocket-core --lib --test reference_protocols reference_ -- --ignored --test-threads=1
 ```
 
-The sing-box cases cover SS AES-128-GCM, VMess AEAD, Trojan/TLS, TUIC v5,
+The sing-box cases cover SS AES-128-GCM, all three SS2022 ciphers, SS2022 over ShadowTLS v3, VMess AEAD, Trojan/TLS, TUIC v5,
 VLESS Vision, AnyTLS, Hysteria2 and WireGuard. The Xray cases exercise VLESS
-XHTTP and Trojan gRPC TunMulti. The cases in `reference_protocols` import a sing-box outbound,
-establish a TCP stream and check two UDP request/reply pairs of different lengths.
+XHTTP and Trojan gRPC TunMulti. The Shadowsocks cases export and reimport the share link before exchanging TCP and UDP data. The ShadowTLS case uses TCP and imports a sing-box configuration with a tagged transport.
 
 The ARM64 Merlin run used sing-box 1.14.3, Mihomo 1.19.31 and Xray
-26.10.31 on the router with loopback echo destinations. All 29 reference
+26.10.31 on the router with loopback echo destinations. All 33 reference
 cases passed. The table records coverage of that run. An empty cell indicates
 that this suite did not run that client/server pairing.
 
 | Native outbound | sing-box peer | Mihomo peer | Xray peer |
 | --- | --- | --- | --- |
-| Shadowsocks | AES-128-GCM | | |
+| Shadowsocks | AES-128-GCM, SS2022 AES-128, AES-256 and ChaCha20, ShadowTLS v3 over TCP | | |
 | VMess | Auto, AES, ChaCha, none, zero, padding and authenticated length | | |
 | VLESS | Vision, TCP and XUDP | | XHTTP, TLS and REALITY |
 | Trojan | TLS, gRPC Tun, HTTPUpgrade | | gRPC TunMulti |

@@ -36,7 +36,9 @@ struct SingBoxOutbound {
     uuid: Option<String>,
     password: Option<String>,
     method: Option<String>, // SS cipher
-    flow: Option<String>,   // VLESS
+    plugin: Option<String>,
+    detour: Option<String>,
+    flow: Option<String>, // VLESS
 
     #[serde(default)]
     global_padding: bool,
@@ -134,6 +136,22 @@ pub fn parse_singbox_config(json_str: &str) -> Result<Vec<Node>> {
     let config: SingBoxConfig =
         serde_json::from_str(json_str).context("Failed to parse sing-box JSON")?;
 
+    let mut tagged = HashMap::new();
+    if config
+        .outbounds
+        .iter()
+        .any(|out| out.get("detour").is_some())
+    {
+        // A duplicate tag may refer to more than one endpoint.
+        for value in config.outbounds.iter().chain(config.endpoints.iter()) {
+            if let Some(tag) = value["tag"].as_str() {
+                tagged
+                    .entry(tag)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(value));
+            }
+        }
+    }
     let mut nodes = Vec::new();
     for value in config.outbounds.iter().chain(config.endpoints.iter()) {
         if value.get("type").and_then(serde_json::Value::as_str) == Some("wireguard") {
@@ -143,14 +161,14 @@ pub fn parse_singbox_config(json_str: &str) -> Result<Vec<Node>> {
             }
             continue;
         }
-        let outbound: SingBoxOutbound = match serde_json::from_value(value.clone()) {
+        let outbound: SingBoxOutbound = match SingBoxOutbound::deserialize(value) {
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!("Skipping malformed sing-box outbound");
                 continue;
             }
         };
-        match convert_singbox_outbound(&outbound) {
+        match convert_singbox_outbound(&outbound, &tagged) {
             Ok(Some(node)) => nodes.push(node),
             Ok(None) => {}
             Err(_) => tracing::warn!("Skipping unsupported or invalid sing-box outbound"),
@@ -168,7 +186,7 @@ pub fn parse_singbox_outbound(json_str: &str) -> Result<Option<Node>> {
     }
     let outbound: SingBoxOutbound =
         serde_json::from_value(value).context("Failed to parse sing-box outbound")?;
-    convert_singbox_outbound(&outbound)
+    convert_singbox_outbound(&outbound, &HashMap::new())
 }
 
 // sing-box accepts Go duration strings, including compound and fractional units.
@@ -206,7 +224,70 @@ fn duration_millis(value: &str) -> Result<u64> {
     Ok((nanos / 1e6).ceil() as u64)
 }
 
-fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShadowTlsDetour {
+    #[serde(rename = "type")]
+    kind: String,
+    tag: String,
+    version: u8,
+    server: String,
+    server_port: u16,
+    password: String,
+    tls: ShadowTlsDetourTls,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShadowTlsDetourTls {
+    enabled: bool,
+    server_name: Option<String>,
+    #[serde(default)]
+    insecure: bool,
+}
+
+fn convert_singbox_outbound(
+    ob: &SingBoxOutbound,
+    tagged: &HashMap<&str, Option<&serde_json::Value>>,
+) -> Result<Option<Node>> {
+    let mut server = ob.server.clone();
+    let mut port = ob.server_port;
+    let mut shadow_tls = None;
+    if let Some(tag) = ob.detour.as_deref().filter(|tag| !tag.is_empty()) {
+        anyhow::ensure!(
+            matches!(ob.outbound_type.as_str(), "ss" | "shadowsocks"),
+            "Unsupported outbound detour"
+        );
+        let value = tagged
+            .get(tag)
+            .copied()
+            .flatten()
+            .context("Missing or ambiguous ShadowTLS detour")?;
+        let target =
+            ShadowTlsDetour::deserialize(value).context("Unsupported ShadowTLS detour options")?;
+        anyhow::ensure!(
+            target.kind == "shadowtls"
+                && target.tag == tag
+                && target.version == 3
+                && target.tls.enabled
+                && !target.password.is_empty()
+                && !target.server.is_empty()
+                && target.server_port != 0,
+            "Invalid ShadowTLS v3 detour"
+        );
+        server = target.server;
+        port = target.server_port;
+        shadow_tls = Some(ShadowTlsConfig {
+            host: target
+                .tls
+                .server_name
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| server.clone()),
+            password: target.password,
+            skip_cert_verify: target.tls.insecure,
+        });
+    }
+
     let udp = match ob.network.as_deref() {
         None | Some("") => ob.udp.unwrap_or(true),
         Some("tcp") => false,
@@ -299,6 +380,10 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
             ProxyProtocol::Trojan { password, udp }
         }
         "shadowsocks" | "ss" => {
+            anyhow::ensure!(
+                ob.plugin.as_deref().unwrap_or("").is_empty(),
+                "Unsupported sing-box SIP003 plugin"
+            );
             let cipher = ob
                 .method
                 .as_ref()
@@ -313,7 +398,7 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
                 cipher,
                 password,
                 udp,
-                shadow_tls: None,
+                shadow_tls,
             }
         }
         // Non-proxy types: skip
@@ -340,7 +425,6 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
     if ob.outbound_type == "vmess" {
         super::v2ray::vmess_framing_options(&mut extra, ob.global_padding, ob.authenticated_length);
     }
-    let mut port = ob.server_port;
     if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
         if let Some(list) = &ob.server_ports {
             let items = match list {
@@ -387,14 +471,14 @@ fn convert_singbox_outbound(ob: &SingBoxOutbound) -> Result<Option<Node>> {
     }
 
     let name = if ob.tag.is_empty() {
-        format!("{}-{}:{}", ob.outbound_type, ob.server, ob.server_port)
+        format!("{}-{}:{}", ob.outbound_type, server, port)
     } else {
         decode_display_name(&ob.tag)
     };
 
     Ok(Some(Node {
         name,
-        server: ob.server.clone(),
+        server,
         port,
         protocol,
         transport,
@@ -540,6 +624,42 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_detours_and_unsupported_plugins_do_not_dial_plain_ss() {
+        use serde_json::json;
+        let ss = json!({"type":"shadowsocks","tag":"wrapped","server":"example.invalid",
+            "server_port":8388,"method":"aes-128-gcm","password":"test","detour":"outer"});
+        let target = json!({"type":"shadowtls","version":3,"tag":"outer","server":"example.invalid",
+            "server_port":443,"password":"test","tls":{"enabled":true}});
+        assert!(parse_singbox_outbound(&ss.to_string()).is_err());
+        for bad_targets in [
+            vec![],
+            vec![target.clone(), target.clone()],
+            vec![{
+                let mut v = target.clone();
+                v["tls"]["certificate_public_key_sha256"] = json!(["fixture"]);
+                v
+            }],
+            vec![{
+                let mut v = target;
+                v["version"] = json!(2);
+                v
+            }],
+        ] {
+            let mut values = vec![ss.clone()];
+            values.extend(bad_targets);
+            assert!(
+                parse_singbox_config(&json!({"outbounds":values}).to_string())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let mut plugin = ss;
+        plugin.as_object_mut().unwrap().remove("detour");
+        plugin["plugin"] = json!("unsupported");
+        assert!(parse_singbox_outbound(&plugin.to_string()).is_err());
+    }
 
     #[test]
     fn disabled_utls_does_not_activate_a_quic_profile() {

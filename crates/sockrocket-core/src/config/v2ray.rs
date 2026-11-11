@@ -252,92 +252,7 @@ pub fn parse_vless_uri(uri: &str) -> Result<Node> {
     })
 }
 
-/// Parse a ss:// share link
-pub fn parse_ss_uri(uri: &str) -> Result<Node> {
-    let without_scheme = uri.strip_prefix("ss://").context("Not a ss:// URI")?;
-
-    // Extract name from fragment
-    let (main, fragment) = match without_scheme.split_once('#') {
-        Some((m, f)) => (m, Some(super::model::decode_display_name(f))),
-        None => (without_scheme, None),
-    };
-
-    // Format 1: ss://base64(method:password)@host:port
-    // Format 2: ss://method:password@host:port (SIP002)
-    if let Some((userinfo, hostport)) = main.split_once('@') {
-        let decoded = general_purpose::STANDARD
-            .decode(userinfo.trim())
-            .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(userinfo.trim()))
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_else(|_| userinfo.to_string());
-
-        let (cipher, password) = decoded
-            .split_once(':')
-            .context("Invalid SS userinfo format")?;
-
-        let parsed = url::Url::parse(&format!("scheme://user@{}", hostport))
-            .context("Failed to parse SS host:port")?;
-        let server = parsed
-            .host_str()
-            .context("Missing server host")?
-            .to_string();
-        let port = parsed.port().unwrap_or(8388);
-        let name = fragment.unwrap_or_else(|| format!("SS-{}", server));
-
-        return Ok(Node {
-            name,
-            server,
-            port,
-            protocol: ProxyProtocol::Shadowsocks {
-                cipher: cipher.to_string(),
-                password: password.to_string(),
-                udp: true,
-                shadow_tls: None,
-            },
-            transport: None,
-            latency_ms: None,
-            tags: vec![],
-            extra: HashMap::new(),
-        });
-    }
-
-    // Format 3: ss://base64(method:password@host:port)
-    let decoded = general_purpose::STANDARD
-        .decode(main.trim())
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(main.trim()))
-        .context("Failed to decode SS base64")?;
-    let decoded_str = String::from_utf8(decoded).context("Invalid UTF-8")?;
-
-    let (method_pass, hostport) = decoded_str.split_once('@').context("Invalid SS format")?;
-    let (cipher, password) = method_pass
-        .split_once(':')
-        .context("Invalid SS method:password")?;
-
-    let parsed = url::Url::parse(&format!("scheme://user@{}", hostport))
-        .context("Failed to parse SS host:port")?;
-    let server = parsed
-        .host_str()
-        .context("Missing server host")?
-        .to_string();
-    let port = parsed.port().unwrap_or(8388);
-    let name = fragment.unwrap_or_else(|| format!("SS-{}", server));
-
-    Ok(Node {
-        name,
-        server,
-        port,
-        protocol: ProxyProtocol::Shadowsocks {
-            cipher: cipher.to_string(),
-            password: password.to_string(),
-            udp: true,
-            shadow_tls: None,
-        },
-        transport: None,
-        latency_ms: None,
-        tags: vec![],
-        extra: HashMap::new(),
-    })
-}
+pub use super::ss_uri::parse_ss_uri;
 
 pub(crate) const TLS_CERT_PIN: &str = "tls_certificate_sha256";
 pub(crate) const HY2_UP: &str = "hysteria2_up_mbps";
@@ -1675,15 +1590,11 @@ pub fn node_to_share_uri(node: &Node) -> String {
             )
         }
         ProxyProtocol::Shadowsocks {
-            cipher, password, ..
-        } => {
-            let userinfo = format!("{}:{}", cipher, password);
-            let encoded = general_purpose::STANDARD.encode(userinfo.as_bytes());
-            format!(
-                "ss://{}@{}:{}#{}",
-                encoded, node.server, node.port, name_enc
-            )
-        }
+            cipher,
+            password,
+            shadow_tls,
+            ..
+        } => super::ss_uri::share_uri(node, cipher, password, shadow_tls.as_ref(), &name_enc),
         ProxyProtocol::VMess {
             uuid,
             alter_id,
