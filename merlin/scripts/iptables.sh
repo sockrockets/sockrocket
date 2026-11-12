@@ -130,7 +130,7 @@ detect_tun_dev() {
     return 1
 }
 
-# The CN shortcut is the only place where changing an IPv4 device scope
+# The CN shortcut is the only place where changing a device scope
 # changes the packet path. Keep the lookup set separate from the destination
 # set; swap it only after every new network has been validated and added.
 CN_SOURCES=sockrocket_cn_sources
@@ -139,15 +139,39 @@ CN_FLOW=SOCKROCKET_CN_FLOW
 # multi-WAN) are preserved. The packet routing mark is still TUN_MARK.
 CN_DIRECT_BIT=0x40000000
 
+CN_TABLES=iptables
+CN_FAMILY=inet
+CN_CHAIN=$MANGLE_CHAIN
+CN_DEST_FLAG=--dump-cn-cidrs
+CN_SOURCE_FLAG=--dump-rule-sources
+CN_FALLBACK=cn_via_tun
+
+# Select the IPv6 kernel objects only for this call. Both families use the
+# same first-packet decision so changing a device rule preserves live flows.
+cn_ipv6() (
+    CN_TABLES=ip6tables
+    CN_FAMILY=inet6
+    CN_CHAIN=$IPV6_MANGLE
+    IPSET_NAME=sockrocket_cn6
+    CN_SOURCES=sockrocket_cn6_sources
+    CN_FLOW=SOCKROCKET_CN6_FLOW
+    CN_DEST_FLAG=--dump-cn-cidrs-v6
+    CN_SOURCE_FLAG=--dump-rule-sources-v6
+    CN_FALLBACK=cn6_via_tun
+    "$@"
+)
+
 sync_cn_sources() (
     local staged sources
     staged="sr_cn_src_$$"
-    sources=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-rule-sources "$SOCKROCKET_CONF") || return 1
-    ipset create "$CN_SOURCES" hash:net family inet maxelem 65536 -exist || return 1
-    ipset create "$staged" hash:net family inet maxelem 65536 || return 1
-    trap 'ipset destroy "$staged" >/dev/null 2>&1 || :' 0
+    sources=$("$SOCKROCKET_DIR/sockrocket-cli" "$CN_SOURCE_FLAG" "$SOCKROCKET_CONF") || return 1
+    ipset create "$CN_SOURCES" hash:net family "$CN_FAMILY" maxelem 65536 -exist || return 1
+    ipset create "$staged" hash:net family "$CN_FAMILY" maxelem 65536 || return 1
+    # Merlin ash releases function locals before running a subshell exit trap.
+    trap "ipset destroy '$staged' >/dev/null 2>&1 || :" 0
     # hash:net cannot store /0; the two /1s represent the same network.
     printf '%s\n' "$sources" | awk -v name="$staged" '
+        $1 == "::/0" {print "add", name, "::/1"; print "add", name, "8000::/1"; next}
         $1 == "0.0.0.0/0" {print "add", name, "0.0.0.0/1"; print "add", name, "128.0.0.0/1"; next}
         NF {print "add", name, $1}
     ' | ipset restore -exist || return 1
@@ -155,33 +179,41 @@ sync_cn_sources() (
 )
 
 cn_flow_installed() {
-    iptables -t mangle -C "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null
+    "$CN_TABLES" -t mangle -C "$CN_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null
 }
 
 install_cn_flow() {
     local proto first
-    load_lan_scope && sync_cn_sources || return 1
-    iptables -t mangle -N "$CN_FLOW" 2>/dev/null || iptables -t mangle -F "$CN_FLOW" || return 1
+    if [ "$CN_FAMILY" = inet ]; then
+        load_lan_scope || return 1
+        set -- -i "$LAN_IFACE" -s "$LAN_SUBNET"
+    else
+        local iface
+        iface=$(ipv6_lan_interface) || return 1
+        set -- -i "$iface"
+    fi
+    sync_cn_sources || return 1
+    "$CN_TABLES" -t mangle -N "$CN_FLOW" 2>/dev/null || "$CN_TABLES" -t mangle -F "$CN_FLOW" || return 1
     for proto in tcp udp; do
         # Only a new LAN flow picks a path from the current set. Established
         # connections reuse that decision across all subsequent group edits.
-        iptables -t mangle -A "$CN_FLOW" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
+        "$CN_TABLES" -t mangle -A "$CN_FLOW" "$@" -p "$proto" \
             -m conntrack ! --ctstatus CONFIRMED -j CONNMARK --set-xmark "0/$CN_DIRECT_BIT" || return 1
-        iptables -t mangle -A "$CN_FLOW" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
+        "$CN_TABLES" -t mangle -A "$CN_FLOW" "$@" -p "$proto" \
             -m conntrack ! --ctstatus CONFIRMED -m set ! --match-set "$CN_SOURCES" src \
             -j CONNMARK --or-mark "$CN_DIRECT_BIT" || return 1
         # LAN replies to inbound port forwards must keep their return path.
-        iptables -t mangle -A "$CN_FLOW" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p "$proto" \
+        "$CN_TABLES" -t mangle -A "$CN_FLOW" "$@" -p "$proto" \
             -m conntrack --ctdir ORIGINAL -m connmark ! --mark "$CN_DIRECT_BIT/$CN_DIRECT_BIT" -j MARK --set-mark "$TUN_MARK" || return 1
     done
     # After private/node exceptions, before both device marks and the generic
     # TUN mark. --goto returns to PREROUTING when CN_FLOW finishes.
-    first=$(iptables -t mangle -L "$MANGLE_CHAIN" --line-numbers -n) || return 1
-    first=$(printf '%s\n' "$first" | awk '$2 == "SOCKROCKET_DEVICES" || $2 == "MARK" {print $1;exit}')
+    first=$("$CN_TABLES" -t mangle -L "$CN_CHAIN" --line-numbers -n) || return 1
+    first=$(printf '%s\n' "$first" | awk '$2 == "SOCKROCKET_DEVICES" || $2 == "SOCKROCKET_IPV6_DEVICES" || $2 == "MARK" {print $1;exit}')
     if [ -n "$first" ]; then
-        iptables -t mangle -I "$MANGLE_CHAIN" "$first" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW"
+        "$CN_TABLES" -t mangle -I "$CN_CHAIN" "$first" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW"
     else
-        iptables -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW"
+        "$CN_TABLES" -t mangle -A "$CN_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW"
     fi
 }
 
@@ -189,10 +221,10 @@ install_cn_flow() {
 # just before the first MARK rule. Idempotent: safe to call standalone
 # (`ipset-on`) while the chain is live, or from do_start on a fresh chain.
 do_ipset_start() {
-    case "$(get_conf builtin_route)" in
-        proxy|reject)
+    case "$(get_conf proxy_mode):$(get_conf builtin_route)" in
+        global:*|*:proxy|*:reject)
             do_ipset_stop || return 1
-            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
+            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/$CN_FALLBACK"
             return $?
             ;;
     esac
@@ -204,53 +236,58 @@ do_ipset_start() {
     # ALWAYS recreate. `ipset create -exist` keeps the previous maxelem; an
     # older 4096-cap set silently truncated the expanded CN list (~6k+) and
     # CN destinations fell through to MARK → proxy.
-    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
+    "$CN_TABLES" -t mangle -D "$CN_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
     ipset destroy "$IPSET_NAME" 2>/dev/null || true
-    if ! ipset create "$IPSET_NAME" hash:net family inet hashsize 4096 maxelem 32768 2>/dev/null; then
+    if ! ipset create "$IPSET_NAME" hash:net family "$CN_FAMILY" hashsize 4096 maxelem 32768 2>/dev/null; then
         err "failed to create $IPSET_NAME"
         return 1
     fi
-    # One atomic restore instead of thousands of individual `ipset add` forks.
-    if ! "$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null \
-        | awk '{print "add '"$IPSET_NAME"' " $1}' \
-        | ipset restore 2>/dev/null; then
-        err "failed to populate $IPSET_NAME"
+    # Load and verify the destination set before attaching its firewall rule.
+    local ranges loaded want
+    ranges=$("$SOCKROCKET_DIR/sockrocket-cli" "$CN_DEST_FLAG") && [ -n "$ranges" ] &&
+        printf '%s\n' "$ranges" | awk -v name="$IPSET_NAME" '{print "add", name, $1}' |
+        ipset restore || {
+            err "failed to populate $IPSET_NAME"
+            ipset destroy "$IPSET_NAME" 2>/dev/null || true
+            return 1
+        }
+    want=$(printf '%s\n' "$ranges" | wc -l)
+    loaded=$(ipset list "$IPSET_NAME" | awk '/^Members:/ {members=1; next} members && NF {n++} END {print n+0}')
+    if [ "$loaded" -ne "$want" ]; then
+        err "$IPSET_NAME has $loaded of $want ranges"
         ipset destroy "$IPSET_NAME" 2>/dev/null || true
         return 1
     fi
-    local loaded want
-    loaded=$(ipset list "$IPSET_NAME" 2>/dev/null | grep -c '^[0-9]')
-    want=$("$SOCKROCKET_DIR/sockrocket-cli" --dump-cn-cidrs 2>/dev/null | wc -l)
-    want=$(echo "$want" | tr -d ' ')
-    if [ -n "$want" ] && [ "$want" -gt 0 ] && [ "$loaded" -lt "$want" ]; then
-        err "CN ipset truncated ($loaded/$want) — check maxelem"
-        return 1
-    fi
     if ! install_cn_flow; then
-        do_ipset_stop
+        do_ipset_stop || return 1
         # Older kernels can lack xt_connmark. On startup the generic TUN path
         # handles domestic destinations too, so keep routing available.
         if [ "${1:-}" = startup ]; then
-            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn_via_tun" || return 1
+            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/$CN_FALLBACK" || return 1
             info "CN acceleration unavailable; routing domestic connections through TUN"
             return 0
         fi
         err "Could not install connection-aware CN acceleration"
         return 1
     fi
-    rm -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
-    ok "CN ipset direct applied ($IPSET_NAME, $loaded ranges)"
+    rm -f "$SOCKROCKET_RUNTIME_DIR/$CN_FALLBACK"
+    ok "CN ipset direct applied ($IPSET_NAME)"
 }
 
 do_ipset_stop() {
-    rm -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun"
-    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null || true
-    iptables -t mangle -F "$CN_FLOW" 2>/dev/null || true
-    iptables -t mangle -X "$CN_FLOW" 2>/dev/null || true
-    ipset destroy "$CN_SOURCES" 2>/dev/null || true
-    iptables -t mangle -D "$MANGLE_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
-    ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    "$CN_TABLES" -t mangle -D "$CN_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null || true
+    cn_flow_installed && return 1
+    "$CN_TABLES" -t mangle -D "$CN_CHAIN" -m set --match-set "$IPSET_NAME" dst -j RETURN 2>/dev/null || true
+    cleanup_cn_objects
     ok "CN ipset direct removed"
+}
+
+cleanup_cn_objects() {
+    rm -f "$SOCKROCKET_RUNTIME_DIR/$CN_FALLBACK"
+    "$CN_TABLES" -t mangle -F "$CN_FLOW" 2>/dev/null || true
+    "$CN_TABLES" -t mangle -X "$CN_FLOW" 2>/dev/null || true
+    ipset destroy "$CN_SOURCES" 2>/dev/null || true
+    ipset destroy "$IPSET_NAME" 2>/dev/null || true
 }
 
 # Merlin transparent routing is IPv4-only. DNS AAAA suppression alone cannot
@@ -396,6 +433,7 @@ ipv6_proxy_stop() {
     ip6tables -t mangle -X "$IPV6_MANGLE" 2>/dev/null || true
     ip6tables -t mangle -F SOCKROCKET_IPV6_DEVICES 2>/dev/null || true
     ip6tables -t mangle -X SOCKROCKET_IPV6_DEVICES 2>/dev/null || true
+    cn_ipv6 cleanup_cn_objects
     count=0
     while [ "$count" -lt 32 ] && ip6tables -D FORWARD -j "$IPV6_FORWARD" 2>/dev/null; do count=$((count+1)); done
     ip6tables -C FORWARD -j "$IPV6_FORWARD" 2>/dev/null && return 1
@@ -469,6 +507,13 @@ ipv6_proxy_start() {
         ip6tables -t mangle -A "$IPV6_MANGLE" -i "$iface" -j SOCKROCKET_IPV6_DEVICES || { ipv6_proxy_stop; return 1; }
         ip6tables -t mangle -A "$IPV6_MANGLE" -m mark --mark "$TUN_MARK" -j RETURN || { ipv6_proxy_stop; return 1; }
     fi
+    if [ "$(get_conf cn_ipset_direct)" = true ]; then
+        if ! cn_ipv6 do_ipset_start startup; then
+            cn_ipv6 do_ipset_stop || { ipv6_proxy_stop; return 1; }
+            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" || return 1
+            info "IPv6 CN acceleration unavailable; routing domestic connections through TUN"
+        fi
+    fi
     # Real-address QUIC must reach userspace too. A stream-only proxy responds
     # with port unreachable there, allowing TCP fallback without bypassing
     # global or destination rules.
@@ -502,6 +547,9 @@ ipv6_proxy_verify() {
     local iface tun
     iface=$(ipv6_lan_interface) || return 1
     tun=$(detect_tun_dev) || return 1
+    if [ "$(get_conf cn_ipset_direct)" = true ] && [ ! -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" ]; then
+        cn_ipv6 cn_flow_installed || return 1
+    fi
     ipv6_forward_jump_ok "$IPV6_FORWARD" || return 1
     ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null &&
     ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p tcp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&
@@ -1226,11 +1274,23 @@ case "$1" in
     dns-stop)  do_dns_stop ;;
     refresh-rule-sources)
         if [ ! -f "$SOCKROCKET_RUNTIME_DIR/cn_via_tun" ]; then
-            cn_flow_installed && sync_cn_sources
+            cn_flow_installed && sync_cn_sources || exit 1
+        fi
+        if ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null &&
+            [ ! -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" ]; then
+            cn_ipv6 cn_flow_installed && cn_ipv6 sync_cn_sources
         fi
         ;;
-    ipset-on)  do_ipset_start ;;
-    ipset-off) do_ipset_stop ;;
+    ipset-on)
+        do_ipset_start || exit 1
+        if ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null; then
+            cn_ipv6 do_ipset_start
+        fi
+        ;;
+    ipset-off)
+        do_ipset_stop || exit 1
+        cn_ipv6 do_ipset_stop
+        ;;
     status)  do_status ;;
     verify)  do_verify ;;
     *)

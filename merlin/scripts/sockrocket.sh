@@ -1180,6 +1180,10 @@ restore_direct_network() {
             ip6tables -t "$v6_table" -X "$v6_chain" 2>/dev/null || true
         done
         v6_attempt=0
+        ip6tables -t mangle -F SOCKROCKET_CN6_FLOW 2>/dev/null || true
+        ip6tables -t mangle -X SOCKROCKET_CN6_FLOW 2>/dev/null || true
+        ipset destroy sockrocket_cn6_sources 2>/dev/null || true
+        ipset destroy sockrocket_cn6 2>/dev/null || true
         while [ "$v6_attempt" -lt 32 ] && ip6tables -D FORWARD -j SOCKROCKET_IPV6_FORWARD 2>/dev/null; do v6_attempt=$((v6_attempt+1)); done
         if ip6tables -C FORWARD -j SOCKROCKET_IPV6_FORWARD 2>/dev/null; then restore_rc=1; fi
         ip6tables -F SOCKROCKET_IPV6_FORWARD 2>/dev/null || true

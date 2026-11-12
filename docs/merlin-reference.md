@@ -129,7 +129,7 @@ Router check (restores TUN+DNS on exit): `scripts/verify_tun_toggle.sh`.
 
 `proxy_mode` (`rule` | `global` | `direct`, default `rule` when omitted): same routing modes as the Mac client. Web UI shows a Rule / Global / Direct control. `set_proxy_mode` restarts the daemon; Global also clears `cn_ipset_direct`.
 
-`cn_ipset_direct: false` by default. When on, `sockrocket_cn` hash:net (from `--dump-cn-cidrs`) lets domestic IPs skip TUN for hardware NAT. **Side effect:** per-domain rules for CN-resolved IPs do not apply on that path. Use the “国内 IP 绕过 TUN” switch in the Web UI network settings. With transparent proxy off, the preference takes effect when TUN starts.
+`cn_ipset_direct: false` by default. When enabled, domestic IPv4 destinations in `sockrocket_cn` bypass TUN. With dual-stack capture active, domestic IPv6 destinations in `sockrocket_cn6` also bypass TUN. Both sets use the built-in GeoIP CN prefixes. Devices with matching source rules still enter TUN. **Side effect:** per-domain rules for CN-resolved IPs do not apply on that path. Use the “国内 IP 绕过 TUN” switch in the Web UI network settings. With transparent proxy off, the preference takes effect when TUN starts.
 
 ---
 
