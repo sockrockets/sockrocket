@@ -87,6 +87,11 @@ pub fn china_ipv4_cidrs() -> Vec<&'static str> {
         .collect()
 }
 
+/// Built-in IPv6 prefixes shared by GeoIP routing and the Merlin kernel bypass.
+pub fn china_ipv6_cidrs() -> &'static [&'static str] {
+    CHINA_IPV6_CIDRS
+}
+
 fn parse_cidr(cidr: &str) -> Option<(std::net::IpAddr, u8)> {
     let parts: Vec<&str> = cidr.splitn(2, '/').collect();
     if parts.len() != 2 {

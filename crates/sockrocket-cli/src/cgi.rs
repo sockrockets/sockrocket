@@ -1940,7 +1940,7 @@ fn act_set_toggles(post: &J) -> J {
         if chain_up {
             let action = if new_cn { "ipset-on" } else { "ipset-off" };
             let script = iptables_sh().to_string_lossy().to_string();
-            let _ = run_cmd("sh", &[&script, action]);
+            let succeeded = run_cmd("sh", &[&script, action]).is_some();
             let applied = run_cmd(
                 "iptables",
                 &[
@@ -1958,13 +1958,16 @@ fn act_set_toggles(post: &J) -> J {
                 ],
             )
             .is_some();
-            if applied != new_cn {
+            if !succeeded || applied != new_cn {
                 let mut map = match load_conf() {
                     Ok(m) => m,
                     Err(e) => return err_msg(&format!("Failed to read config: {e}")),
                 };
                 map.insert(ykey("cn_ipset_direct"), Y::Bool(cur_cn));
-                let _ = save_conf(&map);
+                if save_conf(&map).is_ok() {
+                    let restore = if cur_cn { "ipset-on" } else { "ipset-off" };
+                    let _ = run_cmd("sh", &[&script, restore]);
+                }
                 return json!({"ok": false, "msg": "Failed to toggle CN direct acceleration: ipset rules not applied (make sure ipset is available and the service is started)"});
             }
         }
@@ -3245,8 +3248,9 @@ fn accelerated_rule_sources(map: &Mapping) -> std::collections::BTreeSet<String>
     }
     let links = devices::links(map).unwrap_or_default();
     let rules = load_routing_rules(map);
+    let dual_stack = conf_str(map, "ipv6_mode").as_deref() == Some("dual_stack");
     sockrocket_core::router::device_policy_sources(&rules, &links)
-        .filter(|source| !source.contains(':'))
+        .filter(|source| dual_stack || !source.contains(':'))
         .map(str::to_owned)
         .collect()
 }

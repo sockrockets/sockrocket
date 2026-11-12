@@ -151,6 +151,16 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
+    if args.iter().any(|a| a == "--dump-cn-cidrs-v6") {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        for cidr in sockrocket_core::router::china::china_ipv6_cidrs() {
+            writeln!(out, "{cidr}")?;
+        }
+        out.flush()?;
+        return Ok(());
+    }
+
     // Source networks with active device policy must reach the router before CN bypass.
     if let Some(index) = args.iter().position(|arg| {
         matches!(

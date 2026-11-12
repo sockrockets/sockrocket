@@ -1442,6 +1442,7 @@ function renderNetworkControls() {
   setChip('cn',!!st.cn_ipset_direct);
   if(st.cn_ipset_direct&&!(online&&st.transparent_proxy))srElement('cn-state').textContent='已保存，待启用 TUN';
   cn.title=globalMode?'全局模式下国内 IP 也走代理。':'命中国内 IP 的局域网流量会绕过 TUN 和域名分流规则。开启透明代理后生效。';
+  if(!globalMode)cn.title+=' (IPv4 / IPv6 dual-stack)';
   if(!SR_STATE.statusKnown){['dns','fw','cn'].forEach(function(id){srElement(id+'-state').textContent='待确认';srElement('chip-'+id).title='状态尚未确认，请等待最新状态。';});return;}
   srElement('chip-dns').title=!online?'服务已停止，DNS 接管已关闭；启动服务时默认开启。':st.dns_hijack?(st.transparent_proxy?'DNS 接管与 TUN 已开启，使用短 TTL Fake-IP':'DNS 接管已开启，使用短 TTL 真实地址'):'DNS 接管已关闭，局域网使用原有 DNS';
   srElement('chip-fw').title=!online?'服务已停止，TUN 透明代理已关闭；启动服务时默认开启。':st.transparent_proxy?'透明代理已开启；单独关闭它会保留 DNS 接管':'透明代理已关闭，DNS 接管由单独开关控制';

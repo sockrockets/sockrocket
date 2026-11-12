@@ -41,6 +41,14 @@ ip6tables() {
     local args="$*" target
     target=${args##* }
     case "$*" in
+        '-t mangle -C SOCKROCKET_IPV6_MANGLE -m set --match-set sockrocket_cn6 dst -g SOCKROCKET_CN6_FLOW')
+            test -f "$FIXTURE/cn6";;
+        '-t mangle -L SOCKROCKET_IPV6_MANGLE --line-numbers -n')
+            printf '1 RETURN\n2 SOCKROCKET_IPV6_DEVICES\n3 MARK\n';;
+        '-t mangle -I SOCKROCKET_IPV6_MANGLE 2 -m set --match-set sockrocket_cn6 dst -g SOCKROCKET_CN6_FLOW')
+            touch "$FIXTURE/cn6";;
+        '-t mangle -D SOCKROCKET_IPV6_MANGLE -m set --match-set sockrocket_cn6 dst -g SOCKROCKET_CN6_FLOW'|'-t mangle -F SOCKROCKET_IPV6_MANGLE')
+            rm -f "$FIXTURE/cn6";;
         '-S FORWARD')
             test ! -f "$FIXTURE/foreign_top" || echo '-A FORWARD -i wg0 -j SKYNET'
             while read -r chain; do echo "-A FORWARD -j $chain"; done < "$FORWARD_LIST";;
@@ -186,6 +194,7 @@ printf 'ipv6_mode: dual_stack\ndns_hijack: true\ntransparent_proxy: true\nproxy_
 #!/bin/sh
 case "$1" in
     --dump-rule-sources-v6) printf '2001:db8:9::/64\n'; exit 0 ;;
+    --dump-cn-cidrs-v6) printf '2001:250::/30\n'; exit 0 ;;
     --supports-udp) exit 1 ;;
     *) exit 0 ;;
 esac
@@ -200,6 +209,38 @@ test -n "$device_line" || fail 'IPv6 device policy is missing'
 grep -q -- '-A SOCKROCKET_IPV6_DEVICES -s 2001:db8:9::/64 -p udp -j MARK' "$CALLS" || fail 'IPv6 device UDP was not marked'
 ipv6_proxy_stop || fail 'IPv6 device chain cleanup'
 grep -q -- '-X SOCKROCKET_IPV6_DEVICES' "$CALLS" || fail 'IPv6 device chain was left behind'
+# Dual-stack CN acceleration uses the exported IPv6 destinations and device
+# scopes, then detaches live without dropping the generic TCP/UDP path.
+ipset() {
+    echo "ipset $*" >> "$CALLS"
+    case "$1" in
+        create) [ "${FAIL_CN6:-0}" = 0 ] || return 1;;
+        restore) /bin/cat >> "$CALLS";;
+        list) [ "${2:-}" != sockrocket_cn6 ] || printf 'Members:\n2001:250::/30\n';;
+    esac
+}
+printf 'ipv6_mode: dual_stack\ntransparent_proxy: true\ncn_ipset_direct: true\n' > "$SOCKROCKET_CONF"
+ipv6_guard_start || fail 'dual-stack start with CN acceleration'
+cn_ipv6 cn_flow_installed || fail 'IPv6 CN bypass missing'
+grep -q 'create sockrocket_cn6 hash:net family inet6' "$CALLS" || fail 'wrong CN address family'
+grep -qx 'add sockrocket_cn6 2001:250::/30' "$CALLS" || fail 'CN IPv6 prefix not loaded'
+grep -q 'add sr_cn_src_.* 2001:db8:9::/64' "$CALLS" || fail 'IPv6 device scope missing'
+for proto in tcp udp; do
+    grep -q -- "-A SOCKROCKET_CN6_FLOW -i br0 -p $proto .* ! --match-set sockrocket_cn6_sources src -j CONNMARK" "$CALLS" || fail 'device policy bypassed'
+    grep -q -- "-A SOCKROCKET_CN6_FLOW -i br0 -p $proto .*--ctdir ORIGINAL .* -j MARK" "$CALLS" || fail 'device traffic did not enter TUN'
+done
+cn_ipv6 do_ipset_stop || fail 'live disable'
+! cn_ipv6 cn_flow_installed || fail 'CN acceleration still active'
+test -f "$FIXTURE/mangle" || fail 'live disable detached IPv6 capture'
+cn_ipv6 do_ipset_start || fail 'live enable'
+cn_ipv6 cn_flow_installed || fail 'live enable skipped IPv6'
+ipv6_proxy_stop || fail 'CN cleanup on stop'
+grep -q '^ipset destroy sockrocket_cn6_sources$' "$CALLS" || fail 'IPv6 source set left behind'
+FAIL_CN6=1
+ipv6_guard_start || fail 'missing inet6 ipset disabled dual-stack routing'
+test -f "$FIXTURE/mangle" && test -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" || fail 'missing IPv6 TUN fallback'
+! cn_ipv6 cn_flow_installed || fail 'partial IPv6 CN rule installed'
+ipv6_proxy_stop || fail 'fallback cleanup'
 # A later firmware IPv6 enable must gain the compatibility guard without a restart.
 printf 'ipv6_mode: compatibility\ntransparent_proxy: true\n' > "$SOCKROCKET_CONF"
 ipv6_guard_stop || fail 'clear guard before compatibility check'
