@@ -191,7 +191,7 @@ From [GitHub Releases](https://github.com/sockrockets/sockrocket/releases), get 
 1. Open the router Web UI → **Software Center** (koolcenter / softcenter).
 2. Use **Offline install** / upload package.
 3. Select the matching `sockrocket-merlin-*.tar.gz` → install.
-4. Open the **Sockrocket** tile (or `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`).
+4. Open the **Sockrocket** tile. To open the same page directly, visit `/Module_sockrocket.asp` on the router’s management origin. On standard Merlin, use `/ext/sockrocket/sockrocket.asp`. Both paths are case-sensitive.
 
 Wrong platform `.valid` → softcenter rejects the package or the binary fails with *Exec format error*. Re-check `uname -m` and the model tables above (`hnd` vs `hnd_v8` is the usual mistake).
 

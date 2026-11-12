@@ -187,7 +187,85 @@ do_softcenter_status() {
     fi
 }
 
+publish_web_page() {
+    local source="$SOCKROCKET_DIR/webui/sockrocket.asp" target="$1" pending
+    [ -s "$source" ] || return 1
+    mkdir -p "${target%/*}" || return 1
+    if [ -f "$target" ] && cmp -s "$source" "$target" 2>/dev/null; then
+        chmod 644 "$target"
+        return
+    fi
+    pending=$(mktemp "${target}.XXXXXX") || return 1
+    if cp "$source" "$pending" && chmod 644 "$pending" && mv -f "$pending" "$target"; then
+        return 0
+    fi
+    rm -f "$pending"
+    return 1
+}
+
+restore_web_ui() (
+    # Only public web assets are created here. The daemon keeps umask 077.
+    umask 022
+    # Restore CGI symlink (tmpfs /www/cgi-bin loses files on reboot).
+    # Skipped automatically on koolcenter firmware where /www is read-only
+    # (mkdir fails) — the koolcenter path uses the API bridge instead.
+    local cgi_src="$SOCKROCKET_DIR/sockrocket.cgi"
+    local cgi_dst="/www/cgi-bin/sockrocket.cgi"
+    if [ -f "$cgi_src" ] && [ ! -e "$cgi_dst" ]; then
+        if mkdir -p "/www/cgi-bin" 2>/dev/null; then
+            ln -sf "$cgi_src" "$cgi_dst" 2>/dev/null || cp "$cgi_src" "$cgi_dst" 2>/dev/null || true
+        fi
+    fi
+
+    # Web UI page on standard Merlin: /www may be tmpfs and wiped on reboot.
+    # Always refresh from the durable copy so deploys are not left stale.
+    if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+        publish_web_page /www/ext/sockrocket/sockrocket.asp 2>/dev/null ||
+            publish_web_page /tmp/var/wwwext/sockrocket/sockrocket.asp ||
+            log_warn "Could not restore Merlin Web UI"
+    fi
+
+    # koolcenter self-heal: Softcenter menu opens Module_sockrocket.asp.
+    # Always overwrite from the durable webui so UI updates are not stuck
+    # on the first-install copy (deploy used to miss this path).
+    if [ -d /koolshare/scripts ] && [ -f /koolshare/scripts/base.sh ]; then
+        local KS_WEBS="/koolshare/webs"
+        if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+            publish_web_page "$KS_WEBS/Module_sockrocket.asp" || log_warn "Could not restore Software Center page"
+            if [ -d /jffs/.koolshare/webs ]; then
+                publish_web_page /jffs/.koolshare/webs/Module_sockrocket.asp || log_warn "Could not restore persistent Software Center page"
+            fi
+        fi
+        if [ ! -f /koolshare/res/icon-sockrocket.png ]; then
+            if [ -f "$SOCKROCKET_DIR/res/icon-sockrocket.png" ]; then
+                mkdir -p /koolshare/res 2>/dev/null || true
+                cp "$SOCKROCKET_DIR/res/icon-sockrocket.png" /koolshare/res/icon-sockrocket.png 2>/dev/null || true
+            fi
+        fi
+        if [ ! -f /koolshare/scripts/sockrocket_api.sh ] && [ -f "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" ]; then
+            cp "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" /koolshare/scripts/sockrocket_api.sh 2>/dev/null
+            chmod +x /koolshare/scripts/sockrocket_api.sh 2>/dev/null || true
+        fi
+        if which dbus >/dev/null 2>&1; then
+            [ -z "$(dbus get softcenter_module_sockrocket_install 2>/dev/null)" ] && \
+                dbus set softcenter_module_sockrocket_install=1 2>/dev/null || true
+            [ -z "$(dbus get softcenter_module_sockrocket_title 2>/dev/null)" ] && \
+                dbus set softcenter_module_sockrocket_title="Sockrocket" 2>/dev/null || true
+            [ "$(dbus get softcenter_module_sockrocket_name 2>/dev/null)" = sockrocket ] || \
+                dbus set softcenter_module_sockrocket_name="sockrocket" 2>/dev/null || true
+            [ -z "$(dbus get softcenter_module_sockrocket_description 2>/dev/null)" ] && \
+                dbus set softcenter_module_sockrocket_description="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
+            [ "$(dbus get softcenter_module_sockrocket_indexpage 2>/dev/null)" = Module_sockrocket.asp ] || \
+                dbus set softcenter_module_sockrocket_indexpage="Module_sockrocket.asp" 2>/dev/null || true
+            local VER
+            VER=$(cat "$SOCKROCKET_DIR/version" 2>/dev/null)
+            [ -n "$VER" ] && dbus set softcenter_module_sockrocket_version="$VER" 2>/dev/null || true
+        fi
+    fi
+)
+
 do_api_start() {
+    restore_web_ui
     sync_softcenter_state
     api_is_running && return 0
     [ -x "$SOCKROCKET_BIN" ] || return 1
@@ -830,65 +908,6 @@ do_start() {
 
     # The Web UI's API bridge must run regardless of proxy state.
     do_api_start
-
-    # Restore CGI symlink (tmpfs /www/cgi-bin loses files on reboot).
-    # Skipped automatically on koolcenter firmware where /www is read-only
-    # (mkdir fails) — the koolcenter path uses the API bridge instead.
-    local cgi_src="$SOCKROCKET_DIR/sockrocket.cgi"
-    local cgi_dst="/www/cgi-bin/sockrocket.cgi"
-    if [ -f "$cgi_src" ] && [ ! -e "$cgi_dst" ]; then
-        if mkdir -p "/www/cgi-bin" 2>/dev/null; then
-            ln -sf "$cgi_src" "$cgi_dst" 2>/dev/null || cp "$cgi_src" "$cgi_dst" 2>/dev/null || true
-        fi
-    fi
-
-    # Web UI page on standard Merlin: /www may be tmpfs and wiped on reboot.
-    # Always refresh from the durable copy so deploys are not left stale.
-    if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
-        if mkdir -p /www/ext/sockrocket 2>/dev/null; then
-            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /www/ext/sockrocket/sockrocket.asp 2>/dev/null || true
-        fi
-        mkdir -p /tmp/var/wwwext/sockrocket 2>/dev/null || true
-        cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /tmp/var/wwwext/sockrocket/sockrocket.asp 2>/dev/null || true
-    fi
-    write_api_js "$(api_port)"
-
-    # koolcenter self-heal: Softcenter menu opens Module_sockrocket.asp.
-    # Always overwrite from the durable webui so UI updates are not stuck
-    # on the first-install copy (deploy used to miss this path).
-    if [ -d /koolshare/scripts ] && [ -f /koolshare/scripts/base.sh ]; then
-        local KS_WEBS="/koolshare/webs"
-        if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
-            mkdir -p "$KS_WEBS" /jffs/.koolshare/webs 2>/dev/null || true
-            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp" 2>/dev/null || true
-            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /jffs/.koolshare/webs/Module_sockrocket.asp 2>/dev/null || true
-        fi
-        if [ ! -f /koolshare/res/icon-sockrocket.png ]; then
-            if [ -f "$SOCKROCKET_DIR/res/icon-sockrocket.png" ]; then
-                mkdir -p /koolshare/res 2>/dev/null || true
-                cp "$SOCKROCKET_DIR/res/icon-sockrocket.png" /koolshare/res/icon-sockrocket.png 2>/dev/null || true
-            fi
-        fi
-        if [ ! -f /koolshare/scripts/sockrocket_api.sh ] && [ -f "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" ]; then
-            cp "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" /koolshare/scripts/sockrocket_api.sh 2>/dev/null
-            chmod +x /koolshare/scripts/sockrocket_api.sh 2>/dev/null || true
-        fi
-        if which dbus >/dev/null 2>&1; then
-            [ -z "$(dbus get softcenter_module_sockrocket_install 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_install=1 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_title 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_title="Sockrocket" 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_name 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_name="Sockrocket" 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_description 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_description="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_indexpage 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_indexpage="Module_sockrocket.asp" 2>/dev/null || true
-            local VER
-            VER=$(cat "$SOCKROCKET_DIR/version" 2>/dev/null)
-            [ -n "$VER" ] && dbus set softcenter_module_sockrocket_version="$VER" 2>/dev/null || true
-        fi
-    fi
 
     rotate_log
     info "Starting Sockrocket..."

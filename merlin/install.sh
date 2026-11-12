@@ -276,7 +276,8 @@ install_common_files() {
     [ -f "$SCRIPT_DIR/scripts/sockrocket_api.sh" ] && xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh"
     xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh"
     mkdir -p "$SOCKROCKET_DIR/webui" 2>/dev/null
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$SOCKROCKET_DIR/webui/sockrocket.asp" 2>/dev/null || true
+    [ -s "$SCRIPT_DIR/webui/sockrocket.asp" ] || err "Package Web UI page missing or empty"
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$SOCKROCKET_DIR/webui/sockrocket.asp" || err "Could not install persistent Web UI page"
     if [ -f "$SCRIPT_DIR/res/icon-sockrocket.png" ]; then
         mkdir -p "$SOCKROCKET_DIR/res" 2>/dev/null || true
         xcp "$SCRIPT_DIR/res/icon-sockrocket.png" "$SOCKROCKET_DIR/res/icon-sockrocket.png" 2>/dev/null || true
@@ -453,7 +454,7 @@ ks_install() {
     # koolshare Web UI: Module_sockrocket.asp → /koolshare/webs/
     info "Installing koolshare Web UI..."
     mkdir -p "$KS_WEBS" "$KS_SCRIPTS" "$KS_INIT" "$KS_DIR/res" 2>/dev/null
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp"
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp" && chmod 644 "$KS_WEBS/Module_sockrocket.asp" || err "Could not publish Software Center page"
     ok "Web UI installed to $KS_WEBS/Module_sockrocket.asp"
 
     # Software-center tile icon (softcenter loads /koolshare/res/icon-<module>.png)
@@ -520,16 +521,16 @@ ks_install() {
         dbus set "${MODULE}_version"="${VER}"                        2>/dev/null || true
         dbus set "softcenter_module_${MODULE}_version"="${VER}"      2>/dev/null || true
         dbus set "softcenter_module_${MODULE}_install"="1"          2>/dev/null || true
-        dbus set "softcenter_module_${MODULE}_name"="${MODULE}"      2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_name"="${MODULE}" || err "Could not register Software Center module name"
         dbus set "softcenter_module_${MODULE}_title"="Sockrocket"          2>/dev/null || true
         dbus set "softcenter_module_${MODULE}_description"="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
         # Page the software center opens when the icon is clicked. Without
         # indexpage the icon shows up but clicking it does nothing — the
         # plugin appears "unreachable" even though everything else works.
-        dbus set "softcenter_module_${MODULE}_indexpage"="Module_${MODULE}.asp" 2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_indexpage"="Module_${MODULE}.asp" || err "Could not register Software Center page"
         ok "Plugin registered in dbus"
     else
-        warn "dbus unavailable, skipping software-center status registration (no functional impact)"
+        warn "dbus unavailable: Software Center may not list Sockrocket. Open /Module_sockrocket.asp directly."
     fi
     "$SOCKROCKET_SCRIPTS/sockrocket.sh" software-center-status >/dev/null 2>&1 || true
 
@@ -558,7 +559,7 @@ merlin_install() {
     install_common_files
 
     info "Installing Web UI page..."
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$WWW_SOCKROCKET/sockrocket.asp"
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$WWW_SOCKROCKET/sockrocket.asp" && chmod 644 "$WWW_SOCKROCKET/sockrocket.asp" || err "Could not publish Merlin Web UI page"
     ok "Web UI installed to $WWW_SOCKROCKET/sockrocket.asp"
 
     info "Hooking into Merlin startup scripts..."
@@ -607,7 +608,7 @@ fi
     ok "Sockrocket installed successfully!"
     echo ""
     echo "  Config file : $SOCKROCKET_CONF"
-    echo "  Web UI      : http://router.asus.com/ext/Sockrocket/sockrocket.asp"
+    echo "  Web UI      : http://router.asus.com/ext/sockrocket/sockrocket.asp"
     echo ""
     echo "  Start  : $SOCKROCKET_SCRIPTS/sockrocket.sh start"
     echo "  Stop   : $SOCKROCKET_SCRIPTS/sockrocket.sh stop"
