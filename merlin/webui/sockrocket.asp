@@ -329,7 +329,7 @@ body.bg {min-width:0!important}
 <table id="sr-firmware-layout" role="presentation"><tr>
 <td class="sr-firmware-nav"><div id="mainMenu"></div><div id="subMenu"></div></td>
 <td class="sr-firmware-content"><div id="tabMenu" class="submenuBlock"></div>
-<div id="sr-host-notice" hidden>固件导航暂不可用，请从路由器软件中心打开 Sockrocket。</div>
+<div id="sr-host-notice" hidden>固件导航暂不可用，仍可使用下方的 Sockrocket 设置。</div>
 <section id="sockrocket-plugin" aria-label="Sockrocket settings">
 <div id="sr-app">
   <!-- ── Title bar ─────────────────────────────────────────────────── -->
@@ -832,11 +832,17 @@ body.bg {min-width:0!important}
 function srElement(id) { return document.getElementById('sr-' + id); }
 
 function sockrocketInitHost() {
-  document.form.current_page.value = location.pathname.split('/').pop() || 'Module_sockrocket.asp';
-  document.form.next_page.value = document.form.current_page.value;
-  if (document.form.preferred_lang) document.form.preferred_lang.value = typeof ui_lang === 'string' ? ui_lang : 'EN';
-  if (document.form.firmver) document.form.firmver.value = typeof exist_firmver === 'string' ? exist_firmver : '';
+  if (location.pathname.indexOf('/ext/') === 0) {
+    var exit = srElement('exit-btn');
+    exit.href = '/';
+    exit.title = '返回路由器首页';
+    document.querySelector('#sockrocket-plugin .breadcrumb').firstChild.nodeValue = '路由器 / Sockrocket ';
+  }
   try {
+    document.form.current_page.value = location.pathname.split('/').pop() || 'Module_sockrocket.asp';
+    document.form.next_page.value = document.form.current_page.value;
+    if (document.form.preferred_lang) document.form.preferred_lang.value = typeof ui_lang === 'string' ? ui_lang : 'EN';
+    if (document.form.firmver) document.form.firmver.value = typeof exist_firmver === 'string' ? exist_firmver : '';
     if (typeof show_menu !== 'function') throw new Error('Firmware navigation unavailable');
     show_menu();
   } catch (e) {

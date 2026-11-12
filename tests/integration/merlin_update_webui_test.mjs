@@ -59,3 +59,15 @@ console.log('PASS: preinstall progress and missing platform package');
   assert.equal(timers.length, 1);
 }
 console.log('PASS: stale success cannot complete a newly submitted update');
+
+const initHost = page.slice(page.indexOf('function sockrocketInitHost'), page.indexOf('var TRANSPORT'));
+for (const pathname of ['/Module_sockrocket.asp', '/ext/sockrocket/sockrocket.asp']) {
+  const notice = {hidden:true}, exit = {href:'/Module_Softcenter.asp#/'}, crumb = {firstChild:{}};
+  const document = {form:{current_page:{}, next_page:{}}, getElementById:() => notice, querySelector:() => crumb};
+  const context = vm.createContext({document, location:{pathname}, srElement:() => exit});
+  new vm.Script(initHost + '\nsockrocketInitHost();').runInContext(context);
+  assert.equal(document.form.current_page.value, pathname.split('/').pop());
+  assert.equal(notice.hidden, false);
+  assert.equal(exit.href, pathname.startsWith('/ext/') ? '/' : '/Module_Softcenter.asp#/');
+}
+console.log('PASS: Software Center and standalone Merlin navigation without firmware menu scripts');

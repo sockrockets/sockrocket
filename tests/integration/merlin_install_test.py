@@ -174,3 +174,43 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         old.terminate()
         old.wait()
 print('PASS: atomic upgrade, preserved install intent, boot wrapper and WAN event hooks')
+
+# Simulate a reboot while stopped with a live management API. The tile URL
+# built from the module name and the legacy indexpage must both resolve.
+control_source = Path('merlin/scripts/sockrocket.sh').read_text()
+def shell_function(name, following):
+    return control_source[control_source.index(name + '()'):control_source.index(following + '()')]
+
+with tempfile.TemporaryDirectory(prefix='sockrocket-web-boot-') as directory:
+    root = Path(directory)
+    (root / 'webui').mkdir()
+    (root / 'webui/sockrocket.asp').write_text('fixture page')
+    (root / 'stopped').touch()
+    (root / 'koolshare/scripts').mkdir(parents=True)
+    (root / 'koolshare/scripts/base.sh').touch()
+    (root / 'softcenter_module_sockrocket_name').write_text('Sockrocket')
+    restore = shell_function('publish_web_page', 'do_api_start')
+    for path in ('/koolshare', '/www', '/jffs', '/tmp/var'):
+        restore = restore.replace(path, str(root) + path)
+    script = '''
+ensure_nat_hook() { :; }
+sync_softcenter_state() { :; }
+api_is_running() { return 0; }
+do_start() { exit 22; }
+log_warn() { echo "$*" >&2; }
+which() { [ "$1" = dbus ]; }
+dbus() {
+    case "$1" in
+        get) cat "$SOCKROCKET_DIR/$2" ;;
+        set) printf "%s" "${2#*=}" > "$SOCKROCKET_DIR/${2%%=*}" ;;
+    esac
+}
+'''
+    script += restore + shell_function('do_api_start', 'do_api_stop') + shell_function('do_boot', 'rotate_log') + '\ndo_boot\n'
+    subprocess.run(['sh', '-c', script], env=dict(os.environ, SOCKROCKET_DIR=str(root)), check=True)
+    name = (root / 'softcenter_module_sockrocket_name').read_text()
+    page = root / 'koolshare/webs' / ('Module_' + name + '.asp')
+    assert page.name == (root / 'softcenter_module_sockrocket_indexpage').read_text()
+    for entry in (page, root / 'www/ext/sockrocket/sockrocket.asp'):
+        assert entry.read_text() == 'fixture page' and entry.stat().st_mode & 0o777 == 0o644
+    assert (root / 'stopped').exists()
