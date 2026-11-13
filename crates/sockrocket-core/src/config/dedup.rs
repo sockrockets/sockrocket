@@ -1090,7 +1090,9 @@ mod provenance_review {
                 .insert(super::super::server_dns::KEY.into(), "old".into());
             tag_subscription_nodes(std::slice::from_mut(&mut old), a);
             if shared {
-                set_sources(&mut old, &BTreeSet::from([a.into(), b.into()]));
+                let mut names = subscription_names(&old);
+                names.insert(b.into(), old.name.clone());
+                set_membership(&mut old, &names);
             } else {
                 old.extra.insert(MANUAL_KEY.into(), "true".into());
             }
