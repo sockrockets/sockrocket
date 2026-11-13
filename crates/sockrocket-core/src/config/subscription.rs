@@ -188,7 +188,9 @@ async fn fetch_subscription_route(
             let result = fetch_valid_subscription(client, sub, clash).await;
             match result {
                 Err(error) if clash && error.kind == BodyErrorKind::Representation => {
-                    fetch_valid_subscription(client, sub, false).await
+                    fetch_valid_subscription(client, sub, false)
+                        .await
+                        .map_err(|fallback| preferred_route_error(error, fallback))
                 }
                 result => result,
             }
