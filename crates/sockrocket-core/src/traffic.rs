@@ -880,6 +880,15 @@ impl SavedTraffic {
     }
 }
 
+fn sort_monthly_rows(rows: &mut [NodeMonthlyTraffic]) {
+    rows.sort_by(|a, b| {
+        b.total
+            .total()
+            .cmp(&a.total.total())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 /// Include empty months in each row, and omit rows with no traffic in the window.
 fn monthly_rows<'a>(
     entries: impl Iterator<Item = (&'a String, &'a String, &'a BTreeMap<String, MonthEntry>)>,
@@ -909,12 +918,7 @@ fn monthly_rows<'a>(
             });
         }
     }
-    out.sort_by(|a, b| {
-        b.total
-            .total()
-            .cmp(&a.total.total())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    sort_monthly_rows(&mut out);
     out
 }
 
@@ -975,12 +979,7 @@ pub fn sum_subscription_members(
             total,
         });
     }
-    out.sort_by(|a, b| {
-        b.total
-            .total()
-            .cmp(&a.total.total())
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    sort_monthly_rows(&mut out);
     out
 }
 

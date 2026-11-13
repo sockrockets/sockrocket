@@ -105,7 +105,7 @@ const config = vm.createContext({
   ruleWorkspaceDirty: () => false, dnsPolicyDirty: false, SR_PAGE_LOADED: {},
   srShowMsg() {}, toastResp() {}, setTimeout() {}, refreshStatus() {}
 });
-vm.runInContext(source.slice(source.indexOf('var savedConfigText'), source.indexOf('var pendingUpdateAsset')), config);
+vm.runInContext(source.slice(source.indexOf('var savedConfigText'), source.indexOf('function srCheckUpdate()')), config);
 config.srLoadConfig();
 configRequests.shift()[2]({ok: false, msg: '读取失败'});
 assert.equal(configElements['config-state'].textContent, '读取失败');

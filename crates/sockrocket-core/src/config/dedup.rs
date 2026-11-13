@@ -56,23 +56,24 @@ fn set_names(node: &mut Node, names: &BTreeMap<String, String>) {
         );
     }
 }
-fn set_sources(node: &mut Node, sources: &BTreeSet<String>) {
-    node.extra.remove(SUB_URL_EXTRA_KEY);
-    node.extra.remove(SOURCES_KEY);
-    if let Some(first) = sources.first() {
+// subscription_names normalizes legacy metadata and gives every source a remark.
+fn set_membership(node: &mut Node, names: &BTreeMap<String, String>) {
+    set_names(node, names);
+    if let Some((first, _)) = names.first_key_value() {
         node.extra.insert(SUB_URL_EXTRA_KEY.into(), first.clone());
         node.extra.insert(
             SOURCES_KEY.into(),
-            serde_json::to_string(sources).expect("string sources"),
+            serde_json::to_string(&names.keys().collect::<Vec<_>>()).expect("string sources"),
         );
+    } else {
+        node.extra.remove(SUB_URL_EXTRA_KEY);
+        node.extra.remove(SOURCES_KEY);
     }
 }
-fn is_manual(node: &Node) -> bool {
-    subscription_sources(node).is_empty()
-        || node
-            .extra
-            .get(MANUAL_KEY)
-            .is_some_and(|value| value == "true")
+fn has_manual_copy(node: &Node) -> bool {
+    node.extra
+        .get(MANUAL_KEY)
+        .is_some_and(|value| value == "true")
 }
 /// Stamp fresh results with exactly their producing source.
 pub fn tag_subscription_nodes(nodes: &mut [Node], url: &str) {
@@ -81,23 +82,19 @@ pub fn tag_subscription_nodes(nodes: &mut [Node], url: &str) {
             .remove(url)
             .unwrap_or_else(|| node.name.clone());
         node.extra.remove(MANUAL_KEY);
-        set_names(node, &BTreeMap::from([(url.to_owned(), name)]));
-        set_sources(node, &BTreeSet::from([url.to_owned()]));
+        set_membership(node, &BTreeMap::from([(url.to_owned(), name)]));
     }
 }
 fn detach_sources(nodes: &mut Vec<Node>, removed: &HashSet<String>) {
     nodes.retain_mut(|node| {
-        let manual = is_manual(node);
         let mut names = subscription_names(node);
+        let manual = names.is_empty() || has_manual_copy(node);
         names.retain(|source, _| !removed.contains(source));
-        set_names(node, &names);
-        let mut sources = subscription_sources(node);
-        sources.retain(|source| !removed.contains(source));
-        set_sources(node, &sources);
+        set_membership(node, &names);
         if manual {
             node.extra.insert(MANUAL_KEY.into(), "true".into());
         }
-        manual || !sources.is_empty()
+        manual || !names.is_empty()
     });
 }
 
@@ -149,7 +146,7 @@ pub fn refresh_with_dns_migrations(
     merged.append(&mut kept);
     // Distinct remarks in this download stay. A previous copy of the same
     // endpoint, or a hand-added duplicate, still folds into the fresh list.
-    dedup_subscription_import(&mut merged, fresh_len);
+    let mut merged = dedup_subscription_import(merged, fresh_len);
     // Shared and manual copies keep their existing references while present.
     if !migrations.is_empty() {
         for node in &merged {
@@ -440,15 +437,16 @@ fn transport_summary(transport: Option<&TransportConfig>) -> String {
 }
 
 fn merge_duplicate(retained: &mut Node, incoming: &Node) {
-    let manual = is_manual(retained) || is_manual(incoming);
     let mut names = subscription_names(retained);
-    for (source, name) in subscription_names(incoming) {
+    let incoming_names = subscription_names(incoming);
+    let manual = names.is_empty()
+        || incoming_names.is_empty()
+        || has_manual_copy(retained)
+        || has_manual_copy(incoming);
+    for (source, name) in incoming_names {
         names.entry(source).or_insert(name);
     }
-    set_names(retained, &names);
-    let mut sources = subscription_sources(retained);
-    sources.extend(subscription_sources(incoming));
-    set_sources(retained, &sources);
+    set_membership(retained, &names);
     if manual {
         retained.extra.insert(MANUAL_KEY.into(), "true".into());
     }
@@ -481,14 +479,12 @@ pub fn dedup_nodes(nodes: &mut Vec<Node>) -> usize {
 /// endpoint under a different name stays. A leftover with the same endpoint
 /// and no other subscription folds into the first fresh remark, so refreshing
 /// cannot leave the previous names behind.
-fn dedup_subscription_import(nodes: &mut Vec<Node>, fresh_len: usize) -> usize {
-    let before = nodes.len();
-    let fresh_len = fresh_len.min(before);
+fn dedup_subscription_import(incoming: Vec<Node>, fresh_len: usize) -> Vec<Node> {
     let mut seen_named = HashMap::<String, usize>::new();
     let mut fresh_by_fp = HashMap::<String, usize>::new();
-    let mut merged: Vec<Node> = Vec::with_capacity(before);
-    let mut incoming = std::mem::take(nodes);
-    for node in incoming.drain(..fresh_len) {
+    let mut merged: Vec<Node> = Vec::with_capacity(incoming.len());
+    let mut incoming = incoming.into_iter();
+    for node in incoming.by_ref().take(fresh_len) {
         let fingerprint = node_fingerprint(&node);
         let key = format!("{fingerprint}\n{}", node.name);
         if let Some(&index) = seen_named.get(&key) {
@@ -504,18 +500,16 @@ fn dedup_subscription_import(nodes: &mut Vec<Node>, fresh_len: usize) -> usize {
         let key = format!("{fingerprint}\n{}", node.name);
         if let Some(&index) = seen_named.get(&key) {
             merge_duplicate(&mut merged[index], &node);
-        } else if fresh_by_fp.contains_key(&fingerprint)
-            && (is_manual(&node) || subscription_sources(&node).is_empty())
+        } else if let Some(&index) = fresh_by_fp.get(&fingerprint)
+            && (has_manual_copy(&node) || subscription_sources(&node).is_empty())
         {
-            let index = fresh_by_fp[&fingerprint];
             merge_duplicate(&mut merged[index], &node);
         } else {
             seen_named.insert(key, merged.len());
             merged.push(node);
         }
     }
-    *nodes = merged;
-    before - nodes.len()
+    merged
 }
 
 /// Make display names unique within the list by appending " #2", " #3", …
@@ -1020,6 +1014,38 @@ mod provenance_review {
             refresh_interval_hours: 24,
             refresh_revision: String::new(),
         }
+    }
+    #[test]
+    fn merged_legacy_memberships_preserve_names_and_manual_copy() {
+        let mut retained = node();
+        retained.extra.insert(SUB_URL_EXTRA_KEY.into(), "b".into());
+        retained.extra.insert(
+            NAMES_KEY.into(),
+            r#"{"b":"old remark","stale":"removed"}"#.into(),
+        );
+        let mut incoming = node();
+        incoming
+            .extra
+            .insert(SOURCES_KEY.into(), r#"["b","a"]"#.into());
+        incoming.extra.insert(
+            NAMES_KEY.into(),
+            r#"{"a":"new remark","b":"ignored duplicate"}"#.into(),
+        );
+        incoming.extra.insert(MANUAL_KEY.into(), "true".into());
+        merge_duplicate(&mut retained, &incoming);
+        assert_eq!(retained.extra[SUB_URL_EXTRA_KEY], "a");
+        assert_eq!(retained.extra[SOURCES_KEY], r#"["a","b"]"#);
+        assert_eq!(
+            retained.extra[NAMES_KEY],
+            r#"{"a":"new remark","b":"old remark"}"#
+        );
+        let mut nodes = vec![retained];
+        detach_sources(&mut nodes, &HashSet::from(["a".into(), "b".into()]));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].extra,
+            HashMap::from([(MANUAL_KEY.into(), "true".into())])
+        );
     }
     #[test]
     fn memberships_survive_dedup_and_independent_source_removal() {

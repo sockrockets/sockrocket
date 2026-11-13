@@ -42,7 +42,7 @@ const checkContext = vm.createContext({
   srApi: (_action,_data,ok) => ok({available:true,latest:'1.2.3',asset_url:null,html_url:'release-page'}),
   srShowMsg: () => {},
 });
-new vm.Script(page.slice(page.indexOf('var pendingUpdateAsset'), page.indexOf('var srUpdatePollTimer')) + '\nsrCheckUpdate();').runInContext(checkContext);
+new vm.Script(page.slice(page.indexOf('function srCheckUpdate()'), page.indexOf('var srUpdatePollTimer')) + '\nsrCheckUpdate();').runInContext(checkContext);
 assert.match(elements.get('update-status').textContent, /1\.2\.3.*未找到适配当前机型的软件包/);
 assert.equal(elements.get('btn-apply-update').style.display, 'none');
 assert.equal(elements.get('btn-update-link').href, 'release-page');

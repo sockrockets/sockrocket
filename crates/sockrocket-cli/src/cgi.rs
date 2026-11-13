@@ -46,6 +46,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use serde_json::{Value as J, json};
 use serde_yaml::{Mapping, Value as Y};
 use sockrocket_core::config::storage::{parse_yaml_document, render_yaml_mapping};
+use sockrocket_core::same_rule_group;
 
 /// True when this process was invoked as a CGI endpoint: either the
 /// executable was called through a `sockrocket.cgi*` link (router httpd) or the
@@ -527,7 +528,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "rename_sub" => act_rename_sub(post),
         "update_subs" => act_update_subs(),
         "speedtest" => act_speedtest(),
-        "stats" => act_stats(),
+        "stats" => act_stats(post.get("traffic_scope").and_then(J::as_str)),
         "set_mode" => act_set_mode(post),
         "set_proxy_mode" => act_set_proxy_mode(post),
         "set_toggles" => act_set_toggles(post),
@@ -2003,7 +2004,7 @@ fn subscription_month_rows(
     sockrocket_core::sum_subscription_members(nodes, &membership, &subscription_names)
 }
 
-fn act_stats() -> J {
+fn act_stats(scope: Option<&str>) -> J {
     let pid = running_pid().map(|(pid, _)| pid);
     let mut uptime = "stopped".to_string();
     if let Some(pid_val) = pid
@@ -2039,70 +2040,82 @@ fn act_stats() -> J {
             uptime = "running".to_string();
         }
     }
-    let dns_active = dnsmasq_hijack_conf().exists();
-    let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
+    let mut response = json!({"ok":true,"uptime":uptime});
+    if scope == Some("none") {
+        return response;
+    }
+    let session = scope != Some("monthly");
+    let monthly = scope != Some("session");
+    let full = session && monthly;
+    if full {
+        let (ipv4, ipv6) = firewall_hooks(run_cmd);
+        response["pid"] = json!(pid.unwrap_or(0));
+        response["dns_active"] = json!(dnsmasq_hijack_conf().exists());
+        response["fw_active"] = json!(ipv4);
+        response["fw_ipv6"] = json!(ipv6);
+    }
     let traffic_path = sockrocket_dir().join("traffic.yaml");
     let traffic = sockrocket_core::traffic::SavedTraffic::read(&traffic_path).unwrap_or_default();
-    let traffic_nodes: Vec<J> = traffic
-        .nodes()
-        .into_iter()
-        .take(40)
-        .map(|snap| {
-            json!({
-                "id": snap.id,
-                "name": sockrocket_core::public_traffic_label(&snap.name, if snap.id == sockrocket_core::DIRECT_TRAFFIC_ID { "直连" } else { "节点" }),
-                "session_up": snap.session.up,
-                "session_down": snap.session.down,
-                "session_total": snap.session.total(),
-            })
-        })
-        .collect();
-    let month_keys = sockrocket_core::recent_month_keys(3);
-    let recent = |rows: Vec<sockrocket_core::NodeMonthlyTraffic>, include_id: bool| -> Vec<J> {
-        rows.into_iter()
+    let mut summary = J::Null;
+    if session {
+        let nodes = traffic
+            .nodes()
+            .into_iter()
             .take(40)
-            .map(|row| {
-                let fallback = if row.id == sockrocket_core::DIRECT_TRAFFIC_ID {
-                    "直连"
-                } else if include_id {
-                    "节点"
-                } else {
-                    "订阅"
-                };
+            .map(|snap| {
                 json!({
-                    "id": if include_id { row.id } else { String::new() },
-                    "name": sockrocket_core::public_traffic_label(&row.name, fallback),
-                    "months": row.months.iter().map(|(key, counters)| json!({
-                        "key": key,
-                        "up": counters.up,
-                        "down": counters.down,
-                        "total": counters.total(),
-                    })).collect::<Vec<_>>(),
-                    "total_up": row.total.up,
-                    "total_down": row.total.down,
-                    "total": row.total.total(),
+                    "id": snap.id,
+                    "name": sockrocket_core::public_traffic_label(&snap.name, if snap.id == sockrocket_core::DIRECT_TRAFFIC_ID { "直连" } else { "节点" }),
+                    "session_up": snap.session.up,
+                    "session_down": snap.session.down,
+                    "session_total": snap.session.total(),
                 })
             })
-            .collect()
-    };
-    let recent_months = traffic.node_months(&month_keys);
-    let recent_subscriptions = subscription_month_rows(&recent_months, &traffic, &month_keys);
-    let session_started = traffic.session_started();
-    json!({
-        "ok": true,
-        "uptime": uptime,
-        "pid": pid.unwrap_or(0),
-        "dns_active": dns_active,
-        "fw_active": fw_active,
-        "fw_ipv6": fw_ipv6,
-        "traffic": {
-            "session_started": session_started,
-            "nodes": traffic_nodes,
-            "recent_month_keys": month_keys,
-            "recent_months": recent(recent_months, true),
-            "recent_subscriptions": recent(recent_subscriptions, false),
-        }
-    })
+            .collect();
+        summary["nodes"] = J::Array(nodes);
+    }
+    if monthly {
+        let month_keys = sockrocket_core::recent_month_keys(3);
+        let recent = |rows: Vec<sockrocket_core::NodeMonthlyTraffic>, include_id: bool| {
+            J::Array(
+                rows.into_iter()
+                    .take(40)
+                    .map(|row| {
+                        let fallback = if row.id == sockrocket_core::DIRECT_TRAFFIC_ID {
+                            "直连"
+                        } else if include_id {
+                            "节点"
+                        } else {
+                            "订阅"
+                        };
+                        json!({
+                            "id": if include_id { row.id } else { String::new() },
+                            "name": sockrocket_core::public_traffic_label(&row.name, fallback),
+                            "months": row.months.iter().map(|(key, counters)| json!({
+                                "key": key,
+                                "up": counters.up,
+                                "down": counters.down,
+                                "total": counters.total(),
+                            })).collect::<Vec<_>>(),
+                            "total_up": row.total.up,
+                            "total_down": row.total.down,
+                            "total": row.total.total(),
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        let recent_months = traffic.node_months(&month_keys);
+        let recent_subscriptions = subscription_month_rows(&recent_months, &traffic, &month_keys);
+        summary["recent_month_keys"] = json!(month_keys);
+        summary["recent_months"] = recent(recent_months, true);
+        summary["recent_subscriptions"] = recent(recent_subscriptions, false);
+    }
+    if full {
+        summary["session_started"] = json!(traffic.session_started());
+    }
+    response["traffic"] = summary;
+    response
 }
 
 fn vm_rss_kb(pid: &str) -> u64 {
@@ -2512,12 +2525,6 @@ fn save_routing_rules(map: &mut Mapping, rules: Vec<sockrocket_core::RoutingRule
     map.insert(ykey("rules"), Y::Sequence(seq));
 }
 
-fn same_rule_group(rule_group: &str, want: &str) -> bool {
-    let g = rule_group.trim();
-    let w = want.trim();
-    if w.is_empty() { g.is_empty() } else { g == w }
-}
-
 fn rule_kind(rule_type: &str) -> &str {
     if rule_type.eq_ignore_ascii_case("match") || rule_type.eq_ignore_ascii_case("final") {
         "final"
@@ -2605,7 +2612,7 @@ fn act_get_rules() -> J {
         .and_then(Y::as_str)
         .map(str::to_owned);
     let (groups, nodes) = proxy_groups::rule_catalogs(&map);
-    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(&map), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2924,6 +2931,47 @@ fn act_fetch_rule_list(post: &J) -> J {
     }
 }
 
+fn parse_pasted_rules(
+    text: &str,
+    rule_type: &str,
+    target: &str,
+    group: &str,
+) -> Result<Vec<sockrocket_core::RoutingRule>, J> {
+    // Unified Clash-style parse (`TYPE,pattern,TARGET`). Plain domains/CIDRs
+    // still auto-detect; typed paste without TYPE is accepted when `rule_type`
+    // is set (WebUI type dropdown) for one-line-per-pattern convenience.
+    let has_rule_types = || {
+        text.lines().map(str::trim).any(|l| {
+            let head = l.split([',', ' ', ':']).next().unwrap_or("");
+            matches!(
+                head.to_ascii_uppercase().as_str(),
+                "SOURCE"
+                    | "DOMAIN"
+                    | "DOMAIN-SUFFIX"
+                    | "DOMAIN-KEYWORD"
+                    | "IP-CIDR"
+                    | "GEOIP"
+                    | "DST-PORT"
+                    | "PORT"
+                    | "MATCH"
+                    | "FINAL"
+            )
+        })
+    };
+    let parsed = if sockrocket_core::rule_type_supports_bulk(rule_type) && !has_rule_types() {
+        sockrocket_core::parse_typed_patterns(text, rule_type, target, group)
+    } else {
+        sockrocket_core::parse_batch_rules_in_group(text, target, group)
+    };
+    if let Some(error) = parsed.errors.first() {
+        return Err(err_msg(format!(
+            "第 {} 行：{}；未保存任何更改",
+            error.line, error.message
+        )));
+    }
+    Ok(parsed.rules)
+}
+
 /// Batch paste / import: multiline text → many rules (same parser as desktop GUI).
 fn act_batch_add_rules(post: &J) -> J {
     let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -2953,46 +3001,11 @@ fn act_batch_add_rules(post: &J) -> J {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim();
-    // Unified Clash-style parse (`TYPE,pattern,TARGET`). Plain domains/CIDRs
-    // still auto-detect; typed paste without TYPE is accepted when `rule_type`
-    // is set (WebUI type dropdown) for one-line-per-pattern convenience.
-    let looks_clash = text.lines().map(str::trim).any(|l| {
-        let head = l.split([',', ' ', ':']).next().unwrap_or("");
-        matches!(
-            head.to_ascii_uppercase().as_str(),
-            "SOURCE"
-                | "DOMAIN"
-                | "DOMAIN-SUFFIX"
-                | "DOMAIN-KEYWORD"
-                | "IP-CIDR"
-                | "GEOIP"
-                | "DST-PORT"
-                | "PORT"
-                | "MATCH"
-                | "FINAL"
-        )
-    });
-    let parsed = if looks_clash || rule_type.is_empty() {
-        sockrocket_core::parse_batch_rules_in_group(text, default_target, group)
-    } else if sockrocket_core::rule_type_supports_bulk(rule_type) {
-        sockrocket_core::parse_typed_patterns(text, rule_type, default_target, group)
-    } else {
-        sockrocket_core::parse_batch_rules_in_group(text, default_target, group)
+    let mut incoming = match parse_pasted_rules(text, rule_type, default_target, group) {
+        Ok(rules) if rules.is_empty() => return err_msg("No valid rules"),
+        Ok(rules) => rules,
+        Err(error) => return error,
     };
-    if let Some(error) = parsed.errors.first() {
-        return err_msg(format!(
-            "第 {} 行：{}；未保存任何更改",
-            error.line, error.message
-        ));
-    }
-    if parsed.rules.is_empty() {
-        let msg = parsed
-            .errors
-            .first()
-            .map(|e| format!("No valid rules (line {}: {})", e.line, e.message))
-            .unwrap_or_else(|| "No valid rules".into());
-        return err_msg(&msg);
-    }
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
@@ -3010,8 +3023,7 @@ fn act_batch_add_rules(post: &J) -> J {
         Ok(value) => value,
         Err(error) => return err_msg(&error),
     };
-    let mut parsed = parsed;
-    for rule in &mut parsed.rules {
+    for rule in &mut incoming {
         if !includes_group_rule(post, rule) {
             return err_msg("默认出口请在设备分流策略中设置");
         }
@@ -3041,13 +3053,9 @@ fn act_batch_add_rules(post: &J) -> J {
                 .map_or(0, |r| r.priority)
         };
     }
-    let n_in = parsed.rules.len();
-    let stats = sockrocket_core::config::rules_batch::merge_rules(
-        &mut existing,
-        parsed.rules,
-        conflict,
-        true,
-    );
+    let n_in = incoming.len();
+    let stats =
+        sockrocket_core::config::rules_batch::merge_rules(&mut existing, incoming, conflict, true);
     let summary = format!(
         "共解析 {n_in} 条，新增 {} 条，替换 {} 条，跳过重复 {} 条。",
         stats.added, stats.replaced, stats.skipped
@@ -3159,7 +3167,7 @@ fn act_set_rule_group_target(post: &J) -> J {
             .filter(|r| same_rule_group(&r.group, &group))
             .map(rule_edit_snapshot)
             .collect();
-        if expected != &json!(current) {
+        if expected != &J::Array(current) {
             return err_msg("分组规则已变化，请刷新后重新选择出口");
         }
     }
@@ -3240,7 +3248,7 @@ fn act_set_rule_group_enabled(post: &J) -> J {
             .filter(|r| includes_group_rule(post, r) && same_rule_group(&r.group, &group))
             .map(rule_edit_snapshot)
             .collect();
-        if expected != &json!(current) {
+        if expected != &J::Array(current) {
             return err_msg("分组规则已变化，请刷新后重新选择开启或停用");
         }
     }
@@ -3301,58 +3309,21 @@ fn act_replace_rule_group(post: &J) -> J {
         Err(e) => return err_msg(e),
     };
 
-    let mut incoming = Vec::new();
-    if text.trim().is_empty() && matches!(rule_type, "match" | "final") {
+    let mut incoming = if text.trim().is_empty() {
+        if !matches!(rule_type, "match" | "final") {
+            return err_msg("Paste the group's patterns first");
+        }
         match sockrocket_core::make_typed_rule("match", "*", target, &new_group) {
-            Ok(mut rule) => {
-                rule.enabled = enabled;
-                rule.priority = priority;
-                incoming.push(rule);
-            }
-            Err(e) => return err_msg(&e),
+            Ok(rule) => vec![rule],
+            Err(error) => return err_msg(&error),
         }
-    } else if text.trim().is_empty() {
-        return err_msg("Paste the group's patterns first");
     } else {
-        let looks_clash = text.lines().map(str::trim).any(|l| {
-            let head = l.split([',', ' ', ':']).next().unwrap_or("");
-            matches!(
-                head.to_ascii_uppercase().as_str(),
-                "SOURCE"
-                    | "DOMAIN"
-                    | "DOMAIN-SUFFIX"
-                    | "DOMAIN-KEYWORD"
-                    | "IP-CIDR"
-                    | "GEOIP"
-                    | "DST-PORT"
-                    | "PORT"
-                    | "MATCH"
-                    | "FINAL"
-            )
-        });
-        let parsed = if looks_clash {
-            sockrocket_core::parse_batch_rules_in_group(text, target, &new_group)
-        } else if sockrocket_core::rule_type_supports_bulk(rule_type) {
-            sockrocket_core::parse_typed_patterns(text, rule_type, target, &new_group)
-        } else {
-            sockrocket_core::parse_batch_rules_in_group(text, target, &new_group)
-        };
-        if let Some(error) = parsed.errors.first() {
-            return err_msg(format!(
-                "第 {} 行：{}；未保存任何更改",
-                error.line, error.message
-            ));
+        match parse_pasted_rules(text, rule_type, target, &new_group) {
+            Ok(rules) if rules.is_empty() => return err_msg("No valid patterns in the group"),
+            Ok(rules) => rules,
+            Err(error) => return error,
         }
-        if parsed.rules.is_empty() {
-            return err_msg("No valid patterns in the group");
-        }
-        for mut rule in parsed.rules {
-            rule.group = new_group.clone();
-            rule.enabled = enabled;
-            rule.priority = priority;
-            incoming.push(rule);
-        }
-    }
+    };
     if incoming.iter().any(|r| !includes_group_rule(post, r)) {
         return err_msg("默认出口请在设备分流策略中设置");
     }
@@ -3369,7 +3340,7 @@ fn act_replace_rule_group(post: &J) -> J {
     }
     if let Some(expected) = post.get("expected_rules") {
         let current: Vec<_> = members.iter().map(|r| rule_edit_snapshot(r)).collect();
-        if expected != &json!(current) {
+        if expected != &J::Array(current) {
             return err_msg("分组规则已变化，请刷新后重新编辑");
         }
     }
@@ -3385,6 +3356,7 @@ fn act_replace_rule_group(post: &J) -> J {
     let default_enabled = members.iter().any(|r| r.enabled);
     let default_priority = members[0].priority;
     for rule in &mut incoming {
+        rule.group.clone_from(&new_group);
         if post.get("source").is_some() || rule.source.is_empty() {
             rule.source.clone_from(&source);
         }
@@ -3393,12 +3365,16 @@ fn act_replace_rule_group(post: &J) -> J {
                 && r.pattern == rule.pattern
                 && r.source == rule.source
         });
-        if post.get("enabled").is_none() {
-            rule.enabled = previous.map_or(default_enabled, |r| r.enabled);
-        }
-        if post.get("priority").is_none() {
-            rule.priority = previous.map_or(default_priority, |r| r.priority);
-        }
+        rule.enabled = if post.get("enabled").is_some() {
+            enabled
+        } else {
+            previous.map_or(default_enabled, |r| r.enabled)
+        };
+        rule.priority = if post.get("priority").is_some() {
+            priority
+        } else {
+            previous.map_or(default_priority, |r| r.priority)
+        };
         if let Some(previous) = previous {
             rule.name.clone_from(&previous.name);
         }
@@ -4713,6 +4689,54 @@ dns_direct_domains:
         assert_eq!(s["sub_count"], J::from(1));
         assert_eq!(s["mode"], J::from("tun"));
         assert_eq!(s["socks_port"], J::from("1080"));
+    }
+
+    #[test]
+    fn stats_scopes_match_their_legacy_fields() {
+        let env = TestEnv::new(SAMPLE);
+        let month = sockrocket_core::recent_month_keys(1).pop().unwrap();
+        fs::write(
+            env.dir.join("traffic.yaml"),
+            format!(
+                "session_started: 42\nsession:\n  direct: {{name: LAN, up: 10, down: 20}}\nhistory:\n  direct:\n    name: LAN\n    months:\n      {month}: {{up: 13, down: 21}}\n"
+            ),
+        )
+        .unwrap();
+        let legacy = dispatch("stats", &J::Null);
+        for key in [
+            "ok",
+            "pid",
+            "uptime",
+            "dns_active",
+            "fw_active",
+            "fw_ipv6",
+            "traffic",
+        ] {
+            assert!(legacy.get(key).is_some(), "missing legacy field {key}");
+        }
+        let traffic = &legacy["traffic"];
+        assert_eq!(traffic["session_started"], 42);
+        assert_eq!(traffic["nodes"][0]["session_total"], 30);
+        assert_eq!(traffic["recent_months"][0]["total"], 34);
+        assert_eq!(
+            dispatch("stats", &json!({"traffic_scope":"future"})),
+            legacy
+        );
+        let scope = |value| dispatch("stats", &json!({"traffic_scope":value}));
+        let uptime = &legacy["uptime"];
+        assert_eq!(scope("none"), json!({"ok":true,"uptime":uptime}));
+        assert_eq!(
+            scope("session"),
+            json!({"ok":true,"uptime":uptime,"traffic":{"nodes":traffic["nodes"]}})
+        );
+        assert_eq!(
+            scope("monthly"),
+            json!({"ok":true,"uptime":uptime,"traffic":{
+                "recent_month_keys":traffic["recent_month_keys"],
+                "recent_months":traffic["recent_months"],
+                "recent_subscriptions":traffic["recent_subscriptions"]
+            }})
+        );
     }
 
     #[test]

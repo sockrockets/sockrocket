@@ -44,7 +44,9 @@ SOCKROCKET_RT_TABLE=5370
 IPSET_NAME="sockrocket_cn"
 
 # Read port from config dynamically (called at runtime, not parse time)
-get_conf() { grep "^${1}:" "$SOCKROCKET_CONF" 2>/dev/null | awk '{print $2}' | head -1 | tr -d '"'; }
+get_conf() {
+    awk -v key="$1:" 'index($0, key) == 1 { gsub(/"/, "", $2); print $2; exit }' "$SOCKROCKET_CONF" 2>/dev/null || :
+}
 
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 info()  { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${CYAN}[Sockrocket-iptables] %s${NC}\n" "$*"; }

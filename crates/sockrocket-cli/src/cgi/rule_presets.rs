@@ -570,7 +570,7 @@ fn group(p: &Preset) -> String {
 }
 
 pub(super) fn catalog() -> J {
-    json!(PRESETS.iter().map(|p|json!({"id":p.id,"title":p.title,"description":p.description,"group":group(p),"target":p.target,"rule_type":p.rule_type,"domains":p.domains,"priority":-10,"enabled":false})).collect::<Vec<_>>())
+    J::Array(PRESETS.iter().map(|p|json!({"id":p.id,"title":p.title,"description":p.description,"group":group(p),"target":p.target,"rule_type":p.rule_type,"domains":p.domains,"priority":-10,"enabled":false})).collect::<Vec<_>>())
 }
 
 pub(super) fn add(post: &J) -> J {
@@ -586,11 +586,12 @@ pub(super) fn add(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("无法读取规则配置");
     };
-    if post.get("expected_revision").and_then(J::as_str) != Some(&route_trace::rules_revision(&map))
+    let mut rules = load_routing_rules(&map);
+    if post.get("expected_revision").and_then(J::as_str)
+        != Some(&route_trace::revision_for_rules(&map, &rules))
     {
         return err_msg("规则已变化，请刷新后重新添加预设");
     }
-    let mut rules = load_routing_rules(&map);
     if rules.len() != conf_seq(&map, "rules").len() {
         return err_msg("规则配置损坏，请先修复后再添加预设");
     }

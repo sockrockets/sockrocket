@@ -65,9 +65,6 @@ pub fn parse_batch_rules_in_group(
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
         let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
         if let Some(g) = parse_group_directive(trimmed) {
             active_group = g;
             continue;
@@ -78,12 +75,8 @@ pub fn parse_batch_rules_in_group(
         }
         match parse_one_line(line, default_target) {
             Ok(mut rule) => {
-                if !name.is_empty() {
-                    rule.name = name;
-                }
-                if rule.group.is_empty() && !active_group.is_empty() {
-                    rule.group = active_group.clone();
-                }
+                rule.name = name.to_owned();
+                rule.group = active_group.clone();
                 out.rules.push(rule);
             }
             Err(message) => out.errors.push(BatchLineError {
@@ -103,7 +96,7 @@ pub fn make_typed_rule(
     group: &str,
 ) -> Result<RoutingRule, String> {
     let target = normalize_target(target).unwrap_or("proxy");
-    let typ = normalize_type(rule_type);
+    let typ = known_rule_type(rule_type).unwrap_or("domain-suffix");
     let mut rule = build_rule(typ, pattern.trim(), target)?;
     rule.group = group.trim().to_string();
     Ok(rule)
@@ -128,41 +121,21 @@ pub fn parse_typed_patterns(
     group: &str,
 ) -> BatchParseResult {
     let target = normalize_target(target).unwrap_or("proxy");
-    let typ = normalize_type(rule_type);
-    let group = group.trim().to_string();
+    let typ = known_rule_type(rule_type).unwrap_or("domain-suffix");
+    let group = group.trim();
+    let split_words = matches!(typ, "domain" | "domain-suffix" | "domain-keyword" | "geoip");
     let mut out = BatchParseResult::default();
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // Strip trailing "# comment" that is not part of the pattern.
         let (line, _) = split_line_and_name(raw);
-        if line.is_empty() {
-            continue;
-        }
-        let tokens: Vec<&str> =
-            if matches!(typ, "domain" | "domain-suffix" | "domain-keyword" | "geoip") {
-                // geoip: allow `CN US JP` or `CN,US,JP` on one line
-                line.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else {
-                // ip-cidr: one CIDR per line (commas rare); still allow comma split
-                line.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-        if tokens.is_empty() {
-            continue;
-        }
+        let tokens = line
+            .split(|c: char| c == ',' || (split_words && (c == ';' || c.is_whitespace())))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         for token in tokens {
             match build_rule(typ, token, target) {
                 Ok(mut rule) => {
-                    rule.group = group.clone();
+                    rule.group = group.to_owned();
                     out.rules.push(rule);
                 }
                 Err(message) => out.errors.push(BatchLineError {
@@ -176,27 +149,17 @@ pub fn parse_typed_patterns(
 }
 
 fn parse_group_directive(trimmed: &str) -> Option<String> {
-    let t = trimmed.trim();
-    if !t.starts_with('#') {
-        return None;
-    }
-    let rest = t.trim_start_matches('#').trim();
-    let lower = rest.to_ascii_lowercase();
-    let after = lower.strip_prefix("@group")?;
-    let name = &rest[rest.len() - after.len()..];
-    Some(name.trim().to_string())
+    let rest = trimmed.strip_prefix('#')?.trim_start_matches('#').trim();
+    let (prefix, name) = rest.split_at_checked("@group".len())?;
+    prefix
+        .eq_ignore_ascii_case("@group")
+        .then(|| name.trim().to_owned())
 }
 
 /// Split `body  # optional name` — full-line comments become empty body.
-fn split_line_and_name(raw: &str) -> (&str, String) {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return ("", String::new());
-    }
-    match trimmed.find('#') {
-        Some(i) => (trimmed[..i].trim(), trimmed[i + 1..].trim().to_string()),
-        None => (trimmed, String::new()),
-    }
+fn split_line_and_name(raw: &str) -> (&str, &str) {
+    let (body, name) = raw.split_once('#').unwrap_or((raw, ""));
+    (body.trim(), name.trim())
 }
 
 /// One Clash-style line: `TYPE,pattern,TARGET` or `MATCH,TARGET`.
@@ -336,54 +299,44 @@ fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, Strin
         return parse_typed_left(left.trim(), target);
     }
     // Whitespace: type pattern [target]
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() >= 2 && looks_like_type(parts[0]) {
-        let target = if parts.len() >= 3 {
-            normalize_target(parts[2]).ok_or_else(|| format!("Unknown target '{}'", parts[2]))?
+    let mut words = line.split_whitespace();
+    if let (Some(first), Some(pattern)) = (words.next(), words.next())
+        && let Some(typ) = known_rule_type(first)
+    {
+        let target = if let Some(action) = words.next() {
+            normalize_target(action).ok_or_else(|| format!("Unknown target '{action}'"))?
         } else {
             default_target
         };
-        return build_rule(normalize_type(parts[0]), parts[1], target);
+        return build_rule(typ, pattern, target);
     }
     // Colon form without arrow: type:pattern
     if let Some((typ, pat)) = line.split_once(':')
-        && looks_like_type(typ)
+        && let Some(typ) = known_rule_type(typ)
     {
-        return build_rule(normalize_type(typ), pat.trim(), default_target);
+        return build_rule(typ, pat.trim(), default_target);
     }
     // Auto-detect plain value
     auto_detect(line, default_target)
 }
 
 fn parse_clash_line(line: &str, default_target: &str) -> Result<RoutingRule, String> {
-    let parts: Vec<&str> = line
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if parts.is_empty() {
-        return Err("Empty rule".into());
-    }
-    let typ_raw = parts[0];
-    if !looks_like_type(typ_raw) {
-        return Err(format!("Unknown rule type '{typ_raw}'"));
-    }
-    let typ = normalize_type(typ_raw);
-    if matches!(typ, "match" | "final") {
+    let mut parts = line.split(',').map(str::trim).filter(|s| !s.is_empty());
+    let typ_raw = parts.next().ok_or("Empty rule")?;
+    let typ = known_rule_type(typ_raw).ok_or_else(|| format!("Unknown rule type '{typ_raw}'"))?;
+    if typ == "match" {
         let target = parts
-            .get(1)
-            .copied()
+            .next()
             .and_then(normalize_target)
             .ok_or_else(|| "MATCH/FINAL requires a target".to_string())?;
         return build_rule(typ, "*", target);
     }
-    if parts.len() < 2 {
-        return Err(format!("{typ} requires a pattern"));
-    }
-    let pattern = parts[1];
+    let pattern = parts
+        .next()
+        .ok_or_else(|| format!("{typ} requires a pattern"))?;
     // Public Clash lists name a policy group this config does not have.
     // Keep the rule on the proxy path instead of dropping the line.
-    let target = match parts.get(2).copied() {
+    let target = match parts.next() {
         None => default_target,
         Some(flag) if flag.eq_ignore_ascii_case("no-resolve") => default_target,
         Some(action) => normalize_target(action).unwrap_or("proxy"),
@@ -393,33 +346,30 @@ fn parse_clash_line(line: &str, default_target: &str) -> Result<RoutingRule, Str
 
 fn parse_typed_left(left: &str, target: &str) -> Result<RoutingRule, String> {
     if let Some((typ, pat)) = left.split_once(':')
-        && looks_like_type(typ)
+        && let Some(typ) = known_rule_type(typ)
     {
-        return build_rule(normalize_type(typ), pat.trim(), target);
+        return build_rule(typ, pat.trim(), target);
     }
-    let parts: Vec<&str> = left.split_whitespace().collect();
-    if parts.len() >= 2 && looks_like_type(parts[0]) {
-        return build_rule(normalize_type(parts[0]), parts[1], target);
-    }
-    if parts.len() == 1 && looks_like_type(parts[0]) {
-        return build_rule(normalize_type(parts[0]), "*", target);
+    let mut words = left.split_whitespace();
+    if let Some(typ) = words.next().and_then(known_rule_type) {
+        return build_rule(typ, words.next().unwrap_or("*"), target);
     }
     Err(format!("Cannot parse typed rule '{left}'"))
 }
 
 fn auto_detect(value: &str, target: &str) -> Result<RoutingRule, String> {
     let v = value.trim();
-    if looks_like_cidr(v) {
-        let cidr = normalize_cidr(v)?;
-        return build_rule("ip-cidr", &cidr, target);
+    if v.contains('/')
+        && let Ok(rule) = build_rule("ip-cidr", v, target)
+    {
+        return Ok(rule);
     }
     if looks_like_ipv4(v) {
         let cidr = format!("{v}/32");
         return build_rule("ip-cidr", &cidr, target);
     }
     if looks_like_domain(v) {
-        let s = v.trim_start_matches('.').to_lowercase();
-        return build_rule("domain-suffix", &s, target);
+        return build_rule("domain-suffix", v, target);
     }
     Err(format!(
         "Unrecognized pattern '{v}' (use domain, CIDR, or TYPE,pattern,TARGET)"
@@ -440,7 +390,7 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
         rule_type
     };
     let pattern = match rule_type {
-        "match" | "final" => "*".to_string(),
+        "match" => "*".to_string(),
         "geoip" => {
             let p = pattern.trim();
             if p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -470,7 +420,7 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
             }
             s
         }
-        "dst-port" | "port" => {
+        "dst-port" => {
             let s = pattern.trim();
             if !valid_port_pattern(s) {
                 return Err(format!("Invalid port '{pattern}' (e.g. 443 or 1000-2000)"));
@@ -483,13 +433,7 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
         source: String::new(),
         name: String::new(),
         group: String::new(),
-        rule_type: if rule_type == "port" {
-            "dst-port".into()
-        } else if rule_type == "final" {
-            "match".into()
-        } else {
-            rule_type.into()
-        },
+        rule_type: rule_type.into(),
         pattern,
         target: target.to_string(),
         enabled: true,
@@ -497,31 +441,8 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
     })
 }
 
-fn looks_like_type(s: &str) -> bool {
-    matches!(
-        s.to_ascii_lowercase().as_str(),
-        "domain"
-            | "domain-suffix"
-            | "domain_suffix"
-            | "domainsuffix"
-            | "domain-keyword"
-            | "domain_keyword"
-            | "domainkeyword"
-            | "ip-cidr"
-            | "ip_cidr"
-            | "ipcidr"
-            | "ip-cidr6"
-            | "geoip"
-            | "dst-port"
-            | "dst_port"
-            | "port"
-            | "match"
-            | "final"
-    )
-}
-
-fn normalize_type(s: &str) -> &str {
-    match s.to_ascii_lowercase().as_str() {
+fn known_rule_type(s: &str) -> Option<&'static str> {
+    Some(match s.to_ascii_lowercase().as_str() {
         "domain" => "domain",
         "domain-suffix" | "domain_suffix" | "domainsuffix" => "domain-suffix",
         "domain-keyword" | "domain_keyword" | "domainkeyword" => "domain-keyword",
@@ -530,8 +451,8 @@ fn normalize_type(s: &str) -> &str {
         "geoip" => "geoip",
         "dst-port" | "dst_port" | "port" => "dst-port",
         "match" | "final" => "match",
-        _ => "domain-suffix",
-    }
+        _ => return None,
+    })
 }
 
 fn normalize_target(s: &str) -> Option<&str> {
@@ -599,10 +520,6 @@ fn looks_like_ipv4(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
-fn looks_like_cidr(s: &str) -> bool {
-    s.contains('/') && normalize_cidr(s).is_ok()
-}
-
 fn normalize_cidr(s: &str) -> Result<String, String> {
     let (addr, prefix) = s
         .split_once('/')
@@ -663,6 +580,27 @@ mod tests {
         assert_eq!(r.rules[1].rule_type, "ip-cidr");
         assert_eq!(r.rules[1].pattern, "10.0.0.0/8");
         assert_eq!(r.rules[2].pattern, "1.2.3.4/32");
+    }
+
+    #[test]
+    fn aliases_and_invalid_types_keep_their_import_behavior() {
+        let parsed = parse_batch_rules(
+            "## @GrOuP 香港\nPoRt, ,443,,DiR # web\nIp_Cidr 192.0.2.0/024 direct\nFiNaL -> proxy\n192.0.2.0/33\nother,example.com,DIRECT",
+            "proxy",
+        );
+        assert_eq!(parsed.rules.len(), 3);
+        assert!(parsed.rules.iter().all(|r| r.group == "香港"));
+        assert_eq!(parsed.rules[0].rule_type, "dst-port");
+        assert_eq!(parsed.rules[0].name, "web");
+        assert_eq!(parsed.rules[0].target, "direct");
+        assert_eq!(parsed.rules[1].pattern, "192.0.2.0/24");
+        assert_eq!(parsed.rules[2].rule_type, "match");
+        assert_eq!(parsed.errors.len(), 2);
+        assert_eq!(parsed.errors[0].line, 5);
+        assert!(parsed.errors[0].message.starts_with("Unrecognized pattern"));
+        assert_eq!(parsed.errors[1].message, "Unknown rule type 'other'");
+        let rule = make_typed_rule("other", "example.com", "direct", "").unwrap();
+        assert_eq!(rule.rule_type, "domain-suffix");
     }
 
     #[test]

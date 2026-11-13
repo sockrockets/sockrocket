@@ -206,7 +206,6 @@
 #sockrocket-plugin .flow-lines {position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
 #sockrocket-plugin .flow-lines path {fill:none;stroke:var(--border);stroke-width:1.5;vector-effect:non-scaling-stroke}
 #sockrocket-plugin .flow-lines path.selected {stroke:var(--accent);stroke-width:2}
-#sockrocket-plugin .flow-lines path.branch {stroke-dasharray:4 4}
 #sockrocket-plugin .routing-map {position:relative;isolation:isolate;margin:8px 0 14px}
 #sockrocket-plugin .routing-map .flow-lines {z-index:-1}
 #sockrocket-plugin .map-head {display:grid;grid-template-columns:22% 34% 22%;justify-content:space-between;color:var(--text-muted);font-size:11px;margin-top:14px}
@@ -940,20 +939,19 @@ function drainKscQueue() {
   apiKscRequest(request[0], request[1], function (d) { finish(request[2], d); },
     function (e) { finish(request[3], e); }, request[4]);
 }
+function newRequestId() {
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+}
 function apiKscRequest(action, data, cb, errCb, timeoutMs) {
-  // Full ms timestamp + wide random suffix: the old `Date.now() % 1e9 +
-  // random(0..999)` form collided when two requests fired within the same
-  // millisecond, making them poll (and possibly read) the same result file.
-  var random = new Uint8Array(16);
-  try { window.crypto.getRandomValues(random); }
+  var seq;
+  try { seq = newRequestId(); }
   catch (e) {
     srShowMsg('请使用支持安全随机数的现代浏览器', 'err');
     if (errCb) errCb({ error_code: 'unsupported_browser' });
     return;
   }
-  var seq = Array.prototype.map.call(random, function (b) {
-    return ('0' + b.toString(16)).slice(-2);
-  }).join('');
   var fields = {};
   // Softcenter may shell-escape JSON quotes stored in fields. Encode UTF-8
   // before dispatch so Chinese names, URLs and rule text arrive byte-for-byte.
@@ -1034,6 +1032,9 @@ function pollKscResult(seq, tries, cb, errCb, deadline) {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/_temp/sockrocket_rpc_' + seq + '.json?_=' + Math.random(), true);
   xhr.timeout = 5000;
+  function retry() {
+    setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb, deadline); }, 200);
+  }
   xhr.onload = function () {
     var t = (xhr.responseText || '').trim();
     if (xhr.status === 200 && t.charAt(0) === '{') {
@@ -1044,13 +1045,10 @@ function pollKscResult(seq, tries, cb, errCb, deadline) {
         return;
       } catch (e) { /* fall through to retry */ }
     }
-    setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb, deadline); }, 200);
+    retry();
   };
-  xhr.onerror = function () {
-    setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb, deadline); }, 200);
-  };
-  xhr.ontimeout = xhr.onerror;
-  try { xhr.send(null); } catch (e) { setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb, deadline); }, 200); }
+  xhr.onerror = xhr.ontimeout = retry;
+  try { xhr.send(null); } catch (e) { retry(); }
 }
 
 
@@ -1131,7 +1129,6 @@ var SR_STATE = {
   page: 'home',
   statusKnown: false,
   status: {},        // status action result
-  stats: {},         // stats action result
   nodes: [],         // node_details
   subs: [],          // subscriptions (for copy-url by index)
   lat: {},           // index -> ms (-1 = timeout)
@@ -1142,6 +1139,7 @@ var SR_PAGE_LOADED = {};
 
 function srShowPage(p) {
   if (SR_PAGES.indexOf(p) < 0) return;
+  var scopeChanged = trafficScope(p) !== trafficScope(SR_STATE.page);
   SR_STATE.page = p;
   SR_PAGES.forEach(function (id) {
     srElement('page-' + id).classList.toggle('active', id === p);
@@ -1149,6 +1147,8 @@ function srShowPage(p) {
     srElement('nav-' + id).setAttribute('aria-selected', id === p ? 'true' : 'false');
     srElement('nav-' + id).tabIndex = id === p ? 0 : -1;
   });
+  if (scopeChanged) { statsGeneration++; refreshStats(); }
+  if (p === 'nodes') renderNodes();
   if (!SR_PAGE_LOADED[p]) {
     SR_PAGE_LOADED[p] = true;
     if (p === 'nodes') { srLoadNodes(); loadProxyGroups(); }
@@ -1157,8 +1157,6 @@ function srShowPage(p) {
     if (p === 'config') srLoadConfig();
     if (p === 'network') loadNetworkPolicy();
     if (p === 'logs') loadLog();
-  } else {
-    if (p === 'nodes') renderNodes();
   }
 }
 
@@ -1226,6 +1224,25 @@ function testDnsPolicy(){
 
 /* ══ Title bar / status bar / home ═════════════════════════════════ */
 var refreshPending = {}, statusGeneration = 0, networkPending = false;
+var statsGeneration = 0;
+function trafficScope(page) { return page === 'home' ? 'session' : page === 'subs' ? 'monthly' : 'none'; }
+function refreshStats() {
+  var scope = trafficScope(SR_STATE.page), generation = statsGeneration;
+  if (refreshPending[scope]) return;
+  refreshPending[scope] = true;
+  function finish(d) {
+    delete refreshPending[scope];
+    if (scope !== trafficScope(SR_STATE.page)) return;
+    // A quick round trip between tabs can revisit an older pending request.
+    if (generation !== statsGeneration) { refreshStats(); return; }
+    if (!d) return;
+    SR_STATE.uptime = d.uptime;
+    if (scope === 'session') renderSessionTraffic(d.traffic);
+    if (scope === 'monthly') renderSubscriptionTraffic(d.traffic);
+    renderChrome();
+  }
+  srApi('stats', {traffic_scope:scope}, finish, function () { finish(); });
+}
 function refreshStatus(withSysinfo) {
   var generation=statusGeneration;
   function read(action, success) {
@@ -1249,20 +1266,17 @@ function refreshStatus(withSysinfo) {
     if(generation!==statusGeneration){refreshStatus(withSysinfo);return;}
     acceptStatus(d);
   });
-  read('stats', function (d) {
-    SR_STATE.stats = d;
-    renderSessionTraffic(d.traffic);
-    renderSubscriptionTraffic(d.traffic);
-    renderChrome();
-  });
+  refreshStats();
   if (withSysinfo) read('sysinfo', function (d) { SR_STATE.sysinfo = d; renderChrome(); });
 }
 
 function acceptStatus(d) {
     if (!d || typeof d.running !== 'boolean') { SR_STATE.statusKnown = false; renderChrome(); return; }
+    var nodeChanged = SR_STATE.status.active_node !== d.active_node;
     SR_STATE.status = d; SR_STATE.statusKnown = true;
     srElement('status-freshness').textContent = '更新于 ' + new Date().toLocaleTimeString();
-    renderChrome(); renderNodes();
+    renderChrome();
+    if (nodeChanged) renderNodes();
     if(SR_STATE.page==='network' && !dnsPolicyPending && !networkPending && !dnsPolicyDirty && d.network_revision && dnsPolicyRevision && d.network_revision!==dnsPolicyRevision)loadNetworkPolicy();
     if(SR_STATE.page==='network' && !dnsPolicyDirty && !dnsPolicyPending && !networkPending)srElement('network-state').textContent=networkStateText(d);
     if(SR_STATE.page==='dns' && !rulePending && !RULE_READ_PENDING && !RULE_FLOW_ERROR && RULE_RULE_REVISION && d.rules_revision && d.rules_revision!==RULE_RULE_REVISION)srLoadRules();
@@ -1311,7 +1325,7 @@ function renderSubscriptionTraffic(traffic) {
   renderMonthTable(srElement('sub-link-traffic'), traffic && traffic.recent_month_keys, traffic && traffic.recent_subscriptions);
 }
 function renderChrome() {
-  var st = SR_STATE.status, ss = SR_STATE.stats, si = SR_STATE.sysinfo || {};
+  var st = SR_STATE.status, uptime = SR_STATE.uptime, si = SR_STATE.sysinfo || {};
   var running = !!st.running;
   var pill = srElement('service-pill');
   pill.textContent = !SR_STATE.statusKnown ? '状态未知' : running ? '运行中' : '已停止';
@@ -1329,7 +1343,7 @@ function renderChrome() {
   srElement('st-connections-sub').textContent = !running ? '服务未运行' : typeof active !== 'number' ? '当前版本未提供计数' : tun.running ? 'TUN 会话 · 约每 30 秒更新' : '代理连接 · 约每 30 秒更新';
   srElement('st-probe').textContent = running && age >= 0 && age < 120 && probe.last_probe_ms != null ? probe.last_probe_ms + ' ms' : '—';
   srElement('st-probe-sub').textContent = !running ? '服务未运行' : probe.consecutive_failures > 0 ? '最近探测失败' : age >= 0 && age < 120 ? '最近检查通过' : '近期没有探测结果';
-  srElement('st-service-uptime').textContent = running && ss.uptime && ss.uptime !== 'stopped' ? ss.uptime : '—';
+  srElement('st-service-uptime').textContent = running && uptime && uptime !== 'stopped' ? uptime : '—';
   // title bar
   var nbName = srElement('nb-name');
   nbName.textContent = SR_STATE.nodes[st.active_node] ? SR_STATE.nodes[st.active_node].name : (st.active_node != null ? '节点 #' + st.active_node : '—');
@@ -1347,7 +1361,7 @@ function renderChrome() {
     (SR_STATE.nodes[st.active_node] ? SR_STATE.nodes[st.active_node].name : '') +
     (activeLat != null ? ' · ' + latText(activeLat) : '');
   srElement('sb-ports').textContent = 'SOCKS :' + (st.socks_port || 1080) + ' · HTTP :' + (st.http_port || 1087);
-  srElement('sb-uptime').textContent = ss.uptime && ss.uptime !== 'stopped' ? '↑ ' + ss.uptime : '';
+  srElement('sb-uptime').textContent = uptime && uptime !== 'stopped' ? '↑ ' + uptime : '';
   srElement('sb-nodes').textContent = (st.node_count || 0) + ' 个节点';
   srElement('sb-ver').textContent = st.version || '';
 
@@ -1361,7 +1375,7 @@ function renderChrome() {
   srElement('hero-node').textContent = n
     ? n.name + ' · ' + (n.protocol || '?') + ' · ' + (n.port || '?')
     : (st.node_count > 0 ? '节点 #' + st.active_node : '暂无节点，请先添加订阅或节点');
-  srElement('hero-uptime').textContent = running ? (ss.uptime || '—') : '—';
+  srElement('hero-uptime').textContent = running ? (uptime || '—') : '—';
   // health check line: probe latency / failure streak / failover history
   var hh = srElement('hero-health');
   var health = st.health;
@@ -1526,6 +1540,7 @@ function runSpeedtest() {
       el.className = 'value ' + (d.latency < 200 ? 'ok' : d.latency < 500 ? 'acc' : 'bad');
       srElement('st-lat-sub').textContent = '通过当前节点';
       SR_STATE.lat[SR_STATE.status.active_node] = d.latency;
+      renderNodes();
       renderChrome();
     } else {
       el.textContent = '失败';
@@ -1615,6 +1630,7 @@ function srLoadNodes() {
   }, failed);
 }
 function renderNodes() {
+  if (SR_STATE.page !== 'nodes') return;
   var el = srElement('node-list');
   if (nodeLoadError) {
     srElement('nodes-count').textContent = '未能读取';
@@ -1683,19 +1699,14 @@ function testNode(i) {
   var el = srElement('lat-' + i);
   if (el) el.textContent = '…';
   // Warm through-proxy probe (warmup + measure). Cap wait for Reality/QUIC.
-  srApi('speedtest_node', { index: i }, function (d) {
+  function finish(d) {
     if (!SR_STATE.nodes[i] || nodeViewKey(SR_STATE.nodes[i]) !== key) return;
-    SR_STATE.lat[i] = d.ok && d.latency >= 0 ? d.latency : -1;
+    SR_STATE.lat[i] = d && d.ok && d.latency >= 0 ? d.latency : -1;
     saveSpeedTests();
     renderNodes();
     renderChrome();
-  }, function () {
-    if (!SR_STATE.nodes[i] || nodeViewKey(SR_STATE.nodes[i]) !== key) return;
-    SR_STATE.lat[i] = -1;
-    saveSpeedTests();
-    renderNodes();
-    renderChrome();
-  }, 60000);
+  }
+  srApi('speedtest_node', { index: i }, finish, function () { finish(); }, 60000);
 }
 var speedTestPollPending = false;
 var speedTestPollTimer = null;
@@ -1735,10 +1746,7 @@ function testAllNodes(mode) {
   SR_STATE.testingAll = true;
   var btn = srElement('test-all-btn');
   btn.disabled = true; btn.textContent = '正在启动测速…';
-  var bytes = new Uint8Array(16);
-  window.crypto.getRandomValues(bytes);
-  var requestId = Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
-  srApi('speedtest_start', {mode: mode || 'tcp', request_id: requestId}, function (data) {
+  srApi('speedtest_start', {mode: mode || 'tcp', request_id: newRequestId()}, function (data) {
     if (!data.ok || !data.job) {
       SR_STATE.testingAll = false; btn.disabled = false; btn.textContent = '快速测速';
       srShowMsg(data.msg || '无法启动测速', 'err'); return;
@@ -1824,7 +1832,7 @@ function srLoadSubs() {
   }, failed);
 }
 function findSubscription(i) {
-  return SR_STATE.subs.filter(function (sub) { return Number(sub.index) === Number(i); })[0];
+  return SR_STATE.subs.find(function (sub) { return Number(sub.index) === Number(i); });
 }
 var inspectedSubIndex = null, inspectedSubUrl = null;
 function inspectSubscription(i) {
@@ -2019,10 +2027,8 @@ function restoreSubscriptionJob() {
 function startSubscriptionJob(action, body) {
   subscriptionNodesLoadedJobId = null;
   subscriptionJobStartedAt = Date.now();
-  var random = new Uint8Array(16);
-  try { window.crypto.getRandomValues(random); }
+  try { subscriptionJobId = newRequestId(); }
   catch (error) { failSubscriptionJob(null, '浏览器无法生成安全任务 ID，请使用现代浏览器。'); return; }
-  subscriptionJobId = Array.prototype.map.call(random, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
   subscriptionAwaitingLaunch = true; subscriptionLaunchError = null; subscriptionMissingPolls = 0;
   subscriptionBusy(true);
   srShowMsg('正在启动后台订阅任务…', 'info');
@@ -2718,7 +2724,7 @@ function loadRulePresets(presets) {
   renderRulePreset();
 }
 function rulePresetGroup(p){return RULE_PRESET_GROUP===null?p.group:RULE_PRESET_GROUP;}
-function selectedRulePreset(){return RULE_PRESETS.filter(function(p){return p.id===srElement('rule-preset').value;})[0];}
+function selectedRulePreset(){return RULE_PRESETS.find(function(p){return p.id===srElement('rule-preset').value;});}
 function renderRulePreset() {
   var p=selectedRulePreset(),unavailable=RULE_FLOW_ERROR||!RULE_RULE_REVISION||!p,busy=!!rulePending||RULE_READ_PENDING;
   srElement('rule-preset').disabled=unavailable||busy;
@@ -2760,17 +2766,6 @@ function toggleRulePreset(enabled) {
   var p=selectedRulePreset();if(!p||RULE_FLOW_ERROR)return;
   setRuleGroupEnabled(encodeURIComponent(rulePresetGroup(p)),enabled);
 }
-function groupRulesForDisplay(rules) {
-  var buckets = [];
-  rules.forEach(function(r, i) {
-    var g = (r.group || '').trim(), last = buckets[buckets.length - 1];
-    if (!last || last.name !== g || rulePhase(r) !== rulePhase(rules[last.indices[0]])) {
-      last = {name:g, indices:[]}; buckets.push(last);
-    }
-    last.indices.push(i);
-  });
-  return buckets;
-}
 function isFinalRule(r) { var kind=String(r.rule_type).toLowerCase(); return kind==='match'||kind==='final'; }
 function rulePhase(r) {return isFinalRule(r) ? (r.source ? 2 : 3) : (r.source ? 0 : 1);}
 function orderedRules(rules) {
@@ -2778,7 +2773,7 @@ function orderedRules(rules) {
     return rulePhase(a) - rulePhase(b) || Number(b.priority || 0) - Number(a.priority || 0) || Number(a.index) - Number(b.index);
   });
 }
-var RULE_FLOW_SELECTED = 0, RULE_FLOW_ERROR = false, RULE_FLOW_CLIENT = '';
+var RULE_FLOW_ERROR = false, RULE_FLOW_CLIENT = '';
 var RULE_TRACE=null,RULE_TRACE_PENDING=false,RULE_TRACE_GENERATION=0,RULE_RULE_REVISION=null,RULE_TRACE_CONTEXT=null;
 var RULE_READ_PENDING=false,RULE_LOAD_GENERATION=0,RULE_SNAPSHOT_MODE=null;
 function ruleTraceContext(){var s=SR_STATE.status||{};return JSON.stringify([s.proxy_mode,s.active_node,s.node_count,s.running,s.transparent_proxy,s.cn_ipset_direct]);}
@@ -2857,7 +2852,6 @@ function changeFlowDevice() {
   var manual=value==='manual',field=srElement('rule-flow-client');
   srElement('rule-flow-manual').hidden=!manual;
   field.value=manual || value==='global'?'':value;
-  RULE_FLOW_SELECTED=0;
   invalidateRuleTrace(value?'已切换模拟来源，输入网站或目的 IP 后检查。':'配置总览。请选择设备后模拟。');
 }
 function chooseFlowHost(ip) {
@@ -2918,8 +2912,14 @@ function openBuiltinSettings() {
   srElement('builtin-route-settings').open=true;
   srElement('builtin-route-target').focus();
 }
+function ruleByIndex(index) {
+  if(index==null)return;
+  var rows=SR_STATE.ruleRows||[],i=Number(index),row=rows[i];
+  // Saved rules arrive in configuration order. Also accept sparse snapshots.
+  return row && Number(row.index)===i ? row : rows.find(function(r){return Number(r.index)===i;});
+}
 function openMapGroup(index) {
-  var rule=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(index);});
+  var rule=ruleByIndex(index);
   if(!rule)return;
   if(isFinalRule(rule)){openDeviceFallback(rule.source || '');return;}
   var name=(rule.group||'').trim(), source=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT;
@@ -3058,13 +3058,12 @@ function previewDeviceFlow() {
   var text=srElement('rule-flow-client').value.trim();
   if(text && (!sourceNetwork(text) || text.indexOf('/')>=0)) {srShowMsg('设备来源请填写单个 IPv4 或 IPv6 地址。','err');return;}
   invalidateRuleTrace('已显示此来源可用的路径，输入目的地址可检查具体命中。');
-  RULE_FLOW_SELECTED=0;renderRuleFlow();
 }
 function resetDeviceFlow() {
   FLOW_EDIT_NETWORK='';FLOW_EDIT_GROUP=null;
   srElement('rule-flow-device').value='';srElement('rule-flow-manual').hidden=true;
   ['rule-flow-client','rule-flow-destination','rule-flow-port','rule-flow-ip'].forEach(function(id){srElement(id).value='';});
-  srElement('rule-flow-resolve').checked=true;RULE_FLOW_SELECTED=0;
+  srElement('rule-flow-resolve').checked=true;
   invalidateRuleTrace('连线表示可能的出口，每次匹配只选一个。输入目的地址可检查命中路径；点击规则组可查看规则。');
 }
 function traceRuleFlow() {
@@ -3094,8 +3093,12 @@ function traceRuleFlow() {
     if(!finish())return;
     if(!d || d.ok!==true || !d.trace || !ruleTargetKnown(d.trace.action) || !Array.isArray(d.trace.steps)){srElement('rule-flow-query-state').textContent='检查结果无效，请刷新或安装完整新版插件。';return;}
     if(RULE_RULE_REVISION && d.revision!==RULE_RULE_REVISION){invalidateRuleTrace('规则已变化，请刷新规则后重新检查。');srLoadRules();return;}
-    RULE_TRACE=d;RULE_FLOW_CLIENT=d.source || '';RULE_FLOW_SELECTED=-1;
-    if(SR_STATE.status){SR_STATE.status.proxy_mode=d.mode;SR_STATE.status.active_node=d.active_node;SR_STATE.status.running=d.running;SR_STATE.status.transparent_proxy=d.transparent_proxy;SR_STATE.status.cn_ipset_direct=d.cn_ipset_direct;}
+    RULE_TRACE=d;RULE_FLOW_CLIENT=d.source || '';
+    if(SR_STATE.status){
+      var nodeChanged=SR_STATE.status.active_node!==d.active_node;
+      SR_STATE.status.proxy_mode=d.mode;SR_STATE.status.active_node=d.active_node;SR_STATE.status.running=d.running;SR_STATE.status.transparent_proxy=d.transparent_proxy;SR_STATE.status.cn_ipset_direct=d.cn_ipset_direct;
+      if(nodeChanged && SR_STATE.page==='nodes')renderNodes();
+    }
     srElement('rule-flow-query-state').textContent='本次查询：'+d.destination+':'+d.port+' · '+(d.source ? '来源 '+d.source : '未指定设备，仅判断全局规则')+'。结果来自保存的配置，不代表既有连接或网页连通性。';
     renderRuleFlow();
   },function(e){
@@ -3116,11 +3119,23 @@ function orderedFlowRules(rows) {
 function byBindingPriority(a,b) {return (b.priority||0)-(a.priority||0);}
 function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
   var deviceConfig=configuredOnly && client;
-  if(mode==='global'||mode==='direct')return deviceConfig?[]:[{kind:'mode',title:mode==='global'?'全局代理':'全部直连',note:'跳过全部分流规则',targets:[mode==='global'?'proxy':'direct']}];
+  if(mode==='global'||mode==='direct')return deviceConfig?[]:[{kind:'mode',title:mode==='global'?'全局代理':'全部直连',targets:[mode==='global'?'proxy':'direct']}];
   var ordered=orderedRows||orderedFlowRules(rows), result=[];
+  // Each call receives one routing phase, with adjacent members in display order.
   function group(kind,label,rules) {
-    groupRulesForDisplay(rules).forEach(function(b){var members=b.indices.map(function(i){return rules[i];}),enabled=members.filter(function(r){return r.enabled!==false;}),first=Number(members[0].priority||0),last=Number(members[members.length-1].priority||0);
-      result.push({kind:kind,bindingPriority:members[0].bindingPriority,title:b.name||'未分组',phaseLabel:label,note:'优先级 '+first+(first!==last?'～'+last:'')+' · 启用 '+enabled.length+'/'+members.length+(enabled.length?'':' · 已停用')+(kind.indexOf('device_')===0&&!client?' · 待指定设备':''),targets:(enabled.length?enabled:members).map(function(r){return r.target;}).filter(function(t,i,a){return a.indexOf(t)===i;}),count:members.length,enabledCount:enabled.length,disabled:!enabled.length,indices:members.map(function(r){return Number(r.index);}),rule:members.length===1?members[0]:null});
+    var lastName,stage;
+    rules.forEach(function(rule){
+      var name=(rule.group||'').trim();
+      if(name!==lastName){
+        lastName=name;
+        stage={kind:kind,bindingPriority:rule.bindingPriority,title:name||'未分组',phaseLabel:label,targets:[],disabled:true,indices:[]};
+        result.push(stage);
+      }
+      stage.indices.push(Number(rule.index));
+      if(rule.enabled!==false){
+        stage.disabled=false;
+        if(!stage.targets.includes(rule.target))stage.targets.push(rule.target);
+      }
     });
   }
   function applies(source) {
@@ -3142,7 +3157,8 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
     linked.sort(function(a,b){return b.bindingPriority-a.bindingPriority;});
     group('device_link','设备关联组',linked);
   }
-  if(!deviceConfig){
+  var assigned=client && hasDeviceAssignment(client);
+  if(!deviceConfig && !assigned){
     var shared=ordered.filter(function(r){return !r.source&&!isFinalRule(r);});
     if(SR_STATE.globalBindings){
       var bindings=new Map(SR_STATE.globalBindings.map(function(b){return [b.group,b];}));
@@ -3151,37 +3167,27 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
         return Object.assign({},r,{target:b&&b.target||r.target,bindingPriority:b&&b.priority||0});
       }).sort(function(a,b){return b.bindingPriority-a.bindingPriority;});
     }
-    if(!hasDeviceAssignment(client))group('global_rule','全局自定义规则',shared);
-    result.push({kind:'builtin',title:'内置国内 / 局域网',note:'匹配国内域名、国内 IP 和局域网地址',targets:[SR_STATE.builtinRoute||'direct']});
+    group('global_rule','全局自定义规则',shared);
   }
+  if(!deviceConfig)result.push({kind:'builtin',title:'内置国内 / 局域网',targets:[SR_STATE.builtinRoute||'direct']});
   function reachableFinals(rules) {
     var first=rules.findIndex(function(r){return r.enabled!==false;});
     return first<0?rules:rules.slice(0,first+1);
   }
   var deviceFinals=reachableFinals(devices.filter(isFinalRule));group('device_final','设备兜底',deviceFinals);
-  if(client && hasDeviceAssignment(client)){
+  if(assigned){
     if(!ordered.some(function(r){return r.source && r.enabled!==false && isFinalRule(r) && sourceContains(r.source,client);}))
-      result.push({kind:'device_default',defaultFallback:true,title:'设备默认出口',note:'设备规则未命中时使用代理',targets:['proxy']});
+      result.push({kind:'device_default',title:'设备默认出口',targets:['proxy']});
     return result;
   }
   if(deviceConfig)return result;
   var finals=reachableFinals(ordered.filter(function(r){return !r.source&&isFinalRule(r);}));group('global_final','全局设备兜底',finals);
-  if(!finals.some(function(r){return r.enabled!==false;}))result.push({kind:'global_final',defaultFallback:true,title:'全局设备兜底',note:'没有启用的全局最终规则，未命中时代理',targets:['proxy']});
+  if(!finals.some(function(r){return r.enabled!==false;}))result.push({kind:'global_final',title:'全局设备兜底',targets:['proxy']});
   return result;
-}
-function selectRuleFlow(index) {
-  var row=ruleFlowModel(SR_STATE.ruleRows||[],RULE_SNAPSHOT_MODE||'rule',RULE_FLOW_CLIENT)[index];
-  if(row && row.indices){var member=(SR_STATE.ruleRows||[]).find(function(r){return Number(r.index)===Number(row.indices[0]);});if(member && !isFinalRule(member) && !changeRuleGroup((member.group||'').trim()))return false;}
-  RULE_FLOW_SELECTED=index;renderRuleFlow();var button=srElement('rule-flow-step-'+index);if(button)button.focus();return true;
 }
 function toggleRuleFlow() {
   var host=srElement('rule-flow'),button=srElement('rule-flow-toggle');host.hidden=!host.hidden;
   button.textContent=host.hidden?'展开概览':'收起概览';button.setAttribute('aria-expanded',String(!host.hidden));
-}
-function showFlowRuleList(kind, index) {
-  if(typeof index==='number') {if(selectRuleFlow(index)===false)return;}
-  else if(!changeRuleGroup(RULE_SELECTED_GROUP))return;
-  srElement('rule-workspace').scrollIntoView({behavior:'smooth',block:'start'});
 }
 function ruleSourceLabel(rule) {
   return rule.source || ((rule.group||'').trim() && !isFinalRule(rule)?'由组绑定决定':'全局设备');
@@ -3190,7 +3196,7 @@ function flowRuleKind(rule){return rule.source ? (isFinalRule(rule)?'device_fina
 function flowMatchedRule(edit) {
   if(rulePending||RULE_READ_PENDING||RULE_FLOW_ERROR)return;
   if(!RULE_TRACE || RULE_TRACE.trace.matched_rule==null)return;
-  var index=Number(RULE_TRACE.trace.matched_rule), rule=(SR_STATE.ruleRows||[]).filter(function(r){return Number(r.index)===index;})[0], expected=RULE_TRACE.trace.matched_snapshot;
+  var index=Number(RULE_TRACE.trace.matched_rule), rule=ruleByIndex(index), expected=RULE_TRACE.trace.matched_snapshot;
   if(!rule || !expected || RULE_TRACE.revision!==RULE_RULE_REVISION || ['source','name','group','rule_type','pattern','target','priority','enabled'].some(function(k){return rule[k]!==expected[k];})){
     invalidateRuleTrace('规则已变化，请重新检查后编辑。');srLoadRules();return;
   }
@@ -3200,7 +3206,7 @@ function flowMatchedRule(edit) {
 }
 function flowTraceHtml(data) {
   if(!data)return '';
-  var t=data.trace, row=t.matched_rule==null?null:(SR_STATE.ruleRows||[]).filter(function(r){return Number(r.index)===Number(t.matched_rule);})[0];
+  var t=data.trace, row=ruleByIndex(t.matched_rule);
   var title=(t.definitive?'判定：':'待验证：')+(RULE_TARGET_LABEL[t.action]||t.action);
   var builtinMatch=t.matched_builtin && t.steps.some(function(step){return step.outcome==='matched' && step.rule_type!=='final';});
   var reason=data.mode!=='rule' ? '当前模式跳过分流规则。' : row ? '命中配置 #'+(Number(t.matched_rule)+1)+' · '+(row.name||row.group||RULE_TYPE_LABEL[row.rule_type]||row.rule_type)+' · '+row.pattern+' · 优先级 '+Number(row.priority||0) : builtinMatch ? '命中内置国内 / 局域网分组。' : hasDeviceAssignment(data.source)?'使用设备默认出口。':'使用全局设备兜底。';
@@ -3215,7 +3221,7 @@ function flowTraceHtml(data) {
   if(t.action.indexOf('group:')===0){reason+=(data.group_type==='fallback'?' · 首选成员（TCP 失败后尝试备用）：':' · 出口成员：')+(data.node_name||'不可用');if(!data.node_name)warnings.push('分组当前成员不可用；实际连接将报错，请重新选择成员。');}
   if(t.action.indexOf('node:')===0){reason+=' · 指定节点：'+(data.node_name||'不可用');if(!data.node_name)warnings.push('指定节点不存在，连接会失败，不会改走全局节点。');}
   var labels={source_mismatch:'来源不符 · 跳过',needs_ip:'缺少 IP · 待验证',not_matched:'未命中',matched:t.definitive?'命中 · 此处结束':'暂定匹配 · 前序 IP 条件待验证'};
-  var checks=t.steps.map(function(s){var r=s.config_index==null?null:(SR_STATE.ruleRows||[]).filter(function(r){return Number(r.index)===Number(s.config_index);})[0];
+  var checks=t.steps.map(function(s){var r=ruleByIndex(s.config_index);
     var text=s.rule_type==='builtin'?'内置规则 · 已检查 '+s.checked+' 项':s.config_index!=null?'配置 #'+(Number(s.config_index)+1)+' · '+(r ? (r.name||r.group||r.pattern||'兜底') : s.pattern):'内置 '+(RULE_TYPE_LABEL[s.rule_type]||s.rule_type)+' · '+(s.pattern||'');
     var condition=s.rule_type==='builtin'?'内置国内 / 局域网条件汇总':'来源 '+(s.source||'全局')+' · '+(RULE_TYPE_LABEL[s.rule_type]||s.rule_type)+' '+(s.pattern||'')+' → '+(RULE_TARGET_LABEL[s.action]||s.action||'');
     return '<li class="'+(s.outcome==='matched'?'matched':'')+'">'+srEsc(text)+' <span class="badge">'+srEsc(labels[s.outcome]||s.outcome)+'</span><div class="hint">'+srEsc(condition)+'</div></li>';
@@ -3234,22 +3240,21 @@ function renderRuleFlow() {
   }
   srElement('rule-flow-state').textContent=(!known?'状态未知':running?'服务运行中':'服务已停止')+' · '+(mode==='global'?'全局模式':mode==='direct'?'直连模式':'规则模式');
   if(!Array.isArray(SR_STATE.ruleRows)){host._flowHtml=null;host.innerHTML='<p class="hint">'+(RULE_FLOW_ERROR?'规则加载失败，请刷新后重试。':'正在加载规则…')+'</p>';return;}
-  var rows=ruleFlowModel(SR_STATE.ruleRows,mode,RULE_FLOW_CLIENT),t=RULE_TRACE&&RULE_TRACE.trace,winner=-1;
+  var rows,t=RULE_TRACE&&RULE_TRACE.trace,winner=-1;
   if(t){
+    rows=ruleFlowModel(SR_STATE.ruleRows,mode,RULE_FLOW_CLIENT);
     var matched=t.steps.find(function(step){return step.outcome==='matched';}),kind;
     if(mode!=='rule')kind='mode';
     else if(t.matched_rule!=null){
-      var original=SR_STATE.ruleRows.find(function(r){return Number(r.index)===Number(t.matched_rule);});
+      var original=ruleByIndex(t.matched_rule);
       if(original)kind=matched && matched.source && !original.source?'device_link':flowRuleKind(original);
     }else kind=t.matched_builtin && matched && matched.rule_type!=='final'?'builtin':hasDeviceAssignment(RULE_FLOW_CLIENT)?'device_default':'global_final';
     winner=rows.findIndex(function(r){
-      return r.kind===kind && !r.disabled && (t.matched_rule!=null ? r.indices&&r.indices.includes(Number(t.matched_rule)) : kind!=='global_final'||r.defaultFallback);
+      return r.kind===kind && !r.disabled && (t.matched_rule!=null ? r.indices&&r.indices.includes(Number(t.matched_rule)) : !r.indices);
     });
   }
   var all=SR_STATE.ruleRows,enabled=all.filter(function(r){return r.enabled!==false;}).length;
   srElement('rule-flow-summary').textContent='与下方同一配置：共 '+all.length+' 条 · 启用 '+enabled+' 条 · 停用 '+(all.length-enabled)+' 条。图中不受列表搜索或分页影响。'+(rulePending?' 正在保存/应用并核对结果…':RULE_READ_PENDING?' 正在读取最新状态…':RULE_FLOW_ERROR?' 当前为上次快照，请刷新。':'');
-  if(RULE_FLOW_SELECTED<0 && winner>=0)RULE_FLOW_SELECTED=winner;
-  RULE_FLOW_SELECTED=Math.max(0,Math.min(RULE_FLOW_SELECTED,rows.length-1));
   var html=sharedFlowGraph(all,mode,rows,winner)+flowTraceHtml(RULE_TRACE);
   if(RULE_FLOW_ERROR)html+='<p class="flow-warning">规则刷新失败，显示的是上次快照。</p>';
   if(host._flowHtml!==html){host.innerHTML=html;host._flowHtml=html;}
@@ -3387,14 +3392,14 @@ function deleteRuleGroup(enc) {
   });
 }
 function inspectRule(index) {
-  var rule = (SR_STATE.ruleRows || []).filter(function (r) { return Number(r.index) === Number(index); })[0];
+  var rule = ruleByIndex(index);
   if (!rule) return;
   srElement('rule-detail-text').textContent = '来源：' + ruleSourceLabel(rule) + '\n类型：' + (RULE_TYPE_LABEL[rule.rule_type] || rule.rule_type) + '\n匹配：' + rule.pattern + '\n处理：' + (RULE_TARGET_LABEL[rule.target] || rule.target) + '\n优先级：' + Number(rule.priority || 0) + '\n分组：' + (rule.group || '未分组') + '\n状态：' + (rule.enabled === false ? '已停用' : '已启用');
   srElement('rule-dialog').showModal();
 }
 var RULE_EDIT_ROW = null;
 function editRule(index) {
-  var r = (SR_STATE.ruleRows || []).filter(function(r) { return Number(r.index) === Number(index); })[0];
+  var r = ruleByIndex(index);
   if (!r || isFinalRule(r) || ruleWorkspaceLocked() || !discardRuleDraft()) return;
   resetRuleEditor();RULE_SELECTED_GROUP=(r.group||'').trim();
   RULE_EDIT_ROW = JSON.parse(JSON.stringify(r));
@@ -3550,7 +3555,7 @@ function addRule() {
   });
 }
 function ruleIndexRequest(i, extra) {
-  var row=(SR_STATE.ruleRows || []).filter(function(r) {return Number(r.index)===Number(i);})[0];
+  var row=ruleByIndex(i);
   if (!row) {srShowMsg('规则已变化，请刷新后重试。','err');return null;}
   var expected=Object.assign({},row);delete expected.index;
   return Object.assign({index:i,expected:expected},extra || {});
@@ -3633,13 +3638,11 @@ window.addEventListener('beforeunload', function (event) {
   if (dnsPolicyDirty || ruleWorkspaceDirty() || srElement('config-text').value !== (savedConfigText === null ? '' : savedConfigText)) { event.preventDefault(); event.returnValue = ''; }
 });
 
-var pendingUpdateAsset = null;
 function srCheckUpdate() {
   var st = srElement('update-status');
   var btn = srElement('btn-apply-update');
   st.textContent = '正在检查 GitHub 发布版本…';
   btn.style.display = 'none';
-  pendingUpdateAsset = null;
   srApi('check_update', null, function (d) {
     if (d.ok === false) {
       st.textContent = d.msg || '检查失败';
@@ -3650,9 +3653,8 @@ function srCheckUpdate() {
     var link = srElement('btn-update-link');
     if (d.html_url) link.href = d.html_url;
     if (d.available) {
-      pendingUpdateAsset = d.asset_url || null;
-      btn.style.display = pendingUpdateAsset ? '' : 'none';
-      if (pendingUpdateAsset) srShowMsg(d.msg || '有可用更新', 'ok');
+      btn.style.display = d.asset_url ? '' : 'none';
+      if (d.asset_url) srShowMsg(d.msg || '有可用更新', 'ok');
       else {
         st.textContent = '发现新版 v' + d.latest + '，但未找到适配当前机型的软件包。可查看发布记录。';
         srShowMsg(st.textContent, 'info');
@@ -3708,9 +3710,7 @@ function srApplyUpdate() {
   var st = srElement('update-status');
   if (!confirm('下载并安装最新完整插件？\n\n订阅、节点和规则会保留。服务将重启，网络连接可能短暂中断。')) return;
   if (srUpdateJobId) return;
-  var random = new Uint8Array(16);
-  window.crypto.getRandomValues(random);
-  srUpdateJobId = Array.prototype.map.call(random, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  srUpdateJobId = newRequestId();
   srUpdateLaunchDeadline = Date.now() + 30000;
   st.textContent = '正在启动更新任务…';
   srElement('btn-apply-update').style.display = 'none';
