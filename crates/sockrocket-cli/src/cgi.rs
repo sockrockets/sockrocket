@@ -1399,7 +1399,7 @@ fn use_tcp_probe(node: &sockrocket_core::Node, http: bool) -> bool {
 
 async fn probe_node_latency(node: &sockrocket_core::Node, quick: bool) -> Result<u32> {
     if quick {
-        return sockrocket_core::tcp_latency_test(&node.server, node.port, 3).await;
+        return sockrocket_core::node_tcp_latency_test(node, 3).await;
     }
     let outbound = sockrocket_core::create_outbound_unwarmed(node)?;
     sockrocket_core::quick_http_latency_test(&outbound, 5).await

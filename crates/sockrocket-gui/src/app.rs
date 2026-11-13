@@ -2431,7 +2431,7 @@ impl AppState {
                         sockrocket_core::ProxyProtocol::Tuic { .. }
                         | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
                         | sockrocket_core::ProxyProtocol::Wireguard { .. }) {
-                        return sockrocket_core::tcp_latency_test(&node.server, node.port, 3)
+                        return sockrocket_core::node_tcp_latency_test(&node, 3)
                             .await.map_err(|e| (format!("{e:#}"), sockrocket_core::classify_probe_error(&e)));
                     }
                     // Unwarmed: this outbound lives only for the latency
@@ -2450,9 +2450,7 @@ impl AppState {
                             // Classify the authoritative proxy-probe failure so
                             // the UI can show why the node is unreachable.
                             let kind = sockrocket_core::classify_probe_error(&http_err);
-                            let tcp_result = sockrocket_core::tcp_latency_test(
-                                &node.server, node.port, 2,
-                            ).await;
+                            let tcp_result = sockrocket_core::node_tcp_latency_test(&node, 2).await;
                             let msg = match tcp_result {
                                 Ok(_) => format!(
                                     "proxy probe failed: {:#} (tcp port reachable but node unusable)",
@@ -3702,11 +3700,6 @@ impl AppState {
                         for n in &mut new_nodes {
                             n.extra.insert("sub_url".to_string(), url.clone());
                         }
-                        // Preserve selection by stable server identity across renames.
-                        let selected_fingerprint = this
-                            .selected_node
-                            .and_then(|i| this.nodes.get(i))
-                            .map(node_fingerprint);
                         let active_fingerprint = this
                             .active_proxy_node
                             .and_then(|i| this.nodes.get(i))
@@ -3714,25 +3707,48 @@ impl AppState {
 
                         let count = new_nodes.len();
                         let mut config = this.snapshot_config();
-                        sockrocket_core::config::dedup::apply_subscription_refresh(
-                            &mut config,
-                            vec![(url.clone(), new_nodes)],
-                        );
+                        let migrations =
+                            sockrocket_core::config::dedup::refresh_with_dns_migrations(
+                                &mut config,
+                                vec![(url.clone(), new_nodes)],
+                            )
+                            .unwrap_or_default();
+                        this.selected_node = config.active_node;
                         this.nodes = config.nodes;
                         this.subscriptions = config.subscriptions;
-
-                        // Restore selection/active by fingerprint
-                        if let Some(fingerprint) = selected_fingerprint {
-                            this.selected_node = this
-                                .nodes
-                                .iter()
-                                .position(|n| node_fingerprint(n) == fingerprint);
-                        }
-                        if let Some(fingerprint) = active_fingerprint {
+                        this.groups = config.groups;
+                        this.device_rule_groups = config.device_rule_groups;
+                        (this.rules, this.router_rules) =
+                            sockrocket_gui::desktop_rules::split(config.rules);
+                        if let Some(fingerprint) = &active_fingerprint {
+                            let current = migrations.get(fingerprint).unwrap_or(fingerprint);
                             this.active_proxy_node = this
                                 .nodes
                                 .iter()
-                                .position(|n| node_fingerprint(n) == fingerprint);
+                                .position(|n| node_fingerprint(n) == *current);
+                        }
+                        if this.proxy_running
+                            && !migrations.is_empty()
+                            && this.active_proxy_node.is_some()
+                        {
+                            // The highlighted row can differ from the live connection.
+                            // Publish the new catalog using the actual active endpoint.
+                            let highlighted = this.selected_node;
+                            this.selected_node = this.active_proxy_node;
+                            let needs_restart = this.health_check.enabled || !this.apply_outbound_hot_swap(cx);
+                            this.selected_node = highlighted;
+                            if needs_restart {
+                                if highlighted == this.active_proxy_node {
+                                    this.restart_proxy_with_current_state(cx);
+                                } else {
+                                    // Restarting here would switch to a different highlighted
+                                    // node. Keep the connection live and show its pending state.
+                                    if active_fingerprint.as_ref().is_some_and(|fp| migrations.contains_key(fp)) {
+                                        this.active_proxy_node = None;
+                                    }
+                                    this.proxy_status = "Subscription DNS changed. Reconnect to apply the updated configuration.".into();
+                                }
+                            }
                         }
 
                         // Update last_updated timestamp

@@ -69,7 +69,7 @@ pub use proxy::service::ProxyService;
 pub use proxy::socks5::Socks5Server;
 pub use proxy::speedtest::{
     ProbeFailureKind, SpeedTestResult, classify_probe_error, http_latency_test, latency_test_node,
-    quick_http_latency_test, speed_test_node, tcp_latency_test,
+    node_tcp_latency_test, quick_http_latency_test, speed_test_node, tcp_latency_test,
 };
 pub use proxy::ss::SsOutbound;
 pub use proxy::trojan::TrojanOutbound;

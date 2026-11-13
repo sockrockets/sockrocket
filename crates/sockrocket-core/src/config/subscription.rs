@@ -131,6 +131,7 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 enum BodyErrorKind {
     Transport,
     Http,
+    Representation,
     Permanent,
 }
 
@@ -175,8 +176,26 @@ async fn fetch_subscription_route(
     client: &reqwest::Client,
     sub: &Subscription,
 ) -> Result<(String, Vec<Node>), BodyError> {
-    let workers =
-        std::array::from_fn(|_| retry_subscription_route(|| fetch_valid_subscription(client, sub)));
+    // Some providers serve different node or DNS settings for the same Clash URL.
+    let clash = sub.format == "clash"
+        || (matches!(sub.format.as_str(), "auto" | "")
+            && url::Url::parse(&sub.url).is_ok_and(|url| {
+                url.query_pairs()
+                    .any(|(key, value)| key == "clash" && value == "1")
+            }));
+    let workers = std::array::from_fn(|_| {
+        retry_subscription_route(|| async {
+            let result = fetch_valid_subscription(client, sub, clash).await;
+            match result {
+                Err(error) if clash && error.kind == BodyErrorKind::Representation => {
+                    fetch_valid_subscription(client, sub, false)
+                        .await
+                        .map_err(|fallback| preferred_route_error(error, fallback))
+                }
+                result => result,
+            }
+        })
+    });
     first_successful_workers(workers).await
 }
 
@@ -239,7 +258,10 @@ where
 {
     for retry in 0..=SUB_FETCH_RETRIES {
         match attempt().await {
-            Err(error) if error.kind != BodyErrorKind::Permanent && retry < SUB_FETCH_RETRIES => {
+            Err(error)
+                if matches!(error.kind, BodyErrorKind::Transport | BodyErrorKind::Http)
+                    && retry < SUB_FETCH_RETRIES =>
+            {
                 tokio::time::sleep(RETRY_BACKOFF * (1 << retry)).await;
             }
             result => return result,
@@ -285,15 +307,16 @@ fn preferred_route_error(direct: BodyError, proxy: BodyError) -> BodyError {
 async fn fetch_valid_subscription(
     client: &reqwest::Client,
     sub: &Subscription,
+    clash: bool,
 ) -> Result<(String, Vec<Node>), BodyError> {
-    let content = fetch_body(client, &sub.url).await?;
+    let content = fetch_body(client, &sub.url, clash).await?;
     let nodes = parse_subscription_content(&content, &sub.format).map_err(|error| BodyError {
-        kind: BodyErrorKind::Permanent,
+        kind: BodyErrorKind::Representation,
         error,
     })?;
     if nodes.is_empty() {
         return Err(BodyError {
-            kind: BodyErrorKind::Permanent,
+            kind: BodyErrorKind::Representation,
             error: anyhow::anyhow!(
                 "Subscription contains no usable nodes; existing nodes were kept"
             ),
@@ -333,8 +356,12 @@ pub(super) fn subscription_client(
     builder.build().context("Failed to create HTTP client")
 }
 
-async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyError> {
-    let mut response = match client.get(url).send().await {
+async fn fetch_body(client: &reqwest::Client, url: &str, clash: bool) -> Result<String, BodyError> {
+    let mut request = client.get(url);
+    if clash {
+        request = request.header(reqwest::header::USER_AGENT, "clash.meta");
+    }
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             return Err(BodyError {
@@ -347,7 +374,11 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
     let status = response.status();
     if !status.is_success() {
         return Err(BodyError {
-            kind: BodyErrorKind::Http,
+            kind: if clash && matches!(status.as_u16(), 403 | 406 | 415) {
+                BodyErrorKind::Representation
+            } else {
+                BodyErrorKind::Http
+            },
             error: anyhow::anyhow!("Subscription returned HTTP {status}"),
         });
     }
@@ -383,7 +414,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
         }
     }
     String::from_utf8(body).map_err(|error| BodyError {
-        kind: BodyErrorKind::Permanent,
+        kind: BodyErrorKind::Representation,
         error: anyhow::Error::from(error).context("Subscription is not valid UTF-8"),
     })
 }

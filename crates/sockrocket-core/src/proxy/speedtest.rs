@@ -215,6 +215,30 @@ pub fn tcp_latency_test(
     })
 }
 
+/// TCP-only probe using the same endpoint DNS policy as the node's outbound.
+pub fn node_tcp_latency_test(
+    node: &crate::Node,
+    timeout_secs: u64,
+) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
+    Box::pin(async move {
+        let policy = crate::config::server_dns::ServerDns::from_node(node)?;
+        let host = node.server.trim_matches(['[', ']']);
+        if let Some(policy) = policy.filter(|_| host.parse::<std::net::IpAddr>().is_err()) {
+            let resolver = crate::dns::DnsResolver::with_config(policy.config()?);
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            let start = std::time::Instant::now();
+            tokio::time::timeout(
+                timeout,
+                super::server_dns::connect_endpoint_tcp(&resolver, host, node.port),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("TCP probe timed out"))??;
+            return Ok(start.elapsed().as_millis() as u32);
+        }
+        tcp_latency_test(&node.server, node.port, timeout_secs).await
+    })
+}
+
 /// Perform an HTTP latency test through a proxy outbound with warmup.
 ///
 /// Does two connections: a warmup (to establish QUIC/TLS sessions for
