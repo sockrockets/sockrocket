@@ -16,6 +16,9 @@ elif command -v llvm-strip >/dev/null 2>&1; then
   strip_tool=$(command -v llvm-strip)
 elif [ -x /opt/homebrew/opt/llvm@21/bin/llvm-strip ]; then
   strip_tool=/opt/homebrew/opt/llvm@21/bin/llvm-strip
+elif compgen -G '/usr/lib/llvm-*/bin/llvm-strip' >/dev/null; then
+  strip_tools=(/usr/lib/llvm-*/bin/llvm-strip)
+  strip_tool=${strip_tools[0]}
 else
   strip_tool=$(command -v aarch64-linux-musl-strip) || {
     echo 'Set MERLIN_STRIP_TOOL to an ELF-capable llvm-strip or aarch64-linux-musl-strip.' >&2
@@ -32,3 +35,8 @@ binary="${CARGO_TARGET_DIR:-$PWD/target}/aarch64-unknown-linux-musl/release/sock
 python3 tools/verify-merlin-allocator.py "$binary"
 cp "$binary" "$binary.symbols"
 "$strip_tool" --strip-all "$binary"
+bytes=$(wc -c < "$binary")
+if (( bytes > 11000000 )); then
+  echo "Merlin ARM64 CLI is $bytes bytes; the package limit is 11000000." >&2
+  exit 1
+fi

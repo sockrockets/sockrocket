@@ -219,12 +219,15 @@ jobs:
               - 'docs/merlin-models.md'
               - 'tools/verify-merlin-targets.py'
               - 'tools/build-merlin-cross.sh'
+              - 'tools/build-merlin-musl.sh'
+              - 'tools/zig-cc-aarch64-musl'
+              - 'tools/zig-ar-aarch64-musl'
               - 'tools/merlin-arm64-rustc-flags.sh'
               - 'tools/merlin-rustc-paths.sh'
               - 'tools/verify-merlin-allocator.py'
 
       - name: Install cross
-        if: steps.changes.outputs.merlin == 'true'
+        if: steps.changes.outputs.merlin == 'true' && matrix.name != 'aarch64'
         run: |
           if ! cross --version 2>/dev/null | grep -Eq '^cross 0[.]2[.]5([[:space:]]|$)'; then
             cargo install cross --version 0.2.5 --locked --force

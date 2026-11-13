@@ -42,7 +42,7 @@ target/aarch64-unknown-linux-musl/release/sockrocket-cli.symbols
 
 这个入口只构建 ARM64 CLI。ARMv7 构建继续使用现有 `cross` 流程；不能把 ARM64 校验器直接用于 ARMv7。
 
-本地和 Actions 的正式包使用 Rust 1.99.1，采用工作区 release 的 O3、fat LTO、单个代码生成单元和 panic 展开。Actions 通过 `bash tools/build-merlin-cross.sh <target>` 构建。两个 ARM64 入口共用 `tools/merlin-arm64-rustc-flags.sh`，最终使用 `rust-lld` 链接，内联阈值为 80，链接器可安全合并相同节。仅 YAML 读写和日志过滤表达式的解析依赖使用体积优化；依赖源码路径在编译时映射为包名和文件名。剥离符号前先校验分配器。变更这些参数时，应对比剥离后的文件大小和实际转发吞吐。ARMv7 沿用原有 cross 构建。
+本地和 Actions 的正式包使用 Rust 1.99.1，采用工作区 release 的 O3、fat LTO、单个代码生成单元和 panic 展开。Actions 通过 `bash tools/build-merlin-cross.sh <target>` 构建。ARM64 CI 复用本地构建脚本，由 Zig 0.16.0 编译 C 依赖，最终使用 `rust-lld` 链接，内联阈值为 80，链接器可安全合并相同节。仅 YAML 读写和日志过滤表达式的解析依赖使用体积优化；依赖源码路径在编译时映射为包名和文件名。剥离符号前先校验分配器，剥离后的 ARM64 CLI 上限为 11,000,000 字节。变更这些参数时，应对比剥离后的文件大小和实际转发吞吐。ARMv7 沿用原有 cross 构建。
 
 ## 分配器验收与来源记录
 
