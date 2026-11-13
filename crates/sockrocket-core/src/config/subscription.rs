@@ -123,7 +123,7 @@ const DIRECT_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const PROXY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SUB_FETCH_CONCURRENCY_PER_ROUTE: usize = 3;
-// Four attempts per worker: the initial request and up to three retries.
+// Four attempts per user agent and worker, all within one download deadline.
 const SUB_FETCH_RETRIES: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -183,18 +183,16 @@ async fn fetch_subscription_route(
                 url.query_pairs()
                     .any(|(key, value)| key == "clash" && value == "1")
             }));
-    let workers = std::array::from_fn(|_| {
-        retry_subscription_route(|| async {
-            let result = fetch_valid_subscription(client, sub, clash).await;
-            match result {
-                Err(error) if clash && error.kind == BodyErrorKind::Representation => {
-                    fetch_valid_subscription(client, sub, false)
-                        .await
-                        .map_err(|fallback| preferred_route_error(error, fallback))
-                }
-                result => result,
+    let workers = std::array::from_fn(|_| async {
+        let fetch = |clash| fetch_valid_subscription(client, sub, clash);
+        match retry_subscription_route(|| fetch(clash)).await {
+            Err(error) if clash && error.kind == BodyErrorKind::Representation => {
+                retry_subscription_route(|| fetch(false))
+                    .await
+                    .map_err(|_| error)
             }
-        })
+            result => result,
+        }
     });
     first_successful_workers(workers).await
 }
