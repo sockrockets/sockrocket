@@ -35,9 +35,6 @@ KS_SCRIPTS="$KS_DIR/scripts"
 KS_INIT="$KS_DIR/init.d"
 MODULE="sockrocket"   # must match the package directory name
 
-# Standard Merlin path (used when NOT in koolshare mode)
-WWW_SOCKROCKET="/www/ext/sockrocket"
-
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.info "$*";  printf "${CYAN}[Sockrocket] %s${NC}\n" "$*"; }
 ok()    { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.info "$*";  printf "${GREEN}[Sockrocket] ✓ %s${NC}\n" "$*"; }
@@ -217,6 +214,9 @@ if [ "$UPDATE_ONLY" = "true" ]; then
     [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && WAS_RUNNING=true
     [ "$WAS_RUNNING" = "true" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" stop 2>/dev/null || true
     install_binary
+    if [ -f "$SCRIPT_DIR/scripts/sockrocket.sh" ]; then
+        sh "$SCRIPT_DIR/scripts/sockrocket.sh" install-cgi || warn "Could not refresh CGI launcher"
+    fi
     ok "Binary updated: $("$SOCKROCKET_BIN" --version 2>/dev/null || echo 'version unknown')"
     # Restart the API bridge too if it is running — it still holds the old binary
     [ -f "$SOCKROCKET_DIR/sockrocket-api.pid" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart 2>/dev/null || true
@@ -292,13 +292,7 @@ install_common_files() {
     ok "Control scripts installed"
 
     info "Installing CGI backend..."
-    # The CGI backend is built into sockrocket-cli itself (Rust, `cgi` module):
-    # sockrocket.cgi is just a symlink to the binary, which detects argv[0] and
-    # answers the web UI's JSON API calls directly. No shell CGI anymore.
-    xlink "$SOCKROCKET_BIN" "$SOCKROCKET_DIR/sockrocket.cgi"
-    mkdir -p "$CGI_BIN" 2>/dev/null
-    xlink "$SOCKROCKET_DIR/sockrocket.cgi" "$CGI_BIN/sockrocket.cgi" || \
-        warn "Could not link CGI into $CGI_BIN — will retry on next start"
+    sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-cgi || warn "Could not install CGI launcher — will retry on next start"
     ok "CGI backend installed (Rust, built into sockrocket-cli)"
 
     # Smoke-test the CGI binary (no grep — shell case match)
@@ -555,12 +549,12 @@ ks_install() {
 # ─────────────────────────────────────────────────────────────────────────────
 merlin_install() {
     info "Installing in Standard Merlin mode..."
-    mkdir -p "$WWW_SOCKROCKET" 2>/dev/null
     install_common_files
 
     info "Installing Web UI page..."
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$WWW_SOCKROCKET/sockrocket.asp" && chmod 644 "$WWW_SOCKROCKET/sockrocket.asp" || err "Could not publish Merlin Web UI page"
-    ok "Web UI installed to $WWW_SOCKROCKET/sockrocket.asp"
+    local page
+    page=$(sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-page) || err "Could not publish Merlin Web UI page"
+    ok "Web UI installed to $page"
 
     info "Hooking into Merlin startup scripts..."
 
@@ -597,7 +591,7 @@ fi
     [ -f "$SOCKROCKET_CONF" ]                 || { warn "Config file missing";         errors=$((errors+1)); }
     [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ]      || { warn "sockrocket.sh not executable";       errors=$((errors+1)); }
     [ -x "$SOCKROCKET_SCRIPTS/iptables.sh" ] || { warn "iptables.sh not executable";  errors=$((errors+1)); }
-    [ -f "$WWW_SOCKROCKET/sockrocket.asp" ]         || { warn "Web UI page missing";         errors=$((errors+1)); }
+    [ -s "$page" ]                                   || { warn "Web UI page missing";         errors=$((errors+1)); }
     [ -x "$SOCKROCKET_DIR/sockrocket.cgi" ]         || { warn "CGI script not executable";   errors=$((errors+1)); }
     [ "$errors" -eq 0 ] && ok "All files installed correctly" \
                          || warn "$errors validation warning(s) — check output above"

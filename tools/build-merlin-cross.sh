@@ -18,7 +18,8 @@ case "$target" in
       fi
     fi
     command -v "$strip_tool" >/dev/null
-    cross rustc --locked --release --package sockrocket-cli --target "$target" -- -C strip=none
+    source tools/merlin-arm64-rustc-flags.sh
+    cross rustc "${merlin_arm64_cargo_flags[@]}" --locked --release --package sockrocket-cli --target "$target" -- -C linker=rust-lld "${merlin_arm64_flags[@]}"
     binary="${CARGO_TARGET_DIR:-target}/$target/release/sockrocket-cli"
     python3 tools/verify-merlin-allocator.py "$binary"
     "$strip_tool" --strip-all "$binary"

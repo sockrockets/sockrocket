@@ -157,7 +157,7 @@ struct NodeHistory {
     months: BTreeMap<String, MonthEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct TrafficFile {
     #[serde(default = "traffic_file_version")]
     version: u32,
@@ -282,7 +282,7 @@ fn shift_month(y: i32, m: u32, delta: i32) -> (i32, u32) {
 fn month_prefix(key: &str) -> Option<String> {
     // Accept YYYY-MM or legacy YYYY-MM-DD.
     if key.len() >= 7 && key.as_bytes().get(4) == Some(&b'-') {
-        let prefix = &key[..7];
+        let prefix = key.get(..7)?;
         if prefix.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
             return Some(prefix.to_string());
         }
@@ -388,16 +388,7 @@ impl TrafficLedger {
     /// Load durable history from `path` (if present) and start a fresh session.
     pub fn load_or_new(path: impl Into<PathBuf>) -> Arc<Self> {
         let path = path.into();
-        let mut history = BTreeMap::new();
-        let mut subscriptions = BTreeMap::new();
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(mut file) = serde_yaml::from_str::<TrafficFile>(&text)
-        {
-            history = file.history;
-            prune_history(&mut history, TRAFFIC_HISTORY_MONTHS);
-            prune_subscriptions(&mut file.subscriptions, TRAFFIC_HISTORY_MONTHS);
-            subscriptions = file.subscriptions;
-        }
+        let file = SavedTraffic::read(&path).unwrap_or_default().0;
         let ledger = Arc::new(Self {
             pending: Mutex::new(Vec::new()),
             current_generation: AtomicU64::new(0),
@@ -406,8 +397,8 @@ impl TrafficLedger {
             current_sub_id: Mutex::new(None),
             current_sub_name: Mutex::new(None),
             session: Mutex::new(BTreeMap::new()),
-            history: Mutex::new(history),
-            subscriptions: Mutex::new(subscriptions),
+            history: Mutex::new(file.history),
+            subscriptions: Mutex::new(file.subscriptions),
             session_started: unix_now(),
             path: Some(path),
             generation: AtomicU64::new(1),
@@ -779,15 +770,53 @@ impl TrafficLedger {
         Ok(())
     }
 
-    /// Read a previously written file without starting a live session (CGI).
+    /// Read a previously written file without starting a live session.
     pub fn read_file(path: &Path) -> Result<Vec<NodeTrafficSnapshot>> {
+        Ok(SavedTraffic::read(path)?.nodes())
+    }
+
+    pub fn read_session_started(path: &Path) -> Option<u64> {
+        let started = SavedTraffic::read(path).ok()?.session_started();
+        (started > 0).then_some(started)
+    }
+
+    pub fn read_recent_months(path: &Path, keep_months: u32) -> Result<Vec<NodeMonthlyTraffic>> {
+        Ok(SavedTraffic::read(path)?.node_months(&recent_month_keys(keep_months)))
+    }
+
+    pub fn read_recent_subscriptions(
+        path: &Path,
+        keep_months: u32,
+    ) -> Result<Vec<NodeMonthlyTraffic>> {
+        Ok(SavedTraffic::read(path)?.subscription_months(&recent_month_keys(keep_months)))
+    }
+}
+
+/// A single persisted ledger snapshot for read-only traffic reports.
+#[derive(Default)]
+pub struct SavedTraffic(TrafficFile);
+
+impl SavedTraffic {
+    pub fn read(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
             Err(error) => return Err(error.into()),
         };
         let mut file: TrafficFile = serde_yaml::from_str(&text)?;
         prune_history(&mut file.history, TRAFFIC_HISTORY_MONTHS);
+        prune_subscriptions(&mut file.subscriptions, TRAFFIC_HISTORY_MONTHS);
+        Ok(Self(file))
+    }
+
+    pub fn session_started(&self) -> u64 {
+        self.0.session_started
+    }
+
+    pub fn nodes(&self) -> Vec<NodeTrafficSnapshot> {
+        let file = &self.0;
         let mut ids: BTreeMap<String, String> = BTreeMap::new();
         for (id, entry) in &file.session {
             ids.insert(id.clone(), entry.name.clone());
@@ -827,110 +856,66 @@ impl TrafficLedger {
                 .cmp(&a.session.total())
                 .then_with(|| b.history.total().cmp(&a.history.total()))
         });
-        Ok(out)
+        out
     }
 
-    pub fn read_session_started(path: &Path) -> Option<u64> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let file: TrafficFile = serde_yaml::from_str(&text).ok()?;
-        (file.session_started > 0).then_some(file.session_started)
+    pub fn node_months(&self, keys: &[String]) -> Vec<NodeMonthlyTraffic> {
+        monthly_rows(
+            self.0
+                .history
+                .iter()
+                .map(|(id, node)| (id, &node.name, &node.months)),
+            keys,
+        )
     }
 
-    /// Per-node monthly totals for the last `keep_months` calendar months.
-    ///
-    /// Empty months are included so UIs can render a fixed column set. Nodes
-    /// with zero bytes across the window are omitted.
-    pub fn read_recent_months(path: &Path, keep_months: u32) -> Result<Vec<NodeMonthlyTraffic>> {
-        let keys = recent_month_keys(keep_months);
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut file: TrafficFile = serde_yaml::from_str(&text)?;
-        prune_history(&mut file.history, TRAFFIC_HISTORY_MONTHS);
-        let mut out = Vec::new();
-        for (id, node) in file.history {
-            let mut total = TrafficCounters::default();
-            let mut months = Vec::with_capacity(keys.len());
-            for key in &keys {
-                let counters = node
-                    .months
-                    .get(key)
-                    .map(|e| TrafficCounters {
-                        up: e.up,
-                        down: e.down,
-                    })
-                    .unwrap_or_default();
-                total.add(counters.up, counters.down);
-                months.push((key.clone(), counters));
-            }
-            if total.total() == 0 {
-                continue;
-            }
+    pub fn subscription_months(&self, keys: &[String]) -> Vec<NodeMonthlyTraffic> {
+        monthly_rows(
+            self.0
+                .subscriptions
+                .iter()
+                .map(|(id, sub)| (id, &sub.name, &sub.months)),
+            keys,
+        )
+    }
+}
+
+/// Include empty months in each row, and omit rows with no traffic in the window.
+fn monthly_rows<'a>(
+    entries: impl Iterator<Item = (&'a String, &'a String, &'a BTreeMap<String, MonthEntry>)>,
+    keys: &[String],
+) -> Vec<NodeMonthlyTraffic> {
+    let mut out = Vec::new();
+    for (id, name, buckets) in entries {
+        let mut total = TrafficCounters::default();
+        let mut months = Vec::with_capacity(keys.len());
+        for key in keys {
+            let counters = buckets
+                .get(key)
+                .map(|e| TrafficCounters {
+                    up: e.up,
+                    down: e.down,
+                })
+                .unwrap_or_default();
+            total.add(counters.up, counters.down);
+            months.push((key.clone(), counters));
+        }
+        if total.total() > 0 {
             out.push(NodeMonthlyTraffic {
-                id,
-                name: node.name,
+                id: id.clone(),
+                name: name.clone(),
                 months,
                 total,
             });
         }
-        out.sort_by(|a, b| {
-            b.total
-                .total()
-                .cmp(&a.total.total())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        Ok(out)
     }
-
-    /// Per-subscription monthly totals for the last `keep_months` calendar months.
-    pub fn read_recent_subscriptions(
-        path: &Path,
-        keep_months: u32,
-    ) -> Result<Vec<NodeMonthlyTraffic>> {
-        let keys = recent_month_keys(keep_months);
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut file: TrafficFile = serde_yaml::from_str(&text)?;
-        prune_subscriptions(&mut file.subscriptions, TRAFFIC_HISTORY_MONTHS);
-        let mut out = Vec::new();
-        for (id, sub) in file.subscriptions {
-            let mut total = TrafficCounters::default();
-            let mut months = Vec::with_capacity(keys.len());
-            for key in &keys {
-                let counters = sub
-                    .months
-                    .get(key)
-                    .map(|e| TrafficCounters {
-                        up: e.up,
-                        down: e.down,
-                    })
-                    .unwrap_or_default();
-                total.add(counters.up, counters.down);
-                months.push((key.clone(), counters));
-            }
-            if total.total() == 0 {
-                continue;
-            }
-            out.push(NodeMonthlyTraffic {
-                id,
-                name: sub.name,
-                months,
-                total,
-            });
-        }
-        out.sort_by(|a, b| {
-            b.total
-                .total()
-                .cmp(&a.total.total())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        Ok(out)
-    }
+    out.sort_by(|a, b| {
+        b.total
+            .total()
+            .cmp(&a.total.total())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
 }
 
 /// Add each node's monthly totals into the subscription that currently owns it.
@@ -1490,6 +1475,30 @@ mod tests {
         assert_eq!(keys.len(), 3);
         assert_eq!(keys[2], month_key());
         assert!(keys[0] < keys[1] && keys[1] < keys[2]);
+    }
+
+    #[test]
+    fn saved_snapshot_keeps_one_generation_for_session_and_monthly_reports() {
+        let path =
+            std::env::temp_dir().join(format!("sockrocket-snapshot-{}", uuid::Uuid::new_v4()));
+        let keys = recent_month_keys(1);
+        let month = &keys[0];
+        let text = format!(
+            "session_started: 42\nsession:\n  a: {{name: Active, up: 4}}\nhistory:\n  a:\n    days:\n      '{month}-01': {{down: 7}}\nsubscriptions:\n  s:\n    months:\n      '{month}': {{up: 8}}\n"
+        );
+        assert!(SavedTraffic::read(&path).unwrap().nodes().is_empty());
+        std::fs::write(&path, text).unwrap();
+        let snapshot = SavedTraffic::read(&path).unwrap();
+        std::fs::write(&path, "broken: [").unwrap();
+        assert!(SavedTraffic::read(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(snapshot.session_started(), 42);
+        let nodes = snapshot.nodes();
+        assert_eq!(nodes[0].session.up, 4);
+        assert_eq!(nodes[0].history.down, 7);
+        assert_eq!(snapshot.node_months(&keys)[0].months[0].1.down, 7);
+        assert_eq!(snapshot.subscription_months(&keys)[0].months[0].1.up, 8);
     }
 
     #[test]

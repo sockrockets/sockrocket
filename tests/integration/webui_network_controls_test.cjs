@@ -48,4 +48,31 @@ mutation[2]({ok:true});request('status')[2](state({proxy_mode:'global',cn_ipset_
 assert.equal(element('chip-cn').disabled,true);
 assert.equal(element('cn-state').textContent,'已关闭');
 c.toggleCnDirect();assert.equal(requests.length,0);
+// A response from the previous tab cannot invalidate the newly opened editor.
+let rulesReloads = 0, networkReloads = 0;
+Object.assign(c, {srLoadRules: () => rulesReloads++, loadNetworkPolicy: () => networkReloads++,
+  RULE_RULE_REVISION: 'old-rules', dnsPolicyRevision: 'old-network',
+  dnsPolicyPending: false, dnsPolicyDirty: false, networkStateText: () => ''});
+function poll(page, scope) {
+  c.SR_STATE.page = page;
+  c.refreshStatus();
+  const status = request('status');
+  assert.equal(status[1].revision_scope, scope);
+  const stats = request('stats');
+  assert.equal(stats[1], null);
+  stats[2]({});
+  return status[2];
+}
+const home = poll('home', 'none');
+c.SR_STATE.page = 'dns';
+home(state({rules_revision: null, network_revision: null}));
+assert.equal(rulesReloads, 0);
+poll('dns', 'rules')(state({rules_revision: 'new-rules'}));
+assert.equal(rulesReloads, 1);
+const fromRules = poll('dns', 'rules');
+c.SR_STATE.page = 'network';
+fromRules(state({rules_revision: 'new-rules', network_revision: null}));
+assert.equal(networkReloads, 0);
+poll('network', 'network')(state({network_revision: 'new-network'}));
+assert.equal(networkReloads, 1);
 console.log('PASS: stopped cleanup display, independent toggles, no implicit start, mutation locking, stale polling, error recovery and Stop');

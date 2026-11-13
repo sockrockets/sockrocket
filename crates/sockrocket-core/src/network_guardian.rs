@@ -139,7 +139,7 @@ fn run() -> Result<()> {
     let mut line = String::new();
     (&mut input).take(65536).read_line(&mut line)?;
     anyhow::ensure!(line.ends_with('\n'), "Invalid guardian initialization");
-    let recovery: Recovery = serde_json::from_str(&line)?;
+    let recovery: Recovery = serde_json::from_slice(line.as_bytes())?;
     anyhow::ensure!(recovery.owner != 0, "Invalid guardian owner");
     std::io::stdout().write_all(b"READY\n")?;
     std::io::stdout().flush()?;
@@ -155,7 +155,7 @@ fn run() -> Result<()> {
                 update.ends_with('\n'),
                 "Invalid recovery authorization update"
             );
-            let form: [u8; 32] = serde_json::from_str(&update)?;
+            let form: [u8; 32] = serde_json::from_slice(update.as_bytes())?;
             crate::managed_proxy::macos::import(form)?;
             std::io::stdout().write_all(b"AUTHOK\n")?;
             std::io::stdout().flush()?;

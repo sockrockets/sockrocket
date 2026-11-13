@@ -2,61 +2,89 @@
 use super::*;
 use sockrocket_core::config::{
     dedup::{node_fingerprint, node_public_id},
-    group::{node_target_id, resolve_members, selected_member, valid_group_name},
+    group::{NodeIndex, node_target_id, valid_group_name},
+    model::proxy_groups_from_yaml,
 };
-use sockrocket_core::{Node, ProxyGroupConfig};
+use sockrocket_core::{Node, ProxyGroupConfig, RoutingRule};
 
-// Legacy config fingerprints contain credentials. Only SHA-256 opaque IDs
-// cross the UI/API boundary; raw identities stay in the private config file.
-fn member_id(value: &str) -> String {
-    node_public_id(value)
-}
-fn groups(map: &Mapping) -> Vec<ProxyGroupConfig> {
-    serde_yaml::from_value(
-        map.get(ykey("groups"))
-            .cloned()
-            .unwrap_or(Y::Sequence(vec![])),
-    )
-    .unwrap_or_default()
-}
 fn nodes(map: &Mapping) -> Vec<Node> {
-    serde_yaml::from_value(Y::Sequence(
-        conf_seq(map, "nodes").into_iter().cloned().collect(),
-    ))
-    .unwrap_or_default()
+    conf_seq(map, "nodes")
+        .iter()
+        .cloned()
+        .map(Node::from_yaml_value)
+        .collect::<Result<_, _>>()
+        .unwrap_or_default()
 }
-fn readable(map: &Mapping) -> bool {
-    serde_yaml::from_value::<Vec<ProxyGroupConfig>>(
-        map.get(ykey("groups"))
-            .cloned()
-            .unwrap_or(Y::Sequence(vec![])),
-    )
-    .is_ok()
-        && load_routing_rules(map).len() == conf_seq(map, "rules").len()
+fn groups_and_rules(map: &Mapping) -> Option<(Vec<ProxyGroupConfig>, Vec<RoutingRule>)> {
+    let groups = proxy_groups_from_yaml(map).ok()?;
+    let rules = load_routing_rules(map);
+    (rules.len() == conf_seq(map, "rules").len()).then_some((groups, rules))
 }
-pub(super) fn catalog(map: &Mapping) -> J {
+
+fn selected_index(group: &ProxyGroupConfig, index: &NodeIndex) -> Option<usize> {
+    if group.gtype == sockrocket_core::GroupType::Fallback {
+        group.members.iter().find_map(|fp| index.get(fp))
+    } else {
+        index.selected_member(group)
+    }
+}
+
+fn group_catalog(groups: &[ProxyGroupConfig], nodes: &[Node]) -> J {
+    if groups.is_empty() {
+        return J::Array(Vec::new());
+    }
+    let index = NodeIndex::new(nodes);
+    let rows: Vec<_> = groups.iter().map(|group| {
+        let selected = selected_index(group, &index);
+        json!({
+            "name": group.name, "type": group.gtype,
+            "members": group.members.iter().map(|fp| node_public_id(fp)).collect::<Vec<_>>(),
+            "current": group.current.as_deref().map(node_public_id),
+            "selected_node": selected.map(|i| &nodes[i].name),
+            "missing_members": group.members.iter().filter(|fp| index.get(fp).is_none()).count(),
+        })
+    }).collect();
+    J::Array(rows)
+}
+
+pub(super) fn trace_group(
+    map: &Mapping,
+    name: &str,
+) -> Option<(sockrocket_core::GroupType, Option<String>)> {
+    let group = proxy_groups_from_yaml(map)
+        .ok()?
+        .into_iter()
+        .find(|g| g.name == name)?;
     let ns = nodes(map);
-    json!(groups(map).iter().map(|g| json!({"name":g.name,"type":g.gtype,"members":g.members.iter().map(|fp|member_id(fp)).collect::<Vec<_>>(),"current":g.current.as_deref().map(member_id),
-        "selected_node":(if g.gtype==sockrocket_core::GroupType::Fallback {resolve_members(g,&ns).first().copied()} else {selected_member(g,&ns)}).map(|i|ns[i].name.clone()),
-        "missing_members":g.members.iter().filter(|fp|!ns.iter().any(|n|node_fingerprint(n)==**fp)).count()})).collect::<Vec<_>>())
+    let selected = selected_index(&group, &NodeIndex::new(&ns)).map(|i| ns[i].name.clone());
+    Some((group.gtype, selected))
 }
+
+fn node_catalog(nodes: &[Node], id_key: &str) -> J {
+    J::Array(
+        nodes
+            .iter()
+            .map(|node| json!({"name": node.name, (id_key): node_public_id(&node_fingerprint(node))}))
+            .collect(),
+    )
+}
+
+pub(super) fn rule_catalogs(map: &Mapping) -> (J, J) {
+    let groups = proxy_groups_from_yaml(map).unwrap_or_default();
+    let nodes = nodes(map);
+    (group_catalog(&groups, &nodes), node_catalog(&nodes, "id"))
+}
+
 pub(super) fn get() -> J {
     let Ok(map) = load_conf() else {
         return err_msg("配置读取失败");
     };
-    if !readable(&map) {
+    let Some((groups, rules)) = groups_and_rules(&map) else {
         return err_msg("现有规则或分组配置损坏");
-    }
-    json!({"ok":true,"groups":catalog(&map),"revision":route_trace::rules_revision(&map),
-        "nodes":nodes(&map).iter().map(|n|json!({"name":n.name,"fingerprint":member_id(&node_fingerprint(n))})).collect::<Vec<_>>()})
-}
-pub(super) fn node_catalog(map: &Mapping) -> J {
-    json!(
-        nodes(map)
-            .iter()
-            .map(|node| json!({"name": node.name, "id": node_public_id(&node_fingerprint(node))}))
-            .collect::<Vec<_>>()
-    )
+    };
+    let nodes = nodes(&map);
+    json!({"ok":true,"groups":group_catalog(&groups, &nodes),"revision":route_trace::revision_for_rules(&map, &rules),
+        "nodes":node_catalog(&nodes, "fingerprint")})
 }
 pub(super) fn node_name(map: &Mapping, id: &str) -> Option<String> {
     nodes(map)
@@ -68,11 +96,19 @@ pub(super) fn valid_target(target: &str) -> bool {
     RULE_TARGETS.contains(&target)
         || node_target_id(target).is_some()
         || target.strip_prefix("group:").is_some_and(|name| {
-            load_conf().is_ok_and(|map| groups(&map).iter().any(|g| g.name == name))
+            load_conf().is_ok_and(|map| {
+                proxy_groups_from_yaml(&map)
+                    .is_ok_and(|groups| groups.iter().any(|g| g.name == name))
+            })
         })
 }
 pub(super) fn check_revision(map: &Mapping, post: &J) -> bool {
-    post.get("revision").and_then(J::as_str) == Some(route_trace::rules_revision(map).as_str())
+    revision_matches(map, &load_routing_rules(map), post)
+}
+fn revision_matches(map: &Mapping, rules: &[RoutingRule], post: &J) -> bool {
+    post.get("revision")
+        .and_then(J::as_str)
+        .is_some_and(|expected| expected == route_trace::revision_for_rules(map, rules))
 }
 pub(super) fn applied(map: &Mapping) -> J {
     if save_conf(map).is_err() {
@@ -87,10 +123,10 @@ pub(super) fn save(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("配置读取失败");
     };
-    if !readable(&map) {
+    let Some((mut gs, mut rules)) = groups_and_rules(&map) else {
         return err_msg("现有规则或分组配置损坏，请先修复；未保存更改");
-    }
-    if !check_revision(&map, post) {
+    };
+    if !revision_matches(&map, &rules, post) {
         return err_msg("配置已变化，请刷新后重试");
     }
     let old = post.get("original_name").and_then(J::as_str).unwrap_or("");
@@ -102,22 +138,23 @@ pub(super) fn save(post: &J) -> J {
     if !valid_group_name(&group.name) {
         return err_msg("名称限 96 字节，使用文字、数字、横线或下划线");
     }
-    let mut gs = groups(&map);
     if gs.iter().any(|g| g.name == group.name && g.name != old) {
         return err_msg("分组名称已存在");
     }
-    if !old.is_empty() && !gs.iter().any(|g| g.name == old) {
+    let position = gs.iter().position(|g| g.name == old);
+    if !old.is_empty() && position.is_none() {
         return err_msg("原分组已不存在，请刷新");
     }
     let mut unique = std::collections::HashSet::new();
     group.members.retain(|fp| unique.insert(fp.clone()));
     let ns = nodes(&map);
-    let previous = gs.iter().find(|g| g.name == old);
+    let previous = position.map(|i| &gs[i]);
+    // Legacy fingerprints can contain credentials. Resolve the opaque IDs from the API locally.
     let identities: std::collections::HashMap<String, String> = ns
         .iter()
         .map(node_fingerprint)
         .chain(previous.into_iter().flat_map(|g| g.members.iter().cloned()))
-        .map(|fp| (member_id(&fp), fp))
+        .map(|fp| (node_public_id(&fp), fp))
         .collect();
     if group.members.iter().any(|id| !identities.contains_key(id)) {
         return err_msg("分组成员已变化，请刷新后重试");
@@ -135,45 +172,36 @@ pub(super) fn save(post: &J) -> J {
         .map(|id| identities[id].clone())
         .collect();
     group.current = group.current.and_then(|id| identities.get(&id).cloned());
-    if group.members.is_empty()
-        || group.members.len() > 256
-        || group.members.iter().any(|fp| {
-            !ns.iter().any(|n| node_fingerprint(n) == *fp)
-                && !previous.is_some_and(|g| g.members.contains(fp))
-        })
-    {
+    if group.members.is_empty() || group.members.len() > 256 {
         return err_msg("请选择 1–256 个有效节点；订阅中失效的原成员可保留或移除");
     }
-    if !group
-        .current
-        .as_ref()
-        .is_some_and(|fp| group.members.contains(fp))
-    {
+    if group.current.is_none() {
         group.current = group.members.first().cloned();
-    }
-    if let Some(i) = gs.iter().position(|g| g.name == old) {
-        gs[i] = group.clone();
-    } else {
-        gs.push(group.clone());
     }
     let Ok(mut links) = devices::links(&map) else {
         return err_msg("设备关联配置无效");
     };
-    for link in &mut links {
-        if !old.is_empty() && link.target == format!("group:{old}") {
-            link.target = format!("group:{}", group.name);
-        }
-    }
-    devices::store_links(&mut map, &links);
     // A rename rewrites all references, including disabled/device rules.
-    let mut rules = load_routing_rules(&map);
-    if !old.is_empty() {
+    if !old.is_empty() && old != group.name {
+        let from = format!("group:{old}");
+        let to = format!("group:{}", group.name);
+        for link in &mut links {
+            if link.target == from {
+                link.target.clone_from(&to);
+            }
+        }
         for rule in &mut rules {
-            if rule.target == format!("group:{old}") {
-                rule.target = format!("group:{}", group.name);
+            if rule.target == from {
+                rule.target.clone_from(&to);
             }
         }
     }
+    if let Some(i) = position {
+        gs[i] = group;
+    } else {
+        gs.push(group);
+    }
+    devices::store_links(&mut map, &links);
     save_routing_rules(&mut map, rules);
     map.insert(ykey("groups"), serde_yaml::to_value(gs).unwrap());
     applied(&map)
@@ -182,29 +210,26 @@ pub(super) fn delete(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("配置读取失败");
     };
-    if !readable(&map) {
+    let Some((mut gs, rules)) = groups_and_rules(&map) else {
         return err_msg("现有规则或分组配置损坏，请先修复；未保存更改");
-    }
-    if !check_revision(&map, post) {
+    };
+    if !revision_matches(&map, &rules, post) {
         return err_msg("配置已变化，请刷新后重试");
     }
     let name = post.get("name").and_then(J::as_str).unwrap_or("");
-    if devices::links(&map)
-        .is_ok_and(|links| links.iter().any(|b| b.target == format!("group:{name}")))
-        || load_routing_rules(&map)
-            .iter()
-            .any(|r| r.target == format!("group:{name}"))
+    let target = format!("group:{name}");
+    if devices::links(&map).is_ok_and(|links| links.iter().any(|b| b.target == target))
+        || rules.iter().any(|r| r.target == target)
     {
         return err_msg("仍有规则或设备策略引用此分组，请先调整出口");
     }
-    let mut gs = groups(&map);
     gs.retain(|g| g.name != name);
     map.insert(ykey("groups"), serde_yaml::to_value(gs).unwrap());
     applied(&map)
 }
 pub(super) fn builtin_route(map: &Mapping) -> Result<sockrocket_core::config::model::BuiltinRoute> {
     Ok(map
-        .get(ykey("builtin_route"))
+        .get("builtin_route")
         .cloned()
         .map(serde_yaml::from_value)
         .transpose()?
@@ -216,7 +241,7 @@ pub(super) fn save_builtin_route(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("配置读取失败");
     };
-    if !readable(&map) || !check_revision(&map, post) {
+    if !groups_and_rules(&map).is_some_and(|(_, rules)| revision_matches(&map, &rules, post)) {
         return err_msg("配置已变化或无效，请刷新后重试");
     }
     let Ok(target) = serde_json::from_value::<BuiltinRoute>(post["target"].clone()) else {
@@ -233,10 +258,10 @@ pub(super) fn device(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("配置读取失败");
     };
-    if !readable(&map) {
+    let Some((_, mut rules)) = groups_and_rules(&map) else {
         return err_msg("现有规则或分组配置损坏，请先修复；未保存更改");
-    }
-    if !check_revision(&map, post) {
+    };
+    if !revision_matches(&map, &rules, post) {
         return err_msg("配置已变化，请刷新后重试");
     }
     let source = match requested_rule_source(post, "") {
@@ -250,7 +275,6 @@ pub(super) fn device(post: &J) -> J {
     if target != "inherit" && !valid_target(target) {
         return err_msg("请选择有效的默认出口");
     }
-    let mut rules = load_routing_rules(&map);
     // This editor owns the final policy for exactly this source. Destination
     // exceptions stay intact. Reset removes only the final for this source.
     let same_final = |r: &sockrocket_core::RoutingRule| {

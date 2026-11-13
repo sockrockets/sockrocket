@@ -1,27 +1,11 @@
 //! Versioned connection identities and migration of saved node references.
 use super::{dedup, model::Node};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 fn lowercase_field(value: &mut Value, key: &str) {
     if let Some(Value::String(text)) = value.get_mut(key) {
         *text = text.to_ascii_lowercase();
-    }
-}
-
-// Sort recursively even when another dependency enables serde_json's
-// preserve_order feature. Header insertion order is not connection identity.
-fn canonical(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(k, v)| (k, canonical(v)))
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
-        other => other,
     }
 }
 
@@ -42,7 +26,7 @@ pub(super) fn fingerprint(node: &Node) -> String {
             lowercase_field(settings, "sni");
         }
     }
-    let extra: BTreeMap<_, _> = [
+    let extra = [
         super::ss_plugin::KEY,
         super::v2ray::VLESS_ENCRYPTION,
         super::v2ray::TLS_CERT_PIN,
@@ -61,15 +45,20 @@ pub(super) fn fingerprint(node: &Node) -> String {
         super::server_dns::KEY,
     ]
     .into_iter()
-    .filter_map(|key| node.extra.get(key).map(|value| (key, value)))
+    .filter_map(|key| {
+        let value = node.extra.get(key)?;
+        Some((key.to_owned(), Value::String(value.clone())))
+    })
     .collect();
-    let value = canonical(serde_json::json!([
-        node.server.to_ascii_lowercase(),
-        node.port,
+    let mut value = Value::Array(vec![
+        Value::String(node.server.to_ascii_lowercase()),
+        Value::from(node.port),
         protocol,
         transport,
-        extra
-    ]));
+        Value::Object(extra),
+    ]);
+    // Preserve persisted identities even when serde_json's preserve_order feature is enabled.
+    value.sort_all_objects();
     // Credentials participate in equality but no longer appear in group keys.
     format!(
         "v2:{}",

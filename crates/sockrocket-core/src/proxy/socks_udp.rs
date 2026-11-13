@@ -123,7 +123,7 @@ pub(super) async fn serve(
             client = Some(source);
             idle.as_mut()
                 .reset(Instant::now() + Duration::from_secs(120));
-            let key = (host.clone(), port);
+            let key = (host, port);
             flows.retain(|_, flow| !flow.task.is_finished());
             if !flows.contains_key(&key) {
                 if flows.len() >= 16
@@ -143,7 +143,7 @@ pub(super) async fn serve(
                     .unwrap_or_else(|| outbound.clone());
                 let Ok(Ok(remote)) = tokio::time::timeout(
                     UPSTREAM_CONNECT_TIMEOUT,
-                    snapshot.0.connect_datagram(&host, port),
+                    snapshot.0.connect_datagram(&key.0, port),
                 )
                 .await
                 else {
@@ -160,18 +160,20 @@ pub(super) async fn serve(
                     stats.clone(),
                 );
                 let traffic = crate::traffic::current_traffic_target();
-                let header = packet[..offset].to_vec();
+                let mut response = vec![0; offset + 65535];
+                response[..offset].copy_from_slice(&packet[..offset]);
                 let task = tokio::spawn(async move {
                     let _permit = worker_permit;
-                    let mut body = vec![0; 65535];
                     loop {
                         tokio::select! {
-                            result = read.recv(&mut body) => {
+                            result = read.recv(&mut response[offset..]) => {
                                 let Ok(n) = result else { break; };
-                                if n+header.len() > 65507 { continue; }
-                                let mut response = header.clone(); response.extend_from_slice(&body[..n]);
-                                if socket.send_to(&response,source).await.is_err() { break; }
-                                stats.add_bytes_for(0, n as u64, traffic.clone()); *active.lock().unwrap()=Instant::now();
+                                if n > 65507 - offset { continue; }
+                                if socket.send_to(&response[..offset + n], source).await.is_err() {
+                                    break;
+                                }
+                                stats.add_bytes_for(0, n as u64, traffic.clone());
+                                *active.lock().unwrap() = Instant::now();
                             }
                             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                                 if active.lock().unwrap().elapsed() >= Duration::from_secs(30) { break; }

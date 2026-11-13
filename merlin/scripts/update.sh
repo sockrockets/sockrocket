@@ -49,6 +49,7 @@ health_check() {
     kill -0 "$(cat "$ROOT/sockrocket.pid")"
 }
 restore_files() {
+    local external_root="$TX"
     failed=0
     sh "$SH" stop >/dev/null 2>&1 || true
     sh "$SH" api-stop >/dev/null 2>&1 || true
@@ -73,14 +74,16 @@ restore_files() {
     [ "$failed" = 0 ] || { echo 'rollback-failed: backup retained' > "$ROOT/update-status"; return 1; }
     if [ -f "$TX/external.tar.gz" ]; then
         gzip -t "$TX/external.tar.gz" || return 1
-        tar -xzf "$TX/external.tar.gz" -C "$TX" || return 1
+        # Legacy CGI entries can each be a full CLI. Expand onto the same
+        # temporary filesystem used to prepare the snapshot, not onto JFFS.
+        external_root=$1
+        tar -xzf "$TX/external.tar.gz" -C "$external_root" || return 1
     fi
     if [ -f "$TX/external-list" ]; then
         while IFS= read -r path; do
-            saved="$TX/external$path"
+            saved="$external_root/external$path"
             if [ -e "$saved" ] || [ -L "$saved" ]; then
-                rm -f "$path" || failed=1
-                mv "$saved" "$path" || failed=1
+                mkdir -p "${path%/*}" && rm -f "$path" && mv "$saved" "$path" || failed=1
             elif [ -f "$TX/absent$path" ]; then
                 rm -f "$path" || failed=1
             fi
@@ -113,7 +116,8 @@ restore() {
     mkdir -p "$runtime" || return 1
     mkdir "$runtime/.update-restore-lock" 2>/dev/null || return 1
     claim_owner
-    restore_files || result=$?
+    restore_files "$runtime/.update-restore-lock" || result=$?
+    rm -rf "$runtime/.update-restore-lock/external" || return 1
     rmdir "$runtime/.update-restore-lock" || return 1
     [ "$result" = 0 ] || echo "rollback-failed: recovery health check failed; backup retained" > "$ROOT/update-status"
     return "$result"
@@ -162,8 +166,23 @@ prepare_snapshot() {
     tar -czf "$snapshot/backup.tar.gz" -C "$ROOT" "$@"
     gzip -t "$snapshot/backup.tar.gz"
     # All installer-owned external files, including firmware hook files.
-    for path in /jffs/scripts/firewall-start /jffs/scripts/nat-start /jffs/scripts/services-start /jffs/scripts/service-event /jffs/scripts/wan-start /jffs/scripts/wan-event /jffs/scripts/dhcpc-event /jffs/scripts/dnsmasq.postconf /koolshare/webs/Module_sockrocket.asp /koolshare/scripts/sockrocket_config.sh /koolshare/scripts/sockrocket_api.sh /koolshare/scripts/sockrocket_status.sh /koolshare/scripts/uninstall_sockrocket.sh /koolshare/init.d/S98sockrocket.sh /koolshare/res/icon-sockrocket.png /www/ext/sockrocket/sockrocket.asp; do
-        [ -d "$(dirname "$path")" ] || continue
+    for path in "$ROOT/sockrocket.cgi" /www/cgi-bin/sockrocket.cgi /jffs/scripts/firewall-start /jffs/scripts/nat-start /jffs/scripts/services-start /jffs/scripts/service-event /jffs/scripts/wan-start /jffs/scripts/wan-event /jffs/scripts/dhcpc-event /jffs/scripts/dnsmasq.postconf /koolshare/webs/Module_sockrocket.asp /koolshare/scripts/sockrocket_config.sh /koolshare/scripts/sockrocket_api.sh /koolshare/scripts/sockrocket_status.sh /koolshare/scripts/uninstall_sockrocket.sh /koolshare/init.d/S98sockrocket.sh /koolshare/res/icon-sockrocket.png /www/ext/sockrocket/sockrocket.asp /tmp/var/wwwext/sockrocket/sockrocket.asp; do
+        case "$path" in
+            /www/cgi-bin/sockrocket.cgi|/www/ext/sockrocket/sockrocket.asp|/tmp/var/wwwext/sockrocket/sockrocket.asp)
+                # These entries are published with rename. Firmware may expose
+                # a read-only primary tree or create its web directories at boot.
+                parent=${path%/*}
+                while [ ! -d "$parent" ] && [ -n "$parent" ]; do
+                    if [ -e "$parent" ] || [ -L "$parent" ]; then continue 2; fi
+                    parent=${parent%/*}
+                done
+                [ -n "$parent" ] || continue
+                probe="$parent/.sockrocket-update.$$"
+                mkdir "$probe" 2>/dev/null || continue
+                rmdir "$probe" || return 1
+                ;;
+            *) [ -d "${path%/*}" ] || continue ;;
+        esac
         echo "$path" >> "$snapshot/external-list"
         mkdir -p "$snapshot/external$(dirname "$path")" "$snapshot/absent$(dirname "$path")"
         if [ -e "$path" ] || [ -L "$path" ]; then cp -a "$path" "$snapshot/external$path"; else touch "$snapshot/absent$path"; fi
@@ -269,7 +288,7 @@ for name in $NAMES; do
     cp -R "$source" "$ROOT/$name"
 done
 # Match the installed layout without duplicating the extracted payload in /tmp.
-cp "$ROOT/scripts/dnsmasq.conf" "$ROOT/scripts/dnsmasq.conf.template"
+mv "$ROOT/scripts/dnsmasq.conf" "$ROOT/scripts/dnsmasq.conf.template"
 test -s "$ROOT/scripts/dnsmasq.conf.template"
 chmod +x "$ROOT/sockrocket-cli" "$ROOT/scripts/"*.sh
 # Reuse the package installer for firmware hooks and Software Center integration.

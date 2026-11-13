@@ -54,7 +54,7 @@ shadowsocks = { version = "1", default-features = false, features = [
     "aead-cipher",
     "aead-cipher-2022",
 ] }
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "bloom", "platform-verifier"] }
 quinn-proto = { version = "0.11.17", default-features = false }
 sysproxy = "0.3.0"
 # Production uses ring explicitly; keep TLS 1.2, std and logging without
@@ -86,7 +86,6 @@ chacha20poly1305 = "0.10"
 
 # Utils
 anyhow = "1"
-thiserror = "2"
 log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }

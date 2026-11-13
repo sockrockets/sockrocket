@@ -26,7 +26,8 @@ test -x "$strip_tool"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$rust_lld"
 export CC_aarch64_unknown_linux_musl="$PWD/tools/zig-cc-aarch64-musl"
 export AR_aarch64_unknown_linux_musl="$PWD/tools/zig-ar-aarch64-musl"
-cargo rustc -p sockrocket-cli --release --target aarch64-unknown-linux-musl --offline "$@" -- -C link-self-contained=yes -C strip=none
+source tools/merlin-arm64-rustc-flags.sh
+cargo rustc "${merlin_arm64_cargo_flags[@]}" -p sockrocket-cli --release --target aarch64-unknown-linux-musl --offline "$@" -- "${merlin_arm64_flags[@]}"
 binary="${CARGO_TARGET_DIR:-$PWD/target}/aarch64-unknown-linux-musl/release/sockrocket-cli"
 python3 tools/verify-merlin-allocator.py "$binary"
 cp "$binary" "$binary.symbols"

@@ -31,7 +31,8 @@ rand = "0.8.5" #!craft!
 
 brotli = "3.4.0"
 flate2 = "1.0.28"
-zstd = "0.12.3"
+# TLS certificate compression uses standard Zstandard frames.
+zstd = { version = "0.12.3", default-features = false }
 
 # !craft! REALITY protocol support
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -45,6 +46,8 @@ sha2 = "0.10"
 [features]
 default = ["logging", "ring", "tls12"]
 logging = ["log"]
+# Initialize the full ALPN variants only for callers that request the set.
+lazy-fingerprint-sets = []
 aws_lc_rs = ["dep:aws-lc-rs", "webpki/aws_lc_rs"]
 ring = ["dep:ring", "webpki/ring"]
 tls12 = []

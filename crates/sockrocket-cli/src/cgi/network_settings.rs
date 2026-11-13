@@ -7,7 +7,7 @@ fn failure(code: &str, msg: &str) -> J {
 }
 pub(super) fn revision(map: &Mapping) -> String {
     use sha2::{Digest, Sha256};
-    let policy = json!({"dns":map.get(ykey("dns")),"ipv6_mode":map.get(ykey("ipv6_mode")),"legacy_server":map.get(ykey("dns_direct_server")),"legacy_domains":map.get(ykey("dns_direct_domains"))});
+    let policy = json!({"dns":map.get("dns"),"ipv6_mode":map.get("ipv6_mode"),"legacy_server":map.get("dns_direct_server"),"legacy_domains":map.get("dns_direct_domains")});
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&policy).unwrap_or_default())
@@ -29,7 +29,7 @@ pub(super) fn get() -> J {
             );
         }
     };
-    let mode: Ipv6Mode = match map.get(ykey("ipv6_mode")) {
+    let mode: Ipv6Mode = match map.get("ipv6_mode") {
         None => Ipv6Mode::default(),
         Some(value) => match serde_yaml::from_value(value.clone()) {
             Ok(mode) => mode,
@@ -104,7 +104,7 @@ pub(super) fn save(post: &J) -> J {
     }
     let old_dns = DnsSettings::from_yaml(&Y::Mapping(map.clone())).ok();
     let old_mode = map
-        .get(ykey("ipv6_mode"))
+        .get("ipv6_mode")
         .cloned()
         .and_then(|v| serde_yaml::from_value::<Ipv6Mode>(v).ok())
         .unwrap_or_default();
@@ -188,10 +188,7 @@ pub(super) fn test(post: &J) -> J {
     if !matches!(group, "direct" | "proxy" | "bootstrap") {
         return failure("dns_test_invalid", "请选择 DNS 测试分组");
     }
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
+    let Ok(rt) = CgiRuntime::new() else {
         return failure("dns_test_failed", "无法创建 DNS 测试任务");
     };
     let started = std::time::Instant::now();
@@ -200,7 +197,7 @@ pub(super) fn test(post: &J) -> J {
         config.domain_rules.clear();
         let outbound = if group == "proxy" {
             let value = Y::Mapping(load_conf()?);
-            let app_config: sockrocket_core::AppConfig = serde_yaml::from_value(value)?;
+            let app_config = sockrocket_core::AppConfig::decode_yaml_fields(value)?;
             let node = app_config
                 .nodes
                 .get(app_config.active_node.unwrap_or(0))

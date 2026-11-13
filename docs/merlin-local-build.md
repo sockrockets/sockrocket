@@ -12,7 +12,7 @@
 
 同一台路由器、同一份受控测试源码，每轮最多持有 1 MiB 小块、每轮全部释放后进入下一尺寸；小块阶段结束时，Zig 链路 RSS 为 17656 KiB，而使用 Rust 自带 musl 的链路为 512 KiB。现场全部内存增长及速度问题是否均由此引起，仍需上线后的同进程数据验证。这个复现确认的是分配器保留机制，不是所有历史问题的唯一根因。
 
-实际 Actions Release 使用 `cross 0.2.5` 容器及 `aarch64-linux-musl-gcc` 最终链接，并带 Rust self-contained CRT。它与出问题的本地 Zig 最终链接链路不同；本地现象不能直接泛化为正式发布包的问题。具体符号、源码行、复现数据及 Actions 运行链接见[调查记录](./architecture/allocator-retention-and-ci-build-2026-10-29.md)。
+当时的 Actions Release 使用 `cross 0.2.5` 容器及 `aarch64-linux-musl-gcc` 最终链接，并带 Rust self-contained CRT。它与出问题的本地 Zig 最终链接链路不同。具体符号、源码行、复现数据及 Actions 运行链接见[调查记录](./architecture/allocator-retention-and-ci-build-2026-10-29.md)。
 
 ## 标准构建
 
@@ -42,7 +42,7 @@ target/aarch64-unknown-linux-musl/release/sockrocket-cli.symbols
 
 这个入口只构建 ARM64 CLI。ARMv7 构建继续使用现有 `cross` 流程；不能把 ARM64 校验器直接用于 ARMv7。
 
-Actions 统一使用 `bash tools/build-merlin-cross.sh <target>`。ARM64 在剥离前同样执行分配器符号校验，再使用 `llvm-strip` 生成部署文件；构建机需要安装 LLVM 工具。本地和 Actions 的正式包均使用 Rust 1.99.1 和工作区 release 配置：优化等级 3、fat LTO、单个代码生成单元、符号剥离及 panic 展开。ARMv7 沿用原有 cross 构建。
+本地和 Actions 的正式包使用 Rust 1.99.1，采用工作区 release 的 O3、fat LTO、单个代码生成单元和 panic 展开。Actions 通过 `bash tools/build-merlin-cross.sh <target>` 构建。两个 ARM64 入口共用 `tools/merlin-arm64-rustc-flags.sh`，最终使用 `rust-lld` 链接，内联阈值为 80，链接器可安全合并相同节。仅 YAML 读写和日志过滤表达式的解析依赖使用体积优化；依赖源码路径在编译时映射为包名和文件名。剥离符号前先校验分配器。变更这些参数时，应对比剥离后的文件大小和实际转发吞吐。ARMv7 沿用原有 cross 构建。
 
 ## 分配器验收与来源记录
 

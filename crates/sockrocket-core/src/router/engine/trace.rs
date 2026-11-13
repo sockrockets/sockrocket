@@ -1,6 +1,7 @@
 //! On-demand explanation of saved routing policy. Does not use/update the
 //! live route cache, open proxy connections, change rules, or log queries.
 use super::*;
+use std::pin::Pin;
 
 #[derive(Debug, serde::Serialize)]
 pub struct RouteTraceStep {
@@ -71,7 +72,7 @@ impl Router {
             if source_ok && needs_ip && !attempted {
                 attempted = true;
                 if resolve_dns {
-                    ip = resolve_host(&lower).await;
+                    ip = resolve_trace_host(&lower).await;
                     trace.resolved_ip = ip;
                     trace.dns = if ip.is_some() { "resolved" } else { "failed" };
                 } else {
@@ -120,6 +121,11 @@ impl Router {
         }
         trace
     }
+}
+
+// A diagnostic lookup shares core's resolver code without instantiating it in the CLI.
+fn resolve_trace_host(host: &str) -> Pin<Box<dyn Future<Output = Option<IpAddr>> + Send + '_>> {
+    Box::pin(resolve_host(host))
 }
 
 fn push_builtin(trace: &mut RouteTrace, checked: usize, needs_ip: bool) {

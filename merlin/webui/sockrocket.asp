@@ -7,9 +7,6 @@
 <meta http-equiv="Expires" content="-1">
 <link rel="shortcut icon" href="/images/favicon.png">
 <title>Sockrocket</title>
-<!-- Written by sockrocket.sh (api-start): defines SOCKROCKET_API_PORT from config.yaml's
-     api_port. Missing on koolcenter / old installs — the code falls back. -->
-<script src="api.js"></script>
 <link rel="stylesheet" href="/index_style.css">
 <link rel="stylesheet" href="/form_style.css">
 <script src="/js/jquery.js"></script>
@@ -125,9 +122,6 @@
 #sockrocket-plugin #sr-node-search {flex:1;min-width:150px;max-width:340px}
 #sockrocket-plugin .config-state {font-size:12px;color:var(--text-muted);margin-top:12px}
 
-#sockrocket-plugin .rule-workspace-controls {display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.4fr);gap:12px;margin:14px 0 10px}
-#sockrocket-plugin .rule-workspace-controls .fg {min-width:0}
-#sockrocket-plugin .rule-workspace-controls select {width:100%;min-width:0}
 #sockrocket-plugin .rule-workspace-actions {margin:12px 0}
 #sockrocket-plugin #sr-rule-default-fields.rule-simple > .fg:not(:first-child) {display:none}
 #sockrocket-plugin #sr-rule-default-fields.rule-simple {grid-template-columns:1fr}
@@ -135,7 +129,6 @@
 #sockrocket-plugin .rule-inline-editor {padding:16px;background:var(--bg-hover);border:1px solid var(--border);border-radius:9px;margin:14px 0}
 #sockrocket-plugin .rule-inline-editor .toolbar {margin-bottom:12px}
 #sockrocket-plugin #sr-rule-list-panel {border-top:1px solid var(--border);margin-top:14px;padding-top:4px}
-@media(max-width:700px) {#sockrocket-plugin .rule-workspace-controls {grid-template-columns:1fr 1fr} #sockrocket-plugin .rule-workspace-controls>.fg:first-child {grid-column:1/-1}}
 #sockrocket-plugin .rule-filters {display:grid;grid-template-columns:minmax(0,1fr) 140px 120px;gap:8px;margin:12px 0}
 #sockrocket-plugin .rule-main {flex:1;min-width:120px;overflow-wrap:anywhere}
 #sockrocket-plugin .rule-pattern {font-family:var(--mono);overflow-wrap:anywhere}
@@ -145,18 +138,12 @@
 #sockrocket-plugin .rule-phase {padding:10px 0;color:var(--text-muted);font-size:12px;border-top:1px dashed var(--border)}
 @media(max-width:700px) {#sockrocket-plugin .rule-filters {grid-template-columns:1fr 1fr} #sockrocket-plugin .rule-filters input {grid-column:1/-1} #sockrocket-plugin .rule-actions {width:100%;justify-content:flex-end}}
 #sockrocket-plugin .rule-group {border:1px solid var(--border);border-radius:9px;overflow:hidden;margin-bottom:12px}
-#sockrocket-plugin .rule-group-hd {display:flex;align-items:center;flex-wrap:wrap;gap:8px;background:var(--bg-hover);padding:10px 12px;}
-#sockrocket-plugin .rg-title {font-weight:600}
-#sockrocket-plugin .rg-count {font-size:11px;color:var(--text-muted)}
-#sockrocket-plugin .rg-actions {display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}
-#sockrocket-plugin .rule-group.collapsed .rule-group-body {display:none}
-#sockrocket-plugin .rule-group-body {padding:0 8px}
 #sockrocket-plugin .collapsible {display:none}
 #sockrocket-plugin .collapsible.open {display:block}
 #sockrocket-plugin .diag-row {display:flex;gap:14px;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
 #sockrocket-plugin .diag-row:last-child {border:0}
 #sockrocket-plugin .d-name {color:var(--text-secondary)}
-#sockrocket-plugin #sr-log-view,#sockrocket-plugin .log-block {height:380px;max-width:100%;overflow:auto;border:1px solid var(--border);border-radius:9px;padding:16px;background:#f7f8fa;color:#343c48;font:12px/1.8 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+#sockrocket-plugin #sr-log-view {height:380px;max-width:100%;overflow:auto;border:1px solid var(--border);border-radius:9px;padding:16px;background:#f7f8fa;color:#343c48;font:12px/1.8 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
 #sockrocket-plugin #sr-statusbar {display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border);margin-top:24px;padding-top:12px}
 #sockrocket-plugin .sb-left,#sockrocket-plugin .sb-right {display:flex;gap:8px;align-items:center;min-width:0;flex-wrap:wrap}
 #sockrocket-plugin .sb-right {margin-left:auto}
@@ -190,7 +177,6 @@
   width:fit-content;border:1px solid var(--border);background:white;border-radius:7px;
   padding:8px 12px;min-height:38px;font-size:13px;font-weight:600;
 }
-#sockrocket-plugin .rule-workspace-actions > .rule-add-options > summary {background:var(--text-accent);color:white;border-color:var(--text-accent)}
 #sockrocket-plugin .rule-workspace-actions > details[open] {flex:1 0 100%;min-width:0;padding:12px;border-radius:8px;background:var(--bg-hover)}
 #sockrocket-plugin .rule-workspace-actions > details[open] > :not(summary) {margin-top:10px}
 #sockrocket-plugin #sr-rule-list-panel {padding-top:14px}
@@ -255,9 +241,6 @@
 #sockrocket-plugin .pg-member label {display:flex;align-items:flex-start;gap:8px;flex:1;min-width:0;margin:0;cursor:pointer}
 #sockrocket-plugin .pg-member input {margin-top:2px;flex:none}
 #sockrocket-plugin .pg-member-move {display:flex;gap:4px;flex:none}
-#sockrocket-plugin .flow-detail {display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:var(--bg-hover);border-radius:8px;padding:12px 14px;margin-top:16px;min-width:0}
-#sockrocket-plugin .flow-detail>div {flex:1;min-width:140px;overflow-wrap:anywhere}
-#sockrocket-plugin .flow-detail p {font-size:11px;color:var(--text-muted)}
 #sockrocket-plugin .flow-state {font-size:11px;background:var(--bg-hover);color:var(--text-muted);border-radius:5px;padding:3px 8px}
 #sockrocket-plugin .traffic-table {width:100%;border-collapse:collapse;font-size:12px}
 #sockrocket-plugin .traffic-table th,#sockrocket-plugin .traffic-table td {padding:7px 8px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
@@ -309,7 +292,6 @@ body.bg {min-width:0!important}
  #sockrocket-plugin .adaptive-form,#sockrocket-plugin .form-grid {grid-template-columns:1fr!important}
  #sockrocket-plugin .stat {padding:15px}
  #sockrocket-plugin .stat .value {font-size:22px}
- #sockrocket-plugin .rg-actions {margin-left:0}
  #sockrocket-plugin .row .btn {min-height:38px}
  #sockrocket-plugin .sb-right {display:none}
  #sockrocket-plugin .diag-row {align-items:flex-start}
@@ -658,7 +640,7 @@ body.bg {min-width:0!important}
           </div>
           </div>
           </div>
-<section hidden class="rule-inline-editor" id="sr-rule-edit-panel" aria-labelledby="sr-rule-edit-title"><h3 id="sr-rule-edit-title">编辑规则</h3><p class="hint">可直接修改优先级，数字越大越先匹配。运行中的服务会重启以应用规则。</p><div class="form-grid"><div class="fg"><label for="sr-edit-rule-group">分组</label><input type="text" id="sr-edit-rule-group" list="sr-rule-group-list"></div><div class="fg"><label for="sr-edit-rule-type">类型</label><select id="sr-edit-rule-type" onchange="editRuleTypeChanged()"><option value="domain">完整域名</option><option value="domain-suffix">域名后缀</option><option value="domain-keyword">域名关键词</option><option value="ip-cidr">IP 网段</option><option value="geoip">地区</option><option value="dst-port">端口</option></select></div><div class="fg"><label for="sr-edit-rule-pattern">匹配内容</label><input type="text" id="sr-edit-rule-pattern" spellcheck="false"></div><div class="fg"><label for="sr-edit-rule-source">设备来源 IP / 网段</label><input id="sr-edit-rule-source" type="text" placeholder="留空作为组内规则" autocomplete="off"></div><div class="fg"><label for="sr-edit-rule-priority">优先级（数字越大越先匹配）</label><input type="number" id="sr-edit-rule-priority" step="1" min="-2147483648" max="2147483647"></div><div class="fg"><label for="sr-edit-rule-target">处理方式</label><select id="sr-edit-rule-target"><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select></div></div><label><input type="checkbox" id="sr-edit-rule-enabled"> 启用此规则</label><div class="dialog-actions"><button class="btn" onclick="cancelRuleRowEditor()">取消</button><button class="btn btn-accent" id="sr-rule-edit-save" onclick="saveRuleEdit()">保存修改</button></div></section>
+<section hidden class="rule-inline-editor" id="sr-rule-edit-panel" aria-labelledby="sr-rule-edit-title"><h3 id="sr-rule-edit-title">编辑规则</h3><p class="hint">可直接修改优先级，数字越大越先匹配。运行中的服务会重启以应用规则。</p><div class="form-grid"><div class="fg"><label for="sr-edit-rule-group">分组</label><input type="text" id="sr-edit-rule-group" list="sr-rule-group-list"></div><div class="fg"><label for="sr-edit-rule-type">类型</label><select id="sr-edit-rule-type" onchange="editRuleTypeChanged()"><option value="domain">完整域名</option><option value="domain-suffix">域名后缀</option><option value="domain-keyword">域名关键词</option><option value="ip-cidr">IP 网段</option><option value="geoip">地区</option><option value="dst-port">端口</option></select></div><div class="fg"><label for="sr-edit-rule-pattern">匹配内容</label><input type="text" id="sr-edit-rule-pattern" spellcheck="false"></div><div class="fg"><label for="sr-edit-rule-source">设备来源 IP / 网段</label><input id="sr-edit-rule-source" type="text" placeholder="留空作为组内规则" autocomplete="off"></div><div class="fg"><label for="sr-edit-rule-priority">优先级（数字越大越先匹配）</label><input type="number" id="sr-edit-rule-priority" step="1" min="-2147483648" max="2147483647"></div><div class="fg"><label for="sr-edit-rule-target">处理方式</label><select id="sr-edit-rule-target"><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select></div></div><label><input type="checkbox" id="sr-edit-rule-enabled"> 启用此规则</label><div class="dialog-actions"><button class="btn" onclick="cancelRuleEditor()">取消</button><button class="btn btn-accent" id="sr-rule-edit-save" onclick="saveRuleEdit()">保存修改</button></div></section>
           <div id="sr-rule-list-panel">
           <input type="text" id="sr-rule-search" autocomplete="off" spellcheck="false" aria-label="搜索规则" placeholder="查找组内规则（域名、IP 或名称）" oninput="renderRules()">
           <details id="sr-rule-filter-panel"><summary>更多筛选</summary><div class="rule-filters"><select id="sr-rule-filter-target" aria-label="筛选处理方式" onchange="renderRules()"><option value="">全部处理方式</option><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select><select id="sr-rule-filter-scope" aria-label="筛选规则来源" onchange="renderRules()"><option value="">全部来源</option><option value="global">全局规则</option><option value="device">设备专属规则</option></select><select id="sr-rule-filter-state" aria-label="筛选状态" onchange="renderRules()"><option value="">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></div><button class="btn btn-sm" onclick="changeRuleGroup(RULE_SELECTED_GROUP)">清除筛选</button></details><p class="hint" id="sr-rule-count" aria-live="polite"></p>
@@ -824,7 +806,6 @@ body.bg {min-width:0!important}
 /* ══ API ═══════════════════════════════════════════════════════════ */
 /* Firmware transports, auto-detected at boot. The built-in HTTP API is
  * loopback-only and token-protected; a browser cannot connect to it directly.
- * The legacy 'http' transport branch below is retained for older pages.
  *   'cgi'  — legacy: direct CGI at /cgi-bin/sockrocket.cgi (the stock Merlin
  *            httpd does NOT execute user CGIs; kept for old installs)
  *   'ksc'  — koolcenter software center (read-only /www): POST /_api/
@@ -851,12 +832,6 @@ function sockrocketInitHost() {
 }
 
 var TRANSPORT = null;
-/* Port comes from api.js (generated by sockrocket.sh from config.yaml's api_port);
- * 18188 is the built-in default matching sockrocket-cli's DEFAULT_API_PORT. */
-var API_PORT = (typeof SOCKROCKET_API_PORT === 'number' && SOCKROCKET_API_PORT > 0) ? SOCKROCKET_API_PORT : 18188;
-
-function apiBase() { return 'http://' + location.hostname + ':' + API_PORT + '/api'; }
-
 function probeTransport(cb) {
   probeGet('/cgi-bin/sockrocket.cgi?action=version', 2500, function (ok) {
     TRANSPORT = ok ? 'cgi' : 'ksc';
@@ -895,17 +870,24 @@ function srApi(action, data, cb, errCb, timeoutMs) {
       } else if (errCb) errCb(error);
     }
     if (TRANSPORT === 'ksc') return apiKsc(action, data, cb, failed, remaining);
-    return apiXhr(TRANSPORT === 'http' ? apiBase() : '/cgi-bin/sockrocket.cgi', action, data, cb, failed, remaining);
+    return apiXhr(action, data, cb, failed, remaining);
   }
   return attempt();
 }
 
-function apiXhr(base, action, data, cb, errCb, timeoutMs) {
+function deliverApiResult(d, cb, errCb) {
+  if (d.error_code || d.error) {
+    if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.msg || d.error || d.error_code), 'err');
+    if (errCb) errCb(d);
+  } else { cb(d); }
+}
+
+function apiXhr(action, data, cb, errCb, timeoutMs) {
   var xhr = new XMLHttpRequest();
   // Same as probeGet: open()/setRequestHeader() throw on a malformed URL and
   // must not escape uncaught.
   try {
-    xhr.open('POST', base + '?action=' + action, true);
+    xhr.open('POST', '/cgi-bin/sockrocket.cgi?action=' + action, true);
     xhr.setRequestHeader('X-Sockrocket-Request', '1');
     xhr.setRequestHeader('Content-Type', 'application/json');
     xhr.timeout = timeoutMs || 15000;
@@ -917,11 +899,7 @@ function apiXhr(base, action, data, cb, errCb, timeoutMs) {
   xhr.onload = function () {
     if (xhr.status < 200 || xhr.status >= 300) { srShowMsg('接口请求失败（' + xhr.status + '）','err'); if (errCb) errCb({error_code:'http_error'}); return; }
     try {
-      var d = JSON.parse(xhr.responseText);
-      if (d.error_code || d.error) {
-        if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.msg || d.error || d.error_code), 'err');
-        if (errCb) errCb(d);
-      } else { cb(d); }
+      deliverApiResult(JSON.parse(xhr.responseText), cb, errCb);
     } catch (e) {
       srShowMsg('接口返回内容无法解析', 'err');
       if (errCb) errCb({ error_code: 'parse_error' });
@@ -1062,10 +1040,7 @@ function pollKscResult(seq, tries, cb, errCb, deadline) {
       try {
         var d = JSON.parse(t);
         acknowledgeKscResult(seq);
-        if (d.error_code || d.error) {
-          if (d.error_code !== 'busy') srShowMsg('错误：' + (d.error_message || d.msg || d.error || d.error_code), 'err');
-          if (errCb) errCb(d);
-        } else { cb(d); }
+        deliverApiResult(d, cb, errCb);
         return;
       } catch (e) { /* fall through to retry */ }
     }
@@ -1155,12 +1130,10 @@ function srCopyText(text, okMsg) {
 var SR_STATE = {
   page: 'home',
   statusKnown: false,
-  statusAt: 0,
   status: {},        // status action result
   stats: {},         // stats action result
   nodes: [],         // node_details
   subs: [],          // subscriptions (for copy-url by index)
-  activeNode: 0,
   lat: {},           // index -> ms (-1 = timeout)
   testingAll: false,
 };
@@ -1258,7 +1231,12 @@ function refreshStatus(withSysinfo) {
   function read(action, success) {
     if (refreshPending[action]) return;
     refreshPending[action] = true;
-    srApi(action, null, function (d) { refreshPending[action] = false; success(d); }, function () {
+    var body = null;
+    if (action === 'status') {
+      var page = SR_STATE.page;
+      body = {revision_scope: page === 'dns' ? 'rules' : page === 'network' ? 'network' : 'none'};
+    }
+    srApi(action, body, function (d) { refreshPending[action] = false; success(d); }, function () {
       refreshPending[action] = false;
       if (action === 'status' && generation===statusGeneration) {
         SR_STATE.statusKnown = false;
@@ -1271,13 +1249,18 @@ function refreshStatus(withSysinfo) {
     if(generation!==statusGeneration){refreshStatus(withSysinfo);return;}
     acceptStatus(d);
   });
-  read('stats', function (d) { SR_STATE.stats = d; renderChrome(); });
+  read('stats', function (d) {
+    SR_STATE.stats = d;
+    renderSessionTraffic(d.traffic);
+    renderSubscriptionTraffic(d.traffic);
+    renderChrome();
+  });
   if (withSysinfo) read('sysinfo', function (d) { SR_STATE.sysinfo = d; renderChrome(); });
 }
 
 function acceptStatus(d) {
     if (!d || typeof d.running !== 'boolean') { SR_STATE.statusKnown = false; renderChrome(); return; }
-    SR_STATE.status = d; SR_STATE.statusKnown = true; SR_STATE.statusAt = Date.now();
+    SR_STATE.status = d; SR_STATE.statusKnown = true;
     srElement('status-freshness').textContent = '更新于 ' + new Date().toLocaleTimeString();
     renderChrome(); renderNodes();
     if(SR_STATE.page==='network' && !dnsPolicyPending && !networkPending && !dnsPolicyDirty && d.network_revision && dnsPolicyRevision && d.network_revision!==dnsPolicyRevision)loadNetworkPolicy();
@@ -1329,8 +1312,6 @@ function renderSubscriptionTraffic(traffic) {
 }
 function renderChrome() {
   var st = SR_STATE.status, ss = SR_STATE.stats, si = SR_STATE.sysinfo || {};
-  renderSessionTraffic(ss && ss.traffic);
-  renderSubscriptionTraffic(ss && ss.traffic);
   var running = !!st.running;
   var pill = srElement('service-pill');
   pill.textContent = !SR_STATE.statusKnown ? '状态未知' : running ? '运行中' : '已停止';
@@ -1441,8 +1422,7 @@ function renderNetworkControls() {
   cn.classList.toggle('pending',networkPending);
   setChip('cn',!!st.cn_ipset_direct);
   if(st.cn_ipset_direct&&!(online&&st.transparent_proxy))srElement('cn-state').textContent='已保存，待启用 TUN';
-  cn.title=globalMode?'全局模式下国内 IP 也走代理。':'命中国内 IP 的局域网流量会绕过 TUN 和域名分流规则。开启透明代理后生效。';
-  if(!globalMode)cn.title+=' (IPv4 / IPv6 dual-stack)';
+  cn.title=globalMode?'全局模式下国内 IP 也走代理。':'开启透明代理后，访问国内 IPv4 地址的流量可绕过 TUN；双栈接管时也支持国内 IPv6 地址。绕过的连接不经过域名分流规则，设有专属规则的设备仍按规则处理。';
   if(!SR_STATE.statusKnown){['dns','fw','cn'].forEach(function(id){srElement(id+'-state').textContent='待确认';srElement('chip-'+id).title='状态尚未确认，请等待最新状态。';});return;}
   srElement('chip-dns').title=!online?'服务已停止，DNS 接管已关闭；启动服务时默认开启。':st.dns_hijack?(st.transparent_proxy?'DNS 接管与 TUN 已开启，使用短 TTL Fake-IP':'DNS 接管已开启，使用短 TTL 真实地址'):'DNS 接管已关闭，局域网使用原有 DNS';
   srElement('chip-fw').title=!online?'服务已停止，TUN 透明代理已关闭；启动服务时默认开启。':st.transparent_proxy?'透明代理已开启；单独关闭它会保留 DNS 接管':'透明代理已关闭，DNS 接管由单独开关控制';
@@ -1630,7 +1610,6 @@ function srLoadNodes() {
       // The backend owns running work and cached results, including after reload.
       pollSpeedTestJob();
     }
-    SR_STATE.activeNode = d.active || 0;
     renderNodes();
     renderChrome();
   }, failed);
@@ -2090,20 +2069,7 @@ function updateSubs() {
 }
 
 
-var SR_PROXY_GROUPS=[], SR_RULE_NODES=[], PG_NODES=[], PG_REVISION=null, PG_EDIT_REVISION=null, PG_ORIGINAL='', PG_KEEP_CURRENT='', PG_BUSY=false, PG_LOAD_GENERATION=0;
-function setProxyGroupTargets(groups) {
-  SR_PROXY_GROUPS=groups||[];
-  if (typeof rebuildRuleTargets==='function') { rebuildRuleTargets(); return; }
-  Object.keys(RULE_TARGET_LABEL).forEach(function(k){if(k.indexOf('group:')===0)delete RULE_TARGET_LABEL[k];});
-  SR_PROXY_GROUPS.forEach(function(g){RULE_TARGET_LABEL['group:'+g.name]='分组 · '+g.name;});
-  ['rule-target','edit-rule-target','rule-filter-target','device-target','device-add-target','preset-route-target'].forEach(function(id){
-    var el=srElement(id);if(!el)return;var old=el.value;
-    var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除单独设置</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
-    el.innerHTML=prefix+['proxy','direct','reject'].concat(SR_PROXY_GROUPS.map(function(g){return 'group:'+g.name;})).map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
-    if(Array.from(el.options).some(function(o){return o.value===old;}))el.value=old;
-    else if(old && old.indexOf('group:')===0){var o=document.createElement('option');o.value=old;o.textContent='已失效 · '+old;el.appendChild(o);el.value=old;}
-  });
-}
+var SR_PROXY_GROUPS=[], PG_NODES=[], PG_REVISION=null, PG_EDIT_REVISION=null, PG_ORIGINAL='', PG_KEEP_CURRENT='', PG_BUSY=false, PG_LOAD_GENERATION=0;
 function loadProxyGroups(){
   if(PG_BUSY)return;
   var generation=++PG_LOAD_GENERATION;
@@ -2671,25 +2637,24 @@ function startRulePresetAddition() {
   srElement('rule-editor-state').textContent='向「'+(RULE_SELECTED_GROUP||'未分组')+'」添加规则';
   renderRuleAddMethod('preset');renderRulePreset();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);
 }
-function startRuleAddition() {
+function startRuleAddition(method) {
   if(ruleWorkspaceLocked() || RULE_SELECTED_GROUP === null || !discardRuleDraft())return;
-  resetRuleEditor();srElement('rule-add-panel').hidden=false;renderRuleAddMethod('manual');
+  var importing=method==='url';
+  if(importing && !RULE_SELECTED_GROUP){srShowMsg('请先新建或选择具名规则组。','err');return;}
+  resetRuleEditor();
+  srElement('rule-add-panel').hidden=false;
   srElement('rule-editor-state').textContent='向「'+(RULE_SELECTED_GROUP || '未分组')+'」添加规则';
-  srElement('rule-group').value=RULE_SELECTED_GROUP;
   var proxy=ruleGroupMembers(RULE_SELECTED_GROUP).filter(function(r){return proxyLikeTarget(r.target);});
   srElement('rule-target').value=proxy.length?proxy[0].target:'proxy';
-  ruleTypeChanged();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);srElement('rule-type').focus();
+  if(importing) {
+    RULE_IMPORT_MODE=true;RULE_WORKSPACE_MODE='import';renderRuleAddMethod('url');
+    srElement('rule-entry-mode').value='bulk';srElement('rule-dup').value='skip';
+    srElement('rule-import-panel').hidden=false;
+  }
+  ruleTypeChanged();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);
+  srElement(importing?'rule-import-url':'rule-type').focus();
 }
-function startRuleImport() {
-  if(ruleWorkspaceLocked() || RULE_SELECTED_GROUP === null || !discardRuleDraft())return;
-  if(!RULE_SELECTED_GROUP){srShowMsg('请先新建或选择具名规则组。','err');return;}
-  resetRuleEditor();startRuleAddition();
-  RULE_IMPORT_MODE=true;RULE_WORKSPACE_MODE='import';renderRuleAddMethod('url');
-  srElement('rule-entry-mode').value='bulk';srElement('rule-dup').value='skip';
-  srElement('rule-import-panel').hidden=false;
-  srElement('rule-editor-state').textContent='向「'+(RULE_SELECTED_GROUP || '未分组')+'」添加规则';
-  ruleTypeChanged();RULE_ADD_BASELINE=ruleEditorSnapshot();renderRules(false);srElement('rule-import-url').focus();
-}
+function startRuleImport() {startRuleAddition('url');}
 function fetchRuleList() {
   if(!RULE_IMPORT_MODE || ruleWorkspaceLocked() || RULE_IMPORT_PENDING)return;
   var url=srElement('rule-import-url').value.trim();
@@ -2715,29 +2680,27 @@ function fetchRuleList() {
   }
   srApi('fetch_rule_list',{url:url,target:srElement('rule-target').value,group:RULE_SELECTED_GROUP},finish,finish,40000);
 }
-function cancelRuleRowEditor() {if(discardRuleDraft()){resetRuleEditor();renderRules(false);}}
-
-var RULE_COLLAPSED = Object.create(null);
-var SR_RULE_NODES = SR_RULE_NODES || [];
+var SR_RULE_NODES = [];
 function ruleActiveNodeName() {
   if(SR_STATE.ruleActiveNodeName!==undefined)return SR_STATE.ruleActiveNodeName;
   var i=(SR_STATE.status||{}).active_node;
   var node=(SR_STATE.nodes||[])[i] || SR_RULE_NODES[i];
   return node?node.name:'';
 }
-function setRuleNodes(nodes) {
-  SR_RULE_NODES = Array.isArray(nodes) ? nodes.filter(function(n){return n && typeof n.id==='string' && /^[0-9a-f]{64}$/.test(n.id) && typeof n.name==='string';}) : [];
-  rebuildRuleTargets();
-}
-function rebuildRuleTargets() {
+function setProxyGroupTargets(groups, nodes) {
+  SR_PROXY_GROUPS = groups || [];
+  if (nodes !== undefined) {
+    SR_RULE_NODES = Array.isArray(nodes) ? nodes.filter(function(n){return n && typeof n.id==='string' && /^[0-9a-f]{64}$/.test(n.id) && typeof n.name==='string';}) : [];
+  }
   Object.keys(RULE_TARGET_LABEL).forEach(function(k){if(k.indexOf('group:')===0 || k.indexOf('node:')===0)delete RULE_TARGET_LABEL[k];});
   SR_RULE_NODES.forEach(function(n){RULE_TARGET_LABEL['node:'+n.id]='节点 · '+n.name;});
   (SR_PROXY_GROUPS||[]).forEach(function(g){RULE_TARGET_LABEL['group:'+g.name]='分组 · '+g.name;});
   var values=['proxy','direct','reject'].concat(SR_RULE_NODES.map(function(n){return 'node:'+n.id;})).concat((SR_PROXY_GROUPS||[]).map(function(g){return 'group:'+g.name;}));
+  var options=values.map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
   ['rule-target','edit-rule-target','rule-filter-target','device-target','device-add-target','preset-route-target'].forEach(function(id){
     var el=srElement(id);if(!el)return;var old=el.value;
     var prefix=id==='device-add-target'?'<option value="">请选择出口（必填）</option>':id==='rule-filter-target'?'<option value="">全部处理方式</option>':id==='device-target'?'<option value="inherit">清除单独设置</option>':id==='preset-route-target'?'<option value="">使用预设默认</option>':'';
-    el.innerHTML=prefix+values.map(function(t){return '<option value="'+srEsc(t)+'">'+srEsc(RULE_TARGET_LABEL[t])+'</option>';}).join('');
+    el.innerHTML=prefix+options;
     var current=el.options?Array.from(el.options):[];
     if(current.some(function(o){return o.value===old;}))el.value=old;
     else if(old && el.options && (old.indexOf('group:')===0 || old.indexOf('node:')===0)){var o=document.createElement('option');o.value=old;o.textContent='已失效 · '+old;el.appendChild(o);el.value=old;}
@@ -2816,7 +2779,7 @@ function orderedRules(rules) {
   });
 }
 var RULE_FLOW_SELECTED = 0, RULE_FLOW_ERROR = false, RULE_FLOW_CLIENT = '';
-var RULE_TRACE=null,RULE_TRACE_PENDING=false,RULE_TRACE_GENERATION=0,RULE_RULE_REVISION=null,RULE_FLOW_FILTER=null,RULE_TRACE_CONTEXT=null;
+var RULE_TRACE=null,RULE_TRACE_PENDING=false,RULE_TRACE_GENERATION=0,RULE_RULE_REVISION=null,RULE_TRACE_CONTEXT=null;
 var RULE_READ_PENDING=false,RULE_LOAD_GENERATION=0,RULE_SNAPSHOT_MODE=null;
 function ruleTraceContext(){var s=SR_STATE.status||{};return JSON.stringify([s.proxy_mode,s.active_node,s.node_count,s.running,s.transparent_proxy,s.cn_ipset_direct]);}
 // Used only for local diagram previews; Rust validates saved selectors.
@@ -3366,9 +3329,7 @@ function srLoadRules(after) {
     RULE_SNAPSHOT_MODE=typeof d.proxy_mode==='string'?d.proxy_mode:(SR_STATE.status||{}).proxy_mode||'rule';
     var revision=d.revision||null, changed=RULE_RULE_REVISION!==revision;
     RULE_RULE_REVISION=revision;
-    if(changed&&RULE_FLOW_FILTER&&RULE_FLOW_FILTER.indices)RULE_FLOW_FILTER=null;
-    setRuleNodes(d.nodes || []);
-    setProxyGroupTargets(d.proxy_groups || []);
+    setProxyGroupTargets(d.proxy_groups, d.nodes || []);
     syncFlowDevicePicker();
     renderDevicePolicies();
     loadRulePresets(d.presets);
@@ -3604,12 +3565,6 @@ function delRule(i) {
   var request=ruleIndexRequest(i);if(!request)return;
   if (!confirm('删除这条规则？')) return;
   ruleApi('del_rule', request, function (d) {
-    toastResp(d);
-  });
-}
-function applyRuleScene(id) {
-  if (!confirm('应用所选规则模板？这会改变流量分流，请确认后继续。')) return;
-  ruleApi('apply_rule_scene', { scene: id }, function (d) {
     toastResp(d);
   });
 }

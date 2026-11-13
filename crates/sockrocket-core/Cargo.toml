@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Forward tracing events to an externally installed log logger in library applications.
+default = ["log-fallback"]
+log-fallback = ["quinn/log"]
+
 [dependencies]
 blake3 = "1.8"
 ctr = "0.9"
@@ -19,8 +24,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-log = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
@@ -33,6 +36,7 @@ socket2 = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 craft-tls = { workspace = true }
+craftls = { package = "rustls", version = "0.22.4", default-features = false, features = ["lazy-fingerprint-sets"] }
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
 sha2 = { workspace = true }
@@ -64,6 +68,7 @@ ipstack = { workspace = true }
 etherparse = { workspace = true }
 
 [dev-dependencies]
+log = { workspace = true }
 # Independent ML-KEM/HRR server fixtures require aws-lc, not the production
 # client. Resolver v2 keeps this backend out of release CLI dependencies.
 rustls = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum"] }

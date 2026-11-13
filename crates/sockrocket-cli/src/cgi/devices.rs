@@ -6,15 +6,13 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 pub(super) fn links(map: &Mapping) -> Result<Vec<DeviceRuleGroup>> {
-    Ok(serde_yaml::from_value(
-        map.get(ykey("device_rule_groups"))
-            .cloned()
-            .unwrap_or(Y::Sequence(vec![])),
+    Ok(sockrocket_core::config::model::device_groups_from_yaml(
+        map,
     )?)
 }
 pub(super) fn store_links(map: &mut Mapping, links: &[DeviceRuleGroup]) {
     if links.is_empty() {
-        map.remove(ykey("device_rule_groups"));
+        map.remove("device_rule_groups");
     } else {
         map.insert(
             ykey("device_rule_groups"),
@@ -24,11 +22,7 @@ pub(super) fn store_links(map: &mut Mapping, links: &[DeviceRuleGroup]) {
 }
 // Materialize legacy membership before an editor can add or rename a group.
 pub(super) fn migrate_bindings(map: &mut Mapping) -> Result<()> {
-    if map
-        .get(ykey("explicit_group_bindings"))
-        .and_then(Y::as_bool)
-        == Some(true)
-    {
+    if map.get("explicit_group_bindings").and_then(Y::as_bool) == Some(true) {
         return Ok(());
     }
     let mut bindings = links(map)?;
@@ -166,10 +160,8 @@ pub(super) fn save_binding(post: &J) -> J {
     proxy_groups::applied(&map)
 }
 fn checked_rules(map: &Mapping) -> Result<Vec<sockrocket_core::RoutingRule>> {
-    Ok(serde_yaml::from_value(
-        map.get(ykey("rules"))
-            .cloned()
-            .unwrap_or(Y::Sequence(vec![])),
+    Ok(sockrocket_core::config::model::routing_rules_from_yaml(
+        map,
     )?)
 }
 
@@ -242,7 +234,7 @@ pub(super) fn catalog() -> Vec<J> {
     let mut aliases = aliases().unwrap_or_default();
     let removed: Vec<String> = load_conf()
         .ok()
-        .and_then(|m| m.get(ykey("removed_device_sources")).cloned())
+        .and_then(|m| m.get("removed_device_sources").cloned())
         .and_then(|v| serde_yaml::from_value(v).ok())
         .unwrap_or_default();
     aliases.retain(|_, a| !removed.contains(&a.source));
@@ -292,7 +284,7 @@ pub(super) fn delete(post: &J) -> J {
     save_routing_rules(&mut map, rules);
     // Alias cleanup is recorded in the same configuration transaction.
     let mut removed: Vec<String> = serde_yaml::from_value(
-        map.get(ykey("removed_device_sources"))
+        map.get("removed_device_sources")
             .cloned()
             .unwrap_or(Y::Sequence(vec![])),
     )
@@ -334,7 +326,7 @@ pub(super) fn save_alias(post: &J) -> J {
     };
     let removed: Vec<String> = load_conf()
         .ok()
-        .and_then(|m| m.get(ykey("removed_device_sources")).cloned())
+        .and_then(|m| m.get("removed_device_sources").cloned())
         .and_then(|v| serde_yaml::from_value(v).ok())
         .unwrap_or_default();
     let previous = aliases
@@ -356,7 +348,7 @@ pub(super) fn save_alias(post: &J) -> J {
         );
     }
     if let Ok(mut map) = load_conf()
-        && let Some(Y::Sequence(removed)) = map.get_mut(ykey("removed_device_sources"))
+        && let Some(Y::Sequence(removed)) = map.get_mut("removed_device_sources")
     {
         removed.retain(|v| v.as_str() != Some(&source));
         if save_conf(&map).is_err() {

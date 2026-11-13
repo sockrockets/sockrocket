@@ -6,9 +6,13 @@ use sockrocket_core::router::{RouteAction, Router, china_geoip_db, rule_mode_wit
 use std::net::IpAddr;
 
 pub(super) fn rules_revision(map: &Mapping) -> String {
-    let input = json!({"builtin_route":map.get(ykey("builtin_route")),"device_rule_groups":map.get(ykey("device_rule_groups")),"groups":map.get(ykey("groups")), "nodes":map.get(ykey("nodes")), "rules": load_routing_rules(map),
+    revision_for_rules(map, &load_routing_rules(map))
+}
+
+pub(super) fn revision_for_rules(map: &Mapping, rules: &[sockrocket_core::RoutingRule]) -> String {
+    let input = json!({"builtin_route":map.get("builtin_route"),"device_rule_groups":map.get("device_rule_groups"),"groups":map.get("groups"), "nodes":map.get("nodes"), "rules": rules,
         "mode": conf_str(map,"proxy_mode").unwrap_or_else(||"rule".into()).to_lowercase(),
-        "active_node": conf_usize(map,"active_node"), "dns":map.get(ykey("dns")),"dns_direct_server":map.get(ykey("dns_direct_server")),"dns_direct_domains":map.get(ykey("dns_direct_domains")),"ipv6_mode":map.get(ykey("ipv6_mode"))});
+        "active_node": conf_usize(map,"active_node"), "dns":map.get("dns"),"dns_direct_server":map.get("dns_direct_server"),"dns_direct_domains":map.get("dns_direct_domains"),"ipv6_mode":map.get("ipv6_mode")});
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&input).unwrap_or_default())
@@ -121,7 +125,8 @@ pub(super) fn act_trace_route(post: &J) -> J {
             );
         }
     };
-    let revision = rules_revision(&map);
+    let rules = load_routing_rules(&map);
+    let revision = revision_for_rules(&map, &rules);
     if post
         .get("expected_revision")
         .is_some_and(|v| v.as_str() != Some(&revision))
@@ -131,7 +136,6 @@ pub(super) fn act_trace_route(post: &J) -> J {
             "规则或模式已经更新，请刷新规则后重新检查",
         );
     }
-    let rules = load_routing_rules(&map);
     if rules.len() != conf_seq(&map, "rules").len() {
         return failure(
             "route_trace_config",
@@ -149,12 +153,8 @@ pub(super) fn act_trace_route(post: &J) -> J {
             return failure("route_trace_config", "设备规则组关联配置无效");
         };
         if !links.is_empty() {
-            let exits = serde_yaml::from_value(
-                map.get(ykey("groups"))
-                    .cloned()
-                    .unwrap_or(Y::Sequence(vec![])),
-            );
-            if !exits.is_ok_and(|exits: Vec<sockrocket_core::ProxyGroupConfig>| {
+            let exits = sockrocket_core::config::model::proxy_groups_from_yaml(&map);
+            if !exits.is_ok_and(|exits| {
                 sockrocket_core::config::model::validate_device_rule_groups(&links, &rules, &exits)
                     .is_ok()
             }) {
@@ -166,10 +166,7 @@ pub(super) fn act_trace_route(post: &J) -> J {
         };
         let router = Router::new(rule_mode_with_builtin(&rules, &links, true, builtin))
             .with_geoip(std::sync::Arc::new(china_geoip_db()));
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        let rt = match CgiRuntime::new() {
             Ok(rt) => rt,
             Err(_) => return failure("route_trace_unavailable", "无法启动分流查询，请稍后重试"),
         };
@@ -177,8 +174,8 @@ pub(super) fn act_trace_route(post: &J) -> J {
             let context = async {
                 let settings =
                     sockrocket_core::config::dns::DnsSettings::from_yaml(&Y::Mapping(map.clone()))?;
-                let config: sockrocket_core::AppConfig =
-                    serde_yaml::from_value(Y::Mapping(map.clone()))?;
+                let config =
+                    sockrocket_core::AppConfig::decode_yaml_fields(Y::Mapping(map.clone()))?;
                 let dns = settings
                     .resolver_config(config.nodes.iter().map(|node| node.server.clone()))?;
                 let mut resolver = sockrocket_core::DnsResolver::with_config(dns);
@@ -227,24 +224,16 @@ pub(super) fn act_trace_route(post: &J) -> J {
     let pinned_node = action
         .strip_prefix("node:")
         .and_then(|id| proxy_groups::node_name(&map, id));
-    let group_info = proxy_groups::catalog(&map);
-    let group_node = selected_group
-        .and_then(|name| {
-            group_info
-                .as_array()?
-                .iter()
-                .find(|g| g["name"].as_str() == Some(name))
-        })
-        .and_then(|g| g["selected_node"].as_str());
+    let group = selected_group.and_then(|name| proxy_groups::trace_group(&map, name));
     let name = active
-        .and_then(|i| nodes[i].get(ykey("name")))
+        .and_then(|i| nodes[i].get("name"))
         .and_then(Y::as_str);
     let (transparent_proxy, _) = effective_toggles(&map);
     json!({"ok":true,"scope":"saved_config","revision":revision,"destination":host,"port":port,"source":source,
         "mode":mode,"running":is_running(),"transparent_proxy":transparent_proxy,
         "lan_degraded":sockrocket_dir().join(".lan_degraded").exists(),
         "cn_ipset_direct":conf_bool(&map,"cn_ipset_direct",false),
-        "active_node":active,"node_name":if selected_group.is_some() {group_node} else if action.starts_with("node:") {pinned_node.as_deref()} else {name},"proxy_group":selected_group,"group_type":selected_group.and_then(|name|group_info.as_array()?.iter().find(|g|g["name"].as_str()==Some(name))).map(|g|g["type"].clone()),"trace":trace})
+        "active_node":active,"node_name":if selected_group.is_some() {group.as_ref().and_then(|(_, node)| node.as_deref())} else if action.starts_with("node:") {pinned_node.as_deref()} else {name},"proxy_group":selected_group,"group_type":group.as_ref().map(|(kind, _)| kind),"trace":trace})
 }
 
 #[cfg(test)]

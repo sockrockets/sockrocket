@@ -203,15 +203,9 @@ pub fn ensure_quic_crypto_provider() {
     });
 }
 
-/// Globally cached root cert store for QUIC TLS (built once).
-static QUIC_ROOT_CERTS: std::sync::OnceLock<rustls::RootCertStore> = std::sync::OnceLock::new();
-
+/// Bundled roots used by standard QUIC TLS clients.
 pub fn quic_root_certs() -> &'static rustls::RootCertStore {
-    QUIC_ROOT_CERTS.get_or_init(|| {
-        let mut store = rustls::RootCertStore::empty();
-        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        store
-    })
+    &crate::TLS_ROOT_CERTIFICATES
 }
 
 /// Build a `quinn::ClientConfig` with TLS settings (reusable across reconnections).
@@ -248,7 +242,7 @@ pub(super) fn build_quic_client_config_with_early_data(
             .with_no_client_auth()
     } else {
         rustls::ClientConfig::builder()
-            .with_root_certificates(quic_root_certs().clone())
+            .with_root_certificates(Arc::clone(&crate::TLS_ROOT_CERTIFICATES))
             .with_no_client_auth()
     };
 

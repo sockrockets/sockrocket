@@ -977,20 +977,27 @@ impl DnsResolver {
     }
 
     /// On-demand wire diagnostic, without cache, Fake-IP or saved history.
-    pub async fn test_upstream(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        anyhow::ensure!(matches!(qtype, 1 | 28), "Unsupported DNS diagnostic type");
-        let query = build_dns_query(domain, qtype);
-        let mut snapshot = self.query_snapshot();
-        let mut config = (*snapshot.config).clone();
-        config.cache_enabled = false;
-        snapshot.config = Arc::new(config);
-        let reply = snapshot.exchange_raw(&query).await?;
-        anyhow::ensure!(
-            reply[3] & 15 == 0,
-            "DNS server returned rcode {}",
-            reply[3] & 15
-        );
-        parse_dns_response(&reply)
+    pub fn test_upstream<'a>(
+        &'a self,
+        domain: &'a str,
+        qtype: u16,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send + 'a>> {
+        // One allocation per manual probe keeps the wire exchange code in core.
+        Box::pin(async move {
+            anyhow::ensure!(matches!(qtype, 1 | 28), "Unsupported DNS diagnostic type");
+            let query = build_dns_query(domain, qtype);
+            let mut snapshot = self.query_snapshot();
+            let mut config = (*snapshot.config).clone();
+            config.cache_enabled = false;
+            snapshot.config = Arc::new(config);
+            let reply = snapshot.exchange_raw(&query).await?;
+            anyhow::ensure!(
+                reply[3] & 15 == 0,
+                "DNS server returned rcode {}",
+                reply[3] & 15
+            );
+            parse_dns_response(&reply)
+        })
     }
 
     /// Resolve to first IPv6 address.
@@ -1056,19 +1063,14 @@ impl DnsResolver {
 
 /// Build the TLS connector used for DNS-over-TLS through the proxy.
 ///
-/// Root store comes from `webpki-roots` (compiled in): the static musl
-/// binary on routers has no system CA bundle to fall back on.
-/// The crypto provider is pinned to ring explicitly: other crates in the
-/// build graph (QUIC stacks) also enable aws-lc-rs, and rustls panics when
-/// it cannot auto-pick a process-level default provider.
+/// Use the bundled roots on routers without a system CA bundle. Pin ring so
+/// the connector is independent of the process-wide default crypto provider.
 fn build_dot_tls_connector() -> tokio_rustls::TlsConnector {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("ring supports rustls' safe default protocol versions")
-        .with_root_certificates(roots)
+        .with_root_certificates(Arc::clone(&crate::TLS_ROOT_CERTIFICATES))
         .with_no_client_auth();
     tokio_rustls::TlsConnector::from(Arc::new(config))
 }

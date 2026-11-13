@@ -274,6 +274,13 @@ do_ipset_start() {
     ok "CN ipset direct applied ($IPSET_NAME)"
 }
 
+start_ipv6_cn_or_use_tun() {
+    cn_ipv6 do_ipset_start "$@" && return 0
+    cn_ipv6 do_ipset_stop || return 1
+    mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" || return 1
+    info "IPv6 CN acceleration unavailable; routing domestic connections through TUN"
+}
+
 do_ipset_stop() {
     "$CN_TABLES" -t mangle -D "$CN_CHAIN" -m set --match-set "$IPSET_NAME" dst -g "$CN_FLOW" 2>/dev/null || true
     cn_flow_installed && return 1
@@ -508,11 +515,7 @@ ipv6_proxy_start() {
         ip6tables -t mangle -A "$IPV6_MANGLE" -m mark --mark "$TUN_MARK" -j RETURN || { ipv6_proxy_stop; return 1; }
     fi
     if [ "$(get_conf cn_ipset_direct)" = true ]; then
-        if ! cn_ipv6 do_ipset_start startup; then
-            cn_ipv6 do_ipset_stop || { ipv6_proxy_stop; return 1; }
-            mkdir -p "$SOCKROCKET_RUNTIME_DIR" && touch "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" || return 1
-            info "IPv6 CN acceleration unavailable; routing domestic connections through TUN"
-        fi
+        start_ipv6_cn_or_use_tun startup || { ipv6_proxy_stop; return 1; }
     fi
     # Real-address QUIC must reach userspace too. A stream-only proxy responds
     # with port unreachable there, allowing TCP fallback without bypassing
@@ -1284,7 +1287,7 @@ case "$1" in
     ipset-on)
         do_ipset_start || exit 1
         if ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null; then
-            cn_ipv6 do_ipset_start
+            start_ipv6_cn_or_use_tun
         fi
         ;;
     ipset-off)

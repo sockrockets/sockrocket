@@ -1,7 +1,7 @@
 //! Loopback-only authenticated HTTP adapter. Browser requests use firmware CGI.
-use super::{dispatch, read_only_action, sockrocket_dir};
+use super::{dispatch, parse_post_body, read_only_action, sockrocket_dir};
 use anyhow::{Context, Result};
-use serde_json::{Value as J, json};
+use serde_json::json;
 use std::{fs, sync::Arc, time::Duration};
 
 /// Default port for `sockrocket-cli api` (Web UI ↔ router JSON API).
@@ -113,7 +113,7 @@ fn cleanup_rpc_results(directory: &std::path::Path) {
     }
 }
 fn rpc_result_janitor() -> RpcResultJanitor {
-    RpcResultJanitor(tokio::spawn(async {
+    RpcResultJanitor(crate::spawn_background(async {
         let mut timer = tokio::time::interval(Duration::from_secs(60));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -297,22 +297,20 @@ pub(super) async fn serve_api_authenticated(port: u16, token: Arc<String>) -> Re
                 let _ = sock.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                 return;
             }
-            if !req.body.is_empty() && serde_json::from_str::<J>(&req.body).is_err() {
-                let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-                return;
-            }
-            // dispatch() shells out (speedtest, sockrocket.sh, …) and can take
-            // seconds — keep it off the async reactor.
-            let out = tokio::task::spawn_blocking(move || {
-                let post: J = if req.body.is_empty() {
-                    J::Null
-                } else {
-                    serde_json::from_str(&req.body).unwrap_or(J::Null)
-                };
-                dispatch(&req.action, &post)
+            // Parse and dispatch on the blocking pool. An admitted request retains
+            // only its bounded body while it is waiting for a worker.
+            let result = tokio::task::spawn_blocking(move || {
+                parse_post_body(&req.body).map(|post| dispatch(&req.action, &post))
             })
-            .await
-            .unwrap_or_else(|_| json!({"ok": false, "msg": "internal error"}));
+            .await;
+            let out = match result {
+                Ok(Ok(out)) => out,
+                Ok(Err(_)) => {
+                    let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                }
+                Err(_) => json!({"ok": false, "msg": "internal error"}),
+            };
             let body = serde_json::to_string(&out).unwrap_or_else(|_| "{}".into());
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

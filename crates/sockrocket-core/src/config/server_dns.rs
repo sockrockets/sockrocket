@@ -62,7 +62,7 @@ impl ServerDns {
         node.extra
             .get(KEY)
             .map(|s| {
-                let policy: Self = serde_json::from_str(s)
+                let policy: Self = serde_json::from_slice(s.as_bytes())
                     .map_err(|_| anyhow::anyhow!("Invalid proxy server DNS policy"))?;
                 policy.config()?;
                 Ok(policy)

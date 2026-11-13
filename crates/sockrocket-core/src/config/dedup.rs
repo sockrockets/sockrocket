@@ -25,7 +25,7 @@ pub fn subscription_sources(node: &Node) -> BTreeSet<String> {
     let mut sources: BTreeSet<String> = node
         .extra
         .get(SOURCES_KEY)
-        .and_then(|value| serde_json::from_str(value).ok())
+        .and_then(|value| serde_json::from_slice(value.as_bytes()).ok())
         .unwrap_or_default();
     if let Some(url) = node.extra.get(SUB_URL_EXTRA_KEY) {
         sources.insert(url.clone());
@@ -37,7 +37,7 @@ fn subscription_names(node: &Node) -> BTreeMap<String, String> {
     let mut names: BTreeMap<String, String> = node
         .extra
         .get(NAMES_KEY)
-        .and_then(|value| serde_json::from_str(value).ok())
+        .and_then(|value| serde_json::from_slice(value.as_bytes()).ok())
         .unwrap_or_default();
     let sources = subscription_sources(node);
     names.retain(|source, _| sources.contains(source));

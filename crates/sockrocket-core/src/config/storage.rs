@@ -1,6 +1,17 @@
 //! Durable private configuration replacement shared by CLI and desktop.
 use anyhow::Result;
 use std::fs;
+use std::path::Path;
+
+/// Read a complete YAML document, including fields outside the typed configuration.
+pub fn parse_yaml_document(text: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
+    serde_yaml::from_str(text)
+}
+
+/// Serialize an edited configuration without copying its nodes, rules, or unknown fields.
+pub fn render_yaml_mapping(map: &serde_yaml::Mapping) -> Result<String, serde_yaml::Error> {
+    serde_yaml::to_string(map)
+}
 
 /// Shared cross-process lock for configuration read/merge/commit transactions.
 pub struct MutationGuard {
@@ -214,6 +225,33 @@ pub fn atomic_write_private(
     result
 }
 
+/// Save the failover target against the current node list without replacing other YAML fields.
+pub fn persist_active_node(path: &Path, fingerprint: &str) -> Result<()> {
+    let _transaction = MutationGuard::acquire(path)?;
+    anyhow::ensure!(
+        !path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".update-transaction")
+            .exists(),
+        "Software update in progress"
+    );
+    let mut value = parse_yaml_document(&fs::read_to_string(path)?)?;
+    let current = super::model::AppConfig::from_yaml_value(value.clone())?;
+    let index = current
+        .nodes
+        .iter()
+        .position(|node| super::dedup::node_fingerprint(node) == fingerprint)
+        .ok_or_else(|| anyhow::anyhow!("Failover node was removed before persistence"))?;
+    if let Some(mapping) = value.as_mapping_mut() {
+        mapping.insert(
+            "active_node".into(),
+            serde_yaml::Value::Number(index.into()),
+        );
+    }
+    atomic_write_private(path, &serde_yaml::to_string(&value)?, true)
+}
+
 /// Replace `nodes`, `subscriptions`, and `active_node` in an existing config
 /// file, leaving every other key (router DNS, mode, comments-as-keys) in place.
 pub fn write_nodes_and_subscriptions(
@@ -221,7 +259,7 @@ pub fn write_nodes_and_subscriptions(
     config: &crate::config::model::AppConfig,
 ) -> Result<()> {
     let content = fs::read_to_string(path)?;
-    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let mut value = parse_yaml_document(&content)?;
     // Migrate references against the old catalog before replacing its nodes.
     super::node_identity::migrate_references(&mut value)?;
     let Some(map) = value.as_mapping_mut() else {
@@ -283,6 +321,27 @@ mod tests {
         assert_eq!(reopened.subscriptions[0].url, config.subscriptions[0].url);
         assert_eq!(reopened.nodes[0].server, "192.0.2.1");
         assert_eq!(reopened.active_node, Some(0));
+        config.active_node = None;
+        let original =
+            serde_yaml::to_string(&config).unwrap() + "merlin_extension: !private [one, two]\n";
+        fs::write(&path, &original).unwrap();
+        assert!(persist_active_node(&path, "removed").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        persist_active_node(
+            &path,
+            &super::super::dedup::node_fingerprint(&config.nodes[0]),
+        )
+        .unwrap();
+        let saved = parse_yaml_document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["active_node"].as_u64(), Some(0));
+        assert_eq!(
+            saved["merlin_extension"],
+            parse_yaml_document(&original).unwrap()["merlin_extension"]
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("yaml.bak")).unwrap(),
+            original
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

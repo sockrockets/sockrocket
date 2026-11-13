@@ -38,24 +38,24 @@ pub(crate) fn get_root_cert_store() -> &'static craft_tls::rustls::RootCertStore
 }
 
 /// Map a fingerprint name from config to a craftls FingerprintBuilder.
-fn fingerprint_builder(name: Option<&str>) -> craft_tls::rustls::craft::FingerprintBuilder {
-    use craft_tls::rustls::craft::*;
+fn fingerprint_builder(name: Option<&str>) -> craftls::craft::FingerprintBuilder {
+    use craftls::craft::*;
     match name.map(|s| s.to_lowercase()).as_deref() {
-        Some("chrome") | Some("chromeauto") | Some("chrome133") | None => CHROME_AUTO.builder(),
+        Some("chrome") | Some("chromeauto") | Some("chrome133") | None => chrome_auto().builder(),
         Some("safari") => {
             // SAFARI_17_1 advertises TLS 1.0/1.1 in supported_versions, which
             // this rustls base cannot emit; strict mode would panic per
             // connection, so relax it.
-            SAFARI_17_1.builder().dangerous_disable_strict_mode()
+            safari_17_1().builder().dangerous_disable_strict_mode()
         }
-        Some("firefox") => FIREFOX_105.builder(),
-        Some("edge") => EDGE_85.builder(),
-        Some("qq") => QQ_11_1.builder(),
-        Some("ios") => IOS_14.builder().dangerous_disable_strict_mode(),
-        Some("chrome108") => CHROME_108.builder(),
-        Some("chrome112") => CHROME_112.builder(),
+        Some("firefox") => firefox_105().builder(),
+        Some("edge") => edge_85().builder(),
+        Some("qq") => qq_11_1().builder(),
+        Some("ios") => ios_14().builder().dangerous_disable_strict_mode(),
+        Some("chrome108") => chrome_108().builder(),
+        Some("chrome112") => chrome_112().builder(),
         // Preserve the default-to-Chrome behavior for unknown names.
-        _ => CHROME_AUTO.builder(),
+        _ => chrome_auto().builder(),
     }
 }
 
@@ -807,7 +807,7 @@ fn build_tls_config(config: Option<&TlsConfig>, pin: Option<[u8; 32]>) -> Arc<Cl
     } else {
         fingerprint_builder(fp_name)
     };
-    let mut tls_config = base_config.with_fingerprint(fp);
+    let mut tls_config = base_config.with_browser_fingerprint(fp);
 
     if let Some(alpn) = alpn {
         tls_config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -872,13 +872,14 @@ pub fn build_reality_tls_connector(
 
     // The built-in fingerprints only know classic key shares; let rustls
     // emit the native key share (our hybrid group) instead.
-    let mut tls_config = base_config.with_fingerprint(if force_classic && modern_chrome(fp_name) {
-        craft_tls::rustls::craft::CHROME_112
-            .builder()
-            .dangerous_disable_override_keyshare()
-    } else {
-        fingerprint_builder(fp_name).dangerous_disable_override_keyshare()
-    });
+    let mut tls_config =
+        base_config.with_browser_fingerprint(if force_classic && modern_chrome(fp_name) {
+            craftls::craft::chrome_112()
+                .builder()
+                .dangerous_disable_override_keyshare()
+        } else {
+            fingerprint_builder(fp_name).dangerous_disable_override_keyshare()
+        });
     tls_config.reality = Some(Arc::new(CraftRealityConfig {
         public_key,
         short_id,

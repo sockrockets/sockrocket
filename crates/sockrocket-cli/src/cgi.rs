@@ -22,9 +22,11 @@ mod network_settings;
 mod proxy_groups;
 mod route_trace;
 mod rule_presets;
+mod runtime;
 mod speedtest_jobs;
 mod storage;
 mod subscription_jobs;
+use runtime::CgiRuntime;
 pub use speedtest_jobs::worker as speedtest_worker;
 pub use subscription_jobs::worker as subscription_worker;
 
@@ -43,6 +45,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde_json::{Value as J, json};
 use serde_yaml::{Mapping, Value as Y};
+use sockrocket_core::config::storage::{parse_yaml_document, render_yaml_mapping};
 
 /// True when this process was invoked as a CGI endpoint: either the
 /// executable was called through a `sockrocket.cgi*` link (router httpd) or the
@@ -78,21 +81,17 @@ pub fn run() -> Result<()> {
     }
     let post = if method == "POST" {
         read_post_body().and_then(|body| {
-            if body.is_empty() {
-                Ok(J::Null)
-            } else {
-                serde_json::from_str(&body).map_err(|error| {
-                    let mut out = request_error(
-                        "request_body_invalid",
-                        "InvalidJson",
-                        "Request JSON is invalid; refresh the page after installing the complete plugin package",
-                    );
-                    out["stage"] = json!("parse_request");
-                    out["line"] = json!(error.line());
-                    out["column"] = json!(error.column());
-                    out
-                })
-            }
+            parse_post_body(&body).map_err(|error| {
+                let mut out = request_error(
+                    "request_body_invalid",
+                    "InvalidJson",
+                    "Request JSON is invalid; refresh the page after installing the complete plugin package",
+                );
+                out["stage"] = json!("parse_request");
+                out["line"] = json!(error.line());
+                out["column"] = json!(error.column());
+                out
+            })
         })
     } else {
         Ok(J::Null)
@@ -135,6 +134,14 @@ const MAX_CGI_BODY: u64 = 1024 * 1024; // 1 MiB — same cap as the HTTP API bri
 fn request_error(code: &str, cause: &str, message: &str) -> J {
     json!({"ok":false,"error_code":code,"stage":"read_request","cause":cause,
         "error":message,"hint":"通过软件中心安装完整插件包后刷新页面；勿单独替换脚本或二进制。"})
+}
+
+fn parse_post_body(body: &str) -> serde_json::Result<J> {
+    if body.is_empty() {
+        Ok(J::Null)
+    } else {
+        serde_json::from_slice(body.as_bytes())
+    }
 }
 
 fn read_post_body() -> std::result::Result<String, J> {
@@ -239,21 +246,19 @@ fn dnsmasq_hijack_conf() -> PathBuf {
 
 // === Small helpers ===
 
-fn is_running() -> bool {
-    let Ok(pid) = fs::read_to_string(pid_path()) else {
-        return false;
-    };
-    let Ok(pid) = pid.trim().parse::<u32>() else {
-        return false;
-    };
+fn running_pid() -> Option<(u32, String)> {
+    let text = fs::read_to_string(pid_path()).ok()?;
+    let pid = text.trim().parse::<u32>().ok()?;
     // Match the process table used by the Merlin lifecycle controller.
     let proc = env::var_os("SOCKROCKET_PROC_BASE")
         .map(PathBuf::from)
         .unwrap_or_else(|| "/proc".into());
-    match fs::read_to_string(proc.join(pid.to_string()).join("comm")) {
-        Ok(comm) => comm.contains("sockrocket-cli"),
-        Err(_) => false,
-    }
+    let comm = fs::read_to_string(proc.join(pid.to_string()).join("comm")).ok()?;
+    comm.contains("sockrocket-cli").then_some((pid, text))
+}
+
+fn is_running() -> bool {
+    running_pid().is_some()
 }
 
 fn version_string() -> String {
@@ -300,13 +305,28 @@ fn tail_lines(path: &PathBuf, n: usize) -> String {
     let Ok(content) = fs::read_to_string(path) else {
         return String::new();
     };
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+    let mut lines: Vec<&str> = content.lines().rev().take(n).collect();
+    lines.reverse();
+    lines.join("\n")
 }
 
-fn err_msg(msg: &str) -> J {
-    json!({"ok": false, "msg": msg})
+fn message_response(ok: bool, message: String) -> J {
+    let mut fields = serde_json::Map::new();
+    fields.insert("ok".into(), J::Bool(ok));
+    fields.insert("msg".into(), J::String(message));
+    J::Object(fields)
+}
+
+fn ok_msg(message: impl Into<String>) -> J {
+    message_response(true, message.into())
+}
+
+fn err_msg(message: impl Into<String>) -> J {
+    message_response(false, message.into())
+}
+
+fn save_failed(error: &dyn std::fmt::Display) -> J {
+    err_msg(format!("Save failed: {error}"))
 }
 
 // === Config (YAML, preserving unknown keys) ===
@@ -317,7 +337,7 @@ fn ykey(k: &str) -> Y {
 
 fn load_conf() -> Result<Mapping> {
     let content = fs::read_to_string(conf_path()).context("Config file not found")?;
-    let mut value: Y = serde_yaml::from_str(&content).context("Failed to parse config")?;
+    let mut value = parse_yaml_document(&content).context("Failed to parse config")?;
     sockrocket_core::config::node_identity::migrate_references(&mut value)?;
     match value {
         Y::Mapping(mut m) => {
@@ -334,12 +354,8 @@ fn load_conf() -> Result<Mapping> {
 }
 
 fn save_conf(map: &Mapping) -> Result<()> {
-    let groups: Vec<sockrocket_core::ProxyGroupConfig> = serde_yaml::from_value(
-        map.get(ykey("groups"))
-            .cloned()
-            .unwrap_or(Y::Sequence(vec![])),
-    )
-    .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
+    let groups = sockrocket_core::config::model::proxy_groups_from_yaml(map)
+        .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
     let rules = load_routing_rules(map);
     sockrocket_core::config::group::validate_targets(&groups, &rules)
         .map_err(anyhow::Error::msg)?;
@@ -349,12 +365,12 @@ fn save_conf(map: &Mapping) -> Result<()> {
         &groups,
     )
     .map_err(anyhow::Error::msg)?;
-    let text = serde_yaml::to_string(&Y::Mapping(map.clone()))?;
+    let text = render_yaml_mapping(map)?;
     storage::atomic_write(&text)
 }
 
 fn conf_str(map: &Mapping, key: &str) -> Option<String> {
-    match map.get(ykey(key)) {
+    match map.get(key) {
         Some(Y::String(s)) => Some(s.clone()),
         Some(Y::Number(n)) => Some(n.to_string()),
         Some(Y::Bool(b)) => Some(b.to_string()),
@@ -363,7 +379,7 @@ fn conf_str(map: &Mapping, key: &str) -> Option<String> {
 }
 
 fn conf_u16(map: &Mapping, key: &str, default: u16) -> u16 {
-    map.get(ykey(key))
+    map.get(key)
         .and_then(|v| v.as_u64())
         .and_then(|n| u16::try_from(n).ok())
         .filter(|port| *port > 0)
@@ -373,7 +389,7 @@ fn conf_u16(map: &Mapping, key: &str, default: u16) -> u16 {
 /// Read a boolean config key with a fallback. Accepts YAML booleans and the
 /// quoted/string forms the router template may contain.
 fn conf_bool(map: &Mapping, key: &str, default: bool) -> bool {
-    match map.get(ykey(key)) {
+    match map.get(key) {
         Some(Y::Bool(b)) => *b,
         Some(Y::String(s)) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "1"),
         Some(Y::Number(n)) => n.as_i64().unwrap_or(0) != 0,
@@ -393,53 +409,24 @@ fn effective_toggles(map: &Mapping) -> (bool, bool) {
 }
 
 fn conf_usize(map: &Mapping, key: &str) -> Option<usize> {
-    map.get(ykey(key))
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
+    map.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
-fn conf_seq<'a>(map: &'a Mapping, key: &str) -> Vec<&'a Y> {
-    match map.get(ykey(key)) {
-        Some(Y::Sequence(s)) => s.iter().collect(),
-        _ => Vec::new(),
-    }
+fn conf_seq<'a>(map: &'a Mapping, key: &str) -> &'a [Y] {
+    map.get(key)
+        .and_then(Y::as_sequence)
+        .map_or(&[], Vec::as_slice)
 }
 
 fn node_count(map: &Mapping) -> usize {
     conf_seq(map, "nodes").len()
 }
 
-struct NodeInfo {
-    name: String,
-    protocol: String,
-    server: String,
-    port: u16,
-}
-
-fn parse_node(v: &Y) -> NodeInfo {
-    let get = |k: &str| v.get(ykey(k));
-    let str_of = |k: &str| -> String {
-        match get(k) {
-            Some(Y::String(s)) => s.clone(),
-            Some(Y::Number(n)) => n.to_string(),
-            _ => String::new(),
-        }
-    };
-    // Protocol label: tagged-enum form ({type: vless, ...}) or legacy flat
-    // string (protocol: vless).
-    let protocol = match get("protocol") {
-        Some(Y::Mapping(p)) => match p.get(ykey("type")) {
-            Some(Y::String(t)) => t.clone(),
-            _ => "?".to_string(),
-        },
-        Some(Y::String(t)) => t.clone(),
-        _ => "?".to_string(),
-    };
-    NodeInfo {
-        name: str_of("name"),
-        protocol,
-        server: str_of("server"),
-        port: get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u16,
+fn node_display_field(node: &Y, field: &str) -> String {
+    match node.get(field) {
+        Some(Y::String(text)) => text.clone(),
+        Some(Y::Number(number)) => number.to_string(),
+        _ => String::new(),
     }
 }
 
@@ -514,7 +501,7 @@ fn dispatch(action: &str, post: &J) -> J {
     } else {
         match storage::MutationGuard::acquire() {
             Ok(guard) => Some(guard),
-            Err(e) => return err_msg(&format!("Configuration transaction failed: {e}")),
+            Err(e) => return err_msg(format!("Configuration transaction failed: {e}")),
         }
     };
     dispatch_inner(action, post)
@@ -522,11 +509,11 @@ fn dispatch(action: &str, post: &J) -> J {
 
 fn dispatch_inner(action: &str, post: &J) -> J {
     match action {
-        "status" => act_status(),
+        "status" => act_status(post.get("revision_scope").and_then(J::as_str)),
         "start" => act_start(),
         "stop" => act_stop(),
         "restart" => act_restart(),
-        "nodes" => act_nodes(),
+        "nodes" => act_nodes(false),
         "set_node" => act_set_node(post),
         "log" => act_log(),
         "config" => act_config(),
@@ -549,7 +536,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "speedtest_node" => act_speedtest_node(post),
         "speedtest_start" => speedtest_jobs::start(post),
         "speedtest_job" => speedtest_jobs::status(),
-        "node_details" => act_node_details(),
+        "node_details" => act_nodes(true),
         "add_node" => act_add_node(post),
         "del_node" => act_del_node(post),
         "sysinfo" => act_sysinfo(),
@@ -591,24 +578,18 @@ fn dispatch_inner(action: &str, post: &J) -> J {
     }
 }
 
-fn act_status() -> J {
+fn act_status(revision_scope: Option<&str>) -> J {
     let map = load_conf().unwrap_or_default();
-    let running = is_running();
-    let pid = if running {
-        fs::read_to_string(pid_path())
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else {
-        String::new()
-    };
+    let daemon = running_pid();
+    let running = daemon.is_some();
+    let pid = daemon.as_ref().map_or("", |(_, text)| text.trim());
     let (transparent_proxy, dns_hijack) = effective_toggles(&map);
     // Health-check runtime state, written by the daemon process on every
     // probe/switch event (tmpfs file). Null when the daemon has never run
     // with health_check.enabled.
     let health = fs::read_to_string(std::env::temp_dir().join("sockrocket_health.json"))
         .ok()
-        .and_then(|s| serde_json::from_str::<J>(&s).ok())
+        .and_then(|s| serde_json::from_slice::<J>(s.as_bytes()).ok())
         .unwrap_or(J::Null);
     json!({
         "running": running,
@@ -622,8 +603,10 @@ fn act_status() -> J {
         "proxy_mode": conf_str(&map, "proxy_mode")
             .unwrap_or_else(|| "rule".into())
             .to_ascii_lowercase(),
-        "rules_revision":route_trace::rules_revision(&map),
-        "network_revision":network_settings::revision(&map),
+        "rules_revision": (!matches!(revision_scope, Some("none" | "network")))
+            .then(|| route_trace::rules_revision(&map)),
+        "network_revision": (!matches!(revision_scope, Some("none" | "rules")))
+            .then(|| network_settings::revision(&map)),
         "ipv6_mode":conf_str(&map,"ipv6_mode").unwrap_or_else(||"compatibility".into()),
         "ipv6_active":network_settings::ipv6_active(running, transparent_proxy, conf_str(&map,"ipv6_mode").as_deref()==Some("dual_stack")),
         "transparent_proxy": transparent_proxy,
@@ -631,7 +614,7 @@ fn act_status() -> J {
         "cn_ipset_direct": conf_bool(&map, "cn_ipset_direct", false),
         "version": version_string(),
         "health": health,
-        "watchdog": if running { pid.parse::<u32>().ok().map(crate::daemon_health::summary).unwrap_or(J::Null) } else { J::Null },
+        "watchdog": daemon.as_ref().map(|(pid, _)| crate::daemon_health::summary(*pid)).unwrap_or(J::Null),
     })
 }
 
@@ -652,14 +635,14 @@ fn act_start() -> J {
         return err_msg("无法保存启动设置，服务未启动，请检查配置与存储权限");
     }
     if let Err(error) = run_sh("start") {
-        return err_msg(&error.to_string());
+        return err_msg(error.to_string());
     }
     std::thread::sleep(Duration::from_secs(1));
     if is_running() {
-        json!({"ok": true, "msg": "Sockrocket started"})
+        ok_msg("Sockrocket started")
     } else {
         let last = tail_lines(&log_path(), 5).replace('\n', " ");
-        json!({"ok": false, "msg": format!("Failed to start: {}", last)})
+        err_msg(format!("Failed to start: {}", last))
     }
 }
 
@@ -667,27 +650,30 @@ fn act_stop() -> J {
     // run_sh blocks until sockrocket.sh finishes, so the verdict below reflects the
     // real post-stop state rather than a sleep-and-hope guess.
     if let Err(error) = run_sh("stop") {
-        return err_msg(&error.to_string());
+        return err_msg(error.to_string());
     }
     // Belt: if DNS hijack / MARK rules somehow survived stop, force restore.
     if dnsmasq_hijack_conf().exists()
         && let Err(error) = run_sh("network-restore")
     {
-        return err_msg(&error.to_string());
+        return err_msg(error.to_string());
     }
     let stopped = !is_running();
     let hijack_gone = !dnsmasq_hijack_conf().exists();
     if stopped && hijack_gone {
-        json!({"ok": true, "msg": "Sockrocket stopped — direct (non-proxy) network restored"})
+        ok_msg("Sockrocket stopped — direct (non-proxy) network restored")
     } else {
         let last = tail_lines(&log_path(), 5).replace('\n', " ");
-        json!({
-            "ok": false,
-            "msg": format!("Stop not fully effective (process: {}, DNS hijack: {}). Retry or check logs: {}",
-                if stopped { "stopped" } else { "still running" },
-                if hijack_gone { "cleared" } else { "still active" },
-                last)
-        })
+        err_msg(format!(
+            "Stop not fully effective (process: {}, DNS hijack: {}). Retry or check logs: {}",
+            if stopped { "stopped" } else { "still running" },
+            if hijack_gone {
+                "cleared"
+            } else {
+                "still active"
+            },
+            last
+        ))
     }
 }
 
@@ -703,43 +689,41 @@ fn act_restart() -> J {
         "start"
     };
     if let Err(error) = run_sh(action) {
-        return err_msg(&error.to_string());
+        return err_msg(error.to_string());
     }
     std::thread::sleep(Duration::from_secs(1));
     if is_running() {
-        json!({"ok": true, "msg": "Sockrocket restarted"})
+        ok_msg("Sockrocket restarted")
     } else {
         err_msg("Restart failed, check log")
     }
 }
 
-fn act_nodes() -> J {
-    let Ok(map) = load_conf() else {
-        return err_msg("无法读取节点配置，请检查配置文件后刷新。");
-    };
-    let names: Vec<J> = conf_seq(&map, "nodes")
-        .iter()
-        .map(|n| J::String(parse_node(n).name))
-        .collect();
-    json!({"nodes": names, "active": conf_usize(&map, "active_node").unwrap_or(0)})
-}
-
-fn act_node_details() -> J {
+fn act_nodes(with_details: bool) -> J {
     let Ok(map) = load_conf() else {
         return err_msg("无法读取节点配置，请检查配置文件后刷新。");
     };
     let nodes: Vec<J> = conf_seq(&map, "nodes")
         .iter()
         .enumerate()
-        .map(|(i, n)| {
-            let info = parse_node(n);
+        .map(|(i, node)| {
+            let name = node_display_field(node, "name");
+            if !with_details {
+                return J::String(name);
+            }
+            // Older configurations store the protocol as a plain string.
+            let protocol = match node.get("protocol") {
+                Some(Y::String(name)) => name.as_str(),
+                Some(Y::Mapping(config)) => config.get("type").and_then(Y::as_str).unwrap_or("?"),
+                _ => "?",
+            };
             json!({
                 "index": i,
-                "test_id": speedtest_jobs::key(i, n),
-                "name": info.name,
-                "protocol": info.protocol,
-                "server": info.server,
-                "port": info.port,
+                "test_id": speedtest_jobs::key(i, node),
+                "name": name,
+                "protocol": protocol,
+                "server": node_display_field(node, "server"),
+                "port": node.get("port").and_then(Y::as_u64).unwrap_or(0) as u16,
             })
         })
         .collect();
@@ -748,7 +732,7 @@ fn act_node_details() -> J {
 
 fn verify_node_selection(map: &Mapping, index: usize, post: &J) -> Result<(), J> {
     let node = map
-        .get(ykey("nodes"))
+        .get("nodes")
         .and_then(Y::as_sequence)
         .and_then(|seq| seq.get(index));
     let Some(node) = node else {
@@ -783,9 +767,9 @@ fn act_set_node(post: &J) -> J {
             // active_node and swaps the outbound while listeners stay up.
             // A full restart drops SOCKS/HTTP mid-flight and makes "switch
             // then probe" look like the new node is dead.
-            json!({"ok": true, "msg": "Active node updated"})
+            ok_msg("Active node updated")
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -823,7 +807,7 @@ fn act_save_config(post: &J) -> J {
         return err_msg("Invalid config data (UTF-8 decode failed)");
     };
     if let Err(e) = validate_advanced_config(&text) {
-        return json!({"ok": false, "msg": format!("Config validation failed: {e}")});
+        return err_msg(format!("Config validation failed: {e}"));
     }
     // dispatch holds the same config lock used by subscription refresh commits.
     if let Some(expected) = post.get("expected_revision") {
@@ -841,7 +825,7 @@ fn act_save_config(post: &J) -> J {
     if let Err(error) =
         sockrocket_core::config::storage::atomic_write_private(&conf_path(), &text, true)
     {
-        return err_msg(&format!("Failed to persist config: {error}"));
+        return err_msg(format!("Failed to persist config: {error}"));
     }
     if is_running()
         && let Err(error) = run_sh("restart")
@@ -853,7 +837,12 @@ fn act_save_config(post: &J) -> J {
 }
 
 fn validate_advanced_config(text: &str) -> Result<()> {
-    let config = sockrocket_core::AppConfig::from_yaml_str(text)?;
+    let raw = parse_yaml_document(text)?;
+    let map = raw.as_mapping();
+    let ipset_direct = map.is_some_and(|map| conf_bool(map, "cn_ipset_direct", false));
+    let transparent = map.is_none_or(|map| effective_toggles(map).0);
+    let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw);
+    let config = sockrocket_core::AppConfig::from_yaml_value(raw)?;
     if !config.nodes.is_empty() {
         anyhow::ensure!(
             config
@@ -862,19 +851,12 @@ fn validate_advanced_config(text: &str) -> Result<()> {
             "active_node is out of range"
         );
     }
-    let raw: Y = serde_yaml::from_str(text)?;
     anyhow::ensure!(
         config.builtin_route == sockrocket_core::config::model::BuiltinRoute::Direct
-            || !raw
-                .as_mapping()
-                .is_some_and(|map| conf_bool(map, "cn_ipset_direct", false)),
+            || !ipset_direct,
         "国内 IP 直连加速与内置分组出口冲突"
     );
-    let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
-    let transparent = raw
-        .as_mapping()
-        .map(|map| effective_toggles(map).0)
-        .unwrap_or(true);
+    let dns = dns?;
     anyhow::ensure!(
         !transparent
             || config.ipv6_mode != sockrocket_core::config::dns::Ipv6Mode::Compatibility
@@ -891,7 +873,7 @@ fn act_subscriptions() -> J {
     let mut node_counts = std::collections::HashMap::<String, usize>::new();
     let mut shared_nodes = 0usize;
     for value in conf_seq(&map, "nodes") {
-        let Ok(node) = serde_yaml::from_value::<sockrocket_core::Node>(value.clone()) else {
+        let Ok(node) = sockrocket_core::Node::from_yaml_value(value.clone()) else {
             continue;
         };
         let sources = sockrocket_core::config::dedup::subscription_sources(&node);
@@ -906,7 +888,7 @@ fn act_subscriptions() -> J {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let get = |k: &str| match s.get(ykey(k)) {
+            let get = |k: &str| match s.get(k) {
                 Some(Y::String(v)) => v.clone(),
                 _ => String::new(),
             };
@@ -957,10 +939,7 @@ fn fetch_sub_nodes(
         refresh_interval_hours: 24,
         refresh_revision: String::new(),
     };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("Failed to start fetch runtime: {e}"))?;
+    let rt = CgiRuntime::new().map_err(|e| format!("Failed to start fetch runtime: {e}"))?;
     let timeout = Duration::from_secs(sockrocket_core::SUB_FETCH_TIMEOUT_SECS);
     rt.block_on(async {
         match tokio::time::timeout(
@@ -1033,13 +1012,13 @@ fn act_add_sub(post: &J) -> J {
         let Ok(mut map) = load_conf() else {
             return err_msg("Config file not found");
         };
-        let mut seq = match map.remove(ykey("subscriptions")) {
+        let mut seq = match map.remove("subscriptions") {
             Some(Y::Sequence(s)) => s,
             _ => Vec::new(),
         };
         if seq
             .iter()
-            .any(|item| item.get(ykey("url")).and_then(Y::as_str) == Some(url))
+            .any(|item| item.get("url").and_then(Y::as_str) == Some(url))
         {
             return json!({"ok":false,"error_code":"subscription_exists","stage":"validate_subscription",
                 "cause":"DuplicateSubscription","msg":"该订阅已存在，请更新已有订阅。",
@@ -1048,7 +1027,7 @@ fn act_add_sub(post: &J) -> J {
         let name = if name.is_empty() {
             let used: std::collections::HashSet<_> = seq
                 .iter()
-                .filter_map(|entry| entry.get(ykey("name")).and_then(Y::as_str))
+                .filter_map(|entry| entry.get("name").and_then(Y::as_str))
                 .collect();
             let mut number = seq.len() + 1;
             while used.contains(format!("订阅 {number}").as_str()) {
@@ -1060,14 +1039,14 @@ fn act_add_sub(post: &J) -> J {
         };
         let entry = sub_entry(&name, url, format);
         let revision = entry
-            .get(ykey("refresh_revision"))
+            .get("refresh_revision")
             .and_then(Y::as_str)
             .expect("new subscriptions have a refresh revision")
             .to_owned();
         seq.push(entry);
         map.insert(ykey("subscriptions"), Y::Sequence(seq));
         if let Err(e) = save_conf(&map) {
-            return json!({"ok": false, "msg": format!("Save failed: {e}")});
+            return save_failed(&e);
         }
         (name, revision)
     };
@@ -1107,7 +1086,7 @@ fn act_add_sub(post: &J) -> J {
                     let total = commit.config.nodes.len();
                     subscription_jobs::progress(1, 1, "applying");
                     if let Err(error) = run_sh("restart") {
-                        return err_msg(&error.to_string());
+                        return err_msg(error.to_string());
                     }
                     json!({
                         "ok": true,
@@ -1118,10 +1097,7 @@ fn act_add_sub(post: &J) -> J {
                 }
                 Ok(_) => json!({"ok":false,"error_code":"subscription_removed",
                     "msg":"订阅在下载期间被删除或已由另一任务更新；过期下载已丢弃，现有节点保持不变"}),
-                Err(e) => json!({
-                    "ok": false,
-                    "msg": format!("Parsed {fetched} node(s) but failed to save: {e}")
-                }),
+                Err(e) => err_msg(format!("Parsed {fetched} node(s) but failed to save: {e}")),
             }
         }
         Err(e) => json!({
@@ -1160,8 +1136,8 @@ fn act_del_sub(post: &J) -> J {
     }
     sockrocket_core::remove_subscription_nodes(&mut cfg, &url);
     match persist_subscription_state(&cfg) {
-        Ok(_) => json!({"ok": true, "msg": "Subscription deleted"}),
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Ok(_) => ok_msg("Subscription deleted"),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -1185,7 +1161,7 @@ fn act_rename_sub(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let mut seq = match map.remove(ykey("subscriptions")) {
+    let mut seq = match map.remove("subscriptions") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
@@ -1194,7 +1170,7 @@ fn act_rename_sub(post: &J) -> J {
     }
     match &mut seq[index] {
         Y::Mapping(m) => {
-            let url = m.get(ykey("url")).and_then(Y::as_str).unwrap_or_default();
+            let url = m.get("url").and_then(Y::as_str).unwrap_or_default();
             if let Err(error) = verify_subscription_selection(post, url) {
                 return error;
             }
@@ -1205,7 +1181,7 @@ fn act_rename_sub(post: &J) -> J {
     map.insert(ykey("subscriptions"), Y::Sequence(seq));
     match save_conf(&map) {
         Ok(()) => json!({"ok": true, "msg": "Subscription renamed", "name": name}),
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -1230,7 +1206,7 @@ fn act_update_subs() -> J {
     let mut skipped_subscriptions = 0usize;
     for (position, s) in subs.iter().enumerate() {
         subscription_jobs::progress(position, subs.len(), "fetching");
-        let get = |k: &str| match s.get(ykey(k)) {
+        let get = |k: &str| match s.get(k) {
             Some(Y::String(v)) => v.clone(),
             _ => String::new(),
         };
@@ -1306,7 +1282,7 @@ fn act_update_subs() -> J {
     ) {
         Ok(cfg) => cfg,
         Err(error) => {
-            return json!({"ok": false, "msg": format!("Fetched nodes but save failed: {error}")});
+            return err_msg(format!("Fetched nodes but save failed: {error}"));
         }
     };
     let applied = &commit.applied_urls;
@@ -1325,7 +1301,7 @@ fn act_update_subs() -> J {
     let total = commit.config.nodes.len();
     subscription_jobs::progress(subs.len(), subs.len(), "applying");
     if let Err(error) = run_sh("restart") {
-        return err_msg(&error.to_string());
+        return err_msg(error.to_string());
     }
     let warn = if errors.is_empty() {
         String::new()
@@ -1410,6 +1386,24 @@ fn act_ip_check() -> J {
     }
 }
 
+fn use_tcp_probe(node: &sockrocket_core::Node, http: bool) -> bool {
+    !http
+        && !matches!(
+            &node.protocol,
+            sockrocket_core::ProxyProtocol::Tuic { .. }
+                | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
+                | sockrocket_core::ProxyProtocol::Wireguard { .. }
+        )
+}
+
+async fn probe_node_latency(node: &sockrocket_core::Node, quick: bool) -> Result<u32> {
+    if quick {
+        return sockrocket_core::tcp_latency_test(&node.server, node.port, 3).await;
+    }
+    let outbound = sockrocket_core::create_outbound_unwarmed(node)?;
+    sockrocket_core::quick_http_latency_test(&outbound, 5).await
+}
+
 fn act_speedtest_node(post: &J) -> J {
     let Some(index) = post
         .get("index")
@@ -1430,52 +1424,33 @@ fn act_speedtest_node(post: &J) -> J {
     // Do NOT shortcut the active node via live SOCKS — that made the
     // selected node look an order of magnitude faster than peers and broke
     // ranking. Dashboard "Speed test" still uses SOCKS via act_speedtest.
-    let node: sockrocket_core::Node = match serde_yaml::from_value((*node).clone()) {
+    let node = match sockrocket_core::Node::from_yaml_value(node.clone()) {
         Ok(n) => n,
         Err(e) => {
             return json!({"ok": false, "latency": -1, "msg": format!("Failed to parse config for node {index}: {e}")});
         }
     };
-    let quick = post.get("mode").and_then(|v| v.as_str()) != Some("http")
-        && !matches!(
-            &node.protocol,
-            sockrocket_core::ProxyProtocol::Tuic { .. }
-                | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
-                | sockrocket_core::ProxyProtocol::Wireguard { .. }
-        );
+    let quick = use_tcp_probe(&node, post.get("mode").and_then(J::as_str) == Some("http"));
     let server = node.server.clone();
     let port = node.port;
     let result = std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        let rt = match CgiRuntime::new() {
             Ok(rt) => rt,
             Err(e) => return Err(anyhow::anyhow!("runtime: {e}")),
         };
         rt.block_on(async {
-            // TCP handshakes are cheap; keep a separate budget from protocol probes.
-            if quick {
+            // Independent requests share limits across the API process.
+            let slots = if quick {
                 static TCP_SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-                let _permit = TCP_SEM
-                    .get_or_init(|| tokio::sync::Semaphore::new(16))
-                    .acquire()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("speedtest cancelled"))?;
-                return sockrocket_core::tcp_latency_test(&node.server, node.port, 3).await;
-            }
-            // Bound concurrent probes so Test-all cannot saturate the router.
-            let _permit = speedtest_semaphore()
+                TCP_SEM.get_or_init(|| tokio::sync::Semaphore::new(16))
+            } else {
+                speedtest_semaphore()
+            };
+            let _permit = slots
                 .acquire()
                 .await
                 .map_err(|_| anyhow::anyhow!("speedtest cancelled"))?;
-            let outbound = sockrocket_core::create_outbound_unwarmed(&node)?;
-            // Warm path: http_latency_test does warmup (Reality classic
-            // discovery / QUIC session) then times the second connect.
-            match sockrocket_core::quick_http_latency_test(&outbound, 5).await {
-                Ok(ms) => Ok(ms),
-                Err(http_err) => Err(http_err),
-            }
+            probe_node_latency(&node, quick).await
         })
     })
     .join();
@@ -1598,13 +1573,11 @@ fn act_add_node(post: &J) -> J {
         node.insert(ykey("transport"), transport);
     }
     if matches!(proto, "anytls" | "wireguard") {
-        let valid = serde_yaml::from_value::<sockrocket_core::config::model::Node>(Y::Mapping(
-            node.clone(),
-        ))
-        .ok()
-        .is_some_and(|node| {
-            sockrocket_core::proxy::factory::create_outbound_unwarmed(&node).is_ok()
-        });
+        let valid = sockrocket_core::Node::from_yaml_value(Y::Mapping(node.clone()))
+            .ok()
+            .is_some_and(|node| {
+                sockrocket_core::proxy::factory::create_outbound_unwarmed(&node).is_ok()
+            });
         if !valid {
             return err_msg("Invalid protocol credentials, endpoint or transport");
         }
@@ -1613,15 +1586,15 @@ fn act_add_node(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let mut seq = match map.remove(ykey("nodes")) {
+    let mut seq = match map.remove("nodes") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
     seq.push(Y::Mapping(node));
     map.insert(ykey("nodes"), Y::Sequence(seq));
     match save_conf(&map) {
-        Ok(()) => json!({"ok": true, "msg": format!("Node added: {name}")}),
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Ok(()) => ok_msg(format!("Node added: {name}")),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -1639,7 +1612,7 @@ fn act_del_node(post: &J) -> J {
     if let Err(error) = verify_node_selection(&map, index, post) {
         return error;
     }
-    let mut seq = match map.remove(ykey("nodes")) {
+    let mut seq = match map.remove("nodes") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
@@ -1647,14 +1620,14 @@ fn act_del_node(post: &J) -> J {
     let count = seq.len();
     map.insert(ykey("nodes"), Y::Sequence(seq));
     if count == 0 {
-        map.remove(ykey("active_node"));
+        map.remove("active_node");
     } else if let Some(active) = conf_usize(&map, "active_node") {
         let shifted = if index < active { active - 1 } else { active };
         set_active_node(&mut map, shifted.min(count - 1));
     }
     match save_conf(&map) {
-        Ok(()) => json!({"ok": true, "msg": "Node deleted"}),
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Ok(()) => ok_msg("Node deleted"),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -1672,11 +1645,11 @@ fn act_set_mode(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
-            json!({"ok": true, "msg": "Mode set; takes effect after restart"})
+            ok_msg("Mode set; takes effect after restart")
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -1706,7 +1679,7 @@ fn act_set_proxy_mode(post: &J) -> J {
         map.insert(ykey("cn_ipset_direct"), Y::Bool(false));
     }
     if let Err(e) = save_conf(&map) {
-        return err_msg(&format!("Save failed: {e}"));
+        return save_failed(&e);
     }
     if mode == "global" && is_running() {
         // Drop CN ipset bypass if it was on.
@@ -1720,7 +1693,7 @@ fn act_set_proxy_mode(post: &J) -> J {
     }
     if is_running() {
         if let Err(error) = run_sh("restart") {
-            return err_msg(&error.to_string());
+            return err_msg(error.to_string());
         }
         if !is_running() {
             return json!({
@@ -1787,11 +1760,11 @@ fn act_set_toggles(post: &J) -> J {
         // reverted by the save below.
         let mut map = match load_conf() {
             Ok(m) => m,
-            Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+            Err(e) => return err_msg(format!("Failed to read config: {e}")),
         };
         map.insert(ykey("transparent_proxy"), Y::Bool(new_proxy));
         if let Err(e) = save_conf(&map) {
-            return err_msg(&format!("Save failed: {e}"));
+            return save_failed(&e);
         }
         if new_proxy {
             // Full transparent path: TUN + DNS hijack. Fake-IP only exists
@@ -1799,12 +1772,12 @@ fn act_set_toggles(post: &J) -> J {
             // (safe). TUN without hijack leaves clients on polluted ISP DNS.
             map.insert(ykey("dns_hijack"), Y::Bool(true));
             if let Err(e) = save_conf(&map) {
-                return err_msg(&format!("Save failed: {e}"));
+                return save_failed(&e);
             }
             // restart brings up --tun + iptables + dnsmasq per the keys.
             // do_start rewrites `mode` on disk while we are in here.
             if let Err(error) = run_sh("restart") {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
             let ok = run_cmd(
                 "iptables",
@@ -1818,7 +1791,7 @@ fn act_set_toggles(post: &J) -> J {
                 // state changed during run_sh.
                 let mut map = match load_conf() {
                     Ok(m) => m,
-                    Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+                    Err(e) => return err_msg(format!("Failed to read config: {e}")),
                 };
                 map.insert(ykey("transparent_proxy"), Y::Bool(false));
                 // Keep DNS hijack on so LAN stays on short-TTL sockrocket DNS
@@ -1828,9 +1801,11 @@ fn act_set_toggles(post: &J) -> J {
                 // Config now says TUN off — tear MARK rules and restart plain
                 // daemon; DNS hijack is re-applied by do_start when wanted.
                 if let Err(error) = run_sh("proxy-off") {
-                    return err_msg(&error.to_string());
+                    return err_msg(error.to_string());
                 }
-                return json!({"ok": false, "msg": "Failed to enable transparent proxy: TUN/iptables/DNS hijack not ready (check the tun module and logs)"});
+                return err_msg(
+                    "Failed to enable transparent proxy: TUN/iptables/DNS hijack not ready (check the tun module and logs)",
+                );
             }
         } else {
             // Turn TUN/iptables off but KEEP dns_hijack. Without --tun the
@@ -1838,7 +1813,7 @@ fn act_set_toggles(post: &J) -> J {
             // online, and re-enabling TUN recovers in seconds instead of
             // waiting out ISP DNS TTLs (~60s+).
             if let Err(error) = run_sh("proxy-off") {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
             let still_on = run_cmd(
                 "iptables",
@@ -1849,11 +1824,11 @@ fn act_set_toggles(post: &J) -> J {
             if still_on {
                 let mut map = match load_conf() {
                     Ok(m) => m,
-                    Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+                    Err(e) => return err_msg(format!("Failed to read config: {e}")),
                 };
                 map.insert(ykey("transparent_proxy"), Y::Bool(true));
                 let _ = save_conf(&map);
-                return json!({"ok": false, "msg": "Failed to disable transparent proxy: iptables MARK still present"});
+                return err_msg("Failed to disable transparent proxy: iptables MARK still present");
             }
             // Refresh cur_dns from disk (proxy-off / do_start may leave it on).
             if let Ok(m) = load_conf() {
@@ -1866,13 +1841,12 @@ fn act_set_toggles(post: &J) -> J {
             let dns_should_stay = want_dns.unwrap_or(cur_dns);
             if dns_should_stay && sockrocket_sh().is_file() && !dnsmasq_hijack_conf().exists() {
                 if let Err(error) = run_sh("dns-on") {
-                    return err_msg(&error.to_string());
+                    return err_msg(error.to_string());
                 }
                 if !dnsmasq_hijack_conf().exists() {
-                    return json!({
-                        "ok": false,
-                        "msg": "Transparent proxy is off, but DNS hijack is missing — LAN may be on ISP DNS. Check that the DNS port is listening, then toggle DNS hijack on."
-                    });
+                    return err_msg(
+                        "Transparent proxy is off, but DNS hijack is missing — LAN may be on ISP DNS. Check that the DNS port is listening, then toggle DNS hijack on.",
+                    );
                 }
             }
         }
@@ -1890,20 +1864,20 @@ fn act_set_toggles(post: &J) -> J {
         // from what is on disk NOW, not from the snapshot taken earlier.
         let mut map = match load_conf() {
             Ok(m) => m,
-            Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+            Err(e) => return err_msg(format!("Failed to read config: {e}")),
         };
         map.insert(ykey("dns_hijack"), Y::Bool(new_dns));
         if let Err(e) = save_conf(&map) {
-            return err_msg(&format!("Save failed: {e}"));
+            return save_failed(&e);
         }
         if let Err(error) = run_sh(if new_dns { "dns-on" } else { "dns-off" }) {
-            return err_msg(&error.to_string());
+            return err_msg(error.to_string());
         }
         let installed = dnsmasq_hijack_conf().exists();
         if installed != new_dns {
             let mut map = match load_conf() {
                 Ok(m) => m,
-                Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+                Err(e) => return err_msg(format!("Failed to read config: {e}")),
             };
             map.insert(ykey("dns_hijack"), Y::Bool(cur_dns));
             let _ = save_conf(&map);
@@ -1926,11 +1900,11 @@ fn act_set_toggles(post: &J) -> J {
     {
         let mut map = match load_conf() {
             Ok(m) => m,
-            Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+            Err(e) => return err_msg(format!("Failed to read config: {e}")),
         };
         map.insert(ykey("cn_ipset_direct"), Y::Bool(new_cn));
         if let Err(e) = save_conf(&map) {
-            return err_msg(&format!("Save failed: {e}"));
+            return save_failed(&e);
         }
         let chain_up = run_cmd(
             "iptables",
@@ -1961,35 +1935,37 @@ fn act_set_toggles(post: &J) -> J {
             if !succeeded || applied != new_cn {
                 let mut map = match load_conf() {
                     Ok(m) => m,
-                    Err(e) => return err_msg(&format!("Failed to read config: {e}")),
+                    Err(e) => return err_msg(format!("Failed to read config: {e}")),
                 };
                 map.insert(ykey("cn_ipset_direct"), Y::Bool(cur_cn));
                 if save_conf(&map).is_ok() {
                     let restore = if cur_cn { "ipset-on" } else { "ipset-off" };
                     let _ = run_cmd("sh", &[&script, restore]);
                 }
-                return json!({"ok": false, "msg": "Failed to toggle CN direct acceleration: ipset rules not applied (make sure ipset is available and the service is started)"});
+                return err_msg(
+                    "Failed to toggle CN direct acceleration: ipset rules not applied (make sure ipset is available and the service is started)",
+                );
             }
         }
     }
 
-    json!({"ok": true, "msg": "Toggles updated"})
+    ok_msg("Toggles updated")
 }
 
 fn act_logs_clear() -> J {
     let _ = fs::write(log_path(), "");
-    json!({"ok": true, "msg": "Log cleared"})
+    ok_msg("Log cleared")
 }
 
 /// Subscription table = current members' node history, not the side ledger.
 /// The side ledger misses traffic recorded before a node was linked to a subscription.
 fn subscription_month_rows(
     nodes: &[sockrocket_core::NodeMonthlyTraffic],
-    traffic_path: &std::path::Path,
+    traffic: &sockrocket_core::traffic::SavedTraffic,
+    month_keys: &[String],
 ) -> Vec<sockrocket_core::NodeMonthlyTraffic> {
     let Ok(cfg) = load_app_config() else {
-        return sockrocket_core::TrafficLedger::read_recent_subscriptions(traffic_path, 3)
-            .unwrap_or_default();
+        return traffic.subscription_months(month_keys);
     };
     let subscription_names: Vec<(String, String)> = cfg
         .subscriptions
@@ -2028,52 +2004,47 @@ fn subscription_month_rows(
 }
 
 fn act_stats() -> J {
-    let running = is_running();
+    let pid = running_pid().map(|(pid, _)| pid);
     let mut uptime = "stopped".to_string();
-    let mut pid_val: u64 = 0;
-    if running {
-        pid_val = fs::read_to_string(pid_path())
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        if let (Ok(stat), Ok(proc_stat)) = (
+    if let Some(pid_val) = pid
+        && let (Ok(stat), Ok(proc_stat)) = (
             fs::read_to_string(format!("/proc/{}/stat", pid_val)),
             fs::read_to_string("/proc/stat"),
-        ) {
-            let starttime: u64 = stat
-                .split_whitespace()
-                .nth(21)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let btime: u64 = proc_stat
-                .lines()
-                .find(|l| l.starts_with("btime"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if btime > 0 && now > 0 && starttime > 0 {
-                let elapsed = now.saturating_sub(btime + starttime / 100);
-                uptime = format!(
-                    "{}h {}m {}s",
-                    elapsed / 3600,
-                    (elapsed % 3600) / 60,
-                    elapsed % 60
-                );
-            } else {
-                uptime = "running".to_string();
-            }
+        )
+    {
+        let starttime: u64 = stat
+            .split_whitespace()
+            .nth(21)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let btime: u64 = proc_stat
+            .lines()
+            .find(|l| l.starts_with("btime"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if btime > 0 && now > 0 && starttime > 0 {
+            let elapsed = now.saturating_sub(btime + starttime / 100);
+            uptime = format!(
+                "{}h {}m {}s",
+                elapsed / 3600,
+                (elapsed % 3600) / 60,
+                elapsed % 60
+            );
+        } else {
+            uptime = "running".to_string();
         }
     }
     let dns_active = dnsmasq_hijack_conf().exists();
     let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
     let traffic_path = sockrocket_dir().join("traffic.yaml");
-    let traffic_nodes: Vec<J> = sockrocket_core::TrafficLedger::read_file(&traffic_path)
-        .unwrap_or_default()
+    let traffic = sockrocket_core::traffic::SavedTraffic::read(&traffic_path).unwrap_or_default();
+    let traffic_nodes: Vec<J> = traffic
+        .nodes()
         .into_iter()
         .take(40)
         .map(|snap| {
@@ -2114,15 +2085,13 @@ fn act_stats() -> J {
             })
             .collect()
     };
-    let recent_months =
-        sockrocket_core::TrafficLedger::read_recent_months(&traffic_path, 3).unwrap_or_default();
-    let recent_subscriptions = subscription_month_rows(&recent_months, &traffic_path);
-    let session_started =
-        sockrocket_core::TrafficLedger::read_session_started(&traffic_path).unwrap_or(0);
+    let recent_months = traffic.node_months(&month_keys);
+    let recent_subscriptions = subscription_month_rows(&recent_months, &traffic, &month_keys);
+    let session_started = traffic.session_started();
     json!({
         "ok": true,
         "uptime": uptime,
-        "pid": pid_val,
+        "pid": pid.unwrap_or(0),
         "dns_active": dns_active,
         "fw_active": fw_active,
         "fw_ipv6": fw_ipv6,
@@ -2262,10 +2231,8 @@ fn act_sysinfo() -> J {
     let wan_addresses = wan_addresses(run_cmd);
     // Per-process RSS so the UI can show Sockrocket's own footprint vs
     // system-wide MemAvailable pressure (often ~40–50% on Merlin even idle).
-    let daemon_rss_kb = fs::read_to_string(pid_path())
-        .ok()
-        .map(|p| vm_rss_kb(p.trim()))
-        .filter(|_| is_running())
+    let daemon_rss_kb = running_pid()
+        .map(|(_, text)| vm_rss_kb(text.trim()))
         .unwrap_or(0);
     let api_rss_kb = vm_rss_kb(&std::process::id().to_string());
     json!({
@@ -2322,17 +2289,17 @@ fn act_add_direct_domain(post: &J) -> J {
         return err_msg("Config file not found");
     };
     if direct_domains(&map).iter().any(|d| d == domain) {
-        return json!({"ok": false, "msg": format!("Domain {domain} already exists")});
+        return err_msg(format!("Domain {domain} already exists"));
     }
-    let mut seq = match map.remove(ykey("dns_direct_domains")) {
+    let mut seq = match map.remove("dns_direct_domains") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
     seq.push(Y::String(domain.to_string()));
     map.insert(ykey("dns_direct_domains"), Y::Sequence(seq));
     match save_conf(&map) {
-        Ok(()) => json!({"ok": true, "msg": format!("Added: {domain}")}),
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Ok(()) => ok_msg(format!("Added: {domain}")),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -2347,7 +2314,7 @@ fn act_del_direct_domain(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Invalid parameters");
     };
-    let mut seq = match map.remove(ykey("dns_direct_domains")) {
+    let mut seq = match map.remove("dns_direct_domains") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
@@ -2356,8 +2323,8 @@ fn act_del_direct_domain(post: &J) -> J {
     }
     map.insert(ykey("dns_direct_domains"), Y::Sequence(seq));
     match save_conf(&map) {
-        Ok(()) => json!({"ok": true, "msg": "Deleted"}),
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Ok(()) => ok_msg("Deleted"),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -2375,11 +2342,13 @@ fn act_set_direct_server(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
-            json!({"ok": true, "msg": format!("DNS server updated to {server}; takes effect after restart")})
+            ok_msg(format!(
+                "DNS server updated to {server}; takes effect after restart"
+            ))
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -2474,35 +2443,29 @@ fn valid_rule_pattern(rule_type: &str, pattern: &str) -> std::result::Result<Str
 fn yaml_to_routing_rule(r: &Y) -> Option<sockrocket_core::RoutingRule> {
     Some(sockrocket_core::RoutingRule {
         source: r
-            .get(ykey("source"))
+            .get("source")
             .and_then(Y::as_str)
             .unwrap_or("")
             .to_string(),
         name: r
-            .get(ykey("name"))
+            .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
         group: r
-            .get(ykey("group"))
+            .get("group")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        rule_type: r.get(ykey("rule_type"))?.as_str()?.to_string(),
-        pattern: r.get(ykey("pattern"))?.as_str()?.to_string(),
+        rule_type: r.get("rule_type")?.as_str()?.to_string(),
+        pattern: r.get("pattern")?.as_str()?.to_string(),
         target: r
-            .get(ykey("target"))
+            .get("target")
             .and_then(|v| v.as_str())
             .unwrap_or("proxy")
             .to_string(),
-        enabled: r
-            .get(ykey("enabled"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        priority: r
-            .get(ykey("priority"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32,
+        enabled: r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+        priority: r.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
     })
 }
 
@@ -2526,7 +2489,7 @@ fn routing_rule_to_yaml(r: sockrocket_core::RoutingRule) -> Y {
 }
 
 fn load_routing_rules(map: &Mapping) -> Vec<sockrocket_core::RoutingRule> {
-    map.get(ykey("rules"))
+    map.get("rules")
         .and_then(|v| v.as_sequence())
         .map(|seq| seq.iter().filter_map(yaml_to_routing_rule).collect())
         .unwrap_or_default()
@@ -2605,7 +2568,7 @@ fn act_get_rules() -> J {
     };
     let parsed = load_routing_rules(&map);
     if map
-        .get(ykey("rules"))
+        .get("rules")
         .is_some_and(|v| !matches!(v, Y::Null | Y::Sequence(_)))
         || parsed.len() != conf_seq(&map, "rules").len()
     {
@@ -2620,21 +2583,14 @@ fn act_get_rules() -> J {
             compiled_targets[index] = Some(&entry.action);
         }
     }
+    let revision = route_trace::revision_for_rules(&map, &parsed);
     let rules: Vec<J> = parsed
         .into_iter()
         .enumerate()
-        .map(|(i, r)| {
-            json!({
-                "index": i,
-                "source": r.source,
-                "name": r.name,
-                "group": r.group,
-                "rule_type": r.rule_type,
-                "pattern": r.pattern,
-                "target": r.target,
-                "priority": r.priority,
-                "enabled": r.enabled,
-            })
+        .map(|(i, rule)| {
+            let mut row = rule_edit_snapshot(&rule);
+            row["index"] = json!(i);
+            row
         })
         .collect();
     let Ok(links) = devices::links(&map) else {
@@ -2648,7 +2604,8 @@ fn act_get_rules() -> J {
         .and_then(|node| node.get("name"))
         .and_then(Y::as_str)
         .map(str::to_owned);
-    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": route_trace::rules_revision(&map), "presets":rule_presets::catalog(), "proxy_groups":proxy_groups::catalog(&map), "nodes":proxy_groups::node_catalog(&map), "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    let (groups, nodes) = proxy_groups::rule_catalogs(&map);
+    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -2674,7 +2631,7 @@ fn act_add_rule(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let mut seq = match map.remove(ykey("rules")) {
+    let mut seq = match map.remove("rules") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
@@ -2684,17 +2641,13 @@ fn act_add_rule(post: &J) -> J {
     };
     let group = post["group"].as_str().unwrap_or("").trim();
     let dup = seq.iter().any(|r| {
-        r.get(ykey("group"))
-            .and_then(Y::as_str)
-            .unwrap_or("")
-            .trim()
-            == group
-            && r.get(ykey("rule_type")).and_then(|v| v.as_str()) == Some(rule_type)
-            && r.get(ykey("pattern")).and_then(|v| v.as_str()) == Some(pattern.as_str())
-            && r.get(ykey("source")).and_then(Y::as_str).unwrap_or("") == source
+        r.get("group").and_then(Y::as_str).unwrap_or("").trim() == group
+            && r.get("rule_type").and_then(|v| v.as_str()) == Some(rule_type)
+            && r.get("pattern").and_then(|v| v.as_str()) == Some(pattern.as_str())
+            && r.get("source").and_then(Y::as_str).unwrap_or("") == source
     });
     if dup {
-        return json!({"ok": false, "msg": format!("Rule already exists: {rule_type} {pattern}")});
+        return err_msg(format!("Rule already exists: {rule_type} {pattern}"));
     }
 
     let mut entry = Mapping::new();
@@ -2730,12 +2683,7 @@ fn act_add_rule(post: &J) -> J {
     // "new rule" stays ahead of older same-priority rules (list order tie-break).
     let insert_at = seq
         .iter()
-        .position(|r| {
-            r.get(ykey("priority"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32
-                <= priority
-        })
+        .position(|r| r.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32 <= priority)
         .unwrap_or(seq.len());
     seq.insert(insert_at, Y::Mapping(entry));
     map.insert(ykey("rules"), Y::Sequence(seq));
@@ -2747,11 +2695,13 @@ fn act_add_rule(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
-            json!({"ok": true, "msg": format!("Added {rule_type} {pattern} -> {target} (takes effect after service restart)")})
+            ok_msg(format!(
+                "Added {rule_type} {pattern} -> {target} (takes effect after service restart)"
+            ))
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -2825,11 +2775,11 @@ fn act_update_rule(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
-            json!({"ok": true, "msg": "规则已保存"})
+            ok_msg("规则已保存")
         }
-        Err(e) => err_msg(&format!("Save failed: {e}")),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -2845,7 +2795,7 @@ fn act_del_rule(post: &J) -> J {
         return err_msg("Config file not found");
     };
     let previous_sources = accelerated_rule_sources(&map);
-    let Some(seq) = map.get_mut(ykey("rules")).and_then(Y::as_sequence_mut) else {
+    let Some(seq) = map.get_mut("rules").and_then(Y::as_sequence_mut) else {
         return err_msg("Rule index out of range");
     };
     if index >= seq.len() {
@@ -2877,7 +2827,7 @@ fn act_move_rule(post: &J) -> J {
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
-    let mut seq = match map.remove(ykey("rules")) {
+    let mut seq = match map.remove("rules") {
         Some(Y::Sequence(s)) => s,
         _ => Vec::new(),
     };
@@ -2889,36 +2839,33 @@ fn act_move_rule(post: &J) -> J {
     }
     // Move against the same effective order shown by the WebUI, rather than
     // swapping unrelated YAML neighbours when priorities differ.
-    let mut indexed: Vec<_> = seq.into_iter().enumerate().collect();
     let final_rule = |r: &Y| {
         matches!(
-            r.get(ykey("rule_type")).and_then(Y::as_str),
+            r.get("rule_type").and_then(Y::as_str),
             Some("final" | "match")
         )
     };
     let phase = |r: &Y| {
-        u8::from(
-            r.get(ykey("source"))
-                .and_then(Y::as_str)
-                .unwrap_or("")
-                .is_empty(),
-        ) * 2
+        u8::from(r.get("source").and_then(Y::as_str).unwrap_or("").is_empty()) * 2
             + u8::from(final_rule(r))
     };
-    indexed.sort_by(|a, b| {
-        phase(&a.1)
-            .cmp(&phase(&b.1))
-            .then_with(|| {
-                let priority = |r: &Y| r.get(ykey("priority")).and_then(Y::as_i64).unwrap_or(0);
-                priority(&b.1).cmp(&priority(&a.1))
-            })
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let index = indexed
+    let mut order: Vec<_> = seq
         .iter()
-        .position(|(original, _)| *original == index)
+        .enumerate()
+        .map(|(index, rule)| {
+            let priority = rule.get("priority").and_then(Y::as_i64).unwrap_or(0);
+            (phase(rule), std::cmp::Reverse(priority), index)
+        })
+        .collect();
+    order.sort_unstable();
+    let index = order
+        .iter()
+        .position(|&(_, _, original)| original == index)
         .expect("validated index");
-    seq = indexed.into_iter().map(|(_, rule)| rule).collect();
+    seq = order
+        .into_iter()
+        .map(|(_, _, original)| std::mem::take(&mut seq[original]))
+        .collect();
     let other = index as isize + dir as isize;
     if other < 0 || other as usize >= seq.len() {
         return err_msg("Already at edge");
@@ -2940,11 +2887,11 @@ fn act_move_rule(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
-            json!({"ok": true, "msg": "Order updated (takes effect after service restart)"})
+            ok_msg("Order updated (takes effect after service restart)")
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -2957,9 +2904,7 @@ fn act_fetch_rule_list(post: &J) -> J {
         return err_msg("请选择有效的规则出口");
     }
     let result = (|| -> Result<_> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let rt = CgiRuntime::new()?;
         rt.block_on(sockrocket_core::config::rule_list::fetch_rule_list(
             url,
             target,
@@ -2975,7 +2920,7 @@ fn act_fetch_rule_list(post: &J) -> J {
         Ok(preview) => {
             json!({"ok":true,"text":preview.text,"count":preview.count,"skipped":preview.skipped})
         }
-        Err(error) => err_msg(&format!("{error:#}")),
+        Err(error) => err_msg(format!("{error:#}")),
     }
 }
 
@@ -3035,7 +2980,7 @@ fn act_batch_add_rules(post: &J) -> J {
         sockrocket_core::parse_batch_rules_in_group(text, default_target, group)
     };
     if let Some(error) = parsed.errors.first() {
-        return err_msg(&format!(
+        return err_msg(format!(
             "第 {} 行：{}；未保存任何更改",
             error.line, error.message
         ));
@@ -3108,7 +3053,7 @@ fn act_batch_add_rules(post: &J) -> J {
         stats.added, stats.replaced, stats.skipped
     );
     if stats.added == 0 && stats.replaced == 0 {
-        return json!({"ok":true,"msg":summary});
+        return ok_msg(summary);
     }
     let previous_sources = accelerated_rule_sources(&map);
     save_routing_rules(&mut map, existing);
@@ -3166,7 +3111,7 @@ fn act_apply_rule_scene(post: &J) -> J {
             if is_running()
                 && let Err(error) = run_sh("restart")
             {
-                return err_msg(&error.to_string());
+                return err_msg(error.to_string());
             }
             json!({
                 "ok": true,
@@ -3176,7 +3121,7 @@ fn act_apply_rule_scene(post: &J) -> J {
                 )
             })
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -3223,7 +3168,7 @@ fn act_set_rule_group_target(post: &J) -> J {
         Err(_) => return err_msg("无法设置这个分组的出口"),
     };
     if changed == 0 {
-        return json!({"ok": true, "msg": "分组出口未变化"});
+        return ok_msg("分组出口未变化");
     }
     save_routing_rules(&mut map, rules);
     match save_conf(&map) {
@@ -3235,7 +3180,7 @@ fn act_set_rule_group_target(post: &J) -> J {
             }
             json!({"ok": true, "saved": true, "applied": is_running(), "msg": format!("已更新 {changed} 条规则的出口")})
         }
-        Err(e) => json!({"ok": false, "msg": format!("Save failed: {e}")}),
+        Err(e) => save_failed(&e),
     }
 }
 
@@ -3259,7 +3204,7 @@ fn accelerated_rule_sources(map: &Mapping) -> std::collections::BTreeSet<String>
 /// the new router for subsequent connections without rebinding any listener.
 fn save_hot_rules(map: &Mapping, previous_sources: std::collections::BTreeSet<String>) -> J {
     if let Err(error) = save_conf(map) {
-        return err_msg(&format!("保存规则失败：{error}"));
+        return err_msg(format!("保存规则失败：{error}"));
     }
     if !is_running() {
         return json!({"ok":true,"saved":true,"applied":false,"msg":"规则已保存，下次启动时生效。"});
@@ -3312,7 +3257,7 @@ fn act_set_rule_group_enabled(post: &J) -> J {
         return err_msg("No rules in that group");
     }
     if !changed {
-        return json!({"ok":true,"msg":"分组已处于所选状态"});
+        return ok_msg("分组已处于所选状态");
     }
     let previous_sources = accelerated_rule_sources(&map);
     save_routing_rules(&mut map, rules);
@@ -3393,18 +3338,13 @@ fn act_replace_rule_group(post: &J) -> J {
             sockrocket_core::parse_batch_rules_in_group(text, target, &new_group)
         };
         if let Some(error) = parsed.errors.first() {
-            return err_msg(&format!(
+            return err_msg(format!(
                 "第 {} 行：{}；未保存任何更改",
                 error.line, error.message
             ));
         }
         if parsed.rules.is_empty() {
-            let msg = parsed
-                .errors
-                .first()
-                .map(|e| format!("No valid rules (line {}: {})", e.line, e.message))
-                .unwrap_or_else(|| "No valid patterns in the group".into());
-            return err_msg(&msg);
+            return err_msg("No valid patterns in the group");
         }
         for mut rule in parsed.rules {
             rule.group = new_group.clone();
@@ -3416,10 +3356,6 @@ fn act_replace_rule_group(post: &J) -> J {
     if incoming.iter().any(|r| !includes_group_rule(post, r)) {
         return err_msg("默认出口请在设备分流策略中设置");
     }
-    if incoming.is_empty() {
-        return err_msg("No valid patterns in the group");
-    }
-
     let Ok(mut map) = load_conf() else {
         return err_msg("Config file not found");
     };
@@ -3502,7 +3438,7 @@ fn act_delete_rule_group(post: &J) -> J {
         return err_msg("规则或关联配置已变化，请刷新后重新确认删除");
     }
     let previous_sources = accelerated_rule_sources(&map);
-    let Some(rows) = map.get_mut(ykey("rules")).and_then(Y::as_sequence_mut) else {
+    let Some(rows) = map.get_mut("rules").and_then(Y::as_sequence_mut) else {
         return err_msg("无法读取规则列表");
     };
     if rows.iter().any(|row| yaml_to_routing_rule(row).is_none()) {
@@ -3511,10 +3447,7 @@ fn act_delete_rule_group(post: &J) -> J {
     let before = rows.len();
     rows.retain(|row| {
         !includes_group_rule(post, &yaml_to_routing_rule(row).unwrap())
-            || !same_rule_group(
-                row.get(ykey("group")).and_then(Y::as_str).unwrap_or(""),
-                group,
-            )
+            || !same_rule_group(row.get("group").and_then(Y::as_str).unwrap_or(""), group)
     });
     let removed = before - rows.len();
     if removed == 0 {
@@ -3525,25 +3458,24 @@ fn act_delete_rule_group(post: &J) -> J {
     save_hot_rules(&map, previous_sources)
 }
 
+fn check_merlin_update(
+    runtime: &CgiRuntime,
+    asset: Option<&str>,
+) -> Result<sockrocket_core::UpdateCheck> {
+    runtime.block_on(sockrocket_core::check_for_update_with_proxy(
+        env!("CARGO_PKG_VERSION"),
+        asset,
+        is_running().then(local_socks_addr).flatten(),
+    ))
+}
+
 fn act_check_update() -> J {
-    let current = env!("CARGO_PKG_VERSION");
     let prefer = merlin_update_asset();
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let rt = match CgiRuntime::new() {
         Ok(rt) => rt,
-        Err(e) => return err_msg(&format!("Runtime error: {e}")),
+        Err(e) => return err_msg(format!("Runtime error: {e}")),
     };
-    let result = rt.block_on(async {
-        sockrocket_core::check_for_update_with_proxy(
-            current,
-            prefer.as_deref(),
-            is_running().then(local_socks_addr).flatten(),
-        )
-        .await
-    });
-    match result {
+    match check_merlin_update(&rt, prefer.as_deref()) {
         Ok(check) => {
             let available = check.availability == sockrocket_core::UpdateAvailability::Available;
             json!({
@@ -3561,7 +3493,7 @@ fn act_check_update() -> J {
                 }
             })
         }
-        Err(e) => json!({"ok": false, "msg": format!("Update check failed: {e}")}),
+        Err(e) => err_msg(format!("Update check failed: {e}")),
     }
 }
 
@@ -3698,21 +3630,15 @@ fn act_apply_update(post: &J) -> J {
         }
         Ok(json!({"ok":true,"job_id":id,"msg":"更新任务已启动"}))
     })();
-    launch.unwrap_or_else(|e| err_msg(&e.to_string()))
+    launch.unwrap_or_else(|e| err_msg(e.to_string()))
 }
 
 pub fn merlin_update_worker() -> Result<()> {
     let result = (|| -> Result<()> {
         let asset =
             merlin_update_asset().ok_or_else(|| anyhow::anyhow!("无法识别当前机型的软件包"))?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let check = rt.block_on(sockrocket_core::check_for_update_with_proxy(
-            env!("CARGO_PKG_VERSION"),
-            Some(&asset),
-            is_running().then(local_socks_addr).flatten(),
-        ))?;
+        let rt = CgiRuntime::new()?;
+        let check = check_merlin_update(&rt, Some(&asset))?;
         if check.availability != sockrocket_core::UpdateAvailability::Available {
             return save_update_status("up-to-date");
         }
@@ -3857,9 +3783,7 @@ pub fn merlin_update_worker() -> Result<()> {
 
 fn act_diagnose() -> J {
     let running = is_running();
-    let config_valid = fs::read_to_string(conf_path())
-        .map(|c| serde_yaml::from_str::<sockrocket_core::AppConfig>(&c).is_ok())
-        .unwrap_or(false);
+    let config_valid = load_app_config().is_ok();
     let ipt_count = run_cmd(
         "iptables",
         &["-t", "mangle", "-L", "SOCKROCKET_MANGLE", "-n"],
@@ -3883,22 +3807,18 @@ fn act_diagnose() -> J {
         .map(|o| o.status.success())
         .unwrap_or(false);
     let (fw_active, fw_ipv6) = firewall_hooks(run_cmd);
-    let errors: Vec<String> = tail_lines(&log_path(), 500)
+    let log = tail_lines(&log_path(), 500);
+    let mut errors: Vec<_> = log
         .lines()
+        .rev()
         .filter(|l| {
             let l = l.to_lowercase();
             l.contains("error") || l.contains("fail")
         })
-        .map(|s| s.to_string())
-        .collect();
-    let last_errors = errors
-        .iter()
-        .rev()
         .take(10)
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    errors.reverse();
+    let last_errors = errors.join("\n");
     json!({
         "ok": true,
         "running": running,
@@ -4635,7 +4555,7 @@ dns_direct_domains:
         let result = dispatch("trace_route", &request);
         assert_eq!(result["ok"], true);
         assert_eq!(result["active_node"], 0);
-        assert_eq!(result["active_node"], act_status()["active_node"]);
+        assert_eq!(result["active_node"], act_status(None)["active_node"]);
         assert_eq!(result["node_name"], "Node A");
         let mut map = load_conf().unwrap();
         set_active_node(&mut map, 1);
@@ -4756,13 +4676,36 @@ dns_direct_domains:
     #[test]
     fn status_preserves_shape() {
         let _env = TestEnv::new(SAMPLE);
-        let s = act_status();
+        let s = act_status(None);
         assert_eq!(s["running"], J::Bool(false));
         assert_eq!(s["active_node"], J::from(0));
         assert_eq!(s["node_count"], J::from(2));
         assert_eq!(s["sub_count"], J::from(1));
         assert_eq!(s["mode"], J::from("tun"));
         assert_eq!(s["socks_port"], J::from("1080"));
+    }
+
+    #[test]
+    fn status_revision_scope_preserves_legacy_snapshots() {
+        let _env = TestEnv::new(SAMPLE);
+        let full = dispatch("status", &J::Null);
+        assert!(full["rules_revision"].is_string() && full["network_revision"].is_string());
+        for (scope, rules, network) in [
+            ("rules", true, false),
+            ("network", false, true),
+            ("none", false, false),
+            ("unrecognized", true, true),
+        ] {
+            let status = dispatch("status", &json!({ "revision_scope": scope }));
+            let mut expected = full.clone();
+            if !rules {
+                expected["rules_revision"] = J::Null;
+            }
+            if !network {
+                expected["network_revision"] = J::Null;
+            }
+            assert_eq!(status, expected, "{scope}");
+        }
     }
 
     #[test]
@@ -4809,7 +4752,7 @@ dns_direct_domains:
     #[test]
     fn node_details_parses_tagged_protocol() {
         let _env = TestEnv::new(SAMPLE);
-        let d = act_node_details();
+        let d = dispatch("node_details", &J::Null);
         let nodes = d["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0]["name"], J::from("Node A"));
@@ -4817,6 +4760,9 @@ dns_direct_domains:
         assert_eq!(nodes[0]["server"], J::from("a.example.com"));
         assert_eq!(nodes[0]["port"], J::from(443));
         assert_eq!(nodes[1]["protocol"], J::from("hysteria2"));
+        let names = dispatch("nodes", &J::Null);
+        assert_eq!(names["active"], d["active"]);
+        assert_eq!(names["nodes"], json!([nodes[0]["name"], nodes[1]["name"]]));
     }
 
     #[test]
@@ -5018,7 +4964,7 @@ dns_direct_domains:
         let text = fs::read_to_string(conf_path()).unwrap();
         serde_yaml::from_str::<sockrocket_core::AppConfig>(&text)
             .expect("config with added nodes must validate");
-        let d = act_node_details();
+        let d = act_nodes(true);
         assert_eq!(d["nodes"].as_array().unwrap().len(), 10);
         assert!(!d.to_string().contains("synthetic-private-password"));
         assert!(!d.to_string().contains("private_key"));
@@ -5051,10 +4997,10 @@ dns_direct_domains:
         set_active_node(&mut map, 1);
         save_conf(&map).unwrap();
 
-        let id = act_node_details()["nodes"][0]["test_id"].clone();
+        let id = act_nodes(true)["nodes"][0]["test_id"].clone();
         let row = json!({"index": 0, "expected_id": id});
         assert_eq!(dispatch("del_node", &row)["ok"], true);
-        let updated = act_node_details();
+        let updated = act_nodes(true);
         assert_eq!(updated["active"], 0);
         assert_eq!(updated["nodes"][0]["name"], "Node B");
         let before = fs::read(conf_path()).unwrap();
@@ -5375,7 +5321,7 @@ dns_direct_domains:
     fn rule_snapshot_matches_status_and_does_not_hide_corrupt_config() {
         let env = TestEnv::new(SAMPLE);
         let snapshot = act_get_rules();
-        assert_eq!(snapshot["revision"], act_status()["rules_revision"]);
+        assert_eq!(snapshot["revision"], act_status(None)["rules_revision"]);
         assert_eq!(snapshot["proxy_mode"], "rule");
         let mut map = load_conf().unwrap();
         map.insert(ykey("proxy_mode"), Y::String("direct".into()));
@@ -6136,7 +6082,7 @@ dns_direct_domains:
             "    protocol: vless",
         );
         let _env = TestEnv::new(&legacy);
-        let d = act_node_details();
+        let d = act_nodes(true);
         assert_eq!(d["nodes"][0]["protocol"], J::from("vless"));
     }
 
@@ -6152,7 +6098,7 @@ dns_direct_domains:
     #[test]
     fn status_exposes_toggle_keys() {
         let _env = TestEnv::new(SAMPLE);
-        let s = act_status();
+        let s = act_status(None);
         // SAMPLE has mode: tun and no explicit toggle keys -> both derived true.
         assert_eq!(s["transparent_proxy"], J::Bool(true), "{s}");
         assert_eq!(s["dns_hijack"], J::Bool(true), "{s}");
@@ -6170,14 +6116,14 @@ dns_direct_domains:
         let map = load_conf().unwrap();
         assert_eq!(conf_str(&map, "proxy_mode").as_deref(), Some("global"));
         assert!(!conf_bool(&map, "cn_ipset_direct", true));
-        let s = act_status();
+        let s = act_status(None);
         assert_eq!(s["proxy_mode"], J::from("global"), "{s}");
     }
 
     #[test]
     fn status_derives_toggles_from_legacy_mode() {
         let _env = TestEnv::new(&SAMPLE.replace("mode: \"tun\"", "mode: \"socks\""));
-        let s = act_status();
+        let s = act_status(None);
         assert_eq!(s["transparent_proxy"], J::Bool(false), "{s}");
         assert_eq!(s["dns_hijack"], J::Bool(false), "{s}");
     }
@@ -6190,7 +6136,7 @@ dns_direct_domains:
             "mode: \"tun\"\ntransparent_proxy: false\ndns_hijack: true",
         );
         let _env = TestEnv::new(&cfg);
-        let s = act_status();
+        let s = act_status(None);
         assert_eq!(s["transparent_proxy"], J::Bool(false), "{s}");
         assert_eq!(s["dns_hijack"], J::Bool(true), "{s}");
     }

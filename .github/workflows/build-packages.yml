@@ -17,6 +17,9 @@ on:
       - "merlin/**"
       - "docs/merlin-models.md"
       - "tools/verify-merlin-targets.py"
+      - "tools/build-merlin-cross.sh"
+      - "tools/merlin-arm64-rustc-flags.sh"
+      - "tools/merlin-rustc-paths.sh"
       - ".github/workflows/build-packages.yml"
 
 env:

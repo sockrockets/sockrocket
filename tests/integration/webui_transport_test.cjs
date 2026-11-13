@@ -14,6 +14,22 @@ const context = vm.createContext({XMLHttpRequest: XHR, Math, Date, JSON, Uint8Ar
   window: {crypto: webcrypto}, TextEncoder, btoa, location: {hostname: 'router'}, srShowMsg() {},
   setTimeout() { throw Error('unexpected retry'); }});
 vm.runInContext(source.slice(source.indexOf('var TRANSPORT ='), source.indexOf('function b64utf8')) + source.slice(source.indexOf('function utf8b64'),source.indexOf('function srEsc')), context);
+const messages = [], probeResults = [];
+context.srShowMsg = message => messages.push(message);
+context.probeTransport(() => probeResults.push(context.TRANSPORT));
+requests.shift().reply(200, '{"version":"test"}');
+assert.deepEqual(probeResults, ['cgi']);
+let failed;
+context.srApi('status', null, () => assert.fail(), error => { failed = error; });
+const cgi = requests.shift();
+assert.equal(cgi.method, 'POST');
+assert.equal(cgi.url, '/cgi-bin/sockrocket.cgi?action=status');
+cgi.reply(200, '{"error_code":"read_failed","msg":"status unavailable"}');
+assert.equal(failed.error_code, 'read_failed');
+assert.deepEqual(messages, ['错误：status unavailable']);
+context.probeTransport(() => probeResults.push(context.TRANSPORT));
+requests.shift().reply(404, '');
+assert.deepEqual(probeResults, ['cgi', 'ksc']);
 let first = 0, second = 0, stopped = 0;
 context.apiKsc('version', null, () => first++);
 context.apiKsc('status', null, () => second++);

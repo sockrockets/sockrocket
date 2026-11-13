@@ -1,6 +1,7 @@
 """Package upgrades preserve executable availability and existing user settings."""
 from pathlib import Path
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -181,17 +182,88 @@ control_source = Path('merlin/scripts/sockrocket.sh').read_text()
 def shell_function(name, following):
     return control_source[control_source.index(name + '()'):control_source.index(following + '()')]
 
+for allow_links in (True, False):
+    with tempfile.TemporaryDirectory(prefix='sockrocket-install-cgi-') as directory:
+        base = Path(directory)
+        pkg = base / 'package'
+        shutil.copytree('merlin', pkg)
+        (base / 'jffs').mkdir()
+        (pkg / 'bin').mkdir(exist_ok=True)
+        def local_paths(script):
+            return re.sub(r'/tmp/var/wwwext|/www|/jffs|/koolshare', lambda match: str(base) + match[0], script)
+        # Run the real offline installer without starting router services on the host.
+        install = pkg / 'install.sh'
+        install.write_text(local_paths(source).replace('    post_install_start\n', '    :\n'))
+        service = pkg / 'scripts/sockrocket.sh'
+        service.write_text(local_paths(control_source).replace('umask 077\n',
+            ('ln() { return 1; }\n' if not allow_links else '') + 'umask 077\n', 1))
+        payload = pkg / 'bin/sockrocket-cli'
+        def version_binary(version):
+            payload.write_text('#!/bin/sh\ncase "$1" in --version) echo "sockrocket-cli ' + version + '";;\n'
+                '*) case "$0:$1" in *sockrocket.cgi:*|*:cgi) '
+                'printf "%s|%s|%s|%s" "' + version + '" "$REQUEST_METHOD" "$QUERY_STRING" "$(cat)";; esac;; esac\n')
+            payload.chmod(0o700)
+        root = base / 'jffs/addons/sockrocket'
+        canonical = root / 'sockrocket-cli'
+        entries = (root / 'sockrocket.cgi', base / 'www/cgi-bin/sockrocket.cgi')
+        def install_package(*args):
+            subprocess.run(['sh', str(install), 'aarch64', *args], check=True,
+                           input=b'', capture_output=True, timeout=20)
+        def check_cgi(version):
+            for entry in entries:
+                assert entry.is_symlink() == allow_links
+                if allow_links:
+                    assert entry.samefile(canonical)
+                else:
+                    assert entry.stat().st_size < 256 and entry.stat().st_mode & 0o777 == 0o700
+                hostile_env = dict(os.environ, SOCKROCKET_DIR='/missing', SOCKROCKET_BIN='/bin/false',
+                                   REQUEST_METHOD='POST', QUERY_STRING='action=fixture')
+                invocation = subprocess.run([str(entry)], input=b'body', env=hostile_env, check=True, capture_output=True)
+                assert invocation.stdout == (version + '|POST|action=fixture|body').encode()
+        version_binary('v1')
+        if not allow_links:
+            # Some firmware exposes only the wwwext backing tree for writes.
+            (base / 'www').mkdir()
+            (base / 'www/ext').touch()
+        install_package()
+        page = base / ('www/ext' if allow_links else 'tmp/var/wwwext') / 'sockrocket/sockrocket.asp'
+        assert page.read_bytes() == (pkg / 'webui/sockrocket.asp').read_bytes()
+        assert page.stat().st_mode & 0o777 == 0o644
+        assert (base / 'jffs/scripts/services-start').is_file()
+        check_cgi('v1')
+        # Both old firmware paths could hold entire executables. A binary-only
+        # update has to migrate them even when the management service is stopped.
+        for entry in entries:
+            entry.unlink()
+            shutil.copyfile(canonical, entry)
+            entry.chmod(0o700)
+        version_binary('v2')
+        install_package('--update')
+        check_cgi('v2')
+        # Boot-time self-heal replaces a stale persistent copy and recreates
+        # the httpd endpoint lost with tmpfs. Keep the real publishing code.
+        for entry in entries:
+            entry.unlink()
+        shutil.copyfile(canonical, entries[0])
+        entries[0].chmod(0o700)
+        restore = local_paths(shell_function('publish_web_page', 'do_api_start'))
+        prefix = 'ln() { return 1; }\n' if not allow_links else ''
+        subprocess.run(['sh', '-c', prefix + restore + '\nrestore_web_ui'], check=True,
+                       env=dict(os.environ, SOCKROCKET_DIR=str(root), SOCKROCKET_BIN=str(canonical)))
+        check_cgi('v2')
+
 with tempfile.TemporaryDirectory(prefix='sockrocket-web-boot-') as directory:
     root = Path(directory)
     (root / 'webui').mkdir()
     (root / 'webui/sockrocket.asp').write_text('fixture page')
+    binary = root / 'sockrocket-cli'
+    binary.touch(mode=0o700)
     (root / 'stopped').touch()
     (root / 'koolshare/scripts').mkdir(parents=True)
     (root / 'koolshare/scripts/base.sh').touch()
     (root / 'softcenter_module_sockrocket_name').write_text('Sockrocket')
     restore = shell_function('publish_web_page', 'do_api_start')
-    for path in ('/koolshare', '/www', '/jffs', '/tmp/var'):
-        restore = restore.replace(path, str(root) + path)
+    restore = re.sub(r'/tmp/var/wwwext|/www|/jffs|/koolshare', lambda match: str(root) + match[0], restore)
     script = '''
 ensure_nat_hook() { :; }
 sync_softcenter_state() { :; }
@@ -207,7 +279,7 @@ dbus() {
 }
 '''
     script += restore + shell_function('do_api_start', 'do_api_stop') + shell_function('do_boot', 'rotate_log') + '\ndo_boot\n'
-    subprocess.run(['sh', '-c', script], env=dict(os.environ, SOCKROCKET_DIR=str(root)), check=True)
+    subprocess.run(['sh', '-c', script], env=dict(os.environ, SOCKROCKET_DIR=str(root), SOCKROCKET_BIN=str(binary)), check=True)
     name = (root / 'softcenter_module_sockrocket_name').read_text()
     page = root / 'koolshare/webs' / ('Module_' + name + '.asp')
     assert page.name == (root / 'softcenter_module_sockrocket_indexpage').read_text()

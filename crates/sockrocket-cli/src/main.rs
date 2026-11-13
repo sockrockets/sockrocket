@@ -56,27 +56,51 @@ fn main() -> Result<()> {
         .block_on(async_main())
 }
 
-async fn async_main() -> Result<()> {
-    // Diagnostics: with SOCKROCKET_LOG_FILE set, write tracing output to that file
-    // instead of stdout (which is unreliable when spawned without a console).
-    if let Ok(path) = env::var("SOCKROCKET_LOG_FILE") {
-        let file = fs::File::create(&path).with_context(|| format!("create {}", path))?;
-        tracing_subscriber::fmt()
-            .with_writer(move || file.try_clone().expect("log file clone"))
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
-    } else {
-        // Default to `info` when RUST_LOG is unset — fmt::init()'s bare
-        // EnvFilter defaults to ERROR-only, which silently swallowed all
-        // startup/diagnostic lines on the router ("daemon logs nothing").
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
+/// Start a low-frequency daemon or web management task.
+fn spawn_background(
+    task: impl Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let task: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(task);
+    tokio::spawn(task)
+}
+
+enum LogOutput {
+    Stdout,
+    File(fs::File),
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogOutput {
+    type Writer = tracing_subscriber::fmt::writer::EitherWriter<std::io::Stdout, &'a fs::File>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        use tracing_subscriber::fmt::writer::EitherWriter;
+        match self {
+            Self::Stdout => EitherWriter::A(std::io::stdout()),
+            Self::File(file) => EitherWriter::B(file),
+        }
     }
+}
+
+fn init_logging() -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+    let builder = tracing_subscriber::fmt();
+    let (builder, output, filter) = if let Ok(path) = env::var("SOCKROCKET_LOG_FILE") {
+        let file = fs::File::create(&path).with_context(|| format!("create {}", path))?;
+        (
+            builder.with_ansi(false),
+            LogOutput::File(file),
+            EnvFilter::new("debug"),
+        )
+    } else {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        (builder, LogOutput::Stdout, filter)
+    };
+    builder.with_writer(output).with_env_filter(filter).init();
+    Ok(())
+}
+
+async fn async_main() -> Result<()> {
+    init_logging()?;
 
     let args: Vec<String> = env::args().collect();
 
@@ -124,8 +148,9 @@ async fn async_main() -> Result<()> {
         let path = args
             .get(index + 1)
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
-        let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
-        let _ = apply_reloaded_config(config).await?;
+        let mut config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
+        normalize_node_names(&mut config.nodes);
+        prepare_routing(&config)?;
         println!("Configuration compatible");
         return Ok(());
     }
@@ -145,17 +170,20 @@ async fn async_main() -> Result<()> {
     // and exit. Used by the router's iptables.sh to load a kernel ipset for
     // hardware-NAT direct routing of domestic traffic.
     if args.iter().any(|a| a == "--dump-cn-cidrs") {
-        for cidr in sockrocket_core::china_ipv4_cidrs() {
-            println!("{cidr}");
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        for (address, prefix) in sockrocket_core::router::china::china_ipv4_prefixes() {
+            writeln!(out, "{address}/{prefix}")?;
         }
+        out.flush()?;
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--dump-cn-cidrs-v6") {
         use std::io::Write;
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-        for cidr in sockrocket_core::router::china::china_ipv6_cidrs() {
-            writeln!(out, "{cidr}")?;
+        for (address, prefix) in sockrocket_core::router::china::china_ipv6_prefixes() {
+            writeln!(out, "{address}/{prefix}")?;
         }
         out.flush()?;
         return Ok(());
@@ -253,8 +281,15 @@ async fn async_main() -> Result<()> {
         .await
         .with_context(|| format!("failed to load config from {}", config_path))?;
 
-    let dns_value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(&config_path)?)?;
-    let dns_settings = sockrocket_core::config::dns::DnsSettings::from_yaml(&dns_value)?;
+    let (dns_settings, dns_port) = {
+        let value = sockrocket_core::config::storage::parse_yaml_document(&fs::read_to_string(
+            &config_path,
+        )?)?;
+        (
+            sockrocket_core::config::dns::DnsSettings::from_yaml(&value)?,
+            router_dns_port(&value),
+        )
+    };
     sockrocket_core::dns::configure_bootstrap(
         &dns_settings,
         config.nodes.iter().map(|n| n.server.clone()),
@@ -266,9 +301,7 @@ async fn async_main() -> Result<()> {
             && dns_settings.strategy == sockrocket_core::config::dns::AddressStrategy::Ipv6Only),
         "IPv6-only DNS requires dual_stack in Merlin transparent mode"
     );
-    let active_index = resolve_active_index(&config)?;
-    let router = router_for_mode(&config);
-    let outbound = build_outbound(&config, active_index, router.as_ref())?;
+    let (active_index, router, outbound) = prepare_routing(&config)?;
     tracing::info!(
         "Proxy mode: {}",
         match config.proxy_mode {
@@ -282,7 +315,8 @@ async fn async_main() -> Result<()> {
     // Swappable wrapper: health-check failover and config hot-reload replace
     // the inner outbound without rebinding the local listeners.
     let swappable = Arc::new(SwappableOutbound::new(outbound.clone()));
-    let mut dns_config = read_router_dns_config(&config_path, &config.nodes)?;
+    let mut dns_config =
+        dns_settings.resolver_config(config.nodes.iter().map(|node| node.server.clone()))?;
     set_transparent_dns_flags(
         &mut dns_config,
         enable_tun && !setup_routes,
@@ -307,7 +341,7 @@ async fn async_main() -> Result<()> {
         let watched_config = config_path.clone();
         let gate = ipv6_dns_open.clone();
         let dual_stack_mode = dual_stack_mode.clone();
-        tokio::spawn(async move {
+        spawn_background(async move {
             use std::sync::atomic::Ordering::Relaxed;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -366,7 +400,6 @@ async fn async_main() -> Result<()> {
     // config, which forwards LAN queries to 127.0.0.1:<dns_port>). The port
     // and direct-upstream server live as router-only keys in config.yaml and
     // are read Value-level here: core's AppConfig does not model them.
-    let dns_port = read_dns_port(&config_path);
     let (dns_failure_tx, mut dns_failure_rx) = tokio::sync::oneshot::channel();
     let dns_listener = match dns_port {
         Some(port) => {
@@ -374,10 +407,11 @@ async fn async_main() -> Result<()> {
             // active proxy node: plain UDP 8.8.8.8 from the router's WAN is
             // GFW-poisoned (fake answers for google/youtube), while the node
             // exit is clean. Direct mode (no node) keeps plain UDP upstreams.
-            let mut dns_config = sockrocket_core::china_split_dns_config();
-            if active_index.is_some() {
-                dns_config = sockrocket_core::china_split_dns_config_proxy_tls();
-            }
+            let dns_config = if active_index.is_some() {
+                sockrocket_core::china_split_dns_config_proxy_tls()
+            } else {
+                sockrocket_core::china_split_dns_config()
+            };
             let mut resolver = DnsResolver::with_config(dns_config);
             // Merlin owns IPv4 policy routing in iptables.sh, rather than
             // --tun-routes. Do not advertise unreachable LAN IPv6 endpoints.
@@ -465,7 +499,7 @@ async fn async_main() -> Result<()> {
         if let Some(mut rx) = service.health_events() {
             let health_config_path = config_path.clone();
             let traffic_ledger = traffic_ledger.clone();
-            tokio::spawn(async move {
+            spawn_background(async move {
                 while rx.changed().await.is_ok() {
                     match rx.borrow().clone() {
                         Some(HealthEvent::ProbeOk { latency_ms }) => {
@@ -526,7 +560,10 @@ async fn async_main() -> Result<()> {
                                 target.subscription_id.clone(),
                                 target.subscription_name.clone(),
                             );
-                            if let Err(e) = persist_active_node(&health_config_path, &node_key) {
+                            if let Err(e) = sockrocket_core::config::storage::persist_active_node(
+                                Path::new(&health_config_path),
+                                &node_key,
+                            ) {
                                 tracing::warn!("failed to persist active_node: {e:#}");
                             }
                         }
@@ -560,7 +597,7 @@ async fn async_main() -> Result<()> {
 
     let diagnostic_stats = service.stats().clone();
     update_health_state(|health| health.config_apply = Default::default());
-    tokio::spawn(async move {
+    spawn_background(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -760,8 +797,10 @@ async fn async_main() -> Result<()> {
                             );
                             continue;
                         }
-                        match apply_reloaded_config(reloaded.config).await {
-                            Ok((new_config, new_index, new_outbound)) => {
+                        let mut new_config = reloaded.config;
+                        normalize_node_names(&mut new_config.nodes);
+                        match prepare_routing(&new_config) {
+                            Ok((new_index, new_router, new_outbound)) => {
                                 let mut dns_config = match settings.resolver_config(
                                     new_config.nodes.iter().map(|node| node.server.clone()),
                                 ) {
@@ -800,7 +839,6 @@ async fn async_main() -> Result<()> {
                                     ipv6_dns_open
                                         .store(answers, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                let new_router = router_for_mode(&new_config);
                                 if let Some(tun) = &tun_proxy {
                                     tun.replace_router(new_router.clone());
                                 }
@@ -898,15 +936,6 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-fn read_router_dns_config(
-    path: &str,
-    nodes: &[sockrocket_core::Node],
-) -> Result<sockrocket_core::dns::DnsConfig> {
-    let value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(path)?)?;
-    let settings = sockrocket_core::config::dns::DnsSettings::from_yaml(&value)?;
-    settings.resolver_config(nodes.iter().map(|node| node.server.clone()))
-}
-
 /// Read the router-only `dns_port` key from config.yaml.
 ///
 /// Returns `None` when the key is absent or unusable, which disables the DNS
@@ -914,9 +943,7 @@ fn read_router_dns_config(
 /// than an error: the router's template always ships the key, but a desktop
 /// config never does, and binding a wrong port would be worse than not
 /// listening (dnsmasq would forward LAN queries into a black hole).
-fn read_dns_port(path: &str) -> Option<u16> {
-    let content = fs::read_to_string(path).ok()?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+fn router_dns_port(value: &serde_yaml::Value) -> Option<u16> {
     let port = value.get("dns_port")?.as_u64()?;
     if port == 0 || port > u16::MAX as u64 {
         tracing::warn!("dns_port {} out of range — DNS listener disabled", port);
@@ -1002,50 +1029,12 @@ fn update_health_state(f: impl FnOnce(&mut HealthState)) {
     let path = health_state_path();
     let mut state: HealthState = fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_slice(s.as_bytes()).ok())
         .unwrap_or_default();
     f(&mut state);
     if let Ok(json) = serde_json::to_string(&state) {
         let _ = sockrocket_core::config::storage::atomic_write_private(&path, &json, false);
     }
-}
-
-/// Write the failover target back into config.yaml as `active_node`, so the
-/// next daemon start comes up on the working node instead of the dead one
-/// (which would cost `failure_threshold` probe intervals of downtime before
-/// the health checker switched again). Value-level rewrite — same approach
-/// as the API bridge's set_node action. The config watcher will see this
-/// write and do one harmless reload that rebuilds the same outbound the
-/// health checker already installed.
-fn persist_active_node(path: &str, key: &str) -> Result<()> {
-    let _transaction = sockrocket_core::config::storage::MutationGuard::acquire(Path::new(path))?;
-    anyhow::ensure!(
-        !Path::new(path)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(".update-transaction")
-            .exists(),
-        "Software update in progress"
-    );
-    let content = fs::read_to_string(path)?;
-    let current = AppConfig::from_yaml_str(&content)?;
-    let index = current
-        .nodes
-        .iter()
-        .position(|node| sockrocket_core::config::dedup::node_fingerprint(node) == key)
-        .ok_or_else(|| anyhow::anyhow!("Failover node was removed before persistence"))?;
-    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
-    if let Some(mapping) = value.as_mapping_mut() {
-        mapping.insert(
-            serde_yaml::Value::String("active_node".into()),
-            serde_yaml::Value::Number(index.into()),
-        );
-    }
-    sockrocket_core::config::storage::atomic_write_private(
-        Path::new(path),
-        &serde_yaml::to_string(&value)?,
-        true,
-    )
 }
 
 fn parse_config_path() -> Result<String> {
@@ -1073,13 +1062,17 @@ fn parse_config_path() -> Result<String> {
 }
 
 /// Generate a default config file at the given path.
+const DEFAULT_CONFIG_YAML: &str = include_str!("default-config.yaml");
+
 fn init_config(path: &str) -> Result<()> {
     if std::path::Path::new(path).exists() {
         bail!("config file already exists: {}", path);
     }
-    let config = AppConfig::default();
-    let content = serde_yaml::to_string(&config)?;
-    sockrocket_core::config::storage::atomic_write_private(Path::new(path), &content, false)?;
+    sockrocket_core::config::storage::atomic_write_private(
+        Path::new(path),
+        DEFAULT_CONFIG_YAML,
+        false,
+    )?;
     println!("✓ Default config written to: {}", path);
     println!("  Edit the file to add subscriptions or nodes, then run:");
     println!("  sockrocket-cli {}", path);
@@ -1199,22 +1192,15 @@ async fn resolve_config(
     Ok((config, changed, refreshed))
 }
 
-/// Validate a hot-reloaded config end-to-end (active index, outbound
-/// construction) before it replaces the running one.
-///
-/// Intentionally does **not** re-fetch subscriptions. Merlin (and the GUI
-/// config editor) write `active_node` / toggles often; each write used to
-/// trigger a full subscription download + 178→89 dedup, saturating the
-/// router's WAN/CPU and briefly swapping the outbound mid-traffic.
-/// Subscription refresh stays explicit: `SOCKROCKET_REFRESH_SUBS=1` on start
-/// (`update-subs` / daily cron) or the Web UI `update_subs` action.
-async fn apply_reloaded_config(
-    mut config: AppConfig,
-) -> Result<(AppConfig, Option<usize>, SharedOutbound)> {
-    normalize_node_names(&mut config.nodes);
-    let index = resolve_active_index(&config)?;
-    let outbound = build_outbound(&config, index, router_for_mode(&config).as_ref())?;
-    Ok((config, index, outbound))
+/// Prepare one routing snapshot for the listeners, TUN and health monitor.
+/// Each config gets a fresh rule cache. A rejected reload drops the snapshot.
+fn prepare_routing(
+    config: &AppConfig,
+) -> Result<(Option<usize>, Option<Arc<Router>>, SharedOutbound)> {
+    let index = resolve_active_index(config)?;
+    let router = router_for_mode(config);
+    let outbound = build_outbound(config, index, router.as_ref())?;
+    Ok((index, router, outbound))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1536,6 +1522,14 @@ mod tests {
     use super::*;
     use sockrocket_core::{GroupType, Node, ProxyGroupConfig, TransportConfig, TransportType};
 
+    #[test]
+    fn init_template_matches_current_defaults() {
+        assert_eq!(
+            DEFAULT_CONFIG_YAML,
+            serde_yaml::to_string(&AppConfig::default()).unwrap()
+        );
+    }
+
     fn sample_node(name: &str) -> Node {
         Node {
             name: name.to_string(),
@@ -1695,26 +1689,20 @@ mod tests {
     }
 
     #[test]
-    fn read_dns_port_reads_router_key() {
-        let dir = std::env::temp_dir().join(format!("sockrocket-dnsport-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.yaml");
-
-        // Present → Some(port). This is the router template's shape.
-        std::fs::write(&path, "mode: \"tun\"\ndns_port: 5300\nnodes: []\n").unwrap();
-        assert_eq!(read_dns_port(path.to_str().unwrap()), Some(5300));
-
-        // Absent (desktop config) → None, listener disabled.
-        std::fs::write(&path, "mode: \"tun\"\nnodes: []\n").unwrap();
-        assert_eq!(read_dns_port(path.to_str().unwrap()), None);
-
-        // Zero / out of range → None rather than binding a bad port.
-        std::fs::write(&path, "dns_port: 0\n").unwrap();
-        assert_eq!(read_dns_port(path.to_str().unwrap()), None);
-        std::fs::write(&path, "dns_port: 70000\n").unwrap();
-        assert_eq!(read_dns_port(path.to_str().unwrap()), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn router_dns_port_reads_valid_ports_only() {
+        for (yaml, expected) in [
+            ("dns_port: 5300", Some(5300)),
+            ("dns_port: 65535", Some(65535)),
+            ("nodes: []", None),
+            ("dns_port: 0", None),
+            ("dns_port: 70000", None),
+            ("dns_port: invalid", None),
+        ] {
+            assert_eq!(
+                router_dns_port(&serde_yaml::from_str(yaml).unwrap()),
+                expected
+            );
+        }
     }
 
     #[test]

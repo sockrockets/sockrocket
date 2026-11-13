@@ -115,7 +115,7 @@ pub fn is_v2ray_config(content: &str) -> bool {
 /// Parse V2Ray JSON config into nodes
 pub fn parse_v2ray_config(json_str: &str) -> Result<Vec<Node>> {
     let config: V2RayConfig =
-        serde_json::from_str(json_str).context("Failed to parse V2Ray JSON")?;
+        serde_json::from_slice(json_str.as_bytes()).context("Failed to parse V2Ray JSON")?;
 
     let mut nodes = Vec::new();
     for outbound in &config.outbounds {
@@ -160,7 +160,7 @@ pub fn parse_vmess_uri(uri: &str) -> Result<Node> {
 
     let json_str = String::from_utf8(decoded).context("Invalid UTF-8 in vmess link")?;
     let link: VMessShareLink =
-        serde_json::from_str(&json_str).context("Failed to parse vmess JSON")?;
+        serde_json::from_slice(json_str.as_bytes()).context("Failed to parse vmess JSON")?;
 
     let port: u16 = match &link.port {
         serde_json::Value::Number(n) => n.as_u64().unwrap_or(443) as u16,
@@ -2317,7 +2317,7 @@ fn uri_xhttp(params: &HashMap<String, String>) -> Result<XhttpConfig> {
         options: Default::default(),
     };
     if let Some(extra) = params.get("extra") {
-        let extra: serde_json::Value = serde_json::from_str(extra)
+        let extra: serde_json::Value = serde_json::from_slice(extra.as_bytes())
             .map_err(|_| anyhow::anyhow!("Invalid XHTTP extra options"))?;
         config.options.insert("extra".into(), extra);
     }

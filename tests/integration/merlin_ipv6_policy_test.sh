@@ -194,6 +194,7 @@ printf 'ipv6_mode: dual_stack\ndns_hijack: true\ntransparent_proxy: true\nproxy_
 #!/bin/sh
 case "$1" in
     --dump-rule-sources-v6) printf '2001:db8:9::/64\n'; exit 0 ;;
+    --dump-cn-cidrs) printf '192.0.2.0/24\n'; exit 0 ;;
     --dump-cn-cidrs-v6) printf '2001:250::/30\n'; exit 0 ;;
     --supports-udp) exit 1 ;;
     *) exit 0 ;;
@@ -214,9 +215,12 @@ grep -q -- '-X SOCKROCKET_IPV6_DEVICES' "$CALLS" || fail 'IPv6 device chain was 
 ipset() {
     echo "ipset $*" >> "$CALLS"
     case "$1" in
-        create) [ "${FAIL_CN6:-0}" = 0 ] || return 1;;
+        create) case " $* " in *" family inet6 "*) [ "${FAIL_CN6:-0}" = 0 ] || return 1;; esac;;
         restore) /bin/cat >> "$CALLS";;
-        list) [ "${2:-}" != sockrocket_cn6 ] || printf 'Members:\n2001:250::/30\n';;
+        list) case "${2:-}" in
+            sockrocket_cn6) printf 'Members:\n2001:250::/30\n';;
+            sockrocket_cn) printf 'Members:\n192.0.2.0/24\n';;
+        esac;;
     esac
 }
 printf 'ipv6_mode: dual_stack\ntransparent_proxy: true\ncn_ipset_direct: true\n' > "$SOCKROCKET_CONF"
@@ -240,6 +244,16 @@ FAIL_CN6=1
 ipv6_guard_start || fail 'missing inet6 ipset disabled dual-stack routing'
 test -f "$FIXTURE/mangle" && test -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" || fail 'missing IPv6 TUN fallback'
 ! cn_ipv6 cn_flow_installed || fail 'partial IPv6 CN rule installed'
+# Re-enable the live IPv4 shortcut through the same dispatch as the Web UI.
+: > "$CALLS"
+rm -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun"
+sed -n '/^case "\$1" in/,$p' "$ROOT/merlin/scripts/iptables.sh" > "$FIXTURE/dispatch.sh"
+(
+    set -- ipset-on
+    . "$FIXTURE/dispatch.sh"
+) || fail 'live enable failed when inet6 ipset was unavailable'
+grep -q -- '-A SOCKROCKET_MANGLE -m set --match-set sockrocket_cn dst -g SOCKROCKET_CN_FLOW' "$CALLS" || fail 'live IPv4 acceleration missing'
+test -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" || fail 'live IPv6 fallback missing'
 ipv6_proxy_stop || fail 'fallback cleanup'
 # A later firmware IPv6 enable must gain the compatibility guard without a restart.
 printf 'ipv6_mode: compatibility\ntransparent_proxy: true\n' > "$SOCKROCKET_CONF"

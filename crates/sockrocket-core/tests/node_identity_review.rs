@@ -33,6 +33,11 @@ fn node() -> Node {
 #[test]
 fn connection_parameters_are_distinct_but_metadata_and_header_order_are_not() {
     let base = node();
+    // This identifier is persisted by groups, routing rules, and traffic history.
+    assert_eq!(
+        node_fingerprint(&base),
+        "v2:1f0a7c5b4f6e48fd3df953d071679d00bab7fa576fa4de6f38b0ced6ce67616e"
+    );
     let mut other = base.clone();
     other.transport.as_mut().unwrap().tls.as_mut().unwrap().sni = Some("two.example".into());
     assert_ne!(node_fingerprint(&base), node_fingerprint(&other));

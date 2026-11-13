@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use base64::Engine;
-use base64::engine::general_purpose;
+use base64::{Engine, engine::general_purpose};
 
 use super::clash;
 use super::model::*;
@@ -480,7 +479,7 @@ fn subscription_entry_count(content: &str) -> usize {
             .count()
     };
     let clash_count = |text: &str| {
-        serde_yaml::from_str::<serde_yaml::Value>(text)
+        super::storage::parse_yaml_document(text)
             .ok()
             .and_then(|value| value.get("proxies")?.as_sequence().map(Vec::len))
             .unwrap_or(0)
@@ -490,23 +489,11 @@ fn subscription_entry_count(content: &str) -> usize {
         SubFormat::PlainLines => count(content),
         SubFormat::Clash => clash_count(content),
         SubFormat::Base64Lines => {
-            let clean: String = content
-                .chars()
-                .filter(|c| !c.is_ascii_whitespace())
-                .collect();
-            let decoded = general_purpose::STANDARD
-                .decode(&clean)
-                .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&clean))
-                .or_else(|_| general_purpose::URL_SAFE.decode(&clean))
-                .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&clean));
-            decoded
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .map_or(0, |text| match detect_format(&text) {
-                    SubFormat::PlainLines => count(&text),
-                    SubFormat::Clash => clash_count(&text),
-                    _ => 0,
-                })
+            decode_subscription_text(content).map_or(0, |text| match detect_format(&text) {
+                SubFormat::PlainLines => count(&text),
+                SubFormat::Clash => clash_count(&text),
+                _ => 0,
+            })
         }
         _ => 0,
     }
@@ -591,37 +578,33 @@ pub fn detect_format(content: &str) -> SubFormat {
 }
 
 fn looks_like_base64(content: &str) -> bool {
-    let clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut symbols = content.chars().filter(|c| !c.is_whitespace()).peekable();
+    symbols.peek().is_some()
+        && symbols.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+}
 
-    if clean.is_empty() {
-        return false;
-    }
-
-    // Base64 characters only
-    clean.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
-    })
+fn decode_subscription_text(content: &str) -> Result<String> {
+    // Some providers wrap the envelope at MIME line boundaries.
+    let unwrapped;
+    let encoded = if content.bytes().any(|b| b.is_ascii_whitespace()) {
+        unwrapped = content
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        unwrapped.as_slice()
+    } else {
+        content.as_bytes()
+    };
+    let decoded = super::decode_base64(encoded)
+        // Preserve the detailed error previously reported by the last decoder.
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+        .context("Failed to Base64 decode subscription content")?;
+    String::from_utf8(decoded).context("Invalid UTF-8 after Base64 decode")
 }
 
 /// Decode Base64 content and parse each line as a proxy URI
 fn parse_base64_lines(content: &str) -> Result<Vec<Node>> {
-    // Strip ALL ASCII whitespace: subscriptions are frequently wrapped at
-    // 76 chars (MIME style), and the STANDARD decoder rejects any `\n`.
-    let clean: String = content
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect();
-
-    // Try standard Base64 first, then URL-safe
-    let decoded = general_purpose::STANDARD
-        .decode(&clean)
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&clean))
-        .or_else(|_| general_purpose::URL_SAFE.decode(&clean))
-        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&clean))
-        .context("Failed to Base64 decode subscription content")?;
-
-    let text = String::from_utf8(decoded).context("Invalid UTF-8 after Base64 decode")?;
-
+    let text = decode_subscription_text(content)?;
     let text = text.trim_start_matches('\u{feff}').trim();
     if text.starts_with("[Interface]") {
         return super::wireguard::parse_profile(text).map(|node| vec![node]);

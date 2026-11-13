@@ -64,7 +64,7 @@ pub(super) fn client_config(
             .with_root_certificates(super::transport::get_root_cert_store().clone())
             .with_no_client_auth()
     };
-    let mut config = config.with_fingerprint(
+    let mut config = config.with_browser_fingerprint(
         tls::craft::CHROME_115_QUIC
             .builder()
             .preserve_protocol_versions(),

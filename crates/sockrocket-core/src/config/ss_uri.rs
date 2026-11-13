@@ -5,17 +5,9 @@ use std::collections::HashMap;
 use super::model::{Node, ProxyProtocol, ShadowTlsConfig};
 
 fn decode_base64(value: &str) -> Result<String> {
-    for encoding in [
-        general_purpose::URL_SAFE_NO_PAD,
-        general_purpose::URL_SAFE,
-        general_purpose::STANDARD_NO_PAD,
-        general_purpose::STANDARD,
-    ] {
-        if let Ok(bytes) = encoding.decode(value.trim()) {
-            return String::from_utf8(bytes).context("Invalid SS credential encoding");
-        }
-    }
-    anyhow::bail!("Invalid SS base64")
+    let bytes = super::decode_base64(value.trim().as_bytes())
+        .map_err(|_| anyhow::anyhow!("Invalid SS base64"))?;
+    String::from_utf8(bytes).context("Invalid SS credential encoding")
 }
 
 pub(super) fn parse_options(options: &str) -> Result<serde_json::Map<String, serde_json::Value>> {

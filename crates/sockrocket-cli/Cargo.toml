@@ -9,7 +9,7 @@ name = "sockrocket-cli"
 path = "src/main.rs"
 
 [dependencies]
-sockrocket-core = { workspace = true }
+sockrocket-core = { path = "../sockrocket-core", default-features = false }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -24,3 +24,7 @@ url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+# Use the compact float formatting tables for the Merlin CLI's YAML output.
+ryu = { version = "1", features = ["small"] }

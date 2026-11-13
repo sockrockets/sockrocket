@@ -149,8 +149,22 @@ fn trim_history() {
             })
         })
         .collect();
-    files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (_, id) in files.into_iter().skip(7) {
+    if files.len() <= 7 {
+        return;
+    }
+    // Only the seven newest are kept. Visit ties backwards so max_by_key's
+    // last match is the first directory entry, as in a stable descending sort.
+    for _ in 0..7 {
+        let index = files
+            .iter()
+            .enumerate()
+            .rev()
+            .max_by_key(|(_, file)| file.0)
+            .expect("at least seven job files")
+            .0;
+        files.remove(index);
+    }
+    for (_, id) in files {
         let _ = fs::remove_file(path(&id));
         let _ = fs::remove_file(root().join(format!("{id}.input")));
     }

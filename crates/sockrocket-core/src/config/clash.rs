@@ -177,7 +177,7 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
     let config: ClashConfig =
         serde_yaml::from_str(yaml_str).context("Failed to parse Clash YAML")?;
 
-    let root: serde_yaml::Value = serde_yaml::from_str(yaml_str)
+    let root = super::storage::parse_yaml_document(yaml_str)
         .map_err(|_| anyhow::anyhow!("Invalid Clash configuration"))?;
     let server_dns = super::server_dns::import(&root)?
         .map(|p| serde_json::to_string(&p))
@@ -491,7 +491,8 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
             (&proxy.down, super::v2ray::HY2_DOWN),
         ] {
             if let Some(value) = value {
-                extra.insert(key.into(), super::bandwidth::canonical_mbps(value)?);
+                // deserialize_bandwidth already normalized the imported value.
+                extra.insert(key.into(), value.clone());
             }
         }
         if let Some(value) = proxy.fast_open {

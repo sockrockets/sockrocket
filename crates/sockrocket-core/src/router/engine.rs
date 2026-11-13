@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use lru::LruCache;
 
-use super::geoip::GeoIpDb;
+use super::geoip::{GeoIpDb, parse_cidr};
 use crate::config::model::RoutingRule;
 
 mod trace;
@@ -156,9 +156,12 @@ impl RuleSet {
     pub(crate) fn from_indexed_config<'a>(
         rules: impl IntoIterator<Item = (usize, &'a RoutingRule)>,
     ) -> Self {
+        let indexed = rules.into_iter().filter(|(_, rule)| rule.enabled).collect();
+        Self::from_enabled_rules(indexed)
+    }
+
+    fn from_enabled_rules(mut indexed: Vec<(usize, &RoutingRule)>) -> Self {
         let mut set = Self::new();
-        let mut indexed: Vec<(usize, &RoutingRule)> =
-            rules.into_iter().filter(|(_, r)| r.enabled).collect();
         indexed.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
 
         for (index, r) in indexed {
@@ -635,23 +638,6 @@ fn source_matches(scope: Option<(IpAddr, u8)>, source: Option<IpAddr>) -> bool {
         (Some((network, bits)), Some(ip)) => cidr_match(ip, network, bits),
         _ => false,
     }
-}
-
-fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
-    let parts: Vec<&str> = cidr.splitn(2, '/').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let addr: IpAddr = parts[0].parse().ok()?;
-    let prefix_len: u8 = parts[1].parse().ok()?;
-
-    match addr {
-        IpAddr::V4(_) if prefix_len > 32 => return None,
-        IpAddr::V6(_) if prefix_len > 128 => return None,
-        _ => {}
-    }
-
-    Some((addr, prefix_len))
 }
 
 /// Check if an IP matches a CIDR.

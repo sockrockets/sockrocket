@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::connector::SharedOutbound;
@@ -199,12 +200,19 @@ pub async fn latency_test_node(outbound: &SharedOutbound, timeout_secs: u64) -> 
 /// This measures just the raw TCP handshake latency to the proxy server,
 /// similar to what Karing and other proxy clients display as "latency".
 /// It does NOT go through the proxy protocol or connect to a target.
-pub async fn tcp_latency_test(server: &str, port: u16, timeout_secs: u64) -> Result<u32> {
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let addr = super::transport::format_host_port(server, port);
-    let start = std::time::Instant::now();
-    let _stream = super::transport::connect_server_tcp(&addr, timeout).await?;
-    Ok(start.elapsed().as_millis() as u32)
+pub fn tcp_latency_test(
+    server: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
+    // Keep the TCP connector's poll code in core when the CLI builds a probe.
+    Box::pin(async move {
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let addr = super::transport::format_host_port(server, port);
+        let start = std::time::Instant::now();
+        let _stream = super::transport::connect_server_tcp(&addr, timeout).await?;
+        Ok(start.elapsed().as_millis() as u32)
+    })
 }
 
 /// Perform an HTTP latency test through a proxy outbound with warmup.

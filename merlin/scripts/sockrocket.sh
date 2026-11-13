@@ -147,13 +147,6 @@ api_port() {
     case "$p" in ''|*[!0-9]*) echo "$DEFAULT_API_PORT" ;; *) echo "$p" ;; esac
 }
 
-# Publish the API port next to the Web UI page: the .asp is static and
-# cannot read config.yaml, so the browser learns the port from api.js.
-write_api_js() {
-    [ -d /www/ext/sockrocket ] || return 0
-    printf 'var SOCKROCKET_API_PORT = %s;\n' "$1" > /www/ext/sockrocket/api.js 2>/dev/null || true
-}
-
 api_is_running() {
     [ -f "$API_PID" ] || return 1
     local pid
@@ -189,7 +182,7 @@ do_softcenter_status() {
 
 publish_web_page() {
     local source="$SOCKROCKET_DIR/webui/sockrocket.asp" target="$1" pending
-    [ -s "$source" ] || return 1
+    [ -s "$source" ] && [ ! -d "$target" ] || return 1
     mkdir -p "${target%/*}" || return 1
     if [ -f "$target" ] && cmp -s "$source" "$target" 2>/dev/null; then
         chmod 644 "$target"
@@ -203,26 +196,62 @@ publish_web_page() {
     return 1
 }
 
+publish_merlin_page() (
+    umask 022
+    for page in /www/ext/sockrocket/sockrocket.asp /tmp/var/wwwext/sockrocket/sockrocket.asp; do
+        if publish_web_page "$page" 2>/dev/null; then
+            printf '%s\n' "$page"
+            return 0
+        fi
+    done
+    return 1
+)
+
+publish_cgi() (
+    local source="$1" target="$2" staging rc
+    # The request supplies CGI input through stdin and the environment. Its
+    # executable path and subcommand always come from this installed launcher.
+    launcher() { printf '%s\n' '#!/bin/sh' 'exec /jffs/addons/sockrocket/sockrocket-cli cgi'; }
+    [ ! -d "$target" ] || return 1
+    if [ -L "$target" ] && [ "$target" -ef "$source" ]; then return 0; fi
+    if [ -f "$target" ] && [ ! -L "$target" ] && [ -x "$target" ] &&
+        launcher | cmp -s - "$target"; then return 0; fi
+
+    # Stage next to the endpoint. Renaming also replaces a running legacy
+    # binary copy without truncating it or following an existing symlink.
+    staging="$target.install.$$"
+    (umask 077; mkdir "$staging") || return 1
+    if ln -s "$source" "$staging/cgi" 2>/dev/null ||
+        { launcher > "$staging/cgi" && chmod 700 "$staging/cgi"; }; then
+        mv -f "$staging/cgi" "$target"
+        rc=$?
+    else
+        rc=1
+    fi
+    rm -rf "$staging"
+    return "$rc"
+)
+
+restore_cgi() (
+    umask 022
+    [ -x "$SOCKROCKET_BIN" ] || return 1
+    publish_cgi "$SOCKROCKET_BIN" "$SOCKROCKET_DIR/sockrocket.cgi" || return 1
+    # KoolCenter's read-only httpd tree uses the separately installed API bridge.
+    if ! mkdir -p /www/cgi-bin 2>/dev/null ||
+        ! publish_cgi "$SOCKROCKET_DIR/sockrocket.cgi" /www/cgi-bin/sockrocket.cgi 2>/dev/null; then
+        [ -f /koolshare/scripts/base.sh ] || return 1
+    fi
+)
+
 restore_web_ui() (
     # Only public web assets are created here. The daemon keeps umask 077.
     umask 022
-    # Restore CGI symlink (tmpfs /www/cgi-bin loses files on reboot).
-    # Skipped automatically on koolcenter firmware where /www is read-only
-    # (mkdir fails) — the koolcenter path uses the API bridge instead.
-    local cgi_src="$SOCKROCKET_DIR/sockrocket.cgi"
-    local cgi_dst="/www/cgi-bin/sockrocket.cgi"
-    if [ -f "$cgi_src" ] && [ ! -e "$cgi_dst" ]; then
-        if mkdir -p "/www/cgi-bin" 2>/dev/null; then
-            ln -sf "$cgi_src" "$cgi_dst" 2>/dev/null || cp "$cgi_src" "$cgi_dst" 2>/dev/null || true
-        fi
-    fi
+    restore_cgi || log_warn "Could not restore CGI launcher"
 
     # Web UI page on standard Merlin: /www may be tmpfs and wiped on reboot.
     # Always refresh from the durable copy so deploys are not left stale.
     if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
-        publish_web_page /www/ext/sockrocket/sockrocket.asp 2>/dev/null ||
-            publish_web_page /tmp/var/wwwext/sockrocket/sockrocket.asp ||
-            log_warn "Could not restore Merlin Web UI"
+        publish_merlin_page >/dev/null || log_warn "Could not restore Merlin Web UI"
     fi
 
     # koolcenter self-heal: Softcenter menu opens Module_sockrocket.asp.
@@ -277,7 +306,6 @@ do_api_start() {
     # cannot starve the data plane on a busy ARM core.
     nice -n 5 "$SOCKROCKET_BIN" api "$port" >> "$SOCKROCKET_LOG" 2>&1 &
     echo $! > "$API_PID"
-    write_api_js "$port"
     sleep 1
     if api_is_running; then
         log_info "API bridge started (PID $(cat "$API_PID"), port $port)"
@@ -2354,6 +2382,8 @@ case "$1" in
         ;;
     status)  do_status ;;
     software-center-status) do_softcenter_status ;;
+    install-cgi) restore_cgi ;;
+    install-page) publish_merlin_page ;;
     log)     tail -100 "$SOCKROCKET_LOG" 2>/dev/null || info "No log file found" ;;
     api-start)
         run_locked 5 do_api_start
