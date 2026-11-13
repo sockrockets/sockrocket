@@ -97,7 +97,7 @@ pub fn import(root: &serde_yaml::Value) -> Result<Option<ServerDns>> {
     if let Some(value) = dns.get("proxy-server-nameserver") {
         return parse_policy(dns, value, "proxy-server-nameserver");
     }
-    if dns.get("enable").and_then(|v| v.as_bool()) == Some(false) {
+    if dns.get("enable").and_then(|v| v.as_bool()) != Some(true) {
         return Ok(None);
     }
     let Some(value) = dns.get("nameserver") else {
@@ -209,9 +209,10 @@ proxies:
     fn disabled_or_unsupported_general_dns_preserves_legacy_import() {
         for dns in [
             "{enable: false, nameserver: [192.0.2.53]}",
-            "{nameserver: []}",
-            "{nameserver: [192.0.2.53, 'https://dns.example.test/dns-query#group']}",
-            "{nameserver: ['https://dns.example.test/dns-query'], default-nameserver: ['tls://192.0.2.53']}",
+            "{nameserver: [192.0.2.53]}",
+            "{enable: true, nameserver: []}",
+            "{enable: true, nameserver: [192.0.2.53, 'https://dns.example.test/dns-query#group']}",
+            "{enable: true, nameserver: ['https://dns.example.test/dns-query'], default-nameserver: ['tls://192.0.2.53']}",
         ] {
             assert!(parse(&format!("dns: {dns}")).unwrap().is_none());
         }
