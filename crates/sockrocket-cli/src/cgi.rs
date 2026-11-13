@@ -3539,6 +3539,24 @@ fn ensure_update_space(path: &std::path::Path, required: u64) -> anyhow::Result<
     Ok(())
 }
 
+fn expanded_package_bytes(archive: &std::path::Path, members: usize) -> Result<u64> {
+    // -O streams the regular files to stdout, without writing any package data.
+    let mut tar = Command::new("tar")
+        .arg("-xOzf")
+        .arg(archive)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut payload = tar
+        .stdout
+        .take()
+        .context("Cannot inspect expanded package")?;
+    let bytes = std::io::copy(&mut payload, &mut std::io::sink());
+    drop(payload);
+    anyhow::ensure!(tar.wait()?.success(), "Cannot measure expanded package");
+    // A partial last block per member also covers the directories on Merlin tmpfs.
+    Ok(bytes?.saturating_add((members as u64).saturating_mul(4096)))
+}
+
 fn save_update_status(status: &str) -> Result<()> {
     sockrocket_core::config::storage::atomic_write_private(
         &sockrocket_dir().join("update-status"),
@@ -3649,11 +3667,11 @@ pub fn merlin_update_worker() -> Result<()> {
             anyhow::anyhow!("Release asset size unavailable; cannot preflight update space")
         })?;
         let temporary = std::env::temp_dir();
-        ensure_update_space(&temporary, size.saturating_add(8 * 1024 * 1024))?;
         let work = temporary.join(format!("sockrocket-update-{}", rand::random::<u64>()));
         fs::create_dir(&work)?;
         let prepare = (|| -> anyhow::Result<()> {
             let archive = work.join("package.tar.gz");
+            ensure_update_space(&work, size)?;
             save_update_status("downloading")?;
             rt.block_on(sockrocket_core::download_file_with_proxy_fallback(
                 &url,
@@ -3681,18 +3699,9 @@ pub fn merlin_update_worker() -> Result<()> {
                     "Unsafe archive path"
                 );
             }
-            // Count expanded tar bytes without materializing them in /tmp.
-            let expanded = Command::new("sh")
-                .arg("-c")
-                .arg(r#"gzip -dc "$1" | wc -c"#)
-                .arg("update-size")
-                .arg(&archive)
-                .output()?;
-            anyhow::ensure!(expanded.status.success(), "Cannot measure expanded package");
-            let bytes = String::from_utf8_lossy(&expanded.stdout)
-                .trim()
-                .parse::<u64>()?;
-            ensure_update_space(&work, bytes.saturating_add(8 * 1024 * 1024))?;
+            // df already accounts for the downloaded archive at this point.
+            let members = String::from_utf8_lossy(&names.stdout).lines().count();
+            ensure_update_space(&work, expanded_package_bytes(&archive, members)?)?;
             anyhow::ensure!(
                 Command::new("tar")
                     .arg("-xzf")
@@ -3835,6 +3844,27 @@ fn act_diagnose() -> J {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpack_space_counts_files_and_detects_tar_failure() {
+        let env = TestEnv::new(SAMPLE);
+        fs::write(env.dir.join("payload"), vec![7; 8193]).unwrap();
+        let archive = env.dir.join("package.tar.gz");
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&env.dir)
+                .arg("payload")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(expanded_package_bytes(&archive, 1).unwrap(), 8193 + 4096);
+        fs::write(&archive, b"invalid compressed archive").unwrap();
+        assert!(expanded_package_bytes(&archive, 1).is_err());
+    }
 
     #[test]
     fn monitor_memory_sources() {

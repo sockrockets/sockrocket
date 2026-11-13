@@ -176,6 +176,73 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         old.wait()
 print('PASS: atomic upgrade, preserved install intent, boot wrapper and WAN event hooks')
 
+# Exercise the production preflight before any file publication or service stop.
+with tempfile.TemporaryDirectory(prefix='sockrocket-install-capacity-') as directory:
+    base = Path(directory)
+    pkg = base / 'package'
+    shutil.copytree('merlin', pkg)
+    jffs = base / 'jffs'
+    jffs.mkdir()
+    ks = base / 'koolshare'
+    (ks / 'scripts').mkdir(parents=True)
+    binary = pkg / 'bin/sockrocket-cli'
+    binary.parent.mkdir(exist_ok=True)
+    binary.touch()
+    # A sparse fixture exercises logical size even when du reports zero.
+    with binary.open('r+b') as stream:
+        stream.truncate(11_200_000)
+    preflight = source[:source.index('# ── Update-only mode')]
+    preflight = re.sub(r'/tmp/var/wwwext|/www|/jffs|/koolshare',
+                       lambda match: str(base) + match[0], preflight)
+    script = pkg / 'install.sh'
+    script.write_text(preflight.replace('restore_path\n', '''
+# Emulate firmware where df and wc exist but the command builtin does not.
+command() { return 127; }
+fixture_volume() {
+    case "$*" in
+        *"/tmp/var/wwwext"*) dev=backup; free=$BACKUP_FREE ;;
+        *"/www"*) dev=primary; free=$PRIMARY_FREE ;;
+        *"/koolshare"*) dev=$KS_DEVICE; free=$KS_FREE ;;
+        *) dev=flash; free=$FLASH_FREE ;;
+    esac
+}
+df() {
+    fixture_volume "$@"
+    echo "Filesystem 1024-blocks Used Available Capacity Mounted"
+    echo "tmpfs 20000 0 $free 0% /${dev}"
+}
+stat() {
+    case "${STAT_STYLE:-gnu}:$2" in gnu:-c|bsd:-f) ;; *) return 1 ;; esac
+    fixture_volume "$@"
+    case "$dev" in flash) echo 20 ;; usb) echo 21 ;; primary) echo 22 ;; backup) echo 23 ;; esac
+}
+restore_path
+''', 1) + '\nexit 0\n')
+    for path in ('www/ext/sockrocket', 'tmp/var/wwwext/sockrocket'):
+        (base / path).mkdir(parents=True)
+    def precheck(*args, flash=12695, ks_device='flash', ks_free=None, primary=0, backup=1000, **extra):
+        env = dict(os.environ, FLASH_FREE=str(flash), KS_DEVICE=ks_device,
+                   KS_FREE=str(flash if ks_free is None else ks_free),
+                   PRIMARY_FREE=str(primary), BACKUP_FREE=str(backup), **extra)
+        return subprocess.run(['sh', str(script), 'aarch64', *args], env=env, capture_output=True)
+    assert precheck().returncode == 0, '13,000,000 byte install with alternate Merlin page volume'
+    assert precheck(primary=0, backup=0).returncode != 0
+    insufficient = precheck(flash=1000)
+    assert insufficient.returncode != 0 and '安装空间不足'.encode() in insufficient.stderr
+    assert list(jffs.iterdir()) == []
+    (ks / 'scripts/base.sh').touch()
+    (jffs / '.koolshare/webs').mkdir(parents=True)
+    assert precheck().returncode == 0, 'Software Center fits 13 decimal MB including its published page'
+    for style in ('gnu', 'bsd', 'missing'):
+        assert precheck(ks_device='usb', ks_free=1000, STAT_STYLE=style).returncode == 0
+        assert precheck(ks_device='usb', ks_free=0, STAT_STYLE=style).returncode != 0, \
+            'an independent full tmpfs must fail even when the identically named JFFS volume has 13 MB'
+    assert precheck('--update', flash=10_000).returncode != 0
+    assert precheck('--update', flash=11_000).returncode == 0
+    assert precheck(flash=0, SOCKROCKET_INTEGRATION_ONLY='1').returncode == 0
+    assert not (jffs / 'addons').exists() and not (jffs / 'scripts').exists()
+print('PASS: independent install volumes, sparse payload, 13 MB capacity, binary replacement and transaction handoff')
+
 # Simulate a reboot while stopped with a live management API. The tile URL
 # built from the module name and the legacy indexpage must both resolve.
 control_source = Path('merlin/scripts/sockrocket.sh').read_text()

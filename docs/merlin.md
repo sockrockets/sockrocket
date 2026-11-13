@@ -197,6 +197,10 @@ Wrong platform `.valid` → softcenter rejects the package or the binary fails w
 
 Archive root is always `sockrocket/` (koolcenter module name).
 
+For the ARM64 `hnd_v8` package, a fresh install fits in 13 MB (13,000,000 bytes) of free JFFS space on the standard Merlin and Software Center layouts tested. Upload and extract the archive under `/tmp`; the compressed archive and expanded files coexist there during extraction. Use `df -Pk /jffs /tmp` to check each filesystem.
+
+An online upgrade also needs space for the recovery files. The updater measures the existing configuration, firmware hooks and Web UI files, and keeps the old executable by renaming it on JFFS. Large configuration backups or old CGI entries that contain full executable copies can increase the requirement. The installed updater performs this check. For a router running v0.1.5 with limited free space, use **Offline install** with the new package to use its space check.
+
 ### 3. SSH (optional)
 
 ```bash

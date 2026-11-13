@@ -25,8 +25,13 @@ class RecoveryTest(unittest.TestCase):
         if not (root / 'config.yaml').exists(): (root / 'config.yaml').write_text('socks_port: 1080\n')
         (root / 'api-token').write_text('test-token')
         (root / 'sockrocket.pid').write_text(str(os.getpid()))
+        proc = root / 'mock-proc'
+        cmdline = proc / str(os.getpid()) / 'cmdline'
+        cmdline.parent.mkdir(parents=True, exist_ok=True)
+        cmdline.write_bytes(os.fsencode(root / 'sockrocket-cli') + b'\0' + os.fsencode(root / 'config.yaml') + b'\0')
         return subprocess.run(['sh', str(WORKER), '--recover'],
-            env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
+            env={**os.environ, 'SOCKROCKET_DIR': str(root), 'SOCKROCKET_PROC_BASE': str(proc),
+                 'SOCKROCKET_RUNTIME_DIR': str(root / 'runtime'),
                  'PATH': str(tools) + os.pathsep + os.environ['PATH']}, capture_output=True, timeout=15)
 
     def test_interrupted_publish_restores_by_rename(self):
@@ -163,12 +168,13 @@ class RecoveryTest(unittest.TestCase):
             for path in (root, pkg, work, commands):
                 path.mkdir()
             (root / 'sockrocket-cli').write_text('old')
+            (root / 'config.yaml').write_text('socks_port: 1080\n')
             for name in ('bin', 'scripts', 'webui', 'res'):
                 (pkg / name).mkdir()
             for name in ('version', 'uninstall.sh'):
                 (pkg / name).touch()
-            # Same-size upgrade: the old binary can still be mapped.
-            data = b'x' * (2 * 1024 * 1024)
+            # A still-mapped old executable cannot count as available flash.
+            data = b'x' * (6 * 1024 * 1024)
             (root / 'sockrocket-cli').write_bytes(data)
             (pkg / 'bin/sockrocket-cli').write_bytes(data)
             df = commands / 'df'
@@ -186,6 +192,203 @@ class RecoveryTest(unittest.TestCase):
             self.assertFalse((root / 'update-status').exists())
             self.assertEqual((root / 'sockrocket-cli').read_bytes(), data)
             self.assertFalse((root / '.update-transaction').exists())
+
+    def test_integration_space_on_separate_volumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            root, pkg, work, tools = [base / n for n in ('root', 'pkg', 'work', 'tools')]
+            for directory in (root / 'scripts', pkg / 'bin', pkg / 'scripts', pkg / 'webui', pkg / 'res',
+                              base / 'koolshare/scripts', base / 'www/ext', base / 'backing', tools):
+                directory.mkdir(parents=True)
+            worker = base / 'worker.sh'
+            rewrite = {'/koolshare': base / 'koolshare', '/jffs': base / 'jffs',
+                       '/www': base / 'www', '/tmp/var/wwwext': base / 'backing'}
+            worker.write_text(re.sub(r'/tmp/var/wwwext|/koolshare|/jffs|/www', lambda m: str(rewrite[m[0]]), WORKER.read_text()))
+            (root / 'scripts/sockrocket.sh').write_text('touch "$SOCKROCKET_DIR/stopped-by-update"')
+            for name in ('sockrocket-cli', 'config.yaml'): (root / name).write_text('old')
+            for name in ('version', 'uninstall.sh'): (pkg / name).touch()
+            (pkg / 'bin/sockrocket-cli').write_text('#!/bin/sh\nexit 0\n')
+            (pkg / 'bin/sockrocket-cli').chmod(0o700)
+            (pkg / 'webui/sockrocket.asp').write_bytes(b'x' * (100 * 1024))
+            (pkg / 'scripts/sockrocket_api.sh').write_bytes(b'y' * (60 * 1024))
+            (base / 'koolshare/scripts/base.sh').touch()
+            stat = tools / 'stat'
+            stat.write_text('#!/bin/sh\nfor path do :; done\ncase "$path" in\n'
+                ' "$BASE"/koolshare*) echo 2;; "$BASE"/www*) echo 3;; "$BASE"/backing*) echo 4;; *) echo 1;; esac\n')
+            stat.chmod(0o700)
+            df = tools / 'df'
+            df.write_text('#!/bin/sh\ncase "$2" in\n'
+                '  "$BASE"/koolshare*) echo "softcenter 1000 0 ${KS_FREE} 0% /ks";;\n'
+                '  "$BASE"/www*) echo "tmpfs 1000 0 ${WEB_FREE} 0% /www";;\n'
+                '  "$BASE"/backing*) echo "tmpfs 1000 0 ${FALLBACK_FREE} 0% /tmp";;\n'
+                '  *) echo "flash 1000000 0 900000 10% /";;\nesac\n')
+            df.chmod(0o700)
+            env = dict(os.environ, SOCKROCKET_DIR=str(root), BASE=str(base), KS_FREE='150', WEB_FREE='1',
+                       FALLBACK_FREE='1', PATH=str(tools) + os.pathsep + os.environ['PATH'])
+
+            def run(*args):
+                work.mkdir(exist_ok=True)
+                return subprocess.run(['sh', str(worker), str(pkg), str(work), *args], env=env, capture_output=True)
+            # Each menu file would fit alone. Their combined allocation cannot.
+            for args in (('--check-space',), ()):
+                failed = run(*args)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertRegex(failed.stderr.decode(), r'/koolshare.*需要 \d+ KiB，可用 150 KiB')
+                self.assertFalse((root / 'stopped-by-update').exists())
+                self.assertFalse((root / '.update-transaction').exists())
+            # The extra Merlin page is optional on KoolCenter.
+            env['KS_FREE'] = '200'
+            self.assertEqual(run('--check-space').returncode, 0)
+            (base / 'koolshare/scripts/base.sh').unlink()
+            failed = run('--check-space')
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn('可用 1 KiB', failed.stderr.decode())
+            env['FALLBACK_FREE'] = '200'
+            self.assertEqual(run('--check-space').returncode, 0)
+
+    def test_update_obeys_stop_intent_and_discards_reused_pids(self):
+        for stopped in (True, False):
+            for interrupted in (True, False):
+                with self.subTest(stopped=stopped, interrupted=interrupted), tempfile.TemporaryDirectory() as tmp:
+                    base = pathlib.Path(tmp)
+                    root, pkg, work, tools = [base / n for n in ('root', 'pkg', 'work', 'tools')]
+                    for directory in (root / 'scripts', pkg / 'bin', pkg / 'scripts', pkg / 'webui',
+                                      pkg / 'res', work, tools):
+                        directory.mkdir(parents=True)
+                    worker = base / 'worker.sh'
+                    worker.write_text(re.sub(r'/tmp/var/wwwext|/www|/jffs|/koolshare',
+                                             lambda m: str(base) + m[0], WORKER.read_text()))
+                    (work / 'worker.sh').write_bytes(worker.read_bytes())
+                    (root / 'sockrocket-cli').write_text('original')
+                    (root / 'config.yaml').write_text('fixture')
+                    (root / 'api-token').write_text('fixture')
+                    if stopped: (root / 'stopped').touch()
+                    (pkg / 'bin/sockrocket-cli').write_text('#!/bin/sh\nexit 0\n')
+                    (pkg / 'bin/sockrocket-cli').chmod(0o700)
+                    (pkg / 'scripts/dnsmasq.conf').write_text('fixture')
+                    (pkg / 'uninstall.sh').touch()
+                    (pkg / 'install.sh').write_text('kill -KILL "$PPID"' if interrupted else 'exit 0')
+                    pid = str(os.getpid())
+                    proc = base / 'proc' / pid
+                    proc.mkdir(parents=True)
+                    (proc / 'cmdline').write_bytes(b'/usr/bin/unrelated\0')
+                    # Both a live recycled pid and dangerous process-group pid
+                    # values must be cleared before the old controller sees them.
+                    for name, value in [('sockrocket.pid', pid), ('sockrocket-api.pid', pid),
+                                        ('sockrocket-guard.pid', '0'), ('sockrocket-supervisor.pid', '-1')]:
+                        (root / name).write_text(value)
+                    for path in (root, pkg):
+                        (path / 'version').write_text('fixture-version')
+                        (path / 'scripts/sockrocket.sh').write_text(
+                            'cd "$SOCKROCKET_DIR" || exit 1\n'
+                            'case "$1" in\n'
+                            ' stop) if test -f sockrocket.pid || test -f sockrocket-api.pid || '
+                            'test -f sockrocket-guard.pid || test -f sockrocket-supervisor.pid; '
+                            'then touch wrong-pid; exit 1; fi; touch stopped;;\n'
+                            ' api-restart) touch api-started;;\n'
+                            ' start) rm -f stopped; printf "%s" "$TEST_PID" > sockrocket.pid; '
+                            'printf "%s\\0%s\\0" "$SOCKROCKET_DIR/sockrocket-cli" "$SOCKROCKET_DIR/config.yaml" '
+                            '> "$SOCKROCKET_PROC_BASE/$TEST_PID/cmdline";;\nesac\n')
+                    (tools / 'curl').write_text('#!/bin/sh\necho fixture-version\n')
+                    (tools / 'nslookup').write_text('#!/bin/sh\nexit 0\n')
+                    for tool in tools.iterdir(): tool.chmod(0o700)
+                    env = dict(os.environ, SOCKROCKET_DIR=str(root), SOCKROCKET_PROC_BASE=str(proc.parent),
+                               SOCKROCKET_RUNTIME_DIR=str(base / 'runtime'), TEST_PID=pid,
+                               PATH=str(tools) + os.pathsep + os.environ['PATH'])
+                    def run(*args):
+                        return subprocess.run(['sh', str(worker), *map(str, args)], env=env,
+                                              capture_output=True, timeout=15)
+                    result = run(pkg, work)
+                    if interrupted:
+                        self.assertNotEqual(result.returncode, 0)
+                        result = run('--recover')
+                        self.assertEqual((root / 'sockrocket-cli').read_text(), 'original')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse((root / 'wrong-pid').exists())
+                    self.assertTrue((root / 'api-started').exists())
+                    self.assertEqual((root / 'stopped').exists(), stopped)
+                    self.assertEqual((root / 'sockrocket.pid').exists(), not stopped)
+
+    def test_13mb_upgrades_keep_pinned_cli_and_retry_rollback(self):
+        for free_kb in (13_000_000 // 1024, 13 * 1024):
+            with self.subTest(free_kb=free_kb), tempfile.TemporaryDirectory() as tmp:
+                base = pathlib.Path(tmp)
+                root, pkg, work, tools = [base / n for n in ('root', 'pkg', 'work', 'tools')]
+                for directory in (root / 'scripts', pkg / 'bin', pkg / 'scripts',
+                                  pkg / 'webui', pkg / 'res', work, tools):
+                    directory.mkdir(parents=True)
+                worker = base / 'worker.sh'
+                worker.write_text(WORKER.read_text().replace('/tmp/var/wwwext', str(base / 'backing'))
+                                  .replace('/www', str(base / 'webroot')))
+                binary = root / 'sockrocket-cli'
+                binary.write_bytes(os.urandom(11 * 1024 * 1024))
+                binary.chmod(0o700)
+                old_inode = binary.stat().st_ino
+                (root / 'scripts/sockrocket.sh').write_text('#!/bin/sh\nexit 0\n')
+                (root / 'stopped').touch()
+                (root / 'version').write_text('test-version')
+                # Independent, poorly compressible 340 KiB configurations.
+                for name in ('config.yaml', 'config.yaml.bak'):
+                    (root / name).write_bytes(os.urandom(340 * 1024))
+                (root / 'api-token').write_text('fixture')
+                (pkg / 'scripts/sockrocket.sh').write_text('#!/bin/sh\nexit 0\n')
+                (pkg / 'scripts/dnsmasq.conf').write_text('server=127.0.0.1\n')
+                (pkg / 'scripts/asset').write_bytes(b's' * 216_000)
+                (pkg / 'webui/page').write_bytes(b'w' * 270_000)
+                (pkg / 'version').write_text('test-version')
+                (pkg / 'uninstall.sh').write_text('#!/bin/sh\n')
+                candidate = pkg / 'bin/sockrocket-cli'
+                with candidate.open('wb') as f:
+                    f.write(b'#!/bin/sh\nexit 0\n#')
+                    f.write(b'x' * (10_983_504 - f.tell()))
+                candidate.chmod(0o700)
+                # The installer runs after the old inode's durable rename.
+                (pkg / 'install.sh').write_text('#!/bin/sh\n'
+                    'if test -f "$SOCKROCKET_DIR/interrupt"; then kill -KILL "$PPID"; fi\n')
+                (work / 'worker.sh').write_bytes(worker.read_bytes())
+                (tools / 'df').write_text('#!/bin/sh\n'
+                    'if test -f "$SOCKROCKET_DIR/.update-transaction/config-backed-up"; then '
+                    'echo "mock 100000 0 ' + str(free_kb - 780) + ' 0% /"; else '
+                    'echo "mock 100000 0 ' + str(free_kb) + ' 0% /"; fi\n')
+                (tools / 'curl').write_text('#!/bin/sh\necho "test-version"\n')
+                for tool in tools.iterdir():
+                    tool.chmod(0o700)
+                env = dict(os.environ, SOCKROCKET_DIR=str(root), SOCKROCKET_RUNTIME_DIR=str(base / 'runtime'),
+                           PATH=str(tools) + os.pathsep + os.environ['PATH'])
+                def run(*args):
+                    return subprocess.run(['sh', str(worker), *map(str, args)], env=env,
+                                          capture_output=True, timeout=20)
+                # Keep the original inode open throughout installation and recovery.
+                with binary.open('rb') as holding_old_cli:
+                    preflight = run(pkg, work, '--check-space')
+                    self.assertEqual(preflight.returncode, 0, preflight.stderr)
+                    (root / 'interrupt').touch()
+                    crashed = run(pkg, work)
+                    self.assertNotEqual(crashed.returncode, 0)
+                    tx = root / '.update-transaction'
+                    self.assertTrue((tx / 'prepared').exists())
+                    self.assertEqual((tx / 'previous-cli').stat().st_ino, old_inode)
+                    with tarfile.open(tx / 'backup.tar.gz') as archive:
+                        self.assertNotIn('sockrocket-cli', archive.getnames())
+                    self.assertNotEqual(binary.stat().st_ino, old_inode)
+                    # Fail after rename-back. The next recovery must keep the
+                    # old CLI even though previous-cli has already been moved.
+                    (tools / 'tar').write_text('#!/bin/sh\ncase "$1:$2" in '
+                        '-xzf:*/backup.tar.gz) exit 1;; esac\nexec "' + shutil.which('tar') + '" "$@"\n')
+                    (tools / 'tar').chmod(0o700)
+                    self.assertNotEqual(run('--recover').returncode, 0)
+                    self.assertEqual(binary.stat().st_ino, old_inode)
+                    (tools / 'tar').unlink()
+                    self.assertEqual(run('--recover').returncode, 0)
+                    self.assertEqual(binary.stat().st_ino, old_inode)
+                    self.assertFalse(tx.exists())
+                    (root / 'interrupt').unlink()
+                    completed = run(pkg, work)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(binary.stat().st_size, candidate.stat().st_size)
+                    self.assertNotEqual(binary.stat().st_ino, old_inode)
+                    self.assertEqual(os.fstat(holding_old_cli.fileno()).st_ino, old_inode)
+                    self.assertFalse(tx.exists())
 
     def test_incompatible_configuration_rejected_before_transaction(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +430,7 @@ class RecoveryTest(unittest.TestCase):
             (root / 'scripts').mkdir()
             (root / 'scripts/sockrocket.sh').write_text('#!/bin/sh\nexit 0\n')
             (root / 'sockrocket-cli').write_text('old')
+            (root / 'stopped').touch()
             (root / 'version').write_text('1.2.3')
             (root / 'api-token').write_text('fixture')
             endpoints = (root / 'sockrocket.cgi', cgi_bin / 'sockrocket.cgi')

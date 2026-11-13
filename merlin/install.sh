@@ -185,6 +185,129 @@ fi
 info "/jffs partition OK"
 check_deps
 
+# Count logical file sizes in 4 KiB blocks, including sparse files copied from
+# an offline package. Only the selected architecture's binary is installed.
+file_kib() {
+    local bytes
+    bytes=$(wc -c < "$1") || return 1
+    echo $(( (bytes + 4095) / 4096 * 4 ))
+}
+
+payload_kib() {
+    local path amount total=0
+    for path in "$@"; do
+        [ -f "$path" ] || continue
+        amount=$(file_kib "$path") || return 1
+        total=$((total + amount))
+    done
+    echo "$total"
+}
+
+# df must see the destination filesystem even before its directories exist.
+destination_space() {
+    local path="$1" listing device blocks used available capacity mount dev
+    while [ ! -d "$path" ]; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+        path=${path%/*}
+        [ -n "$path" ] || path=/
+    done
+    [ -w "$path" ] || return 1
+    listing=$(df -Pk "$path") || return 1
+    # A name such as tmpfs may identify several independent mounts.
+    dev=$(stat -L -c %d "$path" 2>/dev/null) || dev=$(stat -L -f %d "$path" 2>/dev/null) || dev=
+    while read -r device blocks used available capacity mount; do
+        case "$available" in ''|*[!0-9]*) continue ;; esac
+        case "$dev" in ''|*[!0-9]*) dev="$device:$mount" ;; esac
+        printf '%s %s\n' "$dev" "$available"
+        return 0
+    done <<EOF
+$listing
+EOF
+    return 1
+}
+
+require_install_kib() {
+    [ "$2" -ge "$3" ] || err "安装空间不足：$1 需要 $3 KiB，可用 $2 KiB，还差 $(($3 - $2)) KiB"
+}
+
+check_install_space() {
+    # The transaction worker measures and stages its rollback and integration files.
+    [ "${SOCKROCKET_INTEGRATION_ONLY:-0}" != 1 ] || return 0
+    # Merlin's minimal BusyBox shell may lack the command builtin.
+    if ! have df || ! have wc; then
+        warn "Cannot preflight disk space in this restricted installer environment"
+        return 0
+    fi
+    local root_space root_device available required amount added target space config hook largest=0
+    root_space=$(destination_space "$SOCKROCKET_DIR") || err "Cannot read installation filesystem space"
+    set -- $root_space
+    root_device=$1
+    available=$2
+    required=$(file_kib "$BINARY") || err "Cannot measure bundled binary"
+    # The old executable may still be open. The pending copy needs its full size.
+    if [ "$UPDATE_ONLY" = true ]; then
+        require_install_kib "$SOCKROCKET_DIR" "$available" "$((required + 8))"
+        return
+    fi
+    config=$SCRIPT_DIR/config.yaml.template
+    [ ! -f "$SOCKROCKET_CONF" ] || config=$SOCKROCKET_CONF
+    amount=$(payload_kib "$config" "$SCRIPT_DIR/.valid" "$SCRIPT_DIR/version" \
+        "$SCRIPT_DIR/uninstall.sh" "$SCRIPT_DIR/webui/sockrocket.asp" "$SCRIPT_DIR/res/icon-sockrocket.png" \
+        "$SCRIPT_DIR/scripts/sockrocket.sh" "$SCRIPT_DIR/scripts/iptables.sh" "$SCRIPT_DIR/scripts/update.sh" \
+        "$SCRIPT_DIR/scripts/dnsmasq-postconf.sh" "$SCRIPT_DIR/scripts/dnsmasq.conf" \
+        "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SCRIPT_DIR/scripts/sockrocket_status.sh") || err "Cannot measure installed files"
+    required=$((required + amount))
+    # Each hook grows by at most one block; only one original is staged at a time.
+    set -- wan-event wan-start dhcpc-event dnsmasq.postconf
+    [ "$KOOLSHARE" = 1 ] || set -- "$@" firewall-start nat-start services-start service-event
+    for hook in "$@"; do
+        amount=$(payload_kib "/jffs/scripts/$hook") || err "Cannot measure existing hook"
+        [ "$amount" -le "$largest" ] || largest=$amount
+    done
+    # Plugin / hook directories, CGI launcher and small generated state files.
+    required=$((required + largest + 4 * $# + 32))
+    require_install_kib "$SOCKROCKET_DIR" "$available" "$required"
+    if [ "$KOOLSHARE" = 1 ]; then
+        # On some images the menu page and its persistent boot-time mirror
+        # are separate files. On others both names resolve to the same directory.
+        if [ -d /jffs/.koolshare/webs ] && ! [ "$KS_WEBS" -ef /jffs/.koolshare/webs ]; then
+            amount=$(file_kib "$SCRIPT_DIR/webui/sockrocket.asp") || err "Cannot measure Software Center page"
+            required=$((required + amount))
+            require_install_kib "$SOCKROCKET_DIR" "$available" "$required"
+        fi
+        local icon="$SCRIPT_DIR/res/icon-sockrocket.png"
+        [ -f "$icon" ] || icon="$SCRIPT_DIR/webui/icon-sockrocket.png"
+        added=$(payload_kib "$SCRIPT_DIR/webui/sockrocket.asp" "$icon" "$SCRIPT_DIR/uninstall.sh" \
+            "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SCRIPT_DIR/scripts/sockrocket_status.sh") || err "Cannot measure Software Center files"
+        added=$((added + 24))
+        space=$(destination_space "$KS_DIR") || err "Cannot read Software Center filesystem space"
+        set -- $space
+        if [ "$1" = "$root_device" ]; then
+            require_install_kib "$SOCKROCKET_DIR" "$available" "$((required + added))"
+        else
+            require_install_kib "$KS_DIR" "$2" "$added"
+        fi
+    else
+        added=$(file_kib "$SCRIPT_DIR/webui/sockrocket.asp") || err "Cannot measure Merlin page"
+        added=$((added + 4))
+        local possible=0 last_target="" last_free=0 last_need=0 need
+        for target in /www/ext/sockrocket /tmp/var/wwwext/sockrocket; do
+            space=$(destination_space "$target") || continue
+            set -- $space
+            need=$added
+            [ "$1" != "$root_device" ] || need=$((required + added))
+            if [ "$2" -ge "$need" ]; then possible=1; break; fi
+            last_target=$target last_free=$2 last_need=$need
+        done
+        if [ "$possible" != 1 ]; then
+            [ -n "$last_target" ] || err "Cannot find a Merlin page destination"
+            require_install_kib "$last_target" "$last_free" "$last_need"
+        fi
+    fi
+}
+
+check_install_space
+
 # ── Update-only mode ───────────────────────────────────────────────────────────
 # Stage beside the destination and rename: cp over a running Linux executable
 # fails with ETXTBSY (the API stays up independently of the proxy).
