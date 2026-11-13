@@ -113,6 +113,15 @@ pub fn apply_subscription_refresh(
     config: &mut AppConfig,
     refreshed: Vec<(String, Vec<Node>)>,
 ) -> bool {
+    refresh_with_dns_migrations(config, refreshed).is_some()
+}
+
+/// Return changed fingerprints so persisted and live selections can follow a
+/// subscription that now supplies a resolver for an existing endpoint.
+pub fn refresh_with_dns_migrations(
+    config: &mut AppConfig,
+    refreshed: Vec<(String, Vec<Node>)>,
+) -> Option<HashMap<String, String>> {
     // An empty/failed source is not an instruction to delete saved nodes.
     let refreshed: Vec<_> = refreshed
         .into_iter()
@@ -121,13 +130,14 @@ pub fn apply_subscription_refresh(
         })
         .collect();
     if refreshed.is_empty() {
-        return false;
+        return None;
     }
     let active = config.active_node.and_then(|index| config.nodes.get(index));
     let active_fp = active.map(node_fingerprint);
     let active_name = active.map(|node| node.name.clone());
     let active_names = active.map(subscription_names).unwrap_or_default();
     let urls: HashSet<String> = refreshed.iter().map(|(url, _)| url.clone()).collect();
+    let mut migrations = added_dns_migrations(&config.nodes, &refreshed);
     let mut kept = std::mem::take(&mut config.nodes);
     detach_sources(&mut kept, &urls);
     let mut merged = Vec::new();
@@ -140,17 +150,42 @@ pub fn apply_subscription_refresh(
     // Distinct remarks in this download stay. A previous copy of the same
     // endpoint, or a hand-added duplicate, still folds into the fresh list.
     dedup_subscription_import(&mut merged, fresh_len);
+    // Shared and manual copies keep their existing references while present.
+    if !migrations.is_empty() {
+        for node in &merged {
+            migrations.remove(&node_fingerprint(node));
+        }
+        for group in &mut config.groups {
+            for member in group.members.iter_mut().chain(group.current.iter_mut()) {
+                if let Some(new) = migrations.get(member) {
+                    member.clone_from(new);
+                }
+            }
+        }
+        let targets = super::node_identity::rule_target_migrations(&migrations);
+        for target in config
+            .rules
+            .iter_mut()
+            .map(|r| &mut r.target)
+            .chain(config.device_rule_groups.iter_mut().map(|r| &mut r.target))
+        {
+            if let Some(new) = targets.get(target) {
+                target.clone_from(new);
+            }
+        }
+    }
     config.active_node = active_fp.and_then(|fingerprint| {
+        let fingerprint = migrations.get(&fingerprint).unwrap_or(&fingerprint);
         let named = active_name.as_ref().and_then(|name| {
             merged
                 .iter()
-                .position(|node| node.name == *name && node_fingerprint(node) == fingerprint)
+                .position(|node| node.name == *name && node_fingerprint(node) == *fingerprint)
         });
         named
             .or_else(|| {
                 merged
                     .iter()
-                    .position(|node| node_fingerprint(node) == fingerprint)
+                    .position(|node| node_fingerprint(node) == *fingerprint)
             })
             .or_else(|| {
                 // Providers can rotate credentials or endpoints while retaining
@@ -177,7 +212,52 @@ pub fn apply_subscription_refresh(
             subscription.refresh_revision = super::storage::new_subscription_revision();
         }
     }
-    true
+    Some(migrations)
+}
+
+// Distinct providers may publish the same credentials with different DNS.
+// Only follow a unique replacement from one of the previous memberships.
+fn added_dns_migrations(
+    old: &[Node],
+    refreshed: &[(String, Vec<Node>)],
+) -> HashMap<String, String> {
+    let policy_key = super::server_dns::KEY;
+    if !refreshed
+        .iter()
+        .flat_map(|(_, nodes)| nodes)
+        .any(|n| n.extra.contains_key(policy_key))
+    {
+        return HashMap::new();
+    }
+    let mut sources_by_id = HashMap::<String, BTreeSet<String>>::new();
+    for node in old.iter().filter(|n| !n.extra.contains_key(policy_key)) {
+        sources_by_id
+            .entry(node_fingerprint(node))
+            .or_default()
+            .extend(subscription_sources(node));
+    }
+    let mut candidates = HashMap::<String, Option<String>>::new();
+    for (url, nodes) in refreshed {
+        for node in nodes.iter().filter(|n| n.extra.contains_key(policy_key)) {
+            let mut original = node.clone();
+            original.extra.remove(policy_key);
+            let from = node_fingerprint(&original);
+            if sources_by_id
+                .get(&from)
+                .is_some_and(|sources| sources.contains(url))
+            {
+                let to = node_fingerprint(node);
+                let candidate = candidates.entry(from).or_insert_with(|| Some(to.clone()));
+                if candidate.as_ref() != Some(&to) {
+                    *candidate = None;
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(old, new)| Some((old, new?)))
+        .collect()
 }
 
 /// Drop one subscription and the nodes it produced. Untagged nodes stay.
@@ -741,6 +821,28 @@ mod tests {
             )]
         ));
         assert_eq!(config.active_node, None);
+    }
+
+    #[test]
+    fn dns_migration_requires_same_source_and_unique_replacement() {
+        let url = "https://source.invalid/a";
+        let mut node = ss("HK", "node.invalid", 443, "pw");
+        tag_subscription_nodes(std::slice::from_mut(&mut node), url);
+        let mut a = node.clone();
+        a.extra
+            .insert(super::super::server_dns::KEY.into(), "a".into());
+        let mut b = a.clone();
+        b.extra
+            .insert(super::super::server_dns::KEY.into(), "b".into());
+        for (source, nodes) in [
+            ("https://source.invalid/b", vec![a.clone()]),
+            (url, vec![a, b]),
+        ] {
+            assert!(
+                added_dns_migrations(std::slice::from_ref(&node), &[(source.into(), nodes)])
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

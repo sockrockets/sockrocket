@@ -202,6 +202,12 @@ async fn proxy_failure_does_not_abort_a_direct_download_that_can_finish() {
 async fn http_responses(
     responses: Vec<(u16, &'static str)>,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    http_fixture(move |index, _| responses[index.min(responses.len() - 1)]).await
+}
+
+async fn http_fixture(
+    reply: impl Fn(usize, &str) -> (u16, &'static str) + Send + 'static,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let count = Arc::new(AtomicUsize::new(0));
@@ -223,7 +229,7 @@ async fn http_responses(
                 continue;
             }
             let index = requests.fetch_add(1, Ordering::SeqCst);
-            let (status, body) = responses[index.min(responses.len() - 1)];
+            let (status, body) = reply(index, &String::from_utf8_lossy(&request));
             let response = format!(
                 "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -232,6 +238,64 @@ async fn http_responses(
         }
     });
     (format!("http://{addr}/private-fixture-token"), count, task)
+}
+
+fn user_agent(request: &str) -> &str {
+    request
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.trim())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn subscription_requests_negotiate_only_clash_sources() {
+    for (format, query, agent) in [
+        ("clash", "", "clash.meta"),
+        ("auto", "?foo=1&clash=1", "clash.meta"),
+        ("auto", "?clash=0", "Sockrocket/0.1"),
+        ("auto", "?hint=clash%3D1", "Sockrocket/0.1"),
+    ] {
+        let unexpected = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&unexpected);
+        let (url, _, task) = http_fixture(move |_, request| {
+            if user_agent(request) != agent {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            (200, BODY)
+        })
+        .await;
+        let mut source = sub(format!("{url}{query}"));
+        source.format = format.into();
+        let nodes = fetch_subscription_with(&source, None).await.unwrap();
+        assert_eq!(nodes[0].name, "fixture");
+        assert_eq!(unexpected.load(Ordering::SeqCst), 0, "{format} {query}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn clash_subscriptions_retry_the_original_agent_for_incompatible_representations() {
+    for response in [(200, "<html>unknown client</html>"), (406, "")] {
+        let seen_clash = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&seen_clash);
+        let (url, _, task) = http_fixture(move |_, request| match user_agent(request) {
+            "clash.meta" => {
+                count.fetch_add(1, Ordering::SeqCst);
+                response
+            }
+            "Sockrocket/0.1" => (200, BODY),
+            _ => (400, ""),
+        })
+        .await;
+        let nodes = fetch_subscription_with(&sub(format!("{url}?clash=1")), None)
+            .await
+            .unwrap();
+        assert_eq!(nodes[0].name, "fixture");
+        assert!(seen_clash.load(Ordering::SeqCst) > 0);
+        task.abort();
+    }
 }
 
 #[tokio::test]

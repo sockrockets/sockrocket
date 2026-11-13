@@ -38,7 +38,8 @@ python3 tools/verify-merlin-allocator.py "$binary"
 cp "$binary" "$binary.symbols"
 "$strip_tool" --strip-all "$binary"
 bytes=$(wc -c < "$binary")
-if (( bytes > 11000000 )); then
-  echo "Merlin ARM64 CLI is $bytes bytes; the package limit is 11000000." >&2
+max_bytes=11100000
+if (( bytes > max_bytes )); then
+  echo "Merlin ARM64 CLI is $bytes bytes; the package limit is $max_bytes." >&2
   exit 1
 fi

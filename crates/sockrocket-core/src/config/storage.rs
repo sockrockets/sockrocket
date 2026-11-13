@@ -150,14 +150,14 @@ pub fn commit_subscription_refresh(
         .collect();
     applied_urls.sort_unstable();
     applied_urls.dedup();
-    if super::dedup::apply_subscription_refresh(
+    if let Some(migrations) = super::dedup::refresh_with_dns_migrations(
         &mut current,
         applicable
             .into_iter()
             .map(|(snapshot, nodes)| (snapshot.url, nodes))
             .collect(),
     ) {
-        write_nodes_and_subscriptions(path, &current)?;
+        write_subscription_state(path, &current, &migrations)?;
     }
     Ok(SubscriptionRefreshCommit {
         config: current,
@@ -258,6 +258,14 @@ pub fn write_nodes_and_subscriptions(
     path: &std::path::Path,
     config: &crate::config::model::AppConfig,
 ) -> Result<()> {
+    write_subscription_state(path, config, &Default::default())
+}
+
+fn write_subscription_state(
+    path: &std::path::Path,
+    config: &crate::config::model::AppConfig,
+    migrations: &std::collections::HashMap<String, String>,
+) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let mut value = parse_yaml_document(&content)?;
     // Migrate references against the old catalog before replacing its nodes.
@@ -265,6 +273,7 @@ pub fn write_nodes_and_subscriptions(
     let Some(map) = value.as_mapping_mut() else {
         anyhow::bail!("config root is not a mapping");
     };
+    super::node_identity::remap_references(map, migrations);
     map.insert(
         serde_yaml::Value::String("nodes".into()),
         serde_yaml::to_value(&config.nodes)?,
@@ -452,6 +461,90 @@ mod tests {
         let readded = commit_subscription_refresh(&path, vec![(source, vec![older])]).unwrap();
         assert!(readded.applied_urls.is_empty());
         assert!(readded.config.nodes.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refreshed_node_dns_preserves_saved_references_and_unknown_fields() {
+        use crate::config::{dedup, model::*};
+        let dir =
+            std::env::temp_dir().join(format!("sockrocket-dns-refresh-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let url = "https://subscription.invalid/a";
+        let mut old = node_for_persist();
+        old.server = "node.invalid".into();
+        dedup::tag_subscription_nodes(std::slice::from_mut(&mut old), url);
+        let old_id = dedup::node_fingerprint(&old);
+        let target = format!("node:{}", dedup::node_public_id(&old_id));
+        let config = AppConfig {
+            subscriptions: vec![Subscription {
+                url: url.into(),
+                name: "A".into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            nodes: vec![old.clone()],
+            active_node: Some(0),
+            groups: vec![ProxyGroupConfig {
+                name: "selected".into(),
+                gtype: GroupType::Select,
+                members: vec![old_id.clone()],
+                current: Some(old_id),
+            }],
+            rules: vec![RoutingRule {
+                name: String::new(),
+                source: String::new(),
+                group: "web".into(),
+                rule_type: "domain".into(),
+                pattern: "test.invalid".into(),
+                target: target.clone(),
+                enabled: true,
+                priority: 0,
+            }],
+            device_rule_groups: vec![DeviceRuleGroup {
+                source: "192.0.2.9".into(),
+                group: "web".into(),
+                target,
+                priority: 0,
+            }],
+            ..AppConfig::default()
+        };
+        let mut raw = serde_yaml::to_value(&config).unwrap();
+        raw["rules"][0]["firmware_extension"] = "retained".into();
+        fs::write(&path, serde_yaml::to_string(&raw).unwrap()).unwrap();
+        let mut fresh = old;
+        fresh.extra.insert(super::super::server_dns::KEY.into(),
+            r#"{"servers":["https://dns.invalid/dns-query"],"bootstrap":["223.5.5.5:53"],"ipv6":false}"#.into());
+        let new_id = dedup::node_fingerprint(&fresh);
+        let new_target = format!("node:{}", dedup::node_public_id(&new_id));
+        let result = commit_subscription_refresh(
+            &path,
+            vec![(
+                SubscriptionRefreshSnapshot {
+                    url: url.into(),
+                    revision: String::new(),
+                },
+                vec![fresh],
+            )],
+        )
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        for updated in [result.config, AppConfig::from_yaml_str(&saved).unwrap()] {
+            assert_eq!(updated.nodes.len(), 1);
+            assert_eq!(updated.active_node, Some(0));
+            assert_eq!(updated.groups[0].members, [new_id.as_str()]);
+            assert_eq!(updated.groups[0].current.as_ref(), Some(&new_id));
+            assert_eq!(updated.rules[0].target, new_target);
+            assert_eq!(updated.device_rule_groups[0].target, new_target);
+        }
+        let raw = parse_yaml_document(&saved).unwrap();
+        assert_eq!(
+            raw["rules"][0]["firmware_extension"].as_str(),
+            Some("retained")
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

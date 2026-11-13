@@ -13,6 +13,28 @@ use crate::{
 use anyhow::Result;
 use std::{future::Future, net::IpAddr, pin::Pin, sync::Mutex};
 
+async fn endpoint_addresses(resolver: &DnsResolver, host: &str) -> Result<Vec<IpAddr>> {
+    let ips = resolver
+        .resolve_addresses(host)
+        .await
+        .map_err(|_| anyhow::anyhow!("Subscription proxy server DNS lookup failed"))?;
+    anyhow::ensure!(
+        !ips.is_empty(),
+        "Subscription proxy server DNS returned no address"
+    );
+    Ok(ips)
+}
+
+pub(super) async fn connect_endpoint_tcp(
+    resolver: &DnsResolver,
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream> {
+    let ips = endpoint_addresses(resolver, host).await?;
+    let addresses: Vec<_> = ips.into_iter().map(|ip| (ip, port).into()).collect();
+    Ok(super::transport::connect_staggered(&addresses).await?)
+}
+
 pub struct ServerDnsOutbound {
     node: Node,
     resolver: DnsResolver,
@@ -34,15 +56,7 @@ impl ServerDnsOutbound {
         })
     }
     async fn addresses(&self) -> Result<Vec<IpAddr>> {
-        let mut ips = self
-            .resolver
-            .resolve_addresses(&self.node.server)
-            .await
-            .map_err(|_| anyhow::anyhow!("Subscription proxy server DNS lookup failed"))?;
-        anyhow::ensure!(
-            !ips.is_empty(),
-            "Subscription proxy server DNS returned no address"
-        );
+        let mut ips = endpoint_addresses(&self.resolver, &self.node.server).await?;
         if let Some((cached_ip, _)) = self.cached.lock().unwrap().as_ref()
             && let Some(index) = ips.iter().position(|ip| ip == cached_ip)
         {
@@ -237,6 +251,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let probe = connect_endpoint_tcp(&w.resolver, &w.node.server, w.node.port)
+            .await
+            .unwrap();
+        assert_eq!(probe.peer_addr().unwrap(), listener.local_addr().unwrap());
         task.abort();
         w.resolver = DnsResolver::with_config(DnsConfig {
             servers: vec![],
@@ -248,6 +266,13 @@ mod tests {
                 .await
                 .err()
                 .unwrap()
+                .to_string()
+                .contains("DNS")
+        );
+        assert!(
+            connect_endpoint_tcp(&w.resolver, &w.node.server, w.node.port)
+                .await
+                .unwrap_err()
                 .to_string()
                 .contains("DNS")
         );
