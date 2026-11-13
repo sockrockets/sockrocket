@@ -212,7 +212,7 @@ async fn connect_bound(sa: SocketAddr) -> std::io::Result<TcpStream> {
 /// CDN-fronted proxy nodes often resolve to a mix of live and dead IPs; a
 /// sequential scan pays a full SYN timeout (≈20s on Windows) per dead entry.
 /// Instead, attempts start staggered 300ms apart and the first success wins.
-async fn connect_staggered(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+pub(super) async fn connect_staggered(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
     use tokio::task::JoinSet;
     const STAGGER: Duration = Duration::from_millis(300);
 

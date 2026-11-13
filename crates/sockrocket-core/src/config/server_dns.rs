@@ -94,11 +94,33 @@ pub fn import(root: &serde_yaml::Value) -> Result<Option<ServerDns>> {
     let Some(dns) = root.get("dns") else {
         return Ok(None);
     };
-    let Some(value) = dns.get("proxy-server-nameserver") else {
+    if let Some(value) = dns.get("proxy-server-nameserver") {
+        return parse_policy(dns, value, "proxy-server-nameserver");
+    }
+    if dns.get("enable").and_then(|v| v.as_bool()) == Some(false) {
+        return Ok(None);
+    }
+    let Some(value) = dns.get("nameserver") else {
         return Ok(None);
     };
+    // General DNS lists may include Mihomo-only transports. Inherit a list
+    // only when we can use it in full, keeping older subscriptions importable.
+    match parse_policy(dns, value, "nameserver") {
+        Ok(policy) => Ok(policy),
+        Err(_) => {
+            tracing::warn!("Unsupported Clash nameserver settings; using existing node DNS");
+            Ok(None)
+        }
+    }
+}
+
+fn parse_policy(
+    dns: &serde_yaml::Value,
+    value: &serde_yaml::Value,
+    field: &str,
+) -> Result<Option<ServerDns>> {
     let servers: Vec<String> = serde_yaml::from_value(value.clone())
-        .map_err(|_| anyhow::anyhow!("proxy-server-nameserver must be a list of strings"))?;
+        .map_err(|_| anyhow::anyhow!("{field} must be a list of strings"))?;
     if servers.is_empty() {
         return Ok(None);
     }
@@ -142,6 +164,57 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[test]
+    fn inherits_enabled_clash_nameservers_for_endpoint_dns() {
+        let yaml = r#"
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  default-nameserver: [192.0.2.53]
+  nameserver: [https://first.example.test/dns-query, https://second.example.test/dns-query]
+  fallback: [https://other.example.test/dns-query]
+proxies:
+- {name: sample, type: vmess, server: hk.example.test, port: 443, uuid: 00000000-0000-0000-0000-000000000001, alterId: 0, cipher: auto}
+"#;
+        let nodes = crate::config::clash::parse_clash_config(yaml).unwrap();
+        let policy = ServerDns::from_node(&nodes[0]).unwrap().unwrap();
+        assert_eq!(
+            policy.servers,
+            [
+                "https://first.example.test/dns-query",
+                "https://second.example.test/dns-query"
+            ]
+        );
+        assert_eq!(policy.bootstrap, ["192.0.2.53:53"]);
+        assert!(!policy.ipv6);
+    }
+
+    #[test]
+    fn explicit_policy_takes_precedence_over_general_dns() {
+        let p = parse("dns: {proxy-server-nameserver: [192.0.2.1], nameserver: [192.0.2.2]}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.servers, ["192.0.2.1"]);
+        assert!(
+            parse("dns: {proxy-server-nameserver: [], nameserver: [192.0.2.2]}")
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse("dns: {proxy-server-nameserver: broken, nameserver: [192.0.2.2]}").is_err());
+    }
+
+    #[test]
+    fn disabled_or_unsupported_general_dns_preserves_legacy_import() {
+        for dns in [
+            "{enable: false, nameserver: [192.0.2.53]}",
+            "{nameserver: []}",
+            "{nameserver: [192.0.2.53, 'https://dns.example.test/dns-query#group']}",
+            "{nameserver: ['https://dns.example.test/dns-query'], default-nameserver: ['tls://192.0.2.53']}",
+        ] {
+            assert!(parse(&format!("dns: {dns}")).unwrap().is_none());
+        }
     }
     #[test]
     fn parses_transports_and_bootstrap_without_changing_doh_paths() {
