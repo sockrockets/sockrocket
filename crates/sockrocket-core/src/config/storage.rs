@@ -515,36 +515,49 @@ mod tests {
         let mut raw = serde_yaml::to_value(&config).unwrap();
         raw["rules"][0]["firmware_extension"] = "retained".into();
         fs::write(&path, serde_yaml::to_string(&raw).unwrap()).unwrap();
-        let mut fresh = old;
-        fresh.extra.insert(super::super::server_dns::KEY.into(),
-            r#"{"servers":["https://dns.invalid/dns-query"],"bootstrap":["223.5.5.5:53"],"ipv6":false}"#.into());
-        let new_id = dedup::node_fingerprint(&fresh);
-        let new_target = format!("node:{}", dedup::node_public_id(&new_id));
-        let result = commit_subscription_refresh(
-            &path,
-            vec![(
-                SubscriptionRefreshSnapshot {
-                    url: url.into(),
-                    revision: String::new(),
-                },
-                vec![fresh],
-            )],
-        )
-        .unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        for updated in [result.config, AppConfig::from_yaml_str(&saved).unwrap()] {
-            assert_eq!(updated.nodes.len(), 1);
-            assert_eq!(updated.active_node, Some(0));
-            assert_eq!(updated.groups[0].members, [new_id.as_str()]);
-            assert_eq!(updated.groups[0].current.as_ref(), Some(&new_id));
-            assert_eq!(updated.rules[0].target, new_target);
-            assert_eq!(updated.device_rule_groups[0].target, new_target);
+        let mut revision = String::new();
+        for resolver in [Some("192.0.2.53"), Some("198.51.100.53"), None] {
+            let mut fresh = old.clone();
+            if let Some(server) = resolver {
+                let policy = super::super::server_dns::ServerDns {
+                    servers: vec![server.into()],
+                    bootstrap: Vec::new(),
+                    ipv6: false,
+                };
+                fresh.extra.insert(
+                    super::super::server_dns::KEY.into(),
+                    serde_json::to_string(&policy).unwrap(),
+                );
+            }
+            let new_id = dedup::node_fingerprint(&fresh);
+            let new_target = format!("node:{}", dedup::node_public_id(&new_id));
+            let result = commit_subscription_refresh(
+                &path,
+                vec![(
+                    SubscriptionRefreshSnapshot {
+                        url: url.into(),
+                        revision,
+                    },
+                    vec![fresh],
+                )],
+            )
+            .unwrap();
+            let saved = fs::read_to_string(&path).unwrap();
+            revision = result.config.subscriptions[0].refresh_revision.clone();
+            for updated in [result.config, AppConfig::from_yaml_str(&saved).unwrap()] {
+                assert_eq!(updated.nodes.len(), 1);
+                assert_eq!(updated.active_node, Some(0));
+                assert_eq!(updated.groups[0].members, [new_id.as_str()]);
+                assert_eq!(updated.groups[0].current.as_ref(), Some(&new_id));
+                assert_eq!(updated.rules[0].target, new_target);
+                assert_eq!(updated.device_rule_groups[0].target, new_target);
+            }
+            let raw = parse_yaml_document(&saved).unwrap();
+            assert_eq!(
+                raw["rules"][0]["firmware_extension"].as_str(),
+                Some("retained")
+            );
         }
-        let raw = parse_yaml_document(&saved).unwrap();
-        assert_eq!(
-            raw["rules"][0]["firmware_extension"].as_str(),
-            Some("retained")
-        );
         fs::remove_dir_all(dir).unwrap();
     }
 
