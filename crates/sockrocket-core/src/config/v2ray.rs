@@ -1179,19 +1179,19 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
         return Ok(None);
     }
 
-    if network == "xhttp" {
-        ss.xhttp_settings.clone().unwrap_or_default().validate()?;
-    }
+    let xhttp = if network == "xhttp" {
+        let config = ss.xhttp_settings.clone().unwrap_or_default();
+        config.validate()?;
+        Some(config)
+    } else {
+        None
+    };
     if security == "reality"
         && let Some(ref rs) = ss.reality_settings
     {
         return Ok(Some(TransportConfig {
             grpc: None,
-            xhttp: if network == "xhttp" {
-                Some(ss.xhttp_settings.clone().unwrap_or_default())
-            } else {
-                None
-            },
+            xhttp,
             transport_type: if network == "xhttp" {
                 TransportType::Xhttp
             } else {
@@ -1224,9 +1224,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
         None
     };
 
-    let xhttp = if network == "xhttp" {
-        let config = ss.xhttp_settings.clone().unwrap_or_default();
-        config.validate()?;
+    if xhttp.is_some() {
         anyhow::ensure!(
             tls.as_ref()
                 .and_then(|t| t.alpn.as_ref())
@@ -1235,10 +1233,7 @@ fn build_v2ray_transport(ss: &V2RayStreamSettings) -> Result<Option<TransportCon
                         .all(|s| matches!(s.as_str(), "h2" | "http/1.1" | "h3"))),
             "Unsupported XHTTP ALPN"
         );
-        Some(config)
-    } else {
-        None
-    };
+    }
     let ws = if matches!(network, "ws" | "httpupgrade") {
         let settings = if network == "httpupgrade" {
             &ss.http_upgrade_settings

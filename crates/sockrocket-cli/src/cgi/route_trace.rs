@@ -172,10 +172,9 @@ pub(super) fn act_trace_route(post: &J) -> J {
         };
         match rt.block_on(async {
             let context = async {
-                let settings =
-                    sockrocket_core::config::dns::DnsSettings::from_yaml(&Y::Mapping(map.clone()))?;
-                let config =
-                    sockrocket_core::AppConfig::decode_yaml_fields(Y::Mapping(map.clone()))?;
+                let raw = Y::Mapping(map.clone());
+                let settings = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
+                let config = sockrocket_core::AppConfig::decode_yaml_fields(raw)?;
                 let dns = settings
                     .resolver_config(config.nodes.iter().map(|node| node.server.clone()))?;
                 let mut resolver = sockrocket_core::DnsResolver::with_config(dns);

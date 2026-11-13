@@ -282,7 +282,7 @@ pub(super) fn device(post: &J) -> J {
             .ok()
             .as_deref()
             == Some(source.as_str())
-            && matches!(rule_kind(&r.rule_type), "final" | "match")
+            && rule_kind(&r.rule_type) == "final"
     };
     if target == "inherit" {
         rules.retain(|r| !same_final(r));

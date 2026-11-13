@@ -15,7 +15,7 @@ const rule=(index,overrides={})=>({index,source:'',name:'',group:'',rule_type:'d
 const result=(row,overrides={})=>({ok:true,revision:'revision',mode:'rule',destination:'example.com',port:443,source:null,active_node:0,node_name:'Example node',running:true,transparent_proxy:true,cn_ipset_direct:false,trace:{action:row.target,matched_rule:row.index,matched_builtin:false,matched_snapshot:Object.fromEntries(Object.entries(row).filter(([k])=>k!=='index')),definitive:true,dns:'not_needed',steps:[{config_index:row.index,rule_type:row.rule_type,outcome:'matched',checked:1}],checked_rules:1,omitted_steps:0},...overrides});
 const f=fixture(),c=f.context;
 c.SR_STATE.ruleRows=Array.from({length:12},(_,i)=>rule(i));
-assert.equal(c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','')[0].count,12,'all rules are represented');
+assert.equal(c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','')[0].indices.length,12,'all rules are represented');
 c.SR_STATE.ruleRows.push(rule(12,{rule_type:'final',source:'192.0.2.8',target:'direct'}));
 let stages=c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','192.0.2.8');
 assert.equal(stages.at(-1).kind,'device_final');
@@ -40,8 +40,8 @@ assert.equal(f.element('rule-flow-check').disabled,false);
 c.traceRuleFlow();req=f.request('trace_route');c.srLoadRules();
 f.request('get_rules')[2]({ok:true,rules:c.SR_STATE.ruleRows,revision:'newest'});
 req[2](result(c.SR_STATE.ruleRows[1]));assert.equal(c.RULE_TRACE,null,'refresh while pending invalidates response');
-c.showFlowRuleList('device_final');assert.match(f.element('rule-count').textContent,/当前显示 12 条/,'unnamed group contains only destination rules');
-c.showFlowRuleList();assert.match(f.element('rule-count').textContent,/当前显示 12 条/);
+assert.match(f.element('rule-flow').innerHTML,/data-index="0" onclick="openMapGroup\(this.dataset.index\)"/);
+c.openMapGroup(0);assert.match(f.element('rule-count').textContent,/当前显示 12 条/,'unnamed group contains only destination rules');
 const unsafe=rule(20,{name:'<img src=x onerror=alert(1)>'});c.SR_STATE.ruleRows=[unsafe];
 const provisional=result(unsafe);provisional.trace.definitive=false;provisional.trace.dns='failed';
 const html=c.flowTraceHtml(provisional);
@@ -52,6 +52,12 @@ const switched=fixture();switched.element('rule-flow-destination').value='exampl
 const pending=switched.request('trace_route');switched.context.SR_STATE.status.proxy_mode='direct';switched.context.renderRuleFlow();
 pending[2](result(rule(0)));assert.equal(switched.context.RULE_TRACE,null,'mode change during DNS lookup invalidates pending result');
 assert.equal(switched.element('rule-flow-check').disabled,false);
+const late=fixture();let nodeRenders=0;
+late.context.renderNodes=()=>nodeRenders++;
+late.element('rule-flow-destination').value='example.com';late.context.traceRuleFlow();
+late.context.SR_STATE.page='nodes';
+late.request('trace_route')[2](result(rule(0),{active_node:1}));
+assert.equal(nodeRenders,1,'a late trace result that changes the active node refreshes the visible node list');
 console.log('PASS: complete phases, device final, exact winner editing, stale inputs/config, list filters, provisional DNS and HTML escaping');
 
 const grouped=fixture(),g=grouped.context;
@@ -60,16 +66,18 @@ const model=g.ruleFlowModel(g.SR_STATE.ruleRows,'rule','');
 assert.deepEqual(Array.from(model.filter(r=>r.indices).flatMap(r=>Array.from(r.indices))),[0,1,2,3,4],'every configured rule appears in effective order, including disabled rules and interleaved groups');
 assert.equal(model[1].disabled,true);assert.equal(model[1].title,'Region');
 g.renderRuleFlow();assert.match(grouped.element('rule-flow-summary').textContent,/共 5 条 · 启用 4 条 · 停用 1 条/);
-g.showFlowRuleList('global_rule',1);assert.match(grouped.element('rule-count').textContent,/当前显示 1 条/);assert.equal(g.RULE_SELECTED_GROUP,'Region');
+assert.match(grouped.element('rule-flow').innerHTML,/data-index="1" onclick="openMapGroup\(this.dataset.index\)"/);
+g.openMapGroup(1);assert.match(grouped.element('rule-count').textContent,/当前显示 1 条/);assert.equal(g.RULE_SELECTED_GROUP,'Region');
 g.SR_RULE_NODES=[{id:'ab'.repeat(32),name:'Example B'}];g.renderRules(false);
 g.SR_STATE.status.transparent_proxy=true;g.SR_STATE.status.cn_ipset_direct=false;
-g.RULE_TRACE=result(g.SR_STATE.ruleRows[3]);g.RULE_FLOW_SELECTED=-1;g.renderRuleFlow();assert.equal(g.RULE_FLOW_SELECTED,3,'highlight the exact matching group segment, not the first global group');
+g.RULE_TRACE=result(g.SR_STATE.ruleRows[3]);g.renderRuleFlow();
 let graph=grouped.element('rule-flow').innerHTML;
 let highlighted=Array.from(graph.matchAll(/<path[^>]* class="selected[^"]*" d="([^"]+)"/g),m=>m[1]);
 assert.equal(highlighted.length,2,'only source-to-winner and winner-to-outlet form the highlighted route');
 assert.match(graph,/<path data-from="s0" data-to="g0" class="selected"/,'the matched Local rule highlights the shared Local node');
+assert.match(graph,/class="map-node outlet selected"[^>]*><strong>拒绝<\/strong>/,'the later Local rule determines the highlighted outlet');
 assert.doesNotMatch(graph,/<path data-from="g1"/,'disabled group has no outlet');
-g.selectRuleFlow(0);
+g.openMapGroup(2);assert.equal(g.RULE_SELECTED_GROUP,'AI');
 assert.deepEqual(Array.from(grouped.element('rule-flow').innerHTML.matchAll(/<path[^>]* class="selected[^"]*" d="([^"]+)"/g),m=>m[1]),highlighted,'inspecting another group cannot change the actual highlighted route');
 g.SR_STATE.status={...g.SR_STATE.status,active_node:0,node_count:1};g.renderRuleFlow();
 assert.notEqual(g.RULE_TRACE,null,'normal status polling must preserve a valid trace on the default node');
@@ -166,7 +174,9 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  assert.deepEqual([...c.ruleFlowModel(rows,'rule','198.51.100.7').find(s=>s.kind==='global_rule').targets],['direct']);
  const match=source=>({config_index:0,source,rule_type:'domain',outcome:'matched',checked:1});
  const reply=result(rows[0],{source:host});reply.trace.steps=[match(host+'/32')];reply.trace.action='proxy';
- c.RULE_TRACE=reply;c.RULE_FLOW_SELECTED=-1;c.renderRuleFlow();assert.equal(route[c.RULE_FLOW_SELECTED].kind,'device_link');
+ c.RULE_TRACE=reply;c.renderRuleFlow();
+ assert.deepEqual(deviceConnections(el('rule-flow').innerHTML,host,true),['Media']);
+ assert.deepEqual(deviceConnections(el('rule-flow').innerHTML,'192.0.2.0/24',true),[]);
  console.log('PASS: inherited and global outlets, overlapping sources and backend-selected phase');
 }
 
@@ -190,7 +200,7 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  assert.match(el('rule-flow').innerHTML,/<strong>Japan<\/strong><small>关联优先级 20/);
  c.SR_STATE.status.transparent_proxy=true;
  const reply=result(rows[1],{source:host});reply.trace.action='reject';reply.trace.steps[0].source=host;
- c.RULE_TRACE=reply;c.RULE_FLOW_SELECTED=-1;c.renderRuleFlow();
+ c.RULE_TRACE=reply;c.renderRuleFlow();
  assert.match(el('rule-flow').innerHTML,/class="map-node outlet selected"[^>]*><strong>拒绝/);
  refresh('');assert.match(el('rule-flow').innerHTML,/<strong>TV<\/strong>/);
  console.log('PASS: device priority, matching exit and refreshed device and subnet names on one graph');
@@ -274,6 +284,13 @@ function deviceConnections(html, source, hitsOnly=false) {
    c.SR_STATE.ruleRows=finals;c.RULE_TRACE=null;c.renderRuleFlow();
    assert.match(graph(), /<button[^>]*onclick="openMapGlobalFallback\(\)"[^>]*><strong>全局设备兜底<\/strong>/);
  }
+ c.SR_STATE.ruleRows=[rule(0,{rule_type:'final',group:'Disabled fallback',target:'direct',enabled:false})];
+ const fallback=result(rows[1]);
+ fallback.trace={...fallback.trace,matched_rule:null,matched_snapshot:null,matched_builtin:true,
+   steps:[{config_index:null,rule_type:'final',outcome:'matched',checked:1}]};
+ c.RULE_TRACE=fallback;c.renderRuleFlow();
+ assert.deepEqual(deviceConnections(graph(),'',true),['全局设备兜底'],'the implicit fallback owns the hit when the configured final rule is disabled');
+ assert.match(graph(),/class="map-node outlet selected"[^>]*><strong>代理<\/strong>/);
  const edits=[];
  c.openDeviceFallback=source=>edits.push(source);
  c.openMapGlobalFallback();

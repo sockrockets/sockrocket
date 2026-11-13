@@ -2,7 +2,7 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const source=fs.readFileSync('merlin/webui/sockrocket.asp','utf8');
 const elements={},requests=[],messages=[];
-function element(id){return elements[id]||=( {textContent:'',disabled:false,className:'',classList:{toggle(){}}} );}
+function element(id){return elements[id]||=( {textContent:'',disabled:false,className:'',classList:{toggle(){}},setAttribute(){}} );}
 const c=vm.createContext({srElement:element,srApi:(...args)=>requests.push(args),srShowMsg:m=>messages.push(m),toastResp:d=>messages.push(d.msg),renderNodes(){},srLoadRules(){},rulePending:false,RULE_READ_PENDING:false,RULE_FLOW_ERROR:false,RULE_RULE_REVISION:null,SR_STATE:{page:'home',statusKnown:true,status:{running:false,transparent_proxy:true,dns_hijack:true}}});
 vm.runInContext(source.slice(source.indexOf('var refreshPending'),source.indexOf('function renderChrome()')),c);
 vm.runInContext(source.slice(source.indexOf('function setChip('),source.indexOf('/* ══ Service control')),c);
@@ -59,7 +59,7 @@ function poll(page, scope) {
   const status = request('status');
   assert.equal(status[1].revision_scope, scope);
   const stats = request('stats');
-  assert.equal(stats[1], null);
+  assert.equal(stats[1].traffic_scope, page === 'home' ? 'session' : page === 'subs' ? 'monthly' : 'none');
   stats[2]({});
   return status[2];
 }
@@ -75,4 +75,48 @@ fromRules(state({rules_revision: 'new-rules', network_revision: null}));
 assert.equal(networkReloads, 0);
 poll('network', 'network')(state({network_revision: 'new-network'}));
 assert.equal(networkReloads, 1);
+
+// Keep the last table visible while requesting fresh data for the selected tab.
+const panels = [];
+c.renderSessionTraffic = t => panels.push(['session', t.nodes[0]]);
+c.renderMonthTable = (el,keys,rows) => panels.push([el === element('sub-traffic-months') ? 'nodes' : 'subs', rows[0]]);
+Object.assign(c, {SR_PAGES:['home','subs','nodes'],SR_PAGE_LOADED:{home:true,subs:true,nodes:true}});
+vm.runInContext(source.slice(source.indexOf('function srShowPage('), source.indexOf('/* Structured DNS policy')), c);
+function stats(scope) {
+  const req = request('stats');
+  assert.equal(req[1].traffic_scope, scope);
+  return req;
+}
+c.srShowPage('home');
+const staleHome = stats('session');
+c.srShowPage('subs');
+const oldMonthly = stats('monthly');
+c.srShowPage('home');
+assert.equal(requests.length, 0, 'avoid a second pending request for the same scope');
+staleHome[2]({uptime:'old',traffic:{nodes:['old']}});
+assert.deepEqual(panels, []);
+stats('session')[2]({uptime:'home',traffic:{nodes:['new']}});
+oldMonthly[2]({uptime:'stale',traffic:{recent_month_keys:[],recent_months:['old'],recent_subscriptions:['old']}});
+assert.equal(c.SR_STATE.uptime, 'home', 'out-of-order reply must not overwrite newer fields');
+assert.deepEqual(panels, [['session','new']]);
+c.srShowPage('subs');
+// A previous-generation router daemon may still return the complete payload.
+stats('monthly')[2]({uptime:'subs',traffic:{nodes:['unused'],recent_month_keys:['2026-11'],recent_months:['monthly node'],recent_subscriptions:['monthly sub']}});
+assert.deepEqual(panels.slice(1), [['nodes','monthly node'],['subs','monthly sub']]);
+let nodeRenders = 0;
+c.renderNodes = () => nodeRenders++;
+c.srShowPage('nodes');
+stats('none')[2]({uptime:'nodes'});
+assert.equal(panels.length, 3, 'uptime-only stats cannot clear traffic tables');
+c.acceptStatus(state({active_node:1}));
+c.acceptStatus(state({active_node:1}));
+assert.equal(nodeRenders, 2, 'entering nodes and changing active node refresh the list, identical polls preserve it');
+c.srShowPage('home');
+const failedHome = stats('session');
+c.srShowPage('nodes');
+stats('none')[2]({uptime:'back'});
+c.srShowPage('home');
+failedHome[3]();
+stats('session')[2]({uptime:'fresh',traffic:{nodes:['next']}});
+assert.deepEqual(panels.at(-1), ['session','next'], 'returning to a tab retries outdated failed requests');
 console.log('PASS: stopped cleanup display, independent toggles, no implicit start, mutation locking, stale polling, error recovery and Stop');

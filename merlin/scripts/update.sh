@@ -394,7 +394,6 @@ for hook in /jffs/scripts/services-start /koolshare/init.d/S98sockrocket.sh; do
 ' "$hook" > "$TX/hook"
     cat "$TX/hook" > "$hook"
 done
-touch "$TX/prepared"
 sync
 
 # A concurrent settings save invalidates the compatibility check.

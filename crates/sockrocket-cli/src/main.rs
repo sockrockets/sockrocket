@@ -82,17 +82,18 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogOutput {
 }
 
 fn init_logging() -> Result<()> {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::{EnvFilter, LevelFilter};
     let builder = tracing_subscriber::fmt();
     let (builder, output, filter) = if let Ok(path) = env::var("SOCKROCKET_LOG_FILE") {
         let file = fs::File::create(&path).with_context(|| format!("create {}", path))?;
         (
             builder.with_ansi(false),
             LogOutput::File(file),
-            EnvFilter::new("debug"),
+            EnvFilter::default().add_directive(LevelFilter::DEBUG.into()),
         )
     } else {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::default().add_directive(LevelFilter::INFO.into()));
         (builder, LogOutput::Stdout, filter)
     };
     builder.with_writer(output).with_env_filter(filter).init();

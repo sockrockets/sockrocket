@@ -2,7 +2,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const source = fs.readFileSync('merlin/webui/sockrocket.asp', 'utf8');
-const code = source.slice(source.indexOf('var speedTestPollPending ='), source.indexOf('function clearAddNodeSecrets'));
+const code = source.slice(source.indexOf('function newRequestId('), source.indexOf('function apiKscRequest(')) +
+  source.slice(source.indexOf('var speedTestPollPending ='), source.indexOf('function clearAddNodeSecrets'));
 const timers = [], requests = [], button = {};
 let renders = 0;
 const state = {nodes: [{test_id:'0-abc'}, {test_id:'1-abc'}], lat:{}};
@@ -13,6 +14,7 @@ const context = vm.createContext({SR_STATE:state, Uint8Array,
  srApi:(action,data,ok,fail)=>requests.push({action,data,ok,fail})});
 vm.runInContext(code+';testAllNodes();',context);
 assert.equal(requests[0].action,'speedtest_start');
+assert.match(requests[0].data.request_id,/^[0-9a-f]{32}$/);
 requests.shift().ok({ok:true,job:{state:'running',completed:0,total:2,results:[]}});
 assert.equal(requests[0].action,'speedtest_job');
 const partial={state:'running',completed:1,total:2,results:[{key:'0-abc',latency:10}]};

@@ -13,7 +13,6 @@ SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
 SOCKROCKET_SCRIPTS="$SOCKROCKET_DIR/scripts"
 SOCKROCKET_PID="$SOCKROCKET_DIR/sockrocket.pid"
 SOCKROCKET_LOG="$SOCKROCKET_DIR/sockrocket.log"
-SOCKROCKET_LOCK="$SOCKROCKET_DIR/sockrocket.lock"
 # Runtime fail-open marker: present ⇒ LAN uses direct DNS/routing; config
 # toggles still express user intent and are re-applied when the probe recovers.
 DEGRADED_FILE="$SOCKROCKET_DIR/.lan_degraded"
@@ -55,15 +54,16 @@ ok()    { log_ok "$*"; }
 warn()  { log_warn "$*"; }
 err()   { log_error "$*"; }
 
-is_running() {
-    [ -f "$SOCKROCKET_PID" ] || return 1
+cli_pid_running() {
+    [ -f "$1" ] || return 1
     local pid
-    pid=$(cat "$SOCKROCKET_PID")
+    pid=$(cat "$1")
     kill -0 "$pid" 2>/dev/null || return 1
-    # Verify the PID belongs to sockrocket-cli, not a reused PID
+    # A stale PID file can point to another process.
     grep -q "sockrocket-cli" "$PROC_BASE/$pid/comm" 2>/dev/null || return 1
-    return 0
 }
+
+is_running() { cli_pid_running "$SOCKROCKET_PID"; }
 
 # ── Orphan daemon cleanup ─────────────────────────────────────────────────────
 # PIDs of sockrocket-cli DAEMON processes, found by full command line rather than the
@@ -123,7 +123,7 @@ kill_stray_apis() {
             [ -n "$keep" ] && [ "$p" = "$keep" ] && continue
             left="$left $p"
         done
-        [ -z "$(echo $left)" ] && return 0
+        [ -z "$left" ] && return 0
         sleep 1; wait=$((wait + 1))
     done
     for p in $(api_pids); do
@@ -147,14 +147,7 @@ api_port() {
     case "$p" in ''|*[!0-9]*) echo "$DEFAULT_API_PORT" ;; *) echo "$p" ;; esac
 }
 
-api_is_running() {
-    [ -f "$API_PID" ] || return 1
-    local pid
-    pid=$(cat "$API_PID")
-    kill -0 "$pid" 2>/dev/null || return 1
-    grep -q "sockrocket-cli" "$PROC_BASE/$pid/comm" 2>/dev/null || return 1
-    return 0
-}
+api_is_running() { cli_pid_running "$API_PID"; }
 
 # Software Center's installed bit is not its enabled bit. Only the proxy
 # daemon counts; the always-on API and a saved configuration do not.
@@ -450,7 +443,7 @@ remove_cron() {
 
 # ── DNS config ────────────────────────────────────────────────────────────────
 get_config_value() {
-    grep "^${1}:" "$SOCKROCKET_CONF" 2>/dev/null | awk '{print $2}' | head -1 | tr -d '"'
+    awk -v key="$1:" 'index($0, key) == 1 { gsub(/"/, "", $2); print $2; exit }' "$SOCKROCKET_CONF" 2>/dev/null || :
 }
 
 # Count nodes / subscriptions in config.yaml (0 when the section is [] or absent)
@@ -1082,12 +1075,10 @@ TUN_DEV="${SOCKROCKET_TUN_DEV:-/dev/net/tun}"
 # Read a boolean config key with a default. Accepts YAML true/false and the
 # quoted forms; anything else falls back to $2.
 conf_bool() {
-    local v
-    v=$(get_config_value "$1")
-    case "$(echo "$v" | tr 'A-Z' 'a-z')" in
-        true|yes|1)  echo "true" ;;
-        false|no|0)  echo "false" ;;
-        *)           echo "$2" ;;
+    case "$(get_config_value "$1")" in
+        [Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|1) echo true ;;
+        [Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|0) echo false ;;
+        *) echo "$2" ;;
     esac
 }
 
@@ -2374,10 +2365,7 @@ case "$1" in
     stop)
         run_locked 15 do_stop
         ;;
-    restart)
-        run_locked 15 do_restart
-        ;;
-    reload)
+    restart|reload)
         run_locked 15 do_restart
         ;;
     status)  do_status ;;

@@ -230,11 +230,11 @@ fn clients(leases: &str, arp: &str) -> BTreeMap<Ipv4Addr, Client> {
     }
     rows
 }
-pub(super) fn catalog() -> Vec<J> {
+pub(super) fn catalog(map: &Mapping) -> Vec<J> {
     let mut aliases = aliases().unwrap_or_default();
-    let removed: Vec<String> = load_conf()
-        .ok()
-        .and_then(|m| m.get("removed_device_sources").cloned())
+    let removed: Vec<String> = map
+        .get("removed_device_sources")
+        .cloned()
         .and_then(|v| serde_yaml::from_value(v).ok())
         .unwrap_or_default();
     aliases.retain(|_, a| !removed.contains(&a.source));
