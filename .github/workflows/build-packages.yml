@@ -211,8 +211,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           # The tag release can reuse the ARM64 dependencies built on main.
-          shared-key: ${{ matrix.name == 'aarch64' && 'merlin-binaries' || 'merlin' }}
-          key: ${{ matrix.name == 'aarch64' && 'merlin-aarch64-release' || format('pkg-merlin-{0}', matrix.name) }}
+          shared-key: ${{ matrix.name == 'aarch64' && 'merlin-aarch64-release-merlin-binaries' || '' }}
+          key: pkg-merlin-${{ matrix.name }}
 
       - name: Install cross
         if: matrix.name != 'aarch64'
