@@ -299,6 +299,40 @@ async fn clash_subscriptions_retry_the_original_agent_for_incompatible_represent
 }
 
 #[tokio::test]
+async fn original_agent_retries_transient_errors_after_clash_is_rejected() {
+    for recover in [true, false] {
+        let fallback_count = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&fallback_count);
+        let (url, total, task) = http_fixture(move |_, request| match user_agent(request) {
+            "clash.meta" => (406, ""),
+            "Sockrocket/0.1" => {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if recover && attempt >= 3 {
+                    (200, BODY)
+                } else {
+                    (503, "")
+                }
+            }
+            _ => panic!("unexpected subscription user agent"),
+        })
+        .await;
+
+        let result = fetch_subscription_with(&sub(format!("{url}?clash=1")), None).await;
+        let fallback = fallback_count.load(Ordering::SeqCst);
+        let primary = total.load(Ordering::SeqCst) - fallback;
+        assert!((1..=3).contains(&primary));
+        if recover {
+            assert_eq!(result.unwrap()[0].name, "fixture");
+            assert!((4..=6).contains(&fallback));
+        } else {
+            assert!(result.unwrap_err().to_string().contains("406"));
+            assert_eq!(fallback, 12);
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn a_direct_http_200_block_page_does_not_beat_a_valid_proxy_subscription() {
     let (url, count, direct) = http_responses(vec![(200, "<html>Access denied</html>")]).await;
     let (proxy, requests, proxy_task) = socks(200).await;
