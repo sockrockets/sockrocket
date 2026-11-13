@@ -20,9 +20,10 @@
 
 ```bash
 rustup target add aarch64-unknown-linux-musl
-cargo fetch --locked --target aarch64-unknown-linux-musl
-bash tools/build-merlin-musl.sh
+CARGO_NET_OFFLINE=false bash tools/build-merlin-musl.sh --locked
 ```
+
+`CARGO_NET_OFFLINE=false` 允许首次编译按锁文件下载目标平台和构建主机所需的依赖。缓存就绪后，可直接运行 `bash tools/build-merlin-musl.sh --locked` 离线构建。
 
 `tools/build-merlin-musl.sh` 会依次完成：
 

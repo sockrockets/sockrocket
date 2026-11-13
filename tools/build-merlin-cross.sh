@@ -20,8 +20,7 @@ case "$target" in
       tar -xJf "$archive" -C "$tool_dir"
       export PATH="$tool_dir/zig-x86_64-linux-0.16.0:$PATH"
     fi
-    cargo fetch --locked --target "$target"
-    bash tools/build-merlin-musl.sh --locked
+    CARGO_NET_OFFLINE=false bash tools/build-merlin-musl.sh --locked
     ;;
   armv7-unknown-linux-musleabihf|armv7-unknown-linux-musleabi)
     cross build --locked --release --package sockrocket-cli --target "$target"

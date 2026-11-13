@@ -210,7 +210,9 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: pkg-merlin-${{ matrix.name }}
+          # The tag release can reuse the ARM64 dependencies built on main.
+          shared-key: ${{ matrix.name == 'aarch64' && 'merlin-binaries' || 'merlin' }}
+          key: ${{ matrix.name == 'aarch64' && 'merlin-aarch64-release' || format('pkg-merlin-{0}', matrix.name) }}
 
       - name: Install cross
         if: matrix.name != 'aarch64'
