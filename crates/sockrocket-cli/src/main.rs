@@ -143,6 +143,38 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(index) = args.iter().position(|arg| arg == "--dnsmasq-hosts") {
+        use sockrocket_core::config::dns::{AddressStrategy, DnsSettings, Ipv6Mode};
+        let path = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
+        let yaml = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+        let settings = DnsSettings::from_yaml(&yaml)?;
+        let mode = yaml
+            .get("ipv6_mode")
+            .map(|v| serde_yaml::from_value::<Ipv6Mode>(v.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let ipv4_clients =
+            args.iter().any(|arg| arg == "--transparent") && !merlin_ipv6_answers(mode, path);
+        let hosts = settings.resolver_config(std::iter::empty())?.hosts;
+        let mut hosts: Vec<_> = hosts.into_iter().collect();
+        hosts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (name, addresses) in hosts {
+            for ip in addresses {
+                if (ip.is_ipv4()
+                    && (ipv4_clients || settings.strategy != AddressStrategy::Ipv6Only))
+                    || (ip.is_ipv6()
+                        && !ipv4_clients
+                        && settings.strategy != AddressStrategy::Ipv4Only)
+                {
+                    println!("host-record={name},{ip},5");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     // Validate an installed configuration without starting listeners, changing
     // routes, fetching subscriptions, or rewriting the configuration file.
     if let Some(index) = args.iter().position(|arg| arg == "--check-config") {

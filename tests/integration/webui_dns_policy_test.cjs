@@ -9,6 +9,9 @@ const dns={direct_servers:['udp://192.0.2.53:53'],proxy_servers:['tls://resolver
 const state={ok:true,dns,ipv6_mode:'compatibility',ipv6_active:false,running:false,revision:'revision-1'};
 c.loadNetworkPolicy();assert.equal(el('network-save').disabled,true);take('network_settings')[2](state);
 assert.equal(el('dns-direct').value,dns.direct_servers[0]);assert.equal(el('network-save').disabled,false);
+assert.equal(el('dns-hosts').value, '');
+el('dns-hosts').value='192.168.1.10 nas.home.arpa\nfd00::10 nas.home.arpa';
+assert.deepEqual(Array.from(c.dnsPolicyBody().dns.hosts), ['192.168.1.10 nas.home.arpa','fd00::10 nas.home.arpa']);
 assert.match(el('network-state').textContent,/停止/);
 el('dns-timeout').value='';c.saveNetworkPolicy();assert.equal(requests.length,0,'empty numeric field must not become zero');
 el('dns-timeout').value='5';el('dns-direct').value='invalid://keep-this-draft';c.saveNetworkPolicy();

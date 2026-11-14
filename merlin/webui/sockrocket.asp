@@ -708,6 +708,7 @@ body.bg {min-width:0!important}
               <div class="fg"><label for="sr-dns-ttl">缓存 TTL（0 为上游 TTL，最多 86400 秒）</label><input id="sr-dns-ttl" type="number" min="0" max="86400" oninput="networkPolicyEdited()"></div>
               <div class="fg"><label for="sr-dns-timeout">查询超时（1–12 秒）</label><input id="sr-dns-timeout" type="number" min="1" max="12" oninput="networkPolicyEdited()"></div>
             </div>
+            <div class="fg"><label for="sr-dns-hosts">自定义 Hosts（每行一个 IP 地址和完整域名）</label><textarea id="sr-dns-hosts" rows="3" spellcheck="false" placeholder="192.168.1.10 nas.home.arpa" oninput="networkPolicyEdited()"></textarea></div>
             <div class="fg"><label for="sr-dns-domains">额外直连解析域名（选填，每行一个后缀）</label><textarea id="sr-dns-domains" rows="3" spellcheck="false" placeholder="example.test" oninput="networkPolicyEdited()"></textarea></div>
           </details>
           <div class="toolbar"><button type="button" class="btn btn-success" id="sr-network-save" onclick="saveNetworkPolicy()" disabled>保存并应用</button><button type="button" class="btn" id="sr-network-reload" onclick="reloadNetworkPolicy()">重新加载</button></div>
@@ -1162,7 +1163,7 @@ function srShowPage(p) {
 
 /* Structured DNS policy; stale reads never overwrite an edited form. */
 var dnsPolicyRevision='',dnsPolicyPending=false,dnsPolicyDirty=false,dnsPolicyGeneration=0,dnsTestGeneration=0,dnsTestPending=false;
-var DNS_POLICY_FIELDS=['ipv6-mode','dns-strategy','dns-direct','dns-proxy','dns-bootstrap','dns-cache','dns-capacity','dns-ttl','dns-timeout','dns-domains'];
+var DNS_POLICY_FIELDS=['ipv6-mode','dns-strategy','dns-direct','dns-proxy','dns-bootstrap','dns-cache','dns-capacity','dns-ttl','dns-timeout','dns-domains','dns-hosts'];
 function networkStateText(d){
   if(!d.running)return '服务已停止；显示已保存配置';
   if(d.ipv6_active)return 'IPv6 双栈已生效；LAN 可达性需实测';
@@ -1174,7 +1175,7 @@ function lockDnsPolicy(on){dnsPolicyPending=on;var busy=on||networkPending;DNS_P
 function dnsPolicyBody(){
   function lines(id){return srElement(id).value.split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean);}
   function number(id,min,max){var text=srElement(id).value.trim(),n=Number(text);if(!text||!Number.isInteger(n)||n<min||n>max)throw new Error('请核对缓存条数、TTL 和查询超时的范围。');return n;}
-  return {dns:{direct_servers:lines('dns-direct'),proxy_servers:lines('dns-proxy'),bootstrap_servers:lines('dns-bootstrap'),direct_domains:lines('dns-domains'),strategy:srElement('dns-strategy').value,cache_enabled:srElement('dns-cache').value==='true',cache_capacity:number('dns-capacity',16,16384),cache_ttl:number('dns-ttl',0,86400),timeout_secs:number('dns-timeout',1,12)},ipv6_mode:srElement('ipv6-mode').value,revision:dnsPolicyRevision};
+  return {dns:{direct_servers:lines('dns-direct'),proxy_servers:lines('dns-proxy'),bootstrap_servers:lines('dns-bootstrap'),direct_domains:lines('dns-domains'),hosts:lines('dns-hosts'),strategy:srElement('dns-strategy').value,cache_enabled:srElement('dns-cache').value==='true',cache_capacity:number('dns-capacity',16,16384),cache_ttl:number('dns-ttl',0,86400),timeout_secs:number('dns-timeout',1,12)},ipv6_mode:srElement('ipv6-mode').value,revision:dnsPolicyRevision};
 }
 function reloadNetworkPolicy(){
   if(dnsPolicyDirty && !confirm('放弃未保存的网络与 DNS 修改并重新加载？'))return;
@@ -1188,6 +1189,7 @@ function loadNetworkPolicy(done){
     if(!d.ok||!d.dns||!d.revision){lockDnsPolicy(false);srElement('network-state').textContent=d.msg||'网络配置读取失败';if(done)done(false);return;}
     var s=d.dns;dnsPolicyRevision=d.revision;dnsPolicyDirty=false;
     ['direct','proxy','bootstrap'].forEach(function(k){srElement('dns-'+k).value=s[k+'_servers'].join('\n');});
+    srElement('dns-hosts').value=(s.hosts||[]).join('\n');
     srElement('dns-domains').value=s.direct_domains.join('\n');srElement('dns-strategy').value=s.strategy;srElement('ipv6-mode').value=d.ipv6_mode;srElement('dns-cache').value=String(s.cache_enabled);srElement('dns-capacity').value=s.cache_capacity;srElement('dns-ttl').value=s.cache_ttl;srElement('dns-timeout').value=s.timeout_secs;
     srElement('network-state').textContent=networkStateText(d);lockDnsPolicy(false);if(done)done(true);
   },function(){lockDnsPolicy(false);srElement('network-state').textContent='网络配置读取失败，请重试';if(done)done(false);});
