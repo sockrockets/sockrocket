@@ -445,10 +445,45 @@ impl Hy2Obfs {
     }
 }
 
+pub(crate) fn validate_mieru_endpoint(
+    server: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    let is_host = if let Some(bare) = server.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        bare.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        server.parse::<std::net::IpAddr>().is_ok()
+            || super::dns::valid_domain(server.strip_suffix('.').unwrap_or(server))
+    };
+    anyhow::ensure!(port > 0 && is_host, "Invalid Mieru endpoint");
+    anyhow::ensure!(
+        (1..=64).contains(&username.len()) && !password.is_empty(),
+        "Invalid Mieru credentials"
+    );
+    Ok(())
+}
+
+fn deserialize_mieru_credentials<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(String, String), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Credentials {
+        username: String,
+        password: String,
+    }
+    let fields = Credentials::deserialize(deserializer)?;
+    Ok((fields.username, fields.password))
+}
+
 /// Supported proxy protocols
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProxyProtocol {
+    #[serde(deserialize_with = "deserialize_mieru_credentials")]
+    Mieru { username: String, password: String },
     /// An in-process, single-peer WireGuard endpoint.
     Wireguard {
         #[serde(flatten)]
@@ -609,6 +644,7 @@ impl ProxyProtocol {
     /// Configured UDP capability; ShadowTLS currently provides streams only.
     pub fn supports_udp(&self) -> bool {
         match self {
+            Self::Mieru { .. } => false,
             Self::Wireguard { config } => config.udp,
             Self::Shadowsocks {
                 udp, shadow_tls, ..
@@ -631,6 +667,7 @@ impl ProxyProtocol {
             ProxyProtocol::Tuic { .. } => "tuic",
             ProxyProtocol::Trojan { .. } => "trojan",
             ProxyProtocol::Hysteria2 { .. } => "hysteria2",
+            ProxyProtocol::Mieru { .. } => "mieru",
             ProxyProtocol::AnyTls { .. } => "anytls",
             ProxyProtocol::Wireguard { .. } => "wireguard",
         }

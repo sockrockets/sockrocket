@@ -387,6 +387,7 @@ pub(crate) fn legacy_node_fingerprint(node: &Node) -> String {
                 .unwrap_or(""),
             serde_json::to_string(&node.transport).unwrap_or_default()
         ),
+        ProxyProtocol::Mieru { .. } => serde_json::to_string(&node.protocol).unwrap_or_default(),
         ProxyProtocol::AnyTls { password, .. } => format!(
             "anytls|{}|{}|{}",
             password,
