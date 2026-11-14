@@ -405,7 +405,9 @@ install_common_files() {
         mkdir -p "$SOCKROCKET_DIR/res" 2>/dev/null || true
         xcp "$SCRIPT_DIR/res/icon-sockrocket.png" "$SOCKROCKET_DIR/res/icon-sockrocket.png" 2>/dev/null || true
     fi
-    [ -f "$SCRIPT_DIR/version" ] && xcp "$SCRIPT_DIR/version" "$SOCKROCKET_DIR/version" 2>/dev/null || true
+    if [ "$KOOLSHARE" != 1 ] && [ -f "$SCRIPT_DIR/version" ]; then
+        xcp "$SCRIPT_DIR/version" "$SOCKROCKET_DIR/version" 2>/dev/null || true
+    fi
     # Keep uninstall next to the install for SSH / manual removal
     if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
         xcp "$SCRIPT_DIR/uninstall.sh" "$SOCKROCKET_DIR/uninstall.sh"
@@ -561,12 +563,20 @@ fi
 # koolshare / koolcenter install path
 # ─────────────────────────────────────────────────────────────────────────────
 ks_install() {
-    local VER
-    VER=$(read_first_line "$SCRIPT_DIR/version")
-    [ -z "$VER" ] && VER="0.1.2"
-    info "Installing Sockrocket ${VER} in koolcenter mode..."
-
+    local VER="" cli_version
+    info "Installing Sockrocket in koolcenter mode..."
     install_common_files
+    if [ -f "$SCRIPT_DIR/version" ]; then
+        IFS= read -r VER < "$SCRIPT_DIR/version" || :
+    fi
+    if [ -z "$VER" ]; then
+        cli_version=$("$SOCKROCKET_BIN" --version) || err "Could not read installed CLI version"
+        case "$cli_version" in
+            'sockrocket-cli '?*) VER=${cli_version#sockrocket-cli } ;;
+            *) err "Invalid installed CLI version" ;;
+        esac
+    fi
+    printf '%s\n' "$VER" > "$SOCKROCKET_DIR/version" || err "Could not record installed version"
 
     # koolshare Web UI: Module_sockrocket.asp → /koolshare/webs/
     info "Installing koolshare Web UI..."
