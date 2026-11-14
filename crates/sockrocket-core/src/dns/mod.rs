@@ -48,6 +48,7 @@ use self::fakeip::FakeIpPool;
 /// DNS resolver configuration.
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
+    pub hosts: HashMap<String, Vec<IpAddr>>,
     pub reject_local_addresses: bool,
     pub bootstrap_servers: Option<Vec<SocketAddr>>,
     pub node_hosts: std::collections::HashSet<String>,
@@ -77,6 +78,7 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
+            hosts: HashMap::new(),
             reject_local_addresses: false,
             bootstrap_servers: None,
             node_hosts: Default::default(),
@@ -709,6 +711,21 @@ impl DnsResolver {
         result
     }
 
+    fn hosts_answer(&self, domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
+        self.config.hosts.get(domain).map(|addresses| {
+            addresses
+                .iter()
+                .copied()
+                .filter(|ip| {
+                    matches!(
+                        (qtype, ip),
+                        (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// Inner resolution path: IP-literal short-circuit, fake-IP hook,
     /// cache, dedup. See [`Self::resolve_with_qtype`] for the contract.
     async fn resolve_qtype_inner(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
@@ -718,6 +735,9 @@ impl DnsResolver {
             (AddressStrategy::Ipv4Only, 28) | (AddressStrategy::Ipv6Only, 1)
         ) {
             return Ok(Vec::new());
+        }
+        if let Some(addresses) = self.hosts_answer(domain, qtype) {
+            return Ok(addresses);
         }
         // IP literals short-circuit; only the queried family answers.
         if let Ok(ip) = domain.parse::<IpAddr>() {
@@ -1203,6 +1223,9 @@ pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u
 async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     let (domain, qtype) = parse_dns_query(query)?;
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(addresses) = resolver.hosts_answer(&domain, qtype) {
+        return build_dns_response_with_ttl(query, &addresses, 5);
+    }
     let Some(pool) = &resolver.fakeip else {
         return resolver.exchange_raw(query).await;
     };

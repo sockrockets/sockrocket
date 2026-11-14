@@ -713,6 +713,20 @@ wait_for_main_dns() {
     return 1
 }
 
+# Publish exact local records so dnsmasq can answer user-configured private
+# addresses while retaining rebind protection for every upstream response.
+render_dnsmasq_config() {
+    local dest="$1" dns_port="$2" router_ip="$3" template="$4" transparent=""
+    local tmp="${dest%/*}/.sockrocket.conf.$$"
+    if [ "$(conf_bool transparent_proxy true)" = true ]; then transparent=--transparent; fi
+    if ! sed -e "s/__DNS_PORT__/$dns_port/g" -e "s/__ROUTER_IP__/$router_ip/g" "$template" > "$tmp" ||
+        ! "$SOCKROCKET_BIN" --dnsmasq-hosts "$SOCKROCKET_CONF" $transparent >> "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; else mv -f "$tmp" "$dest"; fi
+}
+
 update_dnsmasq() {
     local action="$1"
     # Overridable for tests/integration/sockrocket_sh_test.sh (default stays the firmware path).
@@ -745,9 +759,7 @@ update_dnsmasq() {
             # Upgrade from the old shared-file pin before a new SDN starts.
             unpin_dns_upstream || return 1
         fi
-        sed -e "s/__DNS_PORT__/$dns_port/g" \
-            -e "s/__ROUTER_IP__/$router_ip/g" \
-            "$TEMPLATE" > "$SOCKROCKET_DNSMASQ"
+        render_dnsmasq_config "$SOCKROCKET_DNSMASQ" "$dns_port" "$router_ip" "$TEMPLATE" || return 1
         if merlin_3006 && ! pin_dns_upstream; then
             update_dnsmasq stop
             return 1
@@ -855,7 +867,7 @@ update_dnsmasq() {
         [ -f "${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" ] && changed=1
         resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
         grep -q '^server=127.0.0.1#' "$resolv_file" 2>/dev/null && changed=1
-        rm -f "$SOCKROCKET_DNSMASQ"
+        rm -f "$SOCKROCKET_DNSMASQ" "$SOCKROCKET_DIR/.dnsmasq_reload_pending"
         rm -f "${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
         [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
             "$SOCKROCKET_DIR/scripts/iptables.sh" dns-stop >/dev/null 2>&1 || true
@@ -2337,6 +2349,19 @@ do_reapply_policy() {
         return 1
     fi
     if [ "$want_dns" = "true" ]; then
+        local conf="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf"
+        if [ -f "$conf" ]; then
+            local pending="$SOCKROCKET_DIR/.dnsmasq_reload_pending" before router_ip port
+            before=$(sha256sum "$conf") || return 1
+            router_ip=$(nvram get lan_ipaddr) && [ -n "$router_ip" ] || return 1
+            port=$(get_config_value dns_port)
+            render_dnsmasq_config "$conf" "${port:-5300}" "$router_ip" "$SOCKROCKET_DIR/scripts/dnsmasq.conf.template" || return 1
+            if [ "$before" != "$(sha256sum "$conf")" ] || [ -e "$pending" ]; then
+                touch "$pending" || return 1
+                service restart_dnsmasq >/dev/null 2>&1 && wait_for_main_dns || return 1
+                rm -f "$pending"
+            fi
+        fi
         if ! iptables -t nat -C PREROUTING -j SOCKROCKET_DNS 2>/dev/null; then
             if ! "$SOCKROCKET_DIR/scripts/iptables.sh" dns-start >> "$SOCKROCKET_LOG" 2>&1; then
                 enter_lan_degraded "IPv4 DNS hijack missing and could not be installed"

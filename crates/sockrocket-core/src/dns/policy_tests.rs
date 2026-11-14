@@ -439,3 +439,37 @@ async fn failed_direct_dns_does_not_fall_back_to_proxy_or_system_dns() {
     deny.abort();
     p.abort();
 }
+
+#[tokio::test]
+async fn custom_hosts_answer_exact_names_before_fakeip() {
+    use crate::config::dns::DnsSettings;
+    let settings = DnsSettings::from_json(serde_json::json!({"hosts": [
+        "192.168.1.10 NAS.home.arpa.", "192.168.1.10 nas.home.arpa",
+        "fd00::10 nas.home.arpa"
+    ]}))
+    .unwrap();
+    let config = settings.resolver_config(std::iter::empty()).unwrap();
+    assert!(!config.hosts.contains_key("sub.nas.home.arpa"));
+    let mut resolver = DnsResolver::with_config(config);
+    resolver.set_fakeip(FakeIpPool::new());
+    for (qtype, expected) in [
+        (1, Some("192.168.1.10")),
+        (28, Some("fd00::10")),
+        (65, None),
+    ] {
+        let expected: Vec<IpAddr> = expected.into_iter().map(|s| s.parse().unwrap()).collect();
+        let reply = answer_raw_dns_query(&resolver, &build_dns_query("NAS.home.arpa", qtype)).await;
+        assert_eq!(reply[3] & 15, 0);
+        assert_eq!(parse_dns_response(&reply).unwrap(), expected);
+        assert_eq!(
+            resolver
+                .resolve_with_qtype("NAS.home.arpa.", qtype)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    for invalid in ["invalid nas.home.arpa", "127.0.0.1 *.example", "127.0.0.1"] {
+        assert!(DnsSettings::from_json(serde_json::json!({"hosts":[invalid]})).is_err());
+    }
+}

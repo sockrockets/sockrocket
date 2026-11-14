@@ -109,6 +109,12 @@ pub(super) fn save(post: &J) -> J {
         .and_then(|v| serde_yaml::from_value::<Ipv6Mode>(v).ok())
         .unwrap_or_default();
     if old_dns.as_ref() == Some(&dns) && old_mode == mode {
+        if sockrocket_dir().join(".dnsmasq_reload_pending").exists() && is_running() {
+            if run_sh("reapply-policy").is_err() {
+                return failure("network_apply_failed", "DNS 转发服务未就绪，请重试保存");
+            }
+            return json!({"ok":true,"saved":false,"applied":true,"msg":"DNS 转发配置已重新应用"});
+        }
         return json!({"ok":true,"saved":false,"applied":false,"unchanged":true,"msg":"设置未改变，服务保持当前状态"});
     }
     // Reject explicit router-local resolvers as well as loopback, preventing
