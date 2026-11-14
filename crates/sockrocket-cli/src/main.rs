@@ -1545,6 +1545,7 @@ fn protocol_name(protocol: &ProxyProtocol) -> &'static str {
         ProxyProtocol::Tuic { .. } => "tuic",
         ProxyProtocol::Trojan { .. } => "trojan",
         ProxyProtocol::Hysteria2 { .. } => "hysteria2",
+        ProxyProtocol::Mieru { .. } => "mieru",
         ProxyProtocol::AnyTls { .. } => "anytls",
         ProxyProtocol::Wireguard { .. } => "wireguard",
     }

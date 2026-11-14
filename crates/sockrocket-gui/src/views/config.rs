@@ -73,6 +73,7 @@ impl AppState {
         let mut tuic_count = 0u32;
         let mut trojan_count = 0u32;
         let mut hy2_count = 0u32;
+        let mut mieru_count = 0u32;
         let mut anytls_count = 0u32;
         let mut wireguard_count = 0u32;
         for node in &self.nodes {
@@ -83,6 +84,7 @@ impl AppState {
                 ProxyProtocol::Tuic { .. } => tuic_count += 1,
                 ProxyProtocol::Trojan { .. } => trojan_count += 1,
                 ProxyProtocol::Hysteria2 { .. } => hy2_count += 1,
+                ProxyProtocol::Mieru { .. } => mieru_count += 1,
                 ProxyProtocol::AnyTls { .. } => anytls_count += 1,
                 ProxyProtocol::Wireguard { .. } => wireguard_count += 1,
             }
@@ -264,6 +266,7 @@ impl AppState {
                     .child(kv_row("TUIC", tuic_count.to_string()))
                     .child(kv_row("Trojan", trojan_count.to_string()))
                     .child(kv_row("Hysteria2", hy2_count.to_string()))
+                    .child(kv_row("Mieru", mieru_count.to_string()))
                     .child(kv_row("AnyTLS", anytls_count.to_string()))
                     .child(kv_row("WireGuard", wireguard_count.to_string()))
                     .child(hairline())

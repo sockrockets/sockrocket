@@ -40,6 +40,8 @@ craftls = { package = "rustls", version = "0.22.4", default-features = false, fe
 webpki-roots = { workspace = true }
 rustls-pki-types = { workspace = true }
 sha2 = { workspace = true }
+pbkdf2 = "0.12"
+futures-util = { version = "0.3", default-features = false }
 sha1 = "0.10"
 sha3 = "0.10"
 blake2 = "0.10"

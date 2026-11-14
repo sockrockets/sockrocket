@@ -446,12 +446,14 @@ body.bg {min-width:0!important}
                 <option value="vless">vless</option>
                 <option value="hysteria2">hysteria2</option>
                 <option value="tuic">tuic</option>
+                <option value="mieru">Mieru（TCP）</option>
                 <option value="anytls">AnyTLS</option>
                 <option value="wireguard">WireGuard</option>
               </select>
             </div>
             <div class="fg"><label for="sr-an-server">服务器</label><input type="text" id="sr-an-server" placeholder="example.com"></div>
             <div class="fg"><label for="sr-an-port">端口</label><input type="number" id="sr-an-port" min="1" max="65535" step="1" placeholder="443"></div>
+            <div class="fg" hidden><label for="sr-an-user">用户名</label><input id="sr-an-user" autocomplete="off"></div>
             <div class="fg"><label for="sr-an-pass">密码</label><input type="password" autocomplete="new-password" id="sr-an-pass" placeholder="(ss/trojan/hy2/tuic)"></div>
             <div class="fg"><label for="sr-an-uuid">UUID</label><input type="text" autocomplete="off" id="sr-an-uuid" placeholder="(vmess/vless/tuic)"></div>
             <div class="fg"><label for="sr-an-cipher">加密方式</label><input type="text" id="sr-an-cipher" placeholder="(ss/vmess, default aes-256-gcm/auto)"></div>
@@ -1761,7 +1763,7 @@ function testAllNodes(mode) {
   });
 }
 function clearAddNodeSecrets() {
-  ['an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id) { srElement(id).value = ''; });
+  ['an-user','an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id) { srElement(id).value = ''; });
 }
 function toggleAddNodeForm() {
   var card=srElement('add-node-card');card.classList.toggle('open');
@@ -1770,9 +1772,10 @@ function toggleAddNodeForm() {
 }
 function updateAddNodeFields() {
   var proto=srElement('an-proto').value;
+  srElement('an-user').parentNode.hidden=proto!=='mieru';
   srElement('an-tls-fields').hidden=proto!=='anytls';
   srElement('an-wg-fields').hidden=proto!=='wireguard';
-  srElement('an-pass').parentNode.hidden=['shadowsocks','trojan','hysteria2','tuic','anytls'].indexOf(proto)<0;
+  srElement('an-pass').parentNode.hidden=['shadowsocks','trojan','hysteria2','tuic','anytls','mieru'].indexOf(proto)<0;
   srElement('an-uuid').parentNode.hidden=['vmess','vless','tuic'].indexOf(proto)<0;
   srElement('an-cipher').parentNode.hidden=['shadowsocks','vmess'].indexOf(proto)<0;
 }
@@ -1789,8 +1792,9 @@ function addNode() {
     skip_cert_verify: srElement('an-insecure').checked,
   };
   var split=function(value){return value.split(/[\s,]+/).filter(Boolean);};
+  if(data.protocol==='mieru') data.username=srElement('an-user').value;
   if(data.protocol==='wireguard') data.wireguard={private_key:srElement('an-wg-private').value.trim(),public_key:srElement('an-wg-public').value.trim(),preshared_key:srElement('an-wg-psk').value.trim()||null,local_addresses:split(srElement('an-wg-address').value),allowed_ips:split(srElement('an-wg-allowed').value),dns:split(srElement('an-wg-dns').value),mtu:Number(srElement('an-wg-mtu').value),persistent_keepalive:Number(srElement('an-wg-keepalive').value),udp:true};
-  var secrets={};['an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id){secrets[id]=srElement(id).value;});
+  var secrets={};['an-user','an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id){secrets[id]=srElement(id).value;});
   if (!data.name || !data.server || !Number.isInteger(data.port) || data.port < 1 || data.port > 65535) { srShowMsg('请填写名称、服务器和有效端口', 'err'); return; }
   srApi('add_node', data, function (d) {
     toastResp(d);

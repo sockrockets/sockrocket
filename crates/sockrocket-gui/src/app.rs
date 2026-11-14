@@ -5910,6 +5910,7 @@ pub(crate) fn protocol_name(protocol: &ProxyProtocol) -> &'static str {
         ProxyProtocol::Trojan { .. } => "Trojan",
         ProxyProtocol::Hysteria2 { .. } => "Hysteria2",
         ProxyProtocol::AnyTls { .. } => "AnyTLS",
+        ProxyProtocol::Mieru { .. } => "Mieru",
         ProxyProtocol::Wireguard { .. } => "WireGuard",
     }
 }
@@ -6002,6 +6003,7 @@ pub(crate) fn auth_summary(protocol: &ProxyProtocol) -> String {
         } => format!("Congestion {congestion_control}"),
         ProxyProtocol::Trojan { .. } => "Password auth".to_string(),
         ProxyProtocol::Hysteria2 { .. } => "Password auth".to_string(),
+        ProxyProtocol::Mieru { .. } => "Username and password".into(),
         ProxyProtocol::AnyTls { .. } => "Password auth".to_string(),
         ProxyProtocol::Wireguard { .. } => "WireGuard key pair".to_string(),
     }

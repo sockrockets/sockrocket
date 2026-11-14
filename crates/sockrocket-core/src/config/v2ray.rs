@@ -490,7 +490,9 @@ pub fn parse_trojan_uri(uri: &str) -> Result<Node> {
 /// Parse any supported proxy URI
 pub fn parse_proxy_uri(uri: &str) -> Result<Node> {
     let uri = uri.trim();
-    if uri.starts_with("wireguard://") {
+    if uri.starts_with("mierus://") {
+        parse_mierus_uri(uri)
+    } else if uri.starts_with("wireguard://") {
         super::wireguard::parse_uri(uri)
     } else if uri.starts_with("anytls://") {
         parse_anytls_uri(uri)
@@ -733,6 +735,77 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         latency_ms: None,
         tags: vec![],
         extra,
+    })
+}
+
+fn parse_mierus_uri(uri: &str) -> Result<Node> {
+    let url = url::Url::parse(uri)?;
+    anyhow::ensure!(
+        url.port().is_none() && url.path().is_empty(),
+        "Invalid Mieru authority"
+    );
+    let server = url
+        .host_str()
+        .context("Missing Mieru host")?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let username = urlencoding::decode(url.username())?.into_owned();
+    let password =
+        urlencoding::decode(url.password().context("Missing Mieru password")?)?.into_owned();
+    let mut params = HashMap::new();
+    for (k, v) in url.query_pairs() {
+        anyhow::ensure!(
+            matches!(
+                k.as_ref(),
+                "profile"
+                    | "port"
+                    | "protocol"
+                    | "multiplexing"
+                    | "handshake-mode"
+                    | "mtu"
+                    | "traffic-pattern"
+            ) && params.insert(k, v).is_none(),
+            "Unsupported Mieru option or multiple port bindings"
+        );
+    }
+    anyhow::ensure!(
+        params
+            .get("protocol")
+            .is_some_and(|s| s.eq_ignore_ascii_case("TCP"))
+            && params
+                .get("multiplexing")
+                .is_none_or(|s| s == "MULTIPLEXING_OFF")
+            && params
+                .get("handshake-mode")
+                .is_none_or(|s| s == "HANDSHAKE_STANDARD")
+            && params.get("traffic-pattern").is_none_or(|s| s.is_empty()),
+        "Unsupported Mieru transport or session mode"
+    );
+    let port = params
+        .get("port")
+        .context("Missing Mieru port")?
+        .parse::<u16>()?;
+    super::model::validate_mieru_endpoint(&server, port, &username, &password)?;
+    // Mieru's TCP carrier uses stream framing independent of the profile MTU.
+    if let Some(mtu) = params.get("mtu") {
+        anyhow::ensure!(
+            (1280..=1500).contains(&mtu.parse::<u16>()?),
+            "Invalid Mieru MTU"
+        );
+    }
+    Ok(Node {
+        name: params
+            .get("profile")
+            .filter(|name| !name.is_empty())
+            .context("Missing Mieru profile")?
+            .to_string(),
+        server,
+        port,
+        protocol: ProxyProtocol::Mieru { username, password },
+        transport: None,
+        tags: vec![],
+        extra: HashMap::new(),
+        latency_ms: None,
     })
 }
 
@@ -1556,6 +1629,21 @@ pub fn node_to_share_uri(node: &Node) -> String {
     }
 
     match &node.protocol {
+        ProxyProtocol::Mieru { username, password } => {
+            let server = if node.server.contains(':') {
+                format!("[{}]", node.server.trim_matches(['[', ']']))
+            } else {
+                node.server.clone()
+            };
+            format!(
+                "mierus://{}:{}@{}?profile={}&port={}&protocol=TCP&multiplexing=MULTIPLEXING_OFF",
+                urlencoding::encode(username),
+                urlencoding::encode(password),
+                server,
+                name_enc,
+                node.port
+            )
+        }
         ProxyProtocol::Wireguard { config } => super::wireguard::share_uri(node, config),
         ProxyProtocol::AnyTls { password, pool, .. } => {
             let mut params = Vec::new();

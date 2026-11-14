@@ -186,6 +186,7 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
         ProxyProtocol::Tuic { .. } => "tuic",
         ProxyProtocol::Trojan { .. } => "trojan",
         ProxyProtocol::Hysteria2 { .. } => "hysteria2",
+        ProxyProtocol::Mieru { .. } => "mieru",
         ProxyProtocol::AnyTls { .. } => "anytls",
         ProxyProtocol::Wireguard { .. } => "wireguard",
     };
@@ -194,6 +195,12 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
     put(&mut m, "port", Value::Number(node.port.into()));
 
     match &node.protocol {
+        ProxyProtocol::Mieru { username, password } => {
+            put(&mut m, "username", s(username));
+            put(&mut m, "password", s(password));
+            put(&mut m, "transport", s("TCP"));
+            put(&mut m, "multiplexing", s("MULTIPLEXING_OFF"));
+        }
         ProxyProtocol::Wireguard { config } => {
             put(&mut m, "private-key", s(&config.private_key));
             if let Some(port) = config.listen_port {

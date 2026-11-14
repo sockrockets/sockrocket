@@ -1490,8 +1490,8 @@ fn act_add_node(post: &J) -> J {
     let proto = match proto_raw.as_str() {
         "ss" => "shadowsocks",
         "hy2" => "hysteria2",
-        "anytls" | "wireguard" | "shadowsocks" | "vmess" | "trojan" | "vless" | "hysteria2"
-        | "tuic" => proto_raw.as_str(),
+        "mieru" | "anytls" | "wireguard" | "shadowsocks" | "vmess" | "trojan" | "vless"
+        | "hysteria2" | "tuic" => proto_raw.as_str(),
         _ => return err_msg("Unsupported protocol"),
     };
     let mut pm = Mapping::new();
@@ -1522,6 +1522,10 @@ fn act_add_node(post: &J) -> J {
         }
         "vless" => {
             pm.insert(ykey("uuid"), Y::String(uuid));
+        }
+        "mieru" => {
+            pm.insert(ykey("username"), Y::String(get("username")));
+            pm.insert(ykey("password"), Y::String(password));
         }
         "anytls" | "trojan" | "hysteria2" => {
             pm.insert(ykey("password"), Y::String(password));
@@ -1573,7 +1577,7 @@ fn act_add_node(post: &J) -> J {
         .unwrap();
         node.insert(ykey("transport"), transport);
     }
-    if matches!(proto, "anytls" | "wireguard") {
+    if matches!(proto, "mieru" | "anytls" | "wireguard") {
         let valid = sockrocket_core::Node::from_yaml_value(Y::Mapping(node.clone()))
             .ok()
             .is_some_and(|node| {
@@ -4995,6 +4999,10 @@ dns_direct_domains:
             ("hysteria2", json!({"password": "pw"})),
             ("tuic", json!({"uuid": "u", "password": "pw"})),
             (
+                "mieru",
+                json!({"username": "synthetic-private-username", "password":"synthetic-private-password"}),
+            ),
+            (
                 "anytls",
                 json!({"password":"synthetic-private-password", "sni":"tls.example.invalid"}),
             ),
@@ -5019,7 +5027,8 @@ dns_direct_domains:
         serde_yaml::from_str::<sockrocket_core::AppConfig>(&text)
             .expect("config with added nodes must validate");
         let d = act_nodes(true);
-        assert_eq!(d["nodes"].as_array().unwrap().len(), 10);
+        assert_eq!(d["nodes"].as_array().unwrap().len(), 11);
+        assert!(!d.to_string().contains("synthetic-private-username"));
         assert!(!d.to_string().contains("synthetic-private-password"));
         assert!(!d.to_string().contains("private_key"));
         let config: sockrocket_core::AppConfig = serde_yaml::from_str(&text).unwrap();
