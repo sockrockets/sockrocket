@@ -1,27 +1,11 @@
 //! Versioned connection identities and migration of saved node references.
 use super::{dedup, model::Node};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 fn lowercase_field(value: &mut Value, key: &str) {
     if let Some(Value::String(text)) = value.get_mut(key) {
         *text = text.to_ascii_lowercase();
-    }
-}
-
-// Sort recursively even when another dependency enables serde_json's
-// preserve_order feature. Header insertion order is not connection identity.
-fn canonical(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(k, v)| (k, canonical(v)))
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
-        other => other,
     }
 }
 
@@ -42,7 +26,7 @@ pub(super) fn fingerprint(node: &Node) -> String {
             lowercase_field(settings, "sni");
         }
     }
-    let extra: BTreeMap<_, _> = [
+    let extra = [
         super::ss_plugin::KEY,
         super::v2ray::VLESS_ENCRYPTION,
         super::v2ray::TLS_CERT_PIN,
@@ -61,15 +45,20 @@ pub(super) fn fingerprint(node: &Node) -> String {
         super::server_dns::KEY,
     ]
     .into_iter()
-    .filter_map(|key| node.extra.get(key).map(|value| (key, value)))
+    .filter_map(|key| {
+        let value = node.extra.get(key)?;
+        Some((key.to_owned(), Value::String(value.clone())))
+    })
     .collect();
-    let value = canonical(serde_json::json!([
-        node.server.to_ascii_lowercase(),
-        node.port,
+    let mut value = Value::Array(vec![
+        Value::String(node.server.to_ascii_lowercase()),
+        Value::from(node.port),
         protocol,
         transport,
-        extra
-    ]));
+        Value::Object(extra),
+    ]);
+    // Preserve persisted identities even when serde_json's preserve_order feature is enabled.
+    value.sort_all_objects();
     // Credentials participate in equality but no longer appear in group keys.
     format!(
         "v2:{}",
@@ -89,16 +78,17 @@ pub fn migrate_references(raw: &mut serde_yaml::Value) -> Result<bool, serde_yam
         .get(key("groups"))
         .and_then(serde_yaml::Value::as_sequence)
         .is_some_and(|v| !v.is_empty())
-        || map
-            .get(key("rules"))
-            .and_then(serde_yaml::Value::as_sequence)
-            .is_some_and(|rules| {
-                rules.iter().any(|rule| {
-                    rule.get("target")
-                        .and_then(serde_yaml::Value::as_str)
-                        .is_some_and(|t| t.starts_with("node:"))
+        || ["rules", "device_rule_groups"].iter().any(|field| {
+            map.get(key(field))
+                .and_then(serde_yaml::Value::as_sequence)
+                .is_some_and(|rules| {
+                    rules.iter().any(|rule| {
+                        rule.get("target")
+                            .and_then(serde_yaml::Value::as_str)
+                            .is_some_and(|t| t.starts_with("node:"))
+                    })
                 })
-            });
+        });
     if !has_references {
         return Ok(false);
     }
@@ -108,15 +98,35 @@ pub fn migrate_references(raw: &mut serde_yaml::Value) -> Result<bool, serde_yam
             .unwrap_or(serde_yaml::Value::Sequence(vec![])),
     )?;
     let mut members = HashMap::new();
-    let mut targets = HashMap::new();
     for node in &nodes {
         let old = dedup::legacy_node_fingerprint(node);
         let new = fingerprint(node);
-        targets
-            .entry(format!("node:{}", dedup::node_public_id(&old)))
-            .or_insert_with(|| format!("node:{}", dedup::node_public_id(&new)));
         members.entry(old).or_insert(new);
     }
+    Ok(remap_references(map, &members))
+}
+
+pub(super) fn rule_target_migrations(members: &HashMap<String, String>) -> HashMap<String, String> {
+    members
+        .iter()
+        .map(|(old, new)| {
+            (
+                format!("node:{}", dedup::node_public_id(old)),
+                format!("node:{}", dedup::node_public_id(new)),
+            )
+        })
+        .collect()
+}
+
+pub(super) fn remap_references(
+    map: &mut serde_yaml::Mapping,
+    members: &HashMap<String, String>,
+) -> bool {
+    if members.is_empty() {
+        return false;
+    }
+    let targets = rule_target_migrations(members);
+    let key = |s: &str| serde_yaml::Value::String(s.into());
     let mut changed = false;
     let mut replace = |value: &mut serde_yaml::Value, replacements: &HashMap<String, String>| {
         if let Some(new) = value.as_str().and_then(|s| replacements.get(s)) {
@@ -130,27 +140,29 @@ pub fn migrate_references(raw: &mut serde_yaml::Value) -> Result<bool, serde_yam
     {
         for group in groups {
             if let Some(current) = group.get_mut("current") {
-                replace(current, &members);
+                replace(current, members);
             }
             if let Some(list) = group
                 .get_mut("members")
                 .and_then(serde_yaml::Value::as_sequence_mut)
             {
                 for member in list {
-                    replace(member, &members);
+                    replace(member, members);
                 }
             }
         }
     }
-    if let Some(rules) = map
-        .get_mut(key("rules"))
-        .and_then(serde_yaml::Value::as_sequence_mut)
-    {
-        for rule in rules {
-            if let Some(target) = rule.get_mut("target") {
-                replace(target, &targets);
+    for field in ["rules", "device_rule_groups"] {
+        if let Some(rules) = map
+            .get_mut(key(field))
+            .and_then(serde_yaml::Value::as_sequence_mut)
+        {
+            for rule in rules {
+                if let Some(target) = rule.get_mut("target") {
+                    replace(target, &targets);
+                }
             }
         }
     }
-    Ok(changed)
+    changed
 }

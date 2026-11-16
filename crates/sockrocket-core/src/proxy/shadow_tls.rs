@@ -30,8 +30,8 @@ use tokio::net::TcpStream;
 
 use craft_tls::rustls::ClientConfig;
 use craft_tls::rustls::client::NoClientSessionStorage;
-use craft_tls::rustls::craft::CHROME_112;
 use craft_tls::rustls::shadow_tls::ShadowTlsConfig as CraftShadowTlsConfig;
+use craftls::craft::chrome_112;
 use rustls_pki_types::ServerName;
 
 use super::connector::{BoxProxyStream, Outbound};
@@ -751,7 +751,7 @@ impl ShadowTlsOutbound {
                 .with_no_client_auth()
         };
 
-        let mut tls_config = base_config.with_fingerprint(CHROME_112.builder());
+        let mut tls_config = base_config.with_browser_fingerprint(chrome_112().builder());
         tls_config.shadow_tls = Some(Arc::new(CraftShadowTlsConfig {
             password: Arc::from(tls_password),
         }));

@@ -1,6 +1,17 @@
 //! Durable private configuration replacement shared by CLI and desktop.
 use anyhow::Result;
 use std::fs;
+use std::path::Path;
+
+/// Read a complete YAML document, including fields outside the typed configuration.
+pub fn parse_yaml_document(text: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
+    serde_yaml::from_str(text)
+}
+
+/// Serialize an edited configuration without copying its nodes, rules, or unknown fields.
+pub fn render_yaml_mapping(map: &serde_yaml::Mapping) -> Result<String, serde_yaml::Error> {
+    serde_yaml::to_string(map)
+}
 
 /// Shared cross-process lock for configuration read/merge/commit transactions.
 pub struct MutationGuard {
@@ -139,14 +150,14 @@ pub fn commit_subscription_refresh(
         .collect();
     applied_urls.sort_unstable();
     applied_urls.dedup();
-    if super::dedup::apply_subscription_refresh(
+    if let Some(migrations) = super::dedup::refresh_with_dns_migrations(
         &mut current,
         applicable
             .into_iter()
             .map(|(snapshot, nodes)| (snapshot.url, nodes))
             .collect(),
     ) {
-        write_nodes_and_subscriptions(path, &current)?;
+        write_subscription_state(path, &current, &migrations)?;
     }
     Ok(SubscriptionRefreshCommit {
         config: current,
@@ -214,19 +225,55 @@ pub fn atomic_write_private(
     result
 }
 
+/// Save the failover target against the current node list without replacing other YAML fields.
+pub fn persist_active_node(path: &Path, fingerprint: &str) -> Result<()> {
+    let _transaction = MutationGuard::acquire(path)?;
+    anyhow::ensure!(
+        !path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".update-transaction")
+            .exists(),
+        "Software update in progress"
+    );
+    let mut value = parse_yaml_document(&fs::read_to_string(path)?)?;
+    let current = super::model::AppConfig::from_yaml_value(value.clone())?;
+    let index = current
+        .nodes
+        .iter()
+        .position(|node| super::dedup::node_fingerprint(node) == fingerprint)
+        .ok_or_else(|| anyhow::anyhow!("Failover node was removed before persistence"))?;
+    if let Some(mapping) = value.as_mapping_mut() {
+        mapping.insert(
+            "active_node".into(),
+            serde_yaml::Value::Number(index.into()),
+        );
+    }
+    atomic_write_private(path, &serde_yaml::to_string(&value)?, true)
+}
+
 /// Replace `nodes`, `subscriptions`, and `active_node` in an existing config
 /// file, leaving every other key (router DNS, mode, comments-as-keys) in place.
 pub fn write_nodes_and_subscriptions(
     path: &std::path::Path,
     config: &crate::config::model::AppConfig,
 ) -> Result<()> {
+    write_subscription_state(path, config, &Default::default())
+}
+
+fn write_subscription_state(
+    path: &std::path::Path,
+    config: &crate::config::model::AppConfig,
+    migrations: &std::collections::HashMap<String, String>,
+) -> Result<()> {
     let content = fs::read_to_string(path)?;
-    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let mut value = parse_yaml_document(&content)?;
     // Migrate references against the old catalog before replacing its nodes.
     super::node_identity::migrate_references(&mut value)?;
     let Some(map) = value.as_mapping_mut() else {
         anyhow::bail!("config root is not a mapping");
     };
+    super::node_identity::remap_references(map, migrations);
     map.insert(
         serde_yaml::Value::String("nodes".into()),
         serde_yaml::to_value(&config.nodes)?,
@@ -283,6 +330,27 @@ mod tests {
         assert_eq!(reopened.subscriptions[0].url, config.subscriptions[0].url);
         assert_eq!(reopened.nodes[0].server, "192.0.2.1");
         assert_eq!(reopened.active_node, Some(0));
+        config.active_node = None;
+        let original =
+            serde_yaml::to_string(&config).unwrap() + "merlin_extension: !private [one, two]\n";
+        fs::write(&path, &original).unwrap();
+        assert!(persist_active_node(&path, "removed").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        persist_active_node(
+            &path,
+            &super::super::dedup::node_fingerprint(&config.nodes[0]),
+        )
+        .unwrap();
+        let saved = parse_yaml_document(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["active_node"].as_u64(), Some(0));
+        assert_eq!(
+            saved["merlin_extension"],
+            parse_yaml_document(&original).unwrap()["merlin_extension"]
+        );
+        assert_eq!(
+            fs::read_to_string(path.with_extension("yaml.bak")).unwrap(),
+            original
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -393,6 +461,103 @@ mod tests {
         let readded = commit_subscription_refresh(&path, vec![(source, vec![older])]).unwrap();
         assert!(readded.applied_urls.is_empty());
         assert!(readded.config.nodes.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refreshed_node_dns_preserves_saved_references_and_unknown_fields() {
+        use crate::config::{dedup, model::*};
+        let dir =
+            std::env::temp_dir().join(format!("sockrocket-dns-refresh-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let url = "https://subscription.invalid/a";
+        let mut old = node_for_persist();
+        old.server = "node.invalid".into();
+        dedup::tag_subscription_nodes(std::slice::from_mut(&mut old), url);
+        let old_id = dedup::node_fingerprint(&old);
+        let target = format!("node:{}", dedup::node_public_id(&old_id));
+        let config = AppConfig {
+            subscriptions: vec![Subscription {
+                url: url.into(),
+                name: "A".into(),
+                format: "auto".into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            }],
+            nodes: vec![old.clone()],
+            active_node: Some(0),
+            groups: vec![ProxyGroupConfig {
+                name: "selected".into(),
+                gtype: GroupType::Select,
+                members: vec![old_id.clone()],
+                current: Some(old_id),
+            }],
+            rules: vec![RoutingRule {
+                name: String::new(),
+                source: String::new(),
+                group: "web".into(),
+                rule_type: "domain".into(),
+                pattern: "test.invalid".into(),
+                target: target.clone(),
+                enabled: true,
+                priority: 0,
+            }],
+            device_rule_groups: vec![DeviceRuleGroup {
+                source: "192.0.2.9".into(),
+                group: "web".into(),
+                target,
+                priority: 0,
+            }],
+            ..AppConfig::default()
+        };
+        let mut raw = serde_yaml::to_value(&config).unwrap();
+        raw["rules"][0]["firmware_extension"] = "retained".into();
+        fs::write(&path, serde_yaml::to_string(&raw).unwrap()).unwrap();
+        let mut revision = String::new();
+        for resolver in [Some("192.0.2.53"), Some("198.51.100.53"), None] {
+            let mut fresh = old.clone();
+            if let Some(server) = resolver {
+                let policy = super::super::server_dns::ServerDns {
+                    servers: vec![server.into()],
+                    bootstrap: Vec::new(),
+                    ipv6: false,
+                };
+                fresh.extra.insert(
+                    super::super::server_dns::KEY.into(),
+                    serde_json::to_string(&policy).unwrap(),
+                );
+            }
+            let new_id = dedup::node_fingerprint(&fresh);
+            let new_target = format!("node:{}", dedup::node_public_id(&new_id));
+            let result = commit_subscription_refresh(
+                &path,
+                vec![(
+                    SubscriptionRefreshSnapshot {
+                        url: url.into(),
+                        revision,
+                    },
+                    vec![fresh],
+                )],
+            )
+            .unwrap();
+            let saved = fs::read_to_string(&path).unwrap();
+            revision = result.config.subscriptions[0].refresh_revision.clone();
+            for updated in [result.config, AppConfig::from_yaml_str(&saved).unwrap()] {
+                assert_eq!(updated.nodes.len(), 1);
+                assert_eq!(updated.active_node, Some(0));
+                assert_eq!(updated.groups[0].members, [new_id.as_str()]);
+                assert_eq!(updated.groups[0].current.as_ref(), Some(&new_id));
+                assert_eq!(updated.rules[0].target, new_target);
+                assert_eq!(updated.device_rule_groups[0].target, new_target);
+            }
+            let raw = parse_yaml_document(&saved).unwrap();
+            assert_eq!(
+                raw["rules"][0]["firmware_extension"].as_str(),
+                Some("retained")
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

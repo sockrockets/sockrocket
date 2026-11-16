@@ -48,6 +48,7 @@ use self::fakeip::FakeIpPool;
 /// DNS resolver configuration.
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
+    pub hosts: HashMap<String, Vec<IpAddr>>,
     pub reject_local_addresses: bool,
     pub bootstrap_servers: Option<Vec<SocketAddr>>,
     pub node_hosts: std::collections::HashSet<String>,
@@ -77,6 +78,7 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
+            hosts: HashMap::new(),
             reject_local_addresses: false,
             bootstrap_servers: None,
             node_hosts: Default::default(),
@@ -709,6 +711,21 @@ impl DnsResolver {
         result
     }
 
+    fn hosts_answer(&self, domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
+        self.config.hosts.get(domain).map(|addresses| {
+            addresses
+                .iter()
+                .copied()
+                .filter(|ip| {
+                    matches!(
+                        (qtype, ip),
+                        (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// Inner resolution path: IP-literal short-circuit, fake-IP hook,
     /// cache, dedup. See [`Self::resolve_with_qtype`] for the contract.
     async fn resolve_qtype_inner(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
@@ -718,6 +735,9 @@ impl DnsResolver {
             (AddressStrategy::Ipv4Only, 28) | (AddressStrategy::Ipv6Only, 1)
         ) {
             return Ok(Vec::new());
+        }
+        if let Some(addresses) = self.hosts_answer(domain, qtype) {
+            return Ok(addresses);
         }
         // IP literals short-circuit; only the queried family answers.
         if let Ok(ip) = domain.parse::<IpAddr>() {
@@ -977,20 +997,27 @@ impl DnsResolver {
     }
 
     /// On-demand wire diagnostic, without cache, Fake-IP or saved history.
-    pub async fn test_upstream(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        anyhow::ensure!(matches!(qtype, 1 | 28), "Unsupported DNS diagnostic type");
-        let query = build_dns_query(domain, qtype);
-        let mut snapshot = self.query_snapshot();
-        let mut config = (*snapshot.config).clone();
-        config.cache_enabled = false;
-        snapshot.config = Arc::new(config);
-        let reply = snapshot.exchange_raw(&query).await?;
-        anyhow::ensure!(
-            reply[3] & 15 == 0,
-            "DNS server returned rcode {}",
-            reply[3] & 15
-        );
-        parse_dns_response(&reply)
+    pub fn test_upstream<'a>(
+        &'a self,
+        domain: &'a str,
+        qtype: u16,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<IpAddr>>> + Send + 'a>> {
+        // One allocation per manual probe keeps the wire exchange code in core.
+        Box::pin(async move {
+            anyhow::ensure!(matches!(qtype, 1 | 28), "Unsupported DNS diagnostic type");
+            let query = build_dns_query(domain, qtype);
+            let mut snapshot = self.query_snapshot();
+            let mut config = (*snapshot.config).clone();
+            config.cache_enabled = false;
+            snapshot.config = Arc::new(config);
+            let reply = snapshot.exchange_raw(&query).await?;
+            anyhow::ensure!(
+                reply[3] & 15 == 0,
+                "DNS server returned rcode {}",
+                reply[3] & 15
+            );
+            parse_dns_response(&reply)
+        })
     }
 
     /// Resolve to first IPv6 address.
@@ -1056,19 +1083,14 @@ impl DnsResolver {
 
 /// Build the TLS connector used for DNS-over-TLS through the proxy.
 ///
-/// Root store comes from `webpki-roots` (compiled in): the static musl
-/// binary on routers has no system CA bundle to fall back on.
-/// The crypto provider is pinned to ring explicitly: other crates in the
-/// build graph (QUIC stacks) also enable aws-lc-rs, and rustls panics when
-/// it cannot auto-pick a process-level default provider.
+/// Use the bundled roots on routers without a system CA bundle. Pin ring so
+/// the connector is independent of the process-wide default crypto provider.
 fn build_dot_tls_connector() -> tokio_rustls::TlsConnector {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("ring supports rustls' safe default protocol versions")
-        .with_root_certificates(roots)
+        .with_root_certificates(Arc::clone(&crate::TLS_ROOT_CERTIFICATES))
         .with_no_client_auth();
     tokio_rustls::TlsConnector::from(Arc::new(config))
 }
@@ -1201,6 +1223,9 @@ pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u
 async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     let (domain, qtype) = parse_dns_query(query)?;
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(addresses) = resolver.hosts_answer(&domain, qtype) {
+        return build_dns_response_with_ttl(query, &addresses, 5);
+    }
     let Some(pool) = &resolver.fakeip else {
         return resolver.exchange_raw(query).await;
     };

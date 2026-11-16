@@ -136,18 +136,54 @@ impl Default for AppConfig {
     }
 }
 
+/// Read a routing section for editors that must preserve the rest of the YAML document.
+fn decode_list<T: serde::de::DeserializeOwned>(
+    map: &serde_yaml::Mapping,
+    key: &str,
+) -> Result<Vec<T>, serde_yaml::Error> {
+    match map.get(key) {
+        Some(value) => serde_yaml::from_value(value.clone()),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub fn proxy_groups_from_yaml(
+    map: &serde_yaml::Mapping,
+) -> Result<Vec<ProxyGroupConfig>, serde_yaml::Error> {
+    decode_list(map, "groups")
+}
+
+pub fn device_groups_from_yaml(
+    map: &serde_yaml::Mapping,
+) -> Result<Vec<DeviceRuleGroup>, serde_yaml::Error> {
+    decode_list(map, "device_rule_groups")
+}
+
+pub fn routing_rules_from_yaml(
+    map: &serde_yaml::Mapping,
+) -> Result<Vec<RoutingRule>, serde_yaml::Error> {
+    decode_list(map, "rules")
+}
+
 impl AppConfig {
+    /// Decode a config mapping whose legacy references have already been handled.
+    /// Callers loading a config file should use `from_yaml_str` for migration and validation.
+    pub fn decode_yaml_fields(value: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_value(value)
+    }
+
     /// Parse YAML config. Missing `proxy_mode` defaults to [`ProxyMode::Rule`]
     /// (Merlin installs historically omitted the key).
     pub fn from_yaml_str(content: &str) -> Result<Self, serde_yaml::Error> {
-        let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
+        let raw = super::storage::parse_yaml_document(content)?;
         Self::from_yaml_value(raw)
     }
 
-    pub(super) fn from_yaml_value(mut raw: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
+    /// Migrate and validate a configuration document that has already been parsed.
+    pub fn from_yaml_value(mut raw: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
         super::node_identity::migrate_references(&mut raw)?;
         let legacy_mode = raw.get("proxy_mode").is_none();
-        let mut cfg: Self = serde_yaml::from_value(raw)?;
+        let mut cfg = Self::decode_yaml_fields(raw)?;
         if legacy_mode {
             cfg.proxy_mode = ProxyMode::Rule;
         }
@@ -259,6 +295,13 @@ pub struct Node {
     /// Extra metadata
     #[serde(default)]
     pub extra: HashMap<String, String>,
+}
+
+impl Node {
+    /// Decode a single entry from the native YAML node catalog.
+    pub fn from_yaml_value(value: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_value(value)
+    }
 }
 
 /// shadow-tls plugin (v3) settings for Shadowsocks nodes.
@@ -402,10 +445,45 @@ impl Hy2Obfs {
     }
 }
 
+pub(crate) fn validate_mieru_endpoint(
+    server: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    let is_host = if let Some(bare) = server.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        bare.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        server.parse::<std::net::IpAddr>().is_ok()
+            || super::dns::valid_domain(server.strip_suffix('.').unwrap_or(server))
+    };
+    anyhow::ensure!(port > 0 && is_host, "Invalid Mieru endpoint");
+    anyhow::ensure!(
+        (1..=64).contains(&username.len()) && !password.is_empty(),
+        "Invalid Mieru credentials"
+    );
+    Ok(())
+}
+
+fn deserialize_mieru_credentials<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(String, String), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Credentials {
+        username: String,
+        password: String,
+    }
+    let fields = Credentials::deserialize(deserializer)?;
+    Ok((fields.username, fields.password))
+}
+
 /// Supported proxy protocols
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProxyProtocol {
+    #[serde(deserialize_with = "deserialize_mieru_credentials")]
+    Mieru { username: String, password: String },
     /// An in-process, single-peer WireGuard endpoint.
     Wireguard {
         #[serde(flatten)]
@@ -566,6 +644,7 @@ impl ProxyProtocol {
     /// Configured UDP capability; ShadowTLS currently provides streams only.
     pub fn supports_udp(&self) -> bool {
         match self {
+            Self::Mieru { .. } => false,
             Self::Wireguard { config } => config.udp,
             Self::Shadowsocks {
                 udp, shadow_tls, ..
@@ -588,6 +667,7 @@ impl ProxyProtocol {
             ProxyProtocol::Tuic { .. } => "tuic",
             ProxyProtocol::Trojan { .. } => "trojan",
             ProxyProtocol::Hysteria2 { .. } => "hysteria2",
+            ProxyProtocol::Mieru { .. } => "mieru",
             ProxyProtocol::AnyTls { .. } => "anytls",
             ProxyProtocol::Wireguard { .. } => "wireguard",
         }

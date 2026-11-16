@@ -56,6 +56,7 @@ jobs:
           key: merlin-${{ matrix.name }}-dispatch
 
       - name: Install cross-compilation toolchain
+        if: matrix.name != 'aarch64'
         run: |
           if ! cross --version 2>/dev/null | grep -Eq '^cross 0[.]2[.]5([[:space:]]|$)'; then
             cargo install cross --version 0.2.5 --locked --force

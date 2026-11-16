@@ -6384,12 +6384,13 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-cli"
-version = "0.1.5"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "base64",
  "libc",
  "rand 0.9.4",
+ "ryu",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -6403,7 +6404,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-core"
-version = "0.1.5"
+version = "0.1.9"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6417,6 +6418,7 @@ dependencies = [
  "crc32fast",
  "ctr",
  "etherparse",
+ "futures-util",
  "h2",
  "h3",
  "h3-quinn",
@@ -6433,6 +6435,7 @@ dependencies = [
  "md-5",
  "ml-kem",
  "parking_lot",
+ "pbkdf2",
  "qrcode",
  "quinn",
  "quinn-proto",
@@ -6440,6 +6443,7 @@ dependencies = [
  "rand_core 0.6.4",
  "reqwest",
  "ring",
+ "rustls 0.22.4",
  "rustls 0.23.38",
  "rustls-pki-types",
  "serde",
@@ -6451,7 +6455,6 @@ dependencies = [
  "shadowsocks",
  "socket2 0.5.10",
  "sysproxy",
- "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.25.0",
  "tokio-rustls 0.26.4",
@@ -6469,7 +6472,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-gui"
-version = "0.1.5"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",

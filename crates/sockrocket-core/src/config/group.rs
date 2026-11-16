@@ -28,10 +28,10 @@ pub fn resolve_members(group: &ProxyGroupConfig, nodes: &[Node]) -> Vec<usize> {
 
 /// Temporary index for one immutable configuration snapshot. Never retained
 /// across subscription updates; first occurrence and member order are preserved.
-pub(crate) struct NodeIndex(std::collections::HashMap<String, usize>);
+pub struct NodeIndex(std::collections::HashMap<String, usize>);
 
 impl NodeIndex {
-    pub(crate) fn new(nodes: &[Node]) -> Self {
+    pub fn new(nodes: &[Node]) -> Self {
         let mut index = std::collections::HashMap::with_capacity(nodes.len());
         for (position, node) in nodes.iter().enumerate() {
             index.entry(node_fingerprint(node)).or_insert(position);
@@ -39,7 +39,7 @@ impl NodeIndex {
         Self(index)
     }
 
-    pub(crate) fn get(&self, fingerprint: &str) -> Option<usize> {
+    pub fn get(&self, fingerprint: &str) -> Option<usize> {
         self.0.get(fingerprint).copied()
     }
 
@@ -47,7 +47,7 @@ impl NodeIndex {
         group.members.iter().filter_map(|fp| self.get(fp)).collect()
     }
 
-    pub(crate) fn selected_member(&self, group: &ProxyGroupConfig) -> Option<usize> {
+    pub fn selected_member(&self, group: &ProxyGroupConfig) -> Option<usize> {
         match &group.current {
             Some(current) => group
                 .members

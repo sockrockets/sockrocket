@@ -11,7 +11,8 @@ function fixture() {
     srCopyText:(text)=>copied.push(text), srShowMsg:(message)=>messages.push(message), toastResp(){}, srLoadNodes(){nodeLoads.push(true);}, refreshStatus(){},
     setTimeout(cb,delay){const id=++next;timers.set(id,cb);timerDelays.push(delay);return id;},clearTimeout:id=>timers.delete(id),
     SR_STATE:{},SR_PAGE_LOADED:{},srEsc:value=>value});
-  vm.runInContext(source.slice(source.indexOf('function srLoadSubs()'),source.indexOf('/* ══ Routing rules')),context);
+  vm.runInContext(source.slice(source.indexOf('function newRequestId('),source.indexOf('function apiKscRequest(')) +
+    source.slice(source.indexOf('function srLoadSubs()'),source.indexOf('/* ══ Routing rules')),context);
   const request=action=>{const index=requests.findIndex(r=>r[0]===action); assert.ok(index>=0,action);return requests.splice(index,1)[0];};
   const tick=()=>{const [id,cb]=timers.entries().next().value;timers.delete(id);cb();};
   return {context,requests,request,tick,element,messages,copied,nodeLoads,timerDelays};

@@ -370,7 +370,7 @@ pub fn parse_uri(uri: &str) -> Result<Node> {
     }
     if let Some(value) = params.get("peers") {
         config.additional_peers =
-            serde_json::from_str(value).context("Invalid WireGuard peer list")?;
+            serde_json::from_slice(value.as_bytes()).context("Invalid WireGuard peer list")?;
     }
     if let Some(value) = params.get("listenport") {
         config.listen_port = Some(value.parse()?).filter(|p| *p != 0);

@@ -10,6 +10,12 @@ pub mod system_proxy;
 pub mod traffic;
 pub mod update;
 
+// DNS-over-TLS and standard QUIC use the same bundled trust anchors.
+static TLS_ROOT_CERTIFICATES: std::sync::LazyLock<std::sync::Arc<rustls::RootCertStore>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect())
+    });
+
 pub use config::clash::parse_clash_config;
 pub use config::dedup::{
     SUB_URL_EXTRA_KEY, apply_subscription_refresh, dedup_nodes, node_fingerprint, node_public_id,
@@ -63,7 +69,7 @@ pub use proxy::service::ProxyService;
 pub use proxy::socks5::Socks5Server;
 pub use proxy::speedtest::{
     ProbeFailureKind, SpeedTestResult, classify_probe_error, http_latency_test, latency_test_node,
-    quick_http_latency_test, speed_test_node, tcp_latency_test,
+    node_tcp_latency_test, quick_http_latency_test, speed_test_node, tcp_latency_test,
 };
 pub use proxy::ss::SsOutbound;
 pub use proxy::trojan::TrojanOutbound;

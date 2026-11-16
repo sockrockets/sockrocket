@@ -42,7 +42,7 @@ const checkContext = vm.createContext({
   srApi: (_action,_data,ok) => ok({available:true,latest:'1.2.3',asset_url:null,html_url:'release-page'}),
   srShowMsg: () => {},
 });
-new vm.Script(page.slice(page.indexOf('var pendingUpdateAsset'), page.indexOf('var srUpdatePollTimer')) + '\nsrCheckUpdate();').runInContext(checkContext);
+new vm.Script(page.slice(page.indexOf('function srCheckUpdate()'), page.indexOf('var srUpdatePollTimer')) + '\nsrCheckUpdate();').runInContext(checkContext);
 assert.match(elements.get('update-status').textContent, /1\.2\.3.*未找到适配当前机型的软件包/);
 assert.equal(elements.get('btn-apply-update').style.display, 'none');
 assert.equal(elements.get('btn-update-link').href, 'release-page');
@@ -59,3 +59,15 @@ console.log('PASS: preinstall progress and missing platform package');
   assert.equal(timers.length, 1);
 }
 console.log('PASS: stale success cannot complete a newly submitted update');
+
+const initHost = page.slice(page.indexOf('function sockrocketInitHost'), page.indexOf('var TRANSPORT'));
+for (const pathname of ['/Module_sockrocket.asp', '/ext/sockrocket/sockrocket.asp']) {
+  const notice = {hidden:true}, exit = {href:'/Module_Softcenter.asp#/'}, crumb = {firstChild:{}};
+  const document = {form:{current_page:{}, next_page:{}}, getElementById:() => notice, querySelector:() => crumb};
+  const context = vm.createContext({document, location:{pathname}, srElement:() => exit});
+  new vm.Script(initHost + '\nsockrocketInitHost();').runInContext(context);
+  assert.equal(document.form.current_page.value, pathname.split('/').pop());
+  assert.equal(notice.hidden, false);
+  assert.equal(exit.href, pathname.startsWith('/ext/') ? '/' : '/Module_Softcenter.asp#/');
+}
+console.log('PASS: Software Center and standalone Merlin navigation without firmware menu scripts');

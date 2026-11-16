@@ -3,54 +3,60 @@
 use super::*;
 use paste::paste;
 
+struct AlpnVariants {
+    http1: Vec<ExtensionSpec>,
+    no_alpn: Vec<ExtensionSpec>,
+}
+
+fn alpn_variants(extensions: &[ExtensionSpec]) -> AlpnVariants {
+    let mut http1 = Vec::with_capacity(extensions.len());
+    let mut no_alpn = Vec::with_capacity(extensions.len());
+    for extension in extensions {
+        if matches!(extension, ExtensionSpec::Craft(CraftExtension::Protocols(_))) {
+            http1.push(ExtensionSpec::Craft(CraftExtension::Protocols(&[b"http/1.1"])));
+        } else {
+            http1.push(extension.clone());
+            no_alpn.push(extension.clone());
+        }
+    }
+    AlpnVariants { http1, no_alpn }
+}
+
 macro_rules! define_fingerprint {
-    ($fingerprint_name:ident { shuffle($extensions:expr), $cipher:expr }) => {
-        define_fingerprint!($fingerprint_name, $extensions, true, $cipher);
+    ($name:ident { shuffle($extensions:expr), $cipher:expr }) => {
+        define_fingerprint!(@build dynamic, $name, $extensions, true, $cipher);
     };
-    ($fingerprint_name:ident { $extensions:expr, $cipher:expr }) => {
-        define_fingerprint!($fingerprint_name, $extensions, false, $cipher);
+    ($name:ident { $extensions:expr, $cipher:expr }) => {
+        define_fingerprint!(@build dynamic, $name, $extensions, false, $cipher);
     };
-    ($fingerprint_name:ident, $extensions:expr, $shuffle_extensions:expr, $cipher:expr) => {
+    (@build $init:meta, $name:ident, $extensions:expr, $shuffle:expr, $cipher:expr) => {
         paste! {
-            #[allow(non_camel_case_types)]
-            #[dynamic]
-            static [<$fingerprint_name _EXT_NO_ALPN>]: Vec<ExtensionSpec> = {
-                use ExtensionSpec::*;
-                ($extensions)
-                    .iter()
-                    .filter(|v| match v {
-                        Craft(CraftExtension::Protocols(..)) => false,
-                        _ => true,
-                    })
-                    .map(|v| v.clone())
-                    .collect()
-            };
+            /// The main fingerprint, using the profile's original extension and cipher lists.
+            pub fn [<$name:lower>]() -> Fingerprint {
+                Fingerprint {
+                    extensions: $extensions,
+                    cipher: $cipher,
+                    shuffle_extensions: $shuffle,
+                }
+            }
 
             #[allow(non_camel_case_types)]
-            #[dynamic]
-            static [<$fingerprint_name _EXT_ALPN_HTTP1>]: Vec<ExtensionSpec> = {
-                use ExtensionSpec::*;
-                ($extensions)
-                    .iter()
-                    .map(|v| match v {
-                        Craft(CraftExtension::Protocols(_)) => Craft(CraftExtension::Protocols(&[b"http/1.1"])),
-                        v => v.clone(),
-                    })
-                    .collect()
-            };
+            #[dynamic(lazy)]
+            static [<$name _ALPN_VARIANTS>]: AlpnVariants =
+                alpn_variants([<$name:lower>]().extensions);
 
             #[allow(non_camel_case_types)]
-            #[dynamic]
-            /// Represents a set of [`Fingerprint`] configurations, each tailored for different ALPN extensions.
-            ///
-            /// Variants:
-            /// - `main`: The default configuration for HTTP/2 (h2) clients, designed to emulate typical browser behavior.
-            /// - `test_alpn_http1`: A configuration for testing HTTP/1 clients, with appropriate ALPN settings.
-            /// - `test_no_alpn`: A configuration for testing clients that do not use ALPN, including HTTP/1 or non-HTTP clients.
-            pub static $fingerprint_name: FingerprintSet = FingerprintSet {
-                main: Fingerprint { extensions: $extensions, cipher: $cipher, shuffle_extensions: $shuffle_extensions },
-                test_alpn_http1: Fingerprint { extensions: &[<$fingerprint_name _EXT_ALPN_HTTP1>], cipher: $cipher, shuffle_extensions: $shuffle_extensions },
-                test_no_alpn: Fingerprint { extensions: &[<$fingerprint_name _EXT_NO_ALPN>], cipher: $cipher, shuffle_extensions: $shuffle_extensions },
+            #[cfg_attr(feature = "lazy-fingerprint-sets", dynamic(lazy))]
+            #[cfg_attr(not(feature = "lazy-fingerprint-sets"), $init)]
+            /// The main fingerprint and its HTTP/1.1-only and ALPN-free variants.
+            pub static $name: FingerprintSet = {
+                let main = [<$name:lower>]();
+                let variants = &[<$name _ALPN_VARIANTS>];
+                FingerprintSet {
+                    test_alpn_http1: Fingerprint { extensions: &variants.http1, ..main },
+                    test_no_alpn: Fingerprint { extensions: &variants.no_alpn, ..main },
+                    main,
+                }
             };
         }
     };
@@ -146,8 +152,8 @@ pub static CHROME_108_EXT: Vec<ExtensionSpec> = {
     ]
 };
 
-#[dynamic]
-/// The extension list of chrome 108
+// A test client's fingerprint is initialized only when that client requests it.
+#[dynamic(lazy)]
 pub(crate) static EXT_TEST: Vec<ExtensionSpec> = {
     use ExtensionSpec::*;
     use KeepExtension::*;
@@ -280,9 +286,9 @@ pub static CHROME_133_EXT: Vec<ExtensionSpec> = {
 };
 define_fingerprint!(CHROME_133 { shuffle(&CHROME_133_EXT), &CHROME_CIPHER });
 /// Pinned Chrome Auto profile; update deliberately with wire and interop tests.
-pub use self::CHROME_133 as CHROME_AUTO;
+pub use self::{CHROME_133 as CHROME_AUTO, chrome_133 as chrome_auto};
 
-define_fingerprint!(RUSTLS_TEST { &EXT_TEST, &CHROME_CIPHER });
+define_fingerprint!(@build dynamic(lazy), RUSTLS_TEST, &EXT_TEST, false, &CHROME_CIPHER);
 
 /// The cipher list of Safari 17.1
 ///
@@ -389,7 +395,7 @@ define_fingerprint!(SAFARI_17_1 { &SAFARI_17_1_EXT, &SAFARI_17_1_CIPHERS });
 
 // uTLS HelloQQ_11_1 and HelloEdge_85 share the Chromium cipher order.
 // Edge omits ALPS. Only TLS versions supported by this client are offered.
-pub use self::CHROME_108 as QQ_11_1;
+pub use self::{CHROME_108 as QQ_11_1, chrome_108 as qq_11_1};
 #[dynamic]
 static EDGE_85_EXT: Vec<ExtensionSpec> = CHROME_108_EXT.iter()
     .filter(|ext| !matches!(ext, ExtensionSpec::Craft(CraftExtension::FakeApplicationSettings)))

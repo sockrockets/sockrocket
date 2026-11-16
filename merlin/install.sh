@@ -35,9 +35,6 @@ KS_SCRIPTS="$KS_DIR/scripts"
 KS_INIT="$KS_DIR/init.d"
 MODULE="sockrocket"   # must match the package directory name
 
-# Standard Merlin path (used when NOT in koolshare mode)
-WWW_SOCKROCKET="/www/ext/sockrocket"
-
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.info "$*";  printf "${CYAN}[Sockrocket] %s${NC}\n" "$*"; }
 ok()    { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.info "$*";  printf "${GREEN}[Sockrocket] ✓ %s${NC}\n" "$*"; }
@@ -188,6 +185,129 @@ fi
 info "/jffs partition OK"
 check_deps
 
+# Count logical file sizes in 4 KiB blocks, including sparse files copied from
+# an offline package. Only the selected architecture's binary is installed.
+file_kib() {
+    local bytes
+    bytes=$(wc -c < "$1") || return 1
+    echo $(( (bytes + 4095) / 4096 * 4 ))
+}
+
+payload_kib() {
+    local path amount total=0
+    for path in "$@"; do
+        [ -f "$path" ] || continue
+        amount=$(file_kib "$path") || return 1
+        total=$((total + amount))
+    done
+    echo "$total"
+}
+
+# df must see the destination filesystem even before its directories exist.
+destination_space() {
+    local path="$1" listing device blocks used available capacity mount dev
+    while [ ! -d "$path" ]; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+        path=${path%/*}
+        [ -n "$path" ] || path=/
+    done
+    [ -w "$path" ] || return 1
+    listing=$(df -Pk "$path") || return 1
+    # A name such as tmpfs may identify several independent mounts.
+    dev=$(stat -L -c %d "$path" 2>/dev/null) || dev=$(stat -L -f %d "$path" 2>/dev/null) || dev=
+    while read -r device blocks used available capacity mount; do
+        case "$available" in ''|*[!0-9]*) continue ;; esac
+        case "$dev" in ''|*[!0-9]*) dev="$device:$mount" ;; esac
+        printf '%s %s\n' "$dev" "$available"
+        return 0
+    done <<EOF
+$listing
+EOF
+    return 1
+}
+
+require_install_kib() {
+    [ "$2" -ge "$3" ] || err "安装空间不足：$1 需要 $3 KiB，可用 $2 KiB，还差 $(($3 - $2)) KiB"
+}
+
+check_install_space() {
+    # The transaction worker measures and stages its rollback and integration files.
+    [ "${SOCKROCKET_INTEGRATION_ONLY:-0}" != 1 ] || return 0
+    # Merlin's minimal BusyBox shell may lack the command builtin.
+    if ! have df || ! have wc; then
+        warn "Cannot preflight disk space in this restricted installer environment"
+        return 0
+    fi
+    local root_space root_device available required amount added target space config hook largest=0
+    root_space=$(destination_space "$SOCKROCKET_DIR") || err "Cannot read installation filesystem space"
+    set -- $root_space
+    root_device=$1
+    available=$2
+    required=$(file_kib "$BINARY") || err "Cannot measure bundled binary"
+    # The old executable may still be open. The pending copy needs its full size.
+    if [ "$UPDATE_ONLY" = true ]; then
+        require_install_kib "$SOCKROCKET_DIR" "$available" "$((required + 8))"
+        return
+    fi
+    config=$SCRIPT_DIR/config.yaml.template
+    [ ! -f "$SOCKROCKET_CONF" ] || config=$SOCKROCKET_CONF
+    amount=$(payload_kib "$config" "$SCRIPT_DIR/.valid" "$SCRIPT_DIR/version" \
+        "$SCRIPT_DIR/uninstall.sh" "$SCRIPT_DIR/webui/sockrocket.asp" "$SCRIPT_DIR/res/icon-sockrocket.png" \
+        "$SCRIPT_DIR/scripts/sockrocket.sh" "$SCRIPT_DIR/scripts/iptables.sh" "$SCRIPT_DIR/scripts/update.sh" \
+        "$SCRIPT_DIR/scripts/dnsmasq-postconf.sh" "$SCRIPT_DIR/scripts/dnsmasq.conf" \
+        "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SCRIPT_DIR/scripts/sockrocket_status.sh") || err "Cannot measure installed files"
+    required=$((required + amount))
+    # Each hook grows by at most one block; only one original is staged at a time.
+    set -- wan-event wan-start dhcpc-event dnsmasq.postconf
+    [ "$KOOLSHARE" = 1 ] || set -- "$@" firewall-start nat-start services-start service-event
+    for hook in "$@"; do
+        amount=$(payload_kib "/jffs/scripts/$hook") || err "Cannot measure existing hook"
+        [ "$amount" -le "$largest" ] || largest=$amount
+    done
+    # Plugin / hook directories, CGI launcher and small generated state files.
+    required=$((required + largest + 4 * $# + 32))
+    require_install_kib "$SOCKROCKET_DIR" "$available" "$required"
+    if [ "$KOOLSHARE" = 1 ]; then
+        # On some images the menu page and its persistent boot-time mirror
+        # are separate files. On others both names resolve to the same directory.
+        if [ -d /jffs/.koolshare/webs ] && ! [ "$KS_WEBS" -ef /jffs/.koolshare/webs ]; then
+            amount=$(file_kib "$SCRIPT_DIR/webui/sockrocket.asp") || err "Cannot measure Software Center page"
+            required=$((required + amount))
+            require_install_kib "$SOCKROCKET_DIR" "$available" "$required"
+        fi
+        local icon="$SCRIPT_DIR/res/icon-sockrocket.png"
+        [ -f "$icon" ] || icon="$SCRIPT_DIR/webui/icon-sockrocket.png"
+        added=$(payload_kib "$SCRIPT_DIR/webui/sockrocket.asp" "$icon" "$SCRIPT_DIR/uninstall.sh" \
+            "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SCRIPT_DIR/scripts/sockrocket_status.sh") || err "Cannot measure Software Center files"
+        added=$((added + 24))
+        space=$(destination_space "$KS_DIR") || err "Cannot read Software Center filesystem space"
+        set -- $space
+        if [ "$1" = "$root_device" ]; then
+            require_install_kib "$SOCKROCKET_DIR" "$available" "$((required + added))"
+        else
+            require_install_kib "$KS_DIR" "$2" "$added"
+        fi
+    else
+        added=$(file_kib "$SCRIPT_DIR/webui/sockrocket.asp") || err "Cannot measure Merlin page"
+        added=$((added + 4))
+        local possible=0 last_target="" last_free=0 last_need=0 need
+        for target in /www/ext/sockrocket /tmp/var/wwwext/sockrocket; do
+            space=$(destination_space "$target") || continue
+            set -- $space
+            need=$added
+            [ "$1" != "$root_device" ] || need=$((required + added))
+            if [ "$2" -ge "$need" ]; then possible=1; break; fi
+            last_target=$target last_free=$2 last_need=$need
+        done
+        if [ "$possible" != 1 ]; then
+            [ -n "$last_target" ] || err "Cannot find a Merlin page destination"
+            require_install_kib "$last_target" "$last_free" "$last_need"
+        fi
+    fi
+}
+
+check_install_space
+
 # ── Update-only mode ───────────────────────────────────────────────────────────
 # Stage beside the destination and rename: cp over a running Linux executable
 # fails with ETXTBSY (the API stays up independently of the proxy).
@@ -217,6 +337,9 @@ if [ "$UPDATE_ONLY" = "true" ]; then
     [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && WAS_RUNNING=true
     [ "$WAS_RUNNING" = "true" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" stop 2>/dev/null || true
     install_binary
+    if [ -f "$SCRIPT_DIR/scripts/sockrocket.sh" ]; then
+        sh "$SCRIPT_DIR/scripts/sockrocket.sh" install-cgi || warn "Could not refresh CGI launcher"
+    fi
     ok "Binary updated: $("$SOCKROCKET_BIN" --version 2>/dev/null || echo 'version unknown')"
     # Restart the API bridge too if it is running — it still holds the old binary
     [ -f "$SOCKROCKET_DIR/sockrocket-api.pid" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart 2>/dev/null || true
@@ -276,7 +399,8 @@ install_common_files() {
     [ -f "$SCRIPT_DIR/scripts/sockrocket_api.sh" ] && xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh"
     xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh"
     mkdir -p "$SOCKROCKET_DIR/webui" 2>/dev/null
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$SOCKROCKET_DIR/webui/sockrocket.asp" 2>/dev/null || true
+    [ -s "$SCRIPT_DIR/webui/sockrocket.asp" ] || err "Package Web UI page missing or empty"
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$SOCKROCKET_DIR/webui/sockrocket.asp" || err "Could not install persistent Web UI page"
     if [ -f "$SCRIPT_DIR/res/icon-sockrocket.png" ]; then
         mkdir -p "$SOCKROCKET_DIR/res" 2>/dev/null || true
         xcp "$SCRIPT_DIR/res/icon-sockrocket.png" "$SOCKROCKET_DIR/res/icon-sockrocket.png" 2>/dev/null || true
@@ -291,13 +415,7 @@ install_common_files() {
     ok "Control scripts installed"
 
     info "Installing CGI backend..."
-    # The CGI backend is built into sockrocket-cli itself (Rust, `cgi` module):
-    # sockrocket.cgi is just a symlink to the binary, which detects argv[0] and
-    # answers the web UI's JSON API calls directly. No shell CGI anymore.
-    xlink "$SOCKROCKET_BIN" "$SOCKROCKET_DIR/sockrocket.cgi"
-    mkdir -p "$CGI_BIN" 2>/dev/null
-    xlink "$SOCKROCKET_DIR/sockrocket.cgi" "$CGI_BIN/sockrocket.cgi" || \
-        warn "Could not link CGI into $CGI_BIN — will retry on next start"
+    sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-cgi || warn "Could not install CGI launcher — will retry on next start"
     ok "CGI backend installed (Rust, built into sockrocket-cli)"
 
     # Smoke-test the CGI binary (no grep — shell case match)
@@ -453,7 +571,7 @@ ks_install() {
     # koolshare Web UI: Module_sockrocket.asp → /koolshare/webs/
     info "Installing koolshare Web UI..."
     mkdir -p "$KS_WEBS" "$KS_SCRIPTS" "$KS_INIT" "$KS_DIR/res" 2>/dev/null
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp"
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp" && chmod 644 "$KS_WEBS/Module_sockrocket.asp" || err "Could not publish Software Center page"
     ok "Web UI installed to $KS_WEBS/Module_sockrocket.asp"
 
     # Software-center tile icon (softcenter loads /koolshare/res/icon-<module>.png)
@@ -520,16 +638,16 @@ ks_install() {
         dbus set "${MODULE}_version"="${VER}"                        2>/dev/null || true
         dbus set "softcenter_module_${MODULE}_version"="${VER}"      2>/dev/null || true
         dbus set "softcenter_module_${MODULE}_install"="1"          2>/dev/null || true
-        dbus set "softcenter_module_${MODULE}_name"="${MODULE}"      2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_name"="${MODULE}" || err "Could not register Software Center module name"
         dbus set "softcenter_module_${MODULE}_title"="Sockrocket"          2>/dev/null || true
         dbus set "softcenter_module_${MODULE}_description"="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
         # Page the software center opens when the icon is clicked. Without
         # indexpage the icon shows up but clicking it does nothing — the
         # plugin appears "unreachable" even though everything else works.
-        dbus set "softcenter_module_${MODULE}_indexpage"="Module_${MODULE}.asp" 2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_indexpage"="Module_${MODULE}.asp" || err "Could not register Software Center page"
         ok "Plugin registered in dbus"
     else
-        warn "dbus unavailable, skipping software-center status registration (no functional impact)"
+        warn "dbus unavailable: Software Center may not list Sockrocket. Open /Module_sockrocket.asp directly."
     fi
     "$SOCKROCKET_SCRIPTS/sockrocket.sh" software-center-status >/dev/null 2>&1 || true
 
@@ -554,12 +672,12 @@ ks_install() {
 # ─────────────────────────────────────────────────────────────────────────────
 merlin_install() {
     info "Installing in Standard Merlin mode..."
-    mkdir -p "$WWW_SOCKROCKET" 2>/dev/null
     install_common_files
 
     info "Installing Web UI page..."
-    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$WWW_SOCKROCKET/sockrocket.asp"
-    ok "Web UI installed to $WWW_SOCKROCKET/sockrocket.asp"
+    local page
+    page=$(sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-page) || err "Could not publish Merlin Web UI page"
+    ok "Web UI installed to $page"
 
     info "Hooking into Merlin startup scripts..."
 
@@ -596,7 +714,7 @@ fi
     [ -f "$SOCKROCKET_CONF" ]                 || { warn "Config file missing";         errors=$((errors+1)); }
     [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ]      || { warn "sockrocket.sh not executable";       errors=$((errors+1)); }
     [ -x "$SOCKROCKET_SCRIPTS/iptables.sh" ] || { warn "iptables.sh not executable";  errors=$((errors+1)); }
-    [ -f "$WWW_SOCKROCKET/sockrocket.asp" ]         || { warn "Web UI page missing";         errors=$((errors+1)); }
+    [ -s "$page" ]                                   || { warn "Web UI page missing";         errors=$((errors+1)); }
     [ -x "$SOCKROCKET_DIR/sockrocket.cgi" ]         || { warn "CGI script not executable";   errors=$((errors+1)); }
     [ "$errors" -eq 0 ] && ok "All files installed correctly" \
                          || warn "$errors validation warning(s) — check output above"
@@ -607,7 +725,7 @@ fi
     ok "Sockrocket installed successfully!"
     echo ""
     echo "  Config file : $SOCKROCKET_CONF"
-    echo "  Web UI      : http://router.asus.com/ext/Sockrocket/sockrocket.asp"
+    echo "  Web UI      : http://router.asus.com/ext/sockrocket/sockrocket.asp"
     echo ""
     echo "  Start  : $SOCKROCKET_SCRIPTS/sockrocket.sh start"
     echo "  Stop   : $SOCKROCKET_SCRIPTS/sockrocket.sh stop"

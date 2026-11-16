@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use base64::Engine;
-use base64::engine::general_purpose;
+use base64::{Engine, engine::general_purpose};
 
 use super::clash;
 use super::model::*;
@@ -124,7 +123,7 @@ const DIRECT_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const PROXY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SUB_FETCH_CONCURRENCY_PER_ROUTE: usize = 3;
-// Four attempts per worker: the initial request and up to three retries.
+// Four attempts per user agent and worker, all within one download deadline.
 const SUB_FETCH_RETRIES: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -132,6 +131,7 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 enum BodyErrorKind {
     Transport,
     Http,
+    Representation,
     Permanent,
 }
 
@@ -176,8 +176,24 @@ async fn fetch_subscription_route(
     client: &reqwest::Client,
     sub: &Subscription,
 ) -> Result<(String, Vec<Node>), BodyError> {
-    let workers =
-        std::array::from_fn(|_| retry_subscription_route(|| fetch_valid_subscription(client, sub)));
+    // Some providers serve different node or DNS settings for the same Clash URL.
+    let clash = sub.format == "clash"
+        || (matches!(sub.format.as_str(), "auto" | "")
+            && url::Url::parse(&sub.url).is_ok_and(|url| {
+                url.query_pairs()
+                    .any(|(key, value)| key == "clash" && value == "1")
+            }));
+    let workers = std::array::from_fn(|_| async {
+        let fetch = |clash| fetch_valid_subscription(client, sub, clash);
+        match retry_subscription_route(|| fetch(clash)).await {
+            Err(error) if clash && error.kind == BodyErrorKind::Representation => {
+                retry_subscription_route(|| fetch(false))
+                    .await
+                    .map_err(|_| error)
+            }
+            result => result,
+        }
+    });
     first_successful_workers(workers).await
 }
 
@@ -240,7 +256,10 @@ where
 {
     for retry in 0..=SUB_FETCH_RETRIES {
         match attempt().await {
-            Err(error) if error.kind != BodyErrorKind::Permanent && retry < SUB_FETCH_RETRIES => {
+            Err(error)
+                if matches!(error.kind, BodyErrorKind::Transport | BodyErrorKind::Http)
+                    && retry < SUB_FETCH_RETRIES =>
+            {
                 tokio::time::sleep(RETRY_BACKOFF * (1 << retry)).await;
             }
             result => return result,
@@ -286,15 +305,16 @@ fn preferred_route_error(direct: BodyError, proxy: BodyError) -> BodyError {
 async fn fetch_valid_subscription(
     client: &reqwest::Client,
     sub: &Subscription,
+    clash: bool,
 ) -> Result<(String, Vec<Node>), BodyError> {
-    let content = fetch_body(client, &sub.url).await?;
+    let content = fetch_body(client, &sub.url, clash).await?;
     let nodes = parse_subscription_content(&content, &sub.format).map_err(|error| BodyError {
-        kind: BodyErrorKind::Permanent,
+        kind: BodyErrorKind::Representation,
         error,
     })?;
     if nodes.is_empty() {
         return Err(BodyError {
-            kind: BodyErrorKind::Permanent,
+            kind: BodyErrorKind::Representation,
             error: anyhow::anyhow!(
                 "Subscription contains no usable nodes; existing nodes were kept"
             ),
@@ -334,8 +354,12 @@ pub(super) fn subscription_client(
     builder.build().context("Failed to create HTTP client")
 }
 
-async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyError> {
-    let mut response = match client.get(url).send().await {
+async fn fetch_body(client: &reqwest::Client, url: &str, clash: bool) -> Result<String, BodyError> {
+    let mut request = client.get(url);
+    if clash {
+        request = request.header(reqwest::header::USER_AGENT, "clash.meta");
+    }
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             return Err(BodyError {
@@ -348,7 +372,11 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
     let status = response.status();
     if !status.is_success() {
         return Err(BodyError {
-            kind: BodyErrorKind::Http,
+            kind: if clash && matches!(status.as_u16(), 403 | 406 | 415) {
+                BodyErrorKind::Representation
+            } else {
+                BodyErrorKind::Http
+            },
             error: anyhow::anyhow!("Subscription returned HTTP {status}"),
         });
     }
@@ -384,7 +412,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, BodyE
         }
     }
     String::from_utf8(body).map_err(|error| BodyError {
-        kind: BodyErrorKind::Permanent,
+        kind: BodyErrorKind::Representation,
         error: anyhow::Error::from(error).context("Subscription is not valid UTF-8"),
     })
 }
@@ -480,7 +508,7 @@ fn subscription_entry_count(content: &str) -> usize {
             .count()
     };
     let clash_count = |text: &str| {
-        serde_yaml::from_str::<serde_yaml::Value>(text)
+        super::storage::parse_yaml_document(text)
             .ok()
             .and_then(|value| value.get("proxies")?.as_sequence().map(Vec::len))
             .unwrap_or(0)
@@ -490,23 +518,11 @@ fn subscription_entry_count(content: &str) -> usize {
         SubFormat::PlainLines => count(content),
         SubFormat::Clash => clash_count(content),
         SubFormat::Base64Lines => {
-            let clean: String = content
-                .chars()
-                .filter(|c| !c.is_ascii_whitespace())
-                .collect();
-            let decoded = general_purpose::STANDARD
-                .decode(&clean)
-                .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&clean))
-                .or_else(|_| general_purpose::URL_SAFE.decode(&clean))
-                .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&clean));
-            decoded
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .map_or(0, |text| match detect_format(&text) {
-                    SubFormat::PlainLines => count(&text),
-                    SubFormat::Clash => clash_count(&text),
-                    _ => 0,
-                })
+            decode_subscription_text(content).map_or(0, |text| match detect_format(&text) {
+                SubFormat::PlainLines => count(&text),
+                SubFormat::Clash => clash_count(&text),
+                _ => 0,
+            })
         }
         _ => 0,
     }
@@ -591,37 +607,33 @@ pub fn detect_format(content: &str) -> SubFormat {
 }
 
 fn looks_like_base64(content: &str) -> bool {
-    let clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut symbols = content.chars().filter(|c| !c.is_whitespace()).peekable();
+    symbols.peek().is_some()
+        && symbols.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+}
 
-    if clean.is_empty() {
-        return false;
-    }
-
-    // Base64 characters only
-    clean.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
-    })
+fn decode_subscription_text(content: &str) -> Result<String> {
+    // Some providers wrap the envelope at MIME line boundaries.
+    let unwrapped;
+    let encoded = if content.bytes().any(|b| b.is_ascii_whitespace()) {
+        unwrapped = content
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        unwrapped.as_slice()
+    } else {
+        content.as_bytes()
+    };
+    let decoded = super::decode_base64(encoded)
+        // Preserve the detailed error previously reported by the last decoder.
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+        .context("Failed to Base64 decode subscription content")?;
+    String::from_utf8(decoded).context("Invalid UTF-8 after Base64 decode")
 }
 
 /// Decode Base64 content and parse each line as a proxy URI
 fn parse_base64_lines(content: &str) -> Result<Vec<Node>> {
-    // Strip ALL ASCII whitespace: subscriptions are frequently wrapped at
-    // 76 chars (MIME style), and the STANDARD decoder rejects any `\n`.
-    let clean: String = content
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect();
-
-    // Try standard Base64 first, then URL-safe
-    let decoded = general_purpose::STANDARD
-        .decode(&clean)
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(&clean))
-        .or_else(|_| general_purpose::URL_SAFE.decode(&clean))
-        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(&clean))
-        .context("Failed to Base64 decode subscription content")?;
-
-    let text = String::from_utf8(decoded).context("Invalid UTF-8 after Base64 decode")?;
-
+    let text = decode_subscription_text(content)?;
     let text = text.trim_start_matches('\u{feff}').trim();
     if text.starts_with("[Interface]") {
         return super::wireguard::parse_profile(text).map(|node| vec![node]);

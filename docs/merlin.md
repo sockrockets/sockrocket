@@ -191,11 +191,15 @@ From [GitHub Releases](https://github.com/sockrockets/sockrocket/releases), get 
 1. Open the router Web UI → **Software Center** (koolcenter / softcenter).
 2. Use **Offline install** / upload package.
 3. Select the matching `sockrocket-merlin-*.tar.gz` → install.
-4. Open the **Sockrocket** tile (or `http://<router-lan-ip>/ext/sockrocket/sockrocket.asp`).
+4. Open the **Sockrocket** tile. To open the same page directly, visit `/Module_sockrocket.asp` on the router’s management origin. On standard Merlin, use `/ext/sockrocket/sockrocket.asp`. Both paths are case-sensitive.
 
 Wrong platform `.valid` → softcenter rejects the package or the binary fails with *Exec format error*. Re-check `uname -m` and the model tables above (`hnd` vs `hnd_v8` is the usual mistake).
 
 Archive root is always `sockrocket/` (koolcenter module name).
+
+For the ARM64 `hnd_v8` package, a fresh install fits in 13 MB (13,000,000 bytes) of free JFFS space on the standard Merlin and Software Center layouts tested. Upload and extract the archive under `/tmp`; the compressed archive and expanded files coexist there during extraction. Use `df -Pk /jffs /tmp` to check each filesystem.
+
+An online upgrade also needs space for the recovery files. The updater measures the existing configuration, firmware hooks and Web UI files, and keeps the old executable by renaming it on JFFS. Large configuration backups or old CGI entries that contain full executable copies can increase the requirement. The installed updater performs this check. For a router running v0.1.5 with limited free space, use **Offline install** with the new package to use its space check.
 
 ### 3. SSH (optional)
 

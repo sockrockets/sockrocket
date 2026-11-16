@@ -39,6 +39,7 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     let mut server = json!({"type":kind,"listen":host,"listen_port":port});
     let mut client = json!({"type":kind,"server":host,"server_port":port});
     match kind {
+        "mieru" => {}
         "shadowsocks" => {
             let method = option.unwrap_or("aes-128-gcm");
             let key = match method {
@@ -109,7 +110,10 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     let mut proc = if mihomo {
         let cmd = std::env::var_os("SOCKROCKET_REFERENCE_MIHOMO")
             .context("Mihomo executable required")?;
-        let config = json!({"listeners":[{"name":"test","type":"tuic","listen":host,"port":port,"users":{(id):pw},"certificate":server["tls"]["certificate"],"private-key":server["tls"]["key"],"alpn":["h3"]}],"rules":["MATCH,DIRECT"],"log-level":"error"});
+        let mut config = json!({"listeners":[{"name":"test","type":"tuic","listen":host,"port":port,"users":{(id):pw},"certificate":server["tls"]["certificate"],"private-key":server["tls"]["key"],"alpn":["h3"]}],"rules":["MATCH,DIRECT"],"log-level":"error"});
+        if kind == "mieru" {
+            config["listeners"] = json!([{"name":"local","type":"mieru","listen":host,"port":port,"transport":"TCP","users":{"test":pw},"user-hint-is-mandatory":true}]);
+        }
         let dir = std::env::temp_dir().join(format!("sockrocket-mihomo-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir)?;
         let child = Command::new(cmd)
@@ -174,7 +178,12 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    let node = if kind == "tuic" && option == Some("uot_v1") {
+    let node = if kind == "mieru" {
+        let yaml = json!({"proxies":[{"name":"local","type":"mieru","server":host,"port":port,"transport":"TCP","username":"test","password":pw}]});
+        sockrocket_core::parse_clash_config(&yaml.to_string())?
+            .pop()
+            .context("Mieru node skipped")?
+    } else if kind == "tuic" && option == Some("uot_v1") {
         let yaml = json!({"proxies":[{"name":"local","type":"tuic","server":host,"port":port,"uuid":id,"password":pw,"udp":true,"udp-over-stream":true,"heartbeat-interval":250,"skip-cert-verify":true,"sni":"localhost","alpn":["h3"]}]});
         sockrocket_core::parse_clash_config(&yaml.to_string())?
             .pop()
@@ -224,6 +233,9 @@ async fn check(kind: &str, option: Option<&str>, mihomo: bool) -> Result<()> {
     };
     let outbound = create_outbound_unwarmed(&node)?;
     check_tcp_echo(&outbound).await?;
+    if kind == "mieru" {
+        return Ok(());
+    }
     let udp = UdpSocket::bind((host, 0)).await?;
     let tunnel = outbound
         .0
@@ -518,5 +530,59 @@ async fn reference_xray_vless_encryption_matrix() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires SOCKROCKET_REFERENCE_MIHOMO and loopback sockets"]
+async fn reference_mieru_tcp() -> Result<()> {
+    check("mieru", None, true).await
+}
+
+#[test]
+fn mieru_subscription_roundtrip() -> Result<()> {
+    use sockrocket_core::config::v2ray::parse_proxy_uri;
+    let link = "mierus://user%40host:p%3A%40ss@[::1]?profile=Test%20node&port=2027&protocol=TCP";
+    let node = parse_proxy_uri(link)?;
+    ensure!(node.name == "Test node" && node.server == "::1" && node.port == 2027);
+    let yaml = sockrocket_core::config::export::nodes_to_clash_yaml(std::slice::from_ref(&node))?;
+    let restored = sockrocket_core::parse_clash_config(&yaml)?
+        .pop()
+        .context("node skipped")?;
+    let next = parse_proxy_uri(&sockrocket_core::node_to_share_uri(&restored))?;
+    ensure!(
+        serde_json::to_value(&next.protocol)?
+            == json!({"type":"mieru","username":"user@host","password":"p:@ss"})
+    );
+    ensure!(!next.protocol.supports_udp());
+    ensure!(parse_proxy_uri(&link.replace("TCP", "UDP")).is_err());
+    ensure!(parse_proxy_uri(&format!("{link}&port=123")).is_err());
+    ensure!(parse_proxy_uri(&format!("{link}&mtu=1400&traffic-pattern=")).is_ok());
+    ensure!(parse_proxy_uri(&format!("{link}&mtu=0")).is_err());
+    ensure!(parse_proxy_uri(&link.replace("Test%20node", "")).is_err());
+    ensure!(parse_proxy_uri(&link.replace("user%40host", &"x".repeat(65))).is_err());
+    let mut native = serde_json::to_value(&next)?;
+    native["protocol"]["transport"] = json!("UDP");
+    ensure!(serde_json::from_value::<sockrocket_core::Node>(native).is_err());
+    Ok(())
+}
+
+#[test]
+fn mieru_clash_preserves_explicit_restrictions() -> Result<()> {
+    let base = json!({
+        "name": "test", "type": "mieru", "server": "example.com", "port": 2027,
+        "username": "user", "password": "password"
+    });
+    let mut udp_only = base.clone();
+    udp_only["sockrocket-udp-only"] = json!(true);
+    let mut pinned = base.clone();
+    pinned["fingerprint"] = json!("ab".repeat(32));
+    let mut tcp = base;
+    tcp["name"] = json!("tcp");
+    tcp["sockrocket-udp-only"] = json!(false);
+    let nodes = sockrocket_core::parse_clash_config(
+        &json!({"proxies": [udp_only, pinned, tcp]}).to_string(),
+    )?;
+    ensure!(nodes.len() == 1 && nodes[0].name == "tcp");
     Ok(())
 }

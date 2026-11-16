@@ -13,6 +13,7 @@ Sockrocket uses one native Rust core shared by the desktop client, CLI and Merli
 | TUIC v5 | Yes | Yes | Native QUIC datagrams, reliable QUIC streams, UDP-over-stream v1/v2 |
 | Hysteria2 | Yes | Yes | Native QUIC; certificate pinning, ALPN, bandwidth limits and Fast Open; Salamander, Gecko and UDP destination port hopping |
 | AnyTLS v2 | Yes | Yes | Native TLS sessions with bounded reuse; UDP-over-TCP v2 |
+| Mieru v3 | Experimental | No | TCP carrier, one fixed port, standard handshake and one session per connection. Import a Clash node or a simple `mierus://` link. Mieru closes both directions together, so a destination that waits for TCP FIN before replying is unsupported. Independent server interoperability is pending. |
 | WireGuard | Yes | Yes | Native userspace, up to 64 peers per node; UDP payload must fit tunnel MTU |
 
 UDP availability also depends on the node's `udp` option. Certificate verification is enabled by default. TLS, WebSocket and REALITY are transports, not separate VPN protocols.

@@ -1,0 +1,20 @@
+listen_addr: 127.0.0.1
+socks_port: 1080
+http_port: 1087
+ipv6_mode: compatibility
+proxy_mode: rule
+nodes: []
+active_node: null
+subscriptions: []
+rules: []
+explicit_group_bindings: false
+builtin_route: direct
+auto_connect: false
+tun_was_enabled: false
+health_check:
+  enabled: false
+  interval_secs: 60
+  failure_threshold: 2
+  auto_switch: true
+groups: []
+locale: en

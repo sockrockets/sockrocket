@@ -13,7 +13,6 @@ SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
 SOCKROCKET_SCRIPTS="$SOCKROCKET_DIR/scripts"
 SOCKROCKET_PID="$SOCKROCKET_DIR/sockrocket.pid"
 SOCKROCKET_LOG="$SOCKROCKET_DIR/sockrocket.log"
-SOCKROCKET_LOCK="$SOCKROCKET_DIR/sockrocket.lock"
 # Runtime fail-open marker: present ⇒ LAN uses direct DNS/routing; config
 # toggles still express user intent and are re-applied when the probe recovers.
 DEGRADED_FILE="$SOCKROCKET_DIR/.lan_degraded"
@@ -55,15 +54,16 @@ ok()    { log_ok "$*"; }
 warn()  { log_warn "$*"; }
 err()   { log_error "$*"; }
 
-is_running() {
-    [ -f "$SOCKROCKET_PID" ] || return 1
+cli_pid_running() {
+    [ -f "$1" ] || return 1
     local pid
-    pid=$(cat "$SOCKROCKET_PID")
+    pid=$(cat "$1")
     kill -0 "$pid" 2>/dev/null || return 1
-    # Verify the PID belongs to sockrocket-cli, not a reused PID
+    # A stale PID file can point to another process.
     grep -q "sockrocket-cli" "$PROC_BASE/$pid/comm" 2>/dev/null || return 1
-    return 0
 }
+
+is_running() { cli_pid_running "$SOCKROCKET_PID"; }
 
 # ── Orphan daemon cleanup ─────────────────────────────────────────────────────
 # PIDs of sockrocket-cli DAEMON processes, found by full command line rather than the
@@ -123,7 +123,7 @@ kill_stray_apis() {
             [ -n "$keep" ] && [ "$p" = "$keep" ] && continue
             left="$left $p"
         done
-        [ -z "$(echo $left)" ] && return 0
+        [ -z "$left" ] && return 0
         sleep 1; wait=$((wait + 1))
     done
     for p in $(api_pids); do
@@ -147,21 +147,7 @@ api_port() {
     case "$p" in ''|*[!0-9]*) echo "$DEFAULT_API_PORT" ;; *) echo "$p" ;; esac
 }
 
-# Publish the API port next to the Web UI page: the .asp is static and
-# cannot read config.yaml, so the browser learns the port from api.js.
-write_api_js() {
-    [ -d /www/ext/sockrocket ] || return 0
-    printf 'var SOCKROCKET_API_PORT = %s;\n' "$1" > /www/ext/sockrocket/api.js 2>/dev/null || true
-}
-
-api_is_running() {
-    [ -f "$API_PID" ] || return 1
-    local pid
-    pid=$(cat "$API_PID")
-    kill -0 "$pid" 2>/dev/null || return 1
-    grep -q "sockrocket-cli" "$PROC_BASE/$pid/comm" 2>/dev/null || return 1
-    return 0
-}
+api_is_running() { cli_pid_running "$API_PID"; }
 
 # Software Center's installed bit is not its enabled bit. Only the proxy
 # daemon counts; the always-on API and a saved configuration do not.
@@ -187,7 +173,121 @@ do_softcenter_status() {
     fi
 }
 
+publish_web_page() {
+    local source="$SOCKROCKET_DIR/webui/sockrocket.asp" target="$1" pending
+    [ -s "$source" ] && [ ! -d "$target" ] || return 1
+    mkdir -p "${target%/*}" || return 1
+    if [ -f "$target" ] && cmp -s "$source" "$target" 2>/dev/null; then
+        chmod 644 "$target"
+        return
+    fi
+    pending=$(mktemp "${target}.XXXXXX") || return 1
+    if cp "$source" "$pending" && chmod 644 "$pending" && mv -f "$pending" "$target"; then
+        return 0
+    fi
+    rm -f "$pending"
+    return 1
+}
+
+publish_merlin_page() (
+    umask 022
+    for page in /www/ext/sockrocket/sockrocket.asp /tmp/var/wwwext/sockrocket/sockrocket.asp; do
+        if publish_web_page "$page" 2>/dev/null; then
+            printf '%s\n' "$page"
+            return 0
+        fi
+    done
+    return 1
+)
+
+publish_cgi() (
+    local source="$1" target="$2" staging rc
+    # The request supplies CGI input through stdin and the environment. Its
+    # executable path and subcommand always come from this installed launcher.
+    launcher() { printf '%s\n' '#!/bin/sh' 'exec /jffs/addons/sockrocket/sockrocket-cli cgi'; }
+    [ ! -d "$target" ] || return 1
+    if [ -L "$target" ] && [ "$target" -ef "$source" ]; then return 0; fi
+    if [ -f "$target" ] && [ ! -L "$target" ] && [ -x "$target" ] &&
+        launcher | cmp -s - "$target"; then return 0; fi
+
+    # Stage next to the endpoint. Renaming also replaces a running legacy
+    # binary copy without truncating it or following an existing symlink.
+    staging="$target.install.$$"
+    (umask 077; mkdir "$staging") || return 1
+    if ln -s "$source" "$staging/cgi" 2>/dev/null ||
+        { launcher > "$staging/cgi" && chmod 700 "$staging/cgi"; }; then
+        mv -f "$staging/cgi" "$target"
+        rc=$?
+    else
+        rc=1
+    fi
+    rm -rf "$staging"
+    return "$rc"
+)
+
+restore_cgi() (
+    umask 022
+    [ -x "$SOCKROCKET_BIN" ] || return 1
+    publish_cgi "$SOCKROCKET_BIN" "$SOCKROCKET_DIR/sockrocket.cgi" || return 1
+    # KoolCenter's read-only httpd tree uses the separately installed API bridge.
+    if ! mkdir -p /www/cgi-bin 2>/dev/null ||
+        ! publish_cgi "$SOCKROCKET_DIR/sockrocket.cgi" /www/cgi-bin/sockrocket.cgi 2>/dev/null; then
+        [ -f /koolshare/scripts/base.sh ] || return 1
+    fi
+)
+
+restore_web_ui() (
+    # Only public web assets are created here. The daemon keeps umask 077.
+    umask 022
+    restore_cgi || log_warn "Could not restore CGI launcher"
+
+    # Web UI page on standard Merlin: /www may be tmpfs and wiped on reboot.
+    # Always refresh from the durable copy so deploys are not left stale.
+    if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+        publish_merlin_page >/dev/null || log_warn "Could not restore Merlin Web UI"
+    fi
+
+    # koolcenter self-heal: Softcenter menu opens Module_sockrocket.asp.
+    # Always overwrite from the durable webui so UI updates are not stuck
+    # on the first-install copy (deploy used to miss this path).
+    if [ -d /koolshare/scripts ] && [ -f /koolshare/scripts/base.sh ]; then
+        local KS_WEBS="/koolshare/webs"
+        if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
+            publish_web_page "$KS_WEBS/Module_sockrocket.asp" || log_warn "Could not restore Software Center page"
+            if [ -d /jffs/.koolshare/webs ]; then
+                publish_web_page /jffs/.koolshare/webs/Module_sockrocket.asp || log_warn "Could not restore persistent Software Center page"
+            fi
+        fi
+        if [ ! -f /koolshare/res/icon-sockrocket.png ]; then
+            if [ -f "$SOCKROCKET_DIR/res/icon-sockrocket.png" ]; then
+                mkdir -p /koolshare/res 2>/dev/null || true
+                cp "$SOCKROCKET_DIR/res/icon-sockrocket.png" /koolshare/res/icon-sockrocket.png 2>/dev/null || true
+            fi
+        fi
+        if [ ! -f /koolshare/scripts/sockrocket_api.sh ] && [ -f "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" ]; then
+            cp "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" /koolshare/scripts/sockrocket_api.sh 2>/dev/null
+            chmod +x /koolshare/scripts/sockrocket_api.sh 2>/dev/null || true
+        fi
+        if which dbus >/dev/null 2>&1; then
+            [ -z "$(dbus get softcenter_module_sockrocket_install 2>/dev/null)" ] && \
+                dbus set softcenter_module_sockrocket_install=1 2>/dev/null || true
+            [ -z "$(dbus get softcenter_module_sockrocket_title 2>/dev/null)" ] && \
+                dbus set softcenter_module_sockrocket_title="Sockrocket" 2>/dev/null || true
+            [ "$(dbus get softcenter_module_sockrocket_name 2>/dev/null)" = sockrocket ] || \
+                dbus set softcenter_module_sockrocket_name="sockrocket" 2>/dev/null || true
+            [ -z "$(dbus get softcenter_module_sockrocket_description 2>/dev/null)" ] && \
+                dbus set softcenter_module_sockrocket_description="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
+            [ "$(dbus get softcenter_module_sockrocket_indexpage 2>/dev/null)" = Module_sockrocket.asp ] || \
+                dbus set softcenter_module_sockrocket_indexpage="Module_sockrocket.asp" 2>/dev/null || true
+            local VER
+            VER=$(cat "$SOCKROCKET_DIR/version" 2>/dev/null)
+            [ -n "$VER" ] && dbus set softcenter_module_sockrocket_version="$VER" 2>/dev/null || true
+        fi
+    fi
+)
+
 do_api_start() {
+    restore_web_ui
     sync_softcenter_state
     api_is_running && return 0
     [ -x "$SOCKROCKET_BIN" ] || return 1
@@ -199,7 +299,6 @@ do_api_start() {
     # cannot starve the data plane on a busy ARM core.
     nice -n 5 "$SOCKROCKET_BIN" api "$port" >> "$SOCKROCKET_LOG" 2>&1 &
     echo $! > "$API_PID"
-    write_api_js "$port"
     sleep 1
     if api_is_running; then
         log_info "API bridge started (PID $(cat "$API_PID"), port $port)"
@@ -344,7 +443,7 @@ remove_cron() {
 
 # ── DNS config ────────────────────────────────────────────────────────────────
 get_config_value() {
-    grep "^${1}:" "$SOCKROCKET_CONF" 2>/dev/null | awk '{print $2}' | head -1 | tr -d '"'
+    awk -v key="$1:" 'index($0, key) == 1 { gsub(/"/, "", $2); print $2; exit }' "$SOCKROCKET_CONF" 2>/dev/null || :
 }
 
 # Count nodes / subscriptions in config.yaml (0 when the section is [] or absent)
@@ -614,6 +713,20 @@ wait_for_main_dns() {
     return 1
 }
 
+# Publish exact local records so dnsmasq can answer user-configured private
+# addresses while retaining rebind protection for every upstream response.
+render_dnsmasq_config() {
+    local dest="$1" dns_port="$2" router_ip="$3" template="$4" transparent=""
+    local tmp="${dest%/*}/.sockrocket.conf.$$"
+    if [ "$(conf_bool transparent_proxy true)" = true ]; then transparent=--transparent; fi
+    if ! sed -e "s/__DNS_PORT__/$dns_port/g" -e "s/__ROUTER_IP__/$router_ip/g" "$template" > "$tmp" ||
+        ! "$SOCKROCKET_BIN" --dnsmasq-hosts "$SOCKROCKET_CONF" $transparent >> "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; else mv -f "$tmp" "$dest"; fi
+}
+
 update_dnsmasq() {
     local action="$1"
     # Overridable for tests/integration/sockrocket_sh_test.sh (default stays the firmware path).
@@ -646,9 +759,7 @@ update_dnsmasq() {
             # Upgrade from the old shared-file pin before a new SDN starts.
             unpin_dns_upstream || return 1
         fi
-        sed -e "s/__DNS_PORT__/$dns_port/g" \
-            -e "s/__ROUTER_IP__/$router_ip/g" \
-            "$TEMPLATE" > "$SOCKROCKET_DNSMASQ"
+        render_dnsmasq_config "$SOCKROCKET_DNSMASQ" "$dns_port" "$router_ip" "$TEMPLATE" || return 1
         if merlin_3006 && ! pin_dns_upstream; then
             update_dnsmasq stop
             return 1
@@ -756,7 +867,7 @@ update_dnsmasq() {
         [ -f "${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}" ] && changed=1
         resolv_file="${SOCKROCKET_RESOLV_FILE:-/tmp/resolv.dnsmasq}"
         grep -q '^server=127.0.0.1#' "$resolv_file" 2>/dev/null && changed=1
-        rm -f "$SOCKROCKET_DNSMASQ"
+        rm -f "$SOCKROCKET_DNSMASQ" "$SOCKROCKET_DIR/.dnsmasq_reload_pending"
         rm -f "${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
         [ -x "$SOCKROCKET_DIR/scripts/iptables.sh" ] && \
             "$SOCKROCKET_DIR/scripts/iptables.sh" dns-stop >/dev/null 2>&1 || true
@@ -830,65 +941,6 @@ do_start() {
 
     # The Web UI's API bridge must run regardless of proxy state.
     do_api_start
-
-    # Restore CGI symlink (tmpfs /www/cgi-bin loses files on reboot).
-    # Skipped automatically on koolcenter firmware where /www is read-only
-    # (mkdir fails) — the koolcenter path uses the API bridge instead.
-    local cgi_src="$SOCKROCKET_DIR/sockrocket.cgi"
-    local cgi_dst="/www/cgi-bin/sockrocket.cgi"
-    if [ -f "$cgi_src" ] && [ ! -e "$cgi_dst" ]; then
-        if mkdir -p "/www/cgi-bin" 2>/dev/null; then
-            ln -sf "$cgi_src" "$cgi_dst" 2>/dev/null || cp "$cgi_src" "$cgi_dst" 2>/dev/null || true
-        fi
-    fi
-
-    # Web UI page on standard Merlin: /www may be tmpfs and wiped on reboot.
-    # Always refresh from the durable copy so deploys are not left stale.
-    if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
-        if mkdir -p /www/ext/sockrocket 2>/dev/null; then
-            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /www/ext/sockrocket/sockrocket.asp 2>/dev/null || true
-        fi
-        mkdir -p /tmp/var/wwwext/sockrocket 2>/dev/null || true
-        cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /tmp/var/wwwext/sockrocket/sockrocket.asp 2>/dev/null || true
-    fi
-    write_api_js "$(api_port)"
-
-    # koolcenter self-heal: Softcenter menu opens Module_sockrocket.asp.
-    # Always overwrite from the durable webui so UI updates are not stuck
-    # on the first-install copy (deploy used to miss this path).
-    if [ -d /koolshare/scripts ] && [ -f /koolshare/scripts/base.sh ]; then
-        local KS_WEBS="/koolshare/webs"
-        if [ -f "$SOCKROCKET_DIR/webui/sockrocket.asp" ]; then
-            mkdir -p "$KS_WEBS" /jffs/.koolshare/webs 2>/dev/null || true
-            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp" 2>/dev/null || true
-            cp "$SOCKROCKET_DIR/webui/sockrocket.asp" /jffs/.koolshare/webs/Module_sockrocket.asp 2>/dev/null || true
-        fi
-        if [ ! -f /koolshare/res/icon-sockrocket.png ]; then
-            if [ -f "$SOCKROCKET_DIR/res/icon-sockrocket.png" ]; then
-                mkdir -p /koolshare/res 2>/dev/null || true
-                cp "$SOCKROCKET_DIR/res/icon-sockrocket.png" /koolshare/res/icon-sockrocket.png 2>/dev/null || true
-            fi
-        fi
-        if [ ! -f /koolshare/scripts/sockrocket_api.sh ] && [ -f "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" ]; then
-            cp "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" /koolshare/scripts/sockrocket_api.sh 2>/dev/null
-            chmod +x /koolshare/scripts/sockrocket_api.sh 2>/dev/null || true
-        fi
-        if which dbus >/dev/null 2>&1; then
-            [ -z "$(dbus get softcenter_module_sockrocket_install 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_install=1 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_title 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_title="Sockrocket" 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_name 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_name="Sockrocket" 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_description 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_description="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
-            [ -z "$(dbus get softcenter_module_sockrocket_indexpage 2>/dev/null)" ] && \
-                dbus set softcenter_module_sockrocket_indexpage="Module_sockrocket.asp" 2>/dev/null || true
-            local VER
-            VER=$(cat "$SOCKROCKET_DIR/version" 2>/dev/null)
-            [ -n "$VER" ] && dbus set softcenter_module_sockrocket_version="$VER" 2>/dev/null || true
-        fi
-    fi
 
     rotate_log
     info "Starting Sockrocket..."
@@ -1035,12 +1087,10 @@ TUN_DEV="${SOCKROCKET_TUN_DEV:-/dev/net/tun}"
 # Read a boolean config key with a default. Accepts YAML true/false and the
 # quoted forms; anything else falls back to $2.
 conf_bool() {
-    local v
-    v=$(get_config_value "$1")
-    case "$(echo "$v" | tr 'A-Z' 'a-z')" in
-        true|yes|1)  echo "true" ;;
-        false|no|0)  echo "false" ;;
-        *)           echo "$2" ;;
+    case "$(get_config_value "$1")" in
+        [Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|1) echo true ;;
+        [Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|0) echo false ;;
+        *) echo "$2" ;;
     esac
 }
 
@@ -1161,6 +1211,10 @@ restore_direct_network() {
             ip6tables -t "$v6_table" -X "$v6_chain" 2>/dev/null || true
         done
         v6_attempt=0
+        ip6tables -t mangle -F SOCKROCKET_CN6_FLOW 2>/dev/null || true
+        ip6tables -t mangle -X SOCKROCKET_CN6_FLOW 2>/dev/null || true
+        ipset destroy sockrocket_cn6_sources 2>/dev/null || true
+        ipset destroy sockrocket_cn6 2>/dev/null || true
         while [ "$v6_attempt" -lt 32 ] && ip6tables -D FORWARD -j SOCKROCKET_IPV6_FORWARD 2>/dev/null; do v6_attempt=$((v6_attempt+1)); done
         if ip6tables -C FORWARD -j SOCKROCKET_IPV6_FORWARD 2>/dev/null; then restore_rc=1; fi
         ip6tables -F SOCKROCKET_IPV6_FORWARD 2>/dev/null || true
@@ -2295,6 +2349,19 @@ do_reapply_policy() {
         return 1
     fi
     if [ "$want_dns" = "true" ]; then
+        local conf="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf"
+        if [ -f "$conf" ]; then
+            local pending="$SOCKROCKET_DIR/.dnsmasq_reload_pending" before router_ip port
+            before=$(sha256sum "$conf") || return 1
+            router_ip=$(nvram get lan_ipaddr) && [ -n "$router_ip" ] || return 1
+            port=$(get_config_value dns_port)
+            render_dnsmasq_config "$conf" "${port:-5300}" "$router_ip" "$SOCKROCKET_DIR/scripts/dnsmasq.conf.template" || return 1
+            if [ "$before" != "$(sha256sum "$conf")" ] || [ -e "$pending" ]; then
+                touch "$pending" || return 1
+                service restart_dnsmasq >/dev/null 2>&1 && wait_for_main_dns || return 1
+                rm -f "$pending"
+            fi
+        fi
         if ! iptables -t nat -C PREROUTING -j SOCKROCKET_DNS 2>/dev/null; then
             if ! "$SOCKROCKET_DIR/scripts/iptables.sh" dns-start >> "$SOCKROCKET_LOG" 2>&1; then
                 enter_lan_degraded "IPv4 DNS hijack missing and could not be installed"
@@ -2323,14 +2390,13 @@ case "$1" in
     stop)
         run_locked 15 do_stop
         ;;
-    restart)
-        run_locked 15 do_restart
-        ;;
-    reload)
+    restart|reload)
         run_locked 15 do_restart
         ;;
     status)  do_status ;;
     software-center-status) do_softcenter_status ;;
+    install-cgi) restore_cgi ;;
+    install-page) publish_merlin_page ;;
     log)     tail -100 "$SOCKROCKET_LOG" 2>/dev/null || info "No log file found" ;;
     api-start)
         run_locked 5 do_api_start

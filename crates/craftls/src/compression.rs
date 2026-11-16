@@ -230,13 +230,19 @@ impl CompressionProvider for ZstdClient {
 /// returns Unsupported; the full *_DEFAULT providers remain available for
 /// callers that need both operations. The advertised algorithms are unchanged.
 pub fn client_certificate_decompressor(alg: CertificateCompressionAlgorithm) -> Option<&'static CertificateCompression> {
+    static ZSTD: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Zstd, provider: &ZstdClient };
+    match alg {
+        CertificateCompressionAlgorithm::Zstd => Some(&ZSTD),
+        _ => browser_certificate_decompressor(alg),
+    }
+}
+
+pub(crate) fn browser_certificate_decompressor(alg: CertificateCompressionAlgorithm) -> Option<&'static CertificateCompression> {
     static BROTLI: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Brotli, provider: &BrotliClient };
     static ZLIB: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Zlib, provider: &ZlibClient };
-    static ZSTD: CertificateCompression = CertificateCompression { alg: CertificateCompressionAlgorithm::Zstd, provider: &ZstdClient };
     match alg {
         CertificateCompressionAlgorithm::Brotli => Some(&BROTLI),
         CertificateCompressionAlgorithm::Zlib => Some(&ZLIB),
-        CertificateCompressionAlgorithm::Zstd => Some(&ZSTD),
         _ => None,
     }
 }

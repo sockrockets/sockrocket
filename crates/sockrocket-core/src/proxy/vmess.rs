@@ -58,15 +58,20 @@ pub(super) struct Framing {
     pub authenticated_length: bool,
 }
 
+const CHUNK_MASKING: u8 = 0x04;
+const GLOBAL_PADDING: u8 = 0x08;
+const AUTHENTICATED_LENGTH: u8 = 0x10;
+
 impl Framing {
-    fn flags(self, security: VMessSecurity) -> u8 {
+    fn flags(self, security: VMessSecurity, aead_header: bool) -> u8 {
         match security {
             VMessSecurity::Zero => 0,
             VMessSecurity::None => 1,
             _ => {
-                1 | (u8::from(self.padding || self.authenticated_length) << 2)
-                    | (u8::from(self.padding) << 3)
-                    | (u8::from(self.authenticated_length) << 4)
+                let masking = aead_header || self.padding || self.authenticated_length;
+                1 | (u8::from(masking) * CHUNK_MASKING)
+                    | (u8::from(self.padding) * GLOBAL_PADDING)
+                    | (u8::from(self.authenticated_length) * AUTHENTICATED_LENGTH)
             }
         }
     }
@@ -179,6 +184,8 @@ impl VMessOutbound {
             self.security
         };
 
+        let flags = self.framing.flags(security, self.alter_key.is_none());
+
         // Generate session keys (in a block so rng drops before await)
         let (req_body_key, req_body_iv, resp_auth, header) = {
             let mut rng = rand::rng();
@@ -195,7 +202,7 @@ impl VMessOutbound {
                 &target_host,
                 port,
                 command,
-                self.framing,
+                flags,
                 self.alter_key.as_ref(),
             )?;
 
@@ -225,9 +232,7 @@ impl VMessOutbound {
         if self.alter_key.is_some() {
             vmess_stream.state = ReadState::LegacyHeader;
         }
-        if !matches!(security, VMessSecurity::None | VMessSecurity::Zero) {
-            vmess_stream.configure_framing(self.framing, security, &req_body_key, &req_body_iv);
-        }
+        vmess_stream.configure_framing(flags, security, &req_body_key, &req_body_iv);
         Ok(vmess_stream)
     }
 }
@@ -444,7 +449,7 @@ fn build_vmess_header(
         host,
         port,
         1,
-        Framing::default(),
+        Framing::default().flags(security, true),
         None,
     )
 }
@@ -459,7 +464,7 @@ fn build_vmess_header_command(
     host: &str,
     port: u16,
     command: u8,
-    framing: Framing,
+    flags: u8,
     alter_key: Option<&[u8; 16]>,
 ) -> Result<Vec<u8>> {
     let cmd_key = vmess_cmd_key(uuid);
@@ -481,7 +486,7 @@ fn build_vmess_header_command(
     header.extend_from_slice(body_key);
     // Response Auth
     header.push(resp_auth);
-    header.push(framing.flags(security));
+    header.push(flags);
     // Padding length (4 bits) + Security (4 bits)
     let padding_len: u8 = rng.random::<u8>() % 16;
     header.push((padding_len << 4) | security.byte());
@@ -663,6 +668,7 @@ struct VMessStream {
     length_scratch: Vec<u8>,
     read_mask: Option<Box<sha3::Shake128Reader>>,
     write_mask: Option<Box<sha3::Shake128Reader>>,
+    global_padding: bool,
     read_padding: usize,
     len_pos: usize,
     /// Length (ciphertext + tag) of the chunk being assembled.
@@ -909,6 +915,7 @@ impl VMessStream {
             length_scratch: Vec::new(),
             read_mask: None,
             write_mask: None,
+            global_padding: false,
             read_padding: 0,
             len_pos: 0,
             chunk_len: 0,
@@ -929,21 +936,24 @@ impl VMessStream {
 
     fn configure_framing(
         &mut self,
-        framing: Framing,
+        flags: u8,
         security: VMessSecurity,
         request_key: &[u8; 16],
         request_iv: &[u8; 16],
     ) {
-        if framing.padding {
+        if flags & CHUNK_MASKING != 0 {
             fn mask(iv: &[u8; 16]) -> Box<sha3::Shake128Reader> {
                 use sha3::digest::{ExtendableOutput, Update};
                 Box::new(sha3::Shake128::default().chain(iv).finalize_xof())
             }
             self.read_mask = Some(mask(&self.resp_iv));
             self.write_mask = Some(mask(request_iv));
+        }
+        self.global_padding = flags & GLOBAL_PADDING != 0;
+        if self.global_padding {
             self.max_chunk -= 63;
         }
-        if framing.authenticated_length {
+        if flags & AUTHENTICATED_LENGTH != 0 {
             let key = kdf(request_key, &[b"auth_len"]);
             self.length_cipher = Some(Box::new(VMessChunkCipher::new(
                 security,
@@ -1219,10 +1229,10 @@ impl AsyncRead for VMessStream {
                         }
                     }
                     this.len_pos = 0;
-                    this.read_padding = this
-                        .read_mask
-                        .as_deref_mut()
-                        .map_or(0, |m| usize::from(next_mask(m) % 64));
+                    if this.global_padding {
+                        this.read_padding =
+                            usize::from(next_mask(this.read_mask.as_deref_mut().unwrap()) % 64);
+                    }
                     let chunk_len = if let Some(cipher) = &this.length_cipher {
                         this.length_scratch.clear();
                         this.length_scratch.extend_from_slice(&this.len_buf);
@@ -1353,10 +1363,11 @@ impl AsyncWrite for VMessStream {
             this.out.clear();
             return Poll::Ready(Err(io::Error::other(format!("{e:#}"))));
         }
-        let padding = this
-            .write_mask
-            .as_deref_mut()
-            .map_or(0, |m| usize::from(next_mask(m) % 64));
+        let padding = if this.global_padding {
+            usize::from(next_mask(this.write_mask.as_deref_mut().unwrap()) % 64)
+        } else {
+            0
+        };
         let end = this.out.len();
         this.out.resize(end + padding, 0);
         if padding > 0 {
@@ -1651,6 +1662,79 @@ mod tests {
         let mut out = enc_len;
         out.extend_from_slice(&enc_payload);
         out
+    }
+
+    #[test]
+    fn vmess_framing_flags_preserve_explicit_options_and_legacy_defaults() {
+        let security = VMessSecurity::Aes128Gcm;
+        let default = Framing::default();
+        assert_eq!(default.flags(security, true), 0x05);
+        assert_eq!(default.flags(security, false), 0x01);
+        for (padding, authenticated_length, expected) in
+            [(true, false, 0x0d), (false, true, 0x15), (true, true, 0x1d)]
+        {
+            let framing = Framing {
+                padding,
+                authenticated_length,
+            };
+            for aead_header in [false, true] {
+                assert_eq!(framing.flags(security, aead_header), expected);
+                assert_eq!(framing.flags(VMessSecurity::None, aead_header), 1);
+                assert_eq!(framing.flags(VMessSecurity::Zero, aead_header), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vmess_default_masked_chunks_match_wire_vectors_in_both_directions() {
+        for security in [VMessSecurity::Aes128Gcm, VMessSecurity::Chacha20Poly1305] {
+            let (client, mut peer) = tokio::io::duplex(1024);
+            let mut stream = VMessStream::new(
+                Box::new(client),
+                Vec::new(),
+                [1; 16],
+                [2; 16],
+                [3; 16],
+                [4; 16],
+                42,
+                security,
+            )
+            .await
+            .unwrap();
+            stream.configure_framing(
+                Framing::default().flags(security, true),
+                security,
+                &[1; 16],
+                &[2; 16],
+            );
+
+            peer.write_all(&seal_response_header(42, &[3; 16], &[4; 16]))
+                .await
+                .unwrap();
+            let req_cipher = VMessChunkCipher::new(security, &[1; 16], &[2; 16]);
+            let resp_cipher = VMessChunkCipher::new(security, &[3; 16], &[4; 16]);
+            // First two big-endian words of SHAKE128 for [2;16] and [4;16].
+            for (count, request_mask, response_mask, data) in [
+                (0, 0xfbe0u16, 0x4061u16, b"ping".as_slice()),
+                (1, 0xb44a, 0x8331, b"second chunk".as_slice()),
+            ] {
+                stream.write_all(data).await.unwrap();
+                let length = data.len() + 16;
+                assert_eq!(peer.read_u16().await.unwrap(), request_mask ^ length as u16);
+                let mut body = vec![0; length];
+                peer.read_exact(&mut body).await.unwrap();
+                req_cipher.decrypt_in_place(count, &mut body).unwrap();
+                assert_eq!(body, data);
+
+                resp_cipher.encrypt_in_place(count, &mut body).unwrap();
+                peer.write_u16(response_mask ^ length as u16).await.unwrap();
+                peer.write_all(&body).await.unwrap();
+            }
+            peer.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"pingsecond chunk");
+        }
     }
 
     /// Response auth mismatch must surface as a READ error (not a silent EOF)

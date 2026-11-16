@@ -172,18 +172,92 @@ struct ClashProxyGroup {
     proxies: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ClashMieru {
+    name: String,
+    server: String,
+    port: u16,
+    username: String,
+    password: String,
+    transport: Option<String>,
+    multiplexing: Option<String>,
+    handshake_mode: Option<String>,
+    traffic_pattern: Option<String>,
+    #[serde(default)]
+    udp: bool,
+    #[serde(default, rename = "sockrocket-udp-only")]
+    udp_only: bool,
+    fingerprint: Option<String>,
+}
+
+fn mieru_from_clash(value: serde_yaml::Value) -> Result<Node> {
+    for key in ["port-range", "ports", "network", "reality-opts", "ws-opts"] {
+        anyhow::ensure!(
+            value.get(key).is_none(),
+            "Unsupported Mieru transport option"
+        );
+    }
+    anyhow::ensure!(
+        value.get("tls").is_none_or(|v| v.as_bool() == Some(false)),
+        "Unsupported Mieru TLS option"
+    );
+    let p: ClashMieru = serde_yaml::from_value(value)?;
+    anyhow::ensure!(
+        p.fingerprint.is_none(),
+        "Mieru does not support certificate pinning"
+    );
+    super::model::validate_mieru_endpoint(&p.server, p.port, &p.username, &p.password)?;
+    anyhow::ensure!(
+        !p.udp
+            && !p.udp_only
+            && p.transport
+                .as_deref()
+                .unwrap_or("TCP")
+                .eq_ignore_ascii_case("TCP")
+            && p.multiplexing
+                .as_deref()
+                .is_none_or(|s| s == "MULTIPLEXING_OFF")
+            && p.handshake_mode
+                .as_deref()
+                .is_none_or(|s| s == "HANDSHAKE_STANDARD")
+            && p.traffic_pattern.as_deref().unwrap_or("").is_empty(),
+        "Unsupported Mieru session mode"
+    );
+    Ok(Node {
+        name: super::model::decode_display_name(&p.name),
+        server: p.server,
+        port: p.port,
+        protocol: ProxyProtocol::Mieru {
+            username: p.username,
+            password: p.password,
+        },
+        transport: None,
+        latency_ms: None,
+        tags: vec![],
+        extra: Default::default(),
+    })
+}
+
 /// Parse a Clash YAML configuration string into a list of nodes
 pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
     let config: ClashConfig =
         serde_yaml::from_str(yaml_str).context("Failed to parse Clash YAML")?;
 
-    let root: serde_yaml::Value = serde_yaml::from_str(yaml_str)
+    let root = super::storage::parse_yaml_document(yaml_str)
         .map_err(|_| anyhow::anyhow!("Invalid Clash configuration"))?;
     let server_dns = super::server_dns::import(&root)?
         .map(|p| serde_json::to_string(&p))
         .transpose()?;
     let mut nodes = Vec::new();
     for value in config.proxies {
+        if value.get("type").and_then(serde_yaml::Value::as_str) == Some("mieru") {
+            match mieru_from_clash(value) {
+                Ok(node) => nodes.push(node),
+                Err(_) => tracing::warn!("Skipping invalid or unsupported Mieru entry"),
+            }
+            continue;
+        }
         if value.get("type").and_then(serde_yaml::Value::as_str) == Some("wireguard") {
             match super::wireguard::from_clash(&value) {
                 Ok(node) => nodes.push(node),
@@ -491,7 +565,8 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
             (&proxy.down, super::v2ray::HY2_DOWN),
         ] {
             if let Some(value) = value {
-                extra.insert(key.into(), super::bandwidth::canonical_mbps(value)?);
+                // deserialize_bandwidth already normalized the imported value.
+                extra.insert(key.into(), value.clone());
             }
         }
         if let Some(value) = proxy.fast_open {

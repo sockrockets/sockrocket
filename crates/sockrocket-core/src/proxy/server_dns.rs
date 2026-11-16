@@ -13,6 +13,28 @@ use crate::{
 use anyhow::Result;
 use std::{future::Future, net::IpAddr, pin::Pin, sync::Mutex};
 
+async fn endpoint_addresses(resolver: &DnsResolver, host: &str) -> Result<Vec<IpAddr>> {
+    let ips = resolver
+        .resolve_addresses(host)
+        .await
+        .map_err(|_| anyhow::anyhow!("Subscription proxy server DNS lookup failed"))?;
+    anyhow::ensure!(
+        !ips.is_empty(),
+        "Subscription proxy server DNS returned no address"
+    );
+    Ok(ips)
+}
+
+pub(super) async fn connect_endpoint_tcp(
+    resolver: &DnsResolver,
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream> {
+    let ips = endpoint_addresses(resolver, host).await?;
+    let addresses: Vec<_> = ips.into_iter().map(|ip| (ip, port).into()).collect();
+    Ok(super::transport::connect_staggered(&addresses).await?)
+}
+
 pub struct ServerDnsOutbound {
     node: Node,
     resolver: DnsResolver,
@@ -34,15 +56,7 @@ impl ServerDnsOutbound {
         })
     }
     async fn addresses(&self) -> Result<Vec<IpAddr>> {
-        let mut ips = self
-            .resolver
-            .resolve_addresses(&self.node.server)
-            .await
-            .map_err(|_| anyhow::anyhow!("Subscription proxy server DNS lookup failed"))?;
-        anyhow::ensure!(
-            !ips.is_empty(),
-            "Subscription proxy server DNS returned no address"
-        );
+        let mut ips = endpoint_addresses(&self.resolver, &self.node.server).await?;
         if let Some((cached_ip, _)) = self.cached.lock().unwrap().as_ref()
             && let Some(index) = ips.iter().position(|ip| ip == cached_ip)
         {
@@ -100,10 +114,17 @@ fn preserve_identity(node: &mut Node, original: &Node) {
         if let Some(r) = t.reality.as_mut() {
             r.sni.get_or_insert_with(|| original.server.clone());
         }
-        if let Some(ws) = t.ws.as_mut() {
-            ws.host.get_or_insert_with(|| {
-                super::transport::format_host_port(&original.server, original.port)
+        if matches!(
+            t.transport_type,
+            TransportType::WebSocket | TransportType::HttpUpgrade
+        ) {
+            // Both upgrade transports default Host to the configured server name.
+            let ws = t.ws.get_or_insert(WsConfig {
+                path: None,
+                host: None,
+                headers: None,
             });
+            ws.host.get_or_insert_with(|| original.server.clone());
         }
     }
 }
@@ -205,6 +226,65 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&a.0, &b.0));
     }
     #[tokio::test]
+    async fn resolved_upgrade_transports_preserve_the_wire_host_and_path() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        for network in ["ws", "httpupgrade"] {
+            for (options, expected_host, expected_path) in [
+                ("", "endpoint.example.test", "/"),
+                (", ws-opts: {path: /path}", "endpoint.example.test", "/path"),
+                (
+                    ", ws-opts: {path: /path, headers: {Host: cdn.example.test:8443}}",
+                    "cdn.example.test:8443",
+                    "/path",
+                ),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let yaml = format!(
+                    "dns: {{enable: true, nameserver: [192.0.2.53]}}\nproxies:\n- {{name: ws-test, type: vmess, server: endpoint.example.test, port: {}, uuid: 00000000-0000-0000-0000-000000000001, network: {network}{options}}}",
+                    addr.port()
+                );
+                let node = crate::config::clash::parse_clash_config(&yaml)
+                    .unwrap()
+                    .remove(0);
+                let policy = ServerDns::from_node(&node).unwrap().unwrap();
+                let wrapper = ServerDnsOutbound::new(&node, policy, false).unwrap();
+                let resolved = wrapper.outbound(addr.ip()).unwrap();
+                let capture = async {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut lines = BufReader::new(stream).lines();
+                    assert_eq!(
+                        lines.next_line().await.unwrap().unwrap(),
+                        format!("GET {expected_path} HTTP/1.1")
+                    );
+                    let mut host = None;
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("host")
+                        {
+                            host = Some(value.trim().to_owned());
+                        }
+                    }
+                    assert_eq!(host.as_deref(), Some(expected_host), "{network}{options}");
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    tokio::select! {
+                        () = capture => {}
+                        result = resolved.connect("destination.example.test", 80) =>
+                            panic!("outbound finished before {network} handshake: {:?}", result.err()),
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn subscription_dns_controls_actual_socket_and_never_falls_back() {
         let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server = dns.local_addr().unwrap();
@@ -237,6 +317,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let probe = connect_endpoint_tcp(&w.resolver, &w.node.server, w.node.port)
+            .await
+            .unwrap();
+        assert_eq!(probe.peer_addr().unwrap(), listener.local_addr().unwrap());
         task.abort();
         w.resolver = DnsResolver::with_config(DnsConfig {
             servers: vec![],
@@ -248,6 +332,13 @@ mod tests {
                 .await
                 .err()
                 .unwrap()
+                .to_string()
+                .contains("DNS")
+        );
+        assert!(
+            connect_endpoint_tcp(&w.resolver, &w.node.server, w.node.port)
+                .await
+                .unwrap_err()
                 .to_string()
                 .contains("DNS")
         );

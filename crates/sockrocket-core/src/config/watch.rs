@@ -252,7 +252,7 @@ fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
 }
 
 fn parse_reload(content: &str) -> anyhow::Result<(AppConfig, super::dns::DnsSettings)> {
-    let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
+    let raw = super::storage::parse_yaml_document(content)?;
     let dns_settings = super::dns::DnsSettings::from_yaml(&raw)?;
     let config = AppConfig::from_yaml_value(raw)?;
     Ok((config, dns_settings))

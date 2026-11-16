@@ -923,7 +923,11 @@ impl FingerprintBuilder {
         CraftOptions(Some(self))
     }
 
-    pub(crate) fn patch_config(self, mut config: ClientConfig) -> ClientConfig {
+    pub(crate) fn patch_config(
+        self,
+        mut config: ClientConfig,
+        decompressor: fn(crate::CertificateCompressionAlgorithm) -> Option<&'static crate::CertificateCompression>,
+    ) -> ClientConfig {
         if self.override_version {
             assert_eq!(ALL_VERSIONS, &[&TLS13, &TLS12]);
             config.versions = EnabledVersions::new(ALL_VERSIONS); // enable both tls 1.2 and 1.3
@@ -993,7 +997,7 @@ impl FingerprintBuilder {
                     }
                     config.certificate_compression_algorithms = algos
                         .iter()
-                        .map(|algo| crate::client_certificate_decompressor(*algo)
+                        .map(|algo| decompressor(*algo)
                             .expect("supported certificate compression algorithm"))
                         .collect();
                 }

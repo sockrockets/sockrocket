@@ -33,7 +33,7 @@ req[2]({ok:true});rows=rows.concat(rule(6,'Other','domain-keyword','media'));req
 c.editRule(2);assert.equal(c.RULE_SELECTED_GROUP,'Services');assert.equal(element('rule-edit-panel').hidden,false);element('edit-rule-pattern').value='198.51.100.0/24';c.saveRuleEdit();req=requests.shift();assert.equal(req[0],'update_rule');assert.equal(req[1].index,2);assert.equal(req[1].expected.pattern,'192.0.2.0/24');
 req[2]({ok:true});rows=rows.map(r=>r.index===2?{...r,pattern:'198.51.100.0/24'}:r);requests.shift()[2]({ok:true,rules:rows,revision:'v4'});assert.equal(element('rule-edit-panel').hidden,true);
 c.changeRuleGroup('');c.startRuleAddition();element('rule-pattern').value='ungrouped.invalid';c.addRule();req=requests.shift();assert.equal(req[1].group,'','legacy unnamed group supports append');req[3]({});requests.shift()[2]({ok:true,rules:rows,revision:'v5'});assert.equal(element('rule-pattern').value,'ungrouped.invalid');
-allowDiscard=false;c.selectRuleFlow(0);assert.equal(c.RULE_SELECTED_GROUP,'','diagram selection protects drafts');allowDiscard=true;c.cancelRuleEditor();
+allowDiscard=false;c.openMapGroup(0);assert.equal(c.RULE_SELECTED_GROUP,'','diagram selection protects drafts');allowDiscard=true;c.cancelRuleEditor();
 element('rule-new-group-name').value='New';c.createRuleGroup();assert.equal(c.RULE_SELECTED_GROUP,'New');assert.equal(c.ruleGroupMembers('New').length,0);assert.equal(element('rule-add-panel').hidden,false);
 c.changeRuleWorkspaceMode('bulk');assert.equal(c.RULE_EDIT_GROUP,null);assert.equal(element('rule-entry-mode').value,'bulk');element('rule-batch').value='GEOIP,JP,PROXY\nDOMAIN,new.invalid,DIRECT';c.addRule();req=requests.shift();assert.equal(req[0],'batch_add_rules');assert.equal(req[1].group,'New');req[2]({ok:true});rows=rows.concat(rule(7,'New','geoip','JP'),rule(8,'New','domain','new.invalid',{target:'direct'}));requests.shift()[2]({ok:true,rules:rows,revision:'v6'});assert.equal(c.RULE_LOCAL_GROUPS.includes('New'),false,'persisted groups leave ephemeral state');
 c.cancelRuleEditor();c.SR_STATE.ruleRows=rows.filter(r=>r.group!=='New');c.renderRules();assert.notEqual(c.RULE_SELECTED_GROUP,'New','deletion cannot resurrect an ephemeral group');
@@ -44,12 +44,11 @@ console.log('PASS: complete mixed groups, append, inline editing, bulk concurren
 c.changeRuleGroup('Services');
 c.RULE_PRESETS=[{id:'services',group:'Services',target:'proxy',domains:[]}];
 element('rule-preset').value='services';
-const serviceFlow=c.ruleFlowModel(c.SR_STATE.ruleRows,'rule','').findIndex(r=>r.indices && r.indices.includes(0));
-for(const [name,view] of [
-  ['picker',()=>c.changeRuleGroup('Services')],
-  ['diagram',()=>c.selectRuleFlow(serviceFlow)],
-  ['diagram details',()=>c.showFlowRuleList('global_rule',serviceFlow)],
-  ['preset',()=>c.viewRulePreset()]
+assert.match(element('rule-flow').innerHTML,/data-index="0" onclick="openMapGroup\(this.dataset.index\)"/);
+for(const [name,view,scope] of [
+  ['picker',()=>c.changeRuleGroup('Services'),''],
+  ['diagram',()=>c.openMapGroup(0),'global'],
+  ['preset',()=>c.viewRulePreset(),'']
 ]){
   c.changeRuleWorkspaceMode('bulk');element('rule-batch').value+='\nDOMAIN,draft.invalid,PROXY';
   element('rule-search').value='no-match';element('rule-filter-target').value='reject';element('rule-filter-state').value='disabled';c.renderRules();
@@ -63,7 +62,8 @@ for(const [name,view] of [
   assert.equal(c.RULE_WORKSPACE_MODE,'list');assert.equal(element('rule-list-panel').hidden,false);
   assert.equal(element('rule-add-panel').hidden,true);assert.equal(element('rule-edit-panel').hidden,true);
   for(const id of ['rule-search','rule-filter-target','rule-filter-state'])assert.equal(element(id).value,'',name+' clears '+id);
-  assert.match(element('rule-count').textContent,/当前显示 3 条/);
+  assert.equal(element('rule-filter-scope').value,scope);
+  assert.match(element('rule-count').textContent,scope==='global'?/当前显示 2 条/:/当前显示 3 条/);
 }
 // Cancellation also protects an inline row draft in the same group.
 c.editRule(2);element('edit-rule-pattern').value='203.0.113.0/24';allowDiscard=false;c.viewRulePreset();

@@ -9,6 +9,7 @@ const el=id=>elements[id]||=( {
 });
 const c=vm.createContext({srElement:el,srEsc:v=>String(v??''),srApi:(...args)=>requests.push(args),srShowMsg(){},toastResp(){},invalidateRuleTrace(){},confirm:()=>true,document:{createElement:()=>({})},RULE_TARGET_LABEL:{proxy:'代理',direct:'直连',reject:'拒绝'},SR_PAGE_LOADED:{},SR_STATE:{ruleRows:[]},RULE_RULE_REVISION:'r1',isFinalRule:r=>['final','match'].includes(r.rule_type),ruleApi:(...args)=>requests.push(args)});
 vm.runInContext(source.slice(source.indexOf('var SR_PROXY_GROUPS='),source.indexOf('/* ══ Routing rules')),c);
+vm.runInContext(source.slice(source.indexOf('var SR_RULE_NODES ='), source.indexOf('function ruleTargetKnown')), c);
 const take=action=>{const i=requests.findIndex(r=>r[0]===action);assert.ok(i>=0,action);return requests.splice(i,1)[0];};
 const nodes=[{name:'Example A',fingerprint:'a'.repeat(64)},{name:'Example B',fingerprint:'b'.repeat(64)}];
 const group={name:'Video',type:'select',members:nodes.map(n=>n.fingerprint),current:nodes[1].fingerprint,selected_node:'Example B'};
@@ -50,7 +51,18 @@ c.loadProxyGroups();const old=take('proxy_groups');c.loadProxyGroups();take('pro
 // Load the real source/CIDR, phase and locking helpers used by the device editor.
 vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')),c);
 c.RULE_RULE_REVISION='r1';
+// The rules snapshot supplies both catalogs. Refreshing only the groups retains node targets.
+const targetId = 'c'.repeat(64);
+c.setProxyGroupTargets([group], [{id:targetId,name:'Rule node'}]);
+el('rule-target').value = 'node:'+targetId;
 c.setProxyGroupTargets([group]);
+assert.equal(el('rule-target').value, 'node:'+targetId);
+assert.equal(el('device-add-target').options[0].value, '');
+el('edit-rule-target').value = 'group:removed';
+c.setProxyGroupTargets([group], []);
+assert.equal(el('edit-rule-target').value, 'group:removed');
+assert.equal(el('edit-rule-target').options.at(-1).textContent, '已失效 · group:removed');
+assert.equal(c.RULE_TARGET_LABEL['node:'+targetId], undefined);
 el('device-available-groups').querySelectorAll=()=>el('device-available-groups').options.filter(box=>box.checked);
 c.ruleApi=(...args)=>requests.push(args);
 c.SR_STATE.devices=[{source:'192.0.2.8/32',key:'mac:00:11:22:33:44:55',alias_key:'mac:00:11:22:33:44:55',alias:'电视',host:'living-room'}];

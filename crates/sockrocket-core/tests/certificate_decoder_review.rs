@@ -51,3 +51,56 @@ fn chrome_advertises_the_same_certificate_codec() {
         BROTLI_DEFAULT.alg
     );
 }
+
+#[test]
+fn browser_and_custom_fingerprints_keep_their_certificate_algorithms() {
+    use craft_tls::rustls::{
+        CertificateCompressionAlgorithm as Algorithm, ClientConfig, RootCertStore,
+        craft::{self, CraftExtension, ExtensionSpec, Fingerprint},
+    };
+    let base = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    for profile in [
+        craft::chrome_108(),
+        craft::chrome_112(),
+        craft::chrome_133(),
+        craft::safari_17_1(),
+        craft::edge_85(),
+        craft::firefox_105(),
+        craft::ios_14(),
+        craft::qq_11_1(),
+        craft::chrome_auto(),
+        craft::CHROME_115_QUIC.clone(),
+    ] {
+        let all = base.clone().with_fingerprint(profile.builder());
+        let small = base.clone().with_browser_fingerprint(profile.builder());
+        assert_eq!(
+            all.certificate_compression_algorithms.len(),
+            small.certificate_compression_algorithms.len()
+        );
+        for (a, b) in all
+            .certificate_compression_algorithms
+            .iter()
+            .zip(&small.certificate_compression_algorithms)
+        {
+            assert!(std::ptr::eq(*a, *b));
+        }
+    }
+    static CUSTOM_EXTENSIONS: &[ExtensionSpec] =
+        &[ExtensionSpec::Craft(CraftExtension::CompressCert(&[
+            Algorithm::Zstd,
+            Algorithm::Zlib,
+        ]))];
+    let custom = Fingerprint {
+        extensions: CUSTOM_EXTENSIONS,
+        ..Default::default()
+    };
+    let config = base.with_fingerprint(custom.builder());
+    let result: Vec<_> = config
+        .certificate_compression_algorithms
+        .iter()
+        .map(|a| a.alg)
+        .collect();
+    assert_eq!(result, [Algorithm::Zstd, Algorithm::Zlib]);
+}

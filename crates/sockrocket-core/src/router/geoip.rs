@@ -1,6 +1,30 @@
 use std::net::IpAddr;
 use std::ops::Range;
 
+pub(super) fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (address, prefix) = cidr.split_once('/')?;
+    let address: IpAddr = address.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    (prefix <= if address.is_ipv4() { 32 } else { 128 }).then_some((address, prefix))
+}
+
+pub(super) fn private_networks() -> impl Iterator<Item = (IpAddr, u8)> {
+    const CIDRS: &[&str] = &[
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ];
+    CIDRS
+        .iter()
+        .map(|cidr| parse_cidr(cidr).expect("valid built-in private CIDR"))
+}
+
 /// A lightweight GeoIP database for country-level lookups.
 /// Uses in-memory CIDR→country mappings (can be loaded from file).
 pub struct GeoIpDb {
@@ -83,18 +107,12 @@ impl GeoIpDb {
 
     /// Add a CIDR→country mapping.
     pub fn add_entry(&mut self, cidr: &str, country: &str) {
-        let Some((address, prefix)) = cidr.split_once('/') else {
-            return;
-        };
-        let addr: IpAddr = match address.parse() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-        let prefix_len: u8 = match prefix.parse() {
-            Ok(p) => p,
-            Err(_) => return,
-        };
+        if let Some((address, prefix)) = parse_cidr(cidr) {
+            self.add_network(address, prefix, country);
+        }
+    }
 
+    pub(super) fn add_network(&mut self, addr: IpAddr, prefix_len: u8, country: &str) {
         let total_bits = if addr.is_ipv4() { 32 } else { 128 };
         if u32::from(prefix_len) > total_bits {
             return;
@@ -149,26 +167,16 @@ impl GeoIpDb {
 
     /// Create a built-in database with common private/reserved ranges.
     pub fn builtin() -> Self {
-        let mut db = Self::new();
-
-        // Private IPv4 ranges → PRIVATE
-        db.add_entry("10.0.0.0/8", "PRIVATE");
-        db.add_entry("172.16.0.0/12", "PRIVATE");
-        db.add_entry("192.168.0.0/16", "PRIVATE");
-        db.add_entry("127.0.0.0/8", "PRIVATE");
-
-        // Link-local
-        db.add_entry("169.254.0.0/16", "PRIVATE");
-
-        // Carrier-grade NAT (RFC 6598)
-        db.add_entry("100.64.0.0/10", "PRIVATE");
-
-        // Private IPv6
-        db.add_entry("::1/128", "PRIVATE");
-        db.add_entry("fc00::/7", "PRIVATE");
-        db.add_entry("fe80::/10", "PRIVATE");
-
+        let mut db = Self::with_private_ranges();
         db.build();
+        db
+    }
+
+    pub(super) fn with_private_ranges() -> Self {
+        let mut db = Self::new();
+        for (address, prefix) in private_networks() {
+            db.add_network(address, prefix, "PRIVATE");
+        }
         db
     }
 

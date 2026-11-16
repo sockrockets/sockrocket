@@ -16,6 +16,9 @@ elif command -v llvm-strip >/dev/null 2>&1; then
   strip_tool=$(command -v llvm-strip)
 elif [ -x /opt/homebrew/opt/llvm@21/bin/llvm-strip ]; then
   strip_tool=/opt/homebrew/opt/llvm@21/bin/llvm-strip
+elif compgen -G '/usr/lib/llvm-*/bin/llvm-strip' >/dev/null; then
+  strip_tools=(/usr/lib/llvm-*/bin/llvm-strip)
+  strip_tool=${strip_tools[0]}
 else
   strip_tool=$(command -v aarch64-linux-musl-strip) || {
     echo 'Set MERLIN_STRIP_TOOL to an ELF-capable llvm-strip or aarch64-linux-musl-strip.' >&2
@@ -26,8 +29,17 @@ test -x "$strip_tool"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$rust_lld"
 export CC_aarch64_unknown_linux_musl="$PWD/tools/zig-cc-aarch64-musl"
 export AR_aarch64_unknown_linux_musl="$PWD/tools/zig-ar-aarch64-musl"
-cargo rustc -p sockrocket-cli --release --target aarch64-unknown-linux-musl --offline "$@" -- -C link-self-contained=yes -C strip=none
+source tools/merlin-arm64-rustc-flags.sh
+# Local builds default to offline. CI fetches locked target and host build
+# dependencies as needed, including procedural macro dependencies on the host.
+CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-true}" cargo rustc "${merlin_arm64_cargo_flags[@]}" -p sockrocket-cli --release --target aarch64-unknown-linux-musl "$@" -- "${merlin_arm64_flags[@]}"
 binary="${CARGO_TARGET_DIR:-$PWD/target}/aarch64-unknown-linux-musl/release/sockrocket-cli"
 python3 tools/verify-merlin-allocator.py "$binary"
 cp "$binary" "$binary.symbols"
 "$strip_tool" --strip-all "$binary"
+bytes=$(wc -c < "$binary")
+max_bytes=11100000
+if (( bytes > max_bytes )); then
+  echo "Merlin ARM64 CLI is $bytes bytes; the package limit is $max_bytes." >&2
+  exit 1
+fi

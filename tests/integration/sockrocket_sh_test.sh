@@ -56,6 +56,7 @@ make_fake_bin() {
 case "\$1" in
     --dns-health) "$SANDBOX/stub/netstat" | grep -q 5300; exit \$? ;;
     --daemon-health) kill -0 "\$2" 2>/dev/null; exit \$? ;;
+    --dnsmasq-hosts) echo "host-record=nas.home.arpa,192.168.1.10,5"; exit 0 ;;
     --supports-udp|--dump-rule-sources|--dump-cn-cidrs) exit 0 ;;
 esac
 mkdir -p "$PROC_FAKE/\$\$" 2>/dev/null
@@ -689,6 +690,7 @@ test_dns_unpin_on_stop() {
     setup
 
     run_sockrocket start
+    assert "custom Hosts published as an exact local record" "1" "$(grep -c '^host-record=nas.home.arpa,192.168.1.10,5$' "$DNS_DIR/sockrocket.conf")"
     assert "upstream pinned to Sockrocket listener while running" \
         "server=127.0.0.1#5300" "$(cat "$SANDBOX/resolv.dnsmasq")"
     assert "ISP upstream backed up" "present" \

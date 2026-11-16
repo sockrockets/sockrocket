@@ -1,4 +1,5 @@
 //! Persisted DNS policy. Endpoint URLs never appear in validation errors.
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Result, ensure};
@@ -32,6 +33,7 @@ pub struct DnsSettings {
     pub proxy_servers: Vec<String>,
     pub bootstrap_servers: Vec<SocketAddr>,
     pub direct_domains: Vec<String>,
+    pub hosts: Vec<String>,
     pub strategy: AddressStrategy,
     pub cache_enabled: bool,
     pub cache_capacity: usize,
@@ -47,6 +49,7 @@ struct DnsSettingsInput {
     proxy_servers: Vec<String>,
     bootstrap_servers: Vec<SocketAddr>,
     direct_domains: Vec<String>,
+    hosts: Vec<String>,
     strategy: AddressStrategy,
     cache_enabled: bool,
     cache_capacity: usize,
@@ -67,6 +70,7 @@ impl Default for DnsSettings {
                 "119.29.29.29:53".parse().unwrap(),
             ],
             direct_domains: Vec::new(),
+            hosts: Vec::new(),
             strategy: AddressStrategy::default(),
             cache_enabled: true,
             cache_capacity: 1024,
@@ -83,6 +87,7 @@ impl Default for DnsSettingsInput {
             proxy_servers: s.proxy_servers,
             bootstrap_servers: s.bootstrap_servers,
             direct_domains: s.direct_domains,
+            hosts: s.hosts,
             strategy: s.strategy,
             cache_enabled: s.cache_enabled,
             cache_capacity: s.cache_capacity,
@@ -99,6 +104,7 @@ impl TryFrom<DnsSettingsInput> for DnsSettings {
             proxy_servers: s.proxy_servers,
             bootstrap_servers: s.bootstrap_servers,
             direct_domains: s.direct_domains,
+            hosts: s.hosts,
             strategy: s.strategy,
             cache_enabled: s.cache_enabled,
             cache_capacity: s.cache_capacity,
@@ -224,6 +230,28 @@ pub fn valid_domain(value: &str) -> bool {
         })
 }
 
+fn parse_hosts(lines: &[String]) -> Result<HashMap<String, Vec<IpAddr>>> {
+    ensure!(lines.len() <= 2048, "Hosts 最多支持 2048 行");
+    let mut hosts = HashMap::<String, Vec<IpAddr>>::new();
+    for (index, line) in lines.iter().enumerate() {
+        let mut fields = line.split_whitespace();
+        let ip = fields.next().and_then(|value| value.parse::<IpAddr>().ok());
+        let domain = fields.next().unwrap_or("");
+        let domain = domain.strip_suffix('.').unwrap_or(domain);
+        ensure!(
+            valid_domain(domain) && domain.parse::<IpAddr>().is_err() && fields.next().is_none(),
+            "Hosts 第 {} 行应为 IP 地址和一个完整域名",
+            index + 1
+        );
+        let ip = ip.ok_or_else(|| anyhow::anyhow!("Hosts 第 {} 行的 IP 地址无效", index + 1))?;
+        let addresses = hosts.entry(domain.to_ascii_lowercase()).or_default();
+        if !addresses.contains(&ip) {
+            addresses.push(ip);
+        }
+    }
+    Ok(hosts)
+}
+
 impl DnsSettings {
     pub fn from_json(value: serde_json::Value) -> Result<Self> {
         let input: DnsSettingsInput = serde_json::from_value(value).map_err(|_| {
@@ -266,6 +294,7 @@ impl DnsSettings {
                 && self.direct_domains.iter().all(|s| valid_domain(s)),
             "dns.direct_domains contains an invalid domain or exceeds 2048 entries"
         );
+        parse_hosts(&self.hosts)?;
         for (field, servers, proxy) in [
             ("direct_servers", &self.direct_servers, false),
             ("proxy_servers", &self.proxy_servers, true),
@@ -281,6 +310,7 @@ impl DnsSettings {
     pub fn resolver_config(&self, node_hosts: impl Iterator<Item = String>) -> Result<DnsConfig> {
         self.validate()?;
         let mut config = crate::dns::china_split_dns_config();
+        config.hosts = parse_hosts(&self.hosts)?;
         config.reject_local_addresses = true;
         let compile = |servers: &[String], proxy| {
             servers

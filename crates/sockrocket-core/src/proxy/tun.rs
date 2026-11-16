@@ -82,19 +82,19 @@ fn route_journal_path() -> Option<std::path::PathBuf> {
         .and_then(|slot| slot.clone())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RouteJournal {
     owner_pid: u32,
     state: TunExitState,
 }
 
-fn write_route_journal(state: &TunExitState) {
+fn write_route_journal(state: TunExitState) {
     let Some(path) = route_journal_path() else {
         return;
     };
     let journal = RouteJournal {
         owner_pid: std::process::id(),
-        state: state.clone(),
+        state,
     };
     let Ok(text) = serde_yaml::to_string(&journal) else {
         return;
@@ -133,7 +133,7 @@ fn save_tun_exit_state(
         None
     };
     if let Some(state) = snapshot {
-        write_route_journal(&state);
+        write_route_journal(state);
     }
 }
 
@@ -2142,7 +2142,7 @@ fn setup_routes_macos(
             Some(state.clone())
         });
         if let Some(state) = snapshot {
-            write_route_journal(&state);
+            write_route_journal(state);
         }
     }
     let gw_str = orig_gateway.to_string();

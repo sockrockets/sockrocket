@@ -13,6 +13,7 @@ pub fn protocol_short_name(protocol: &ProxyProtocol) -> &'static str {
         ProxyProtocol::Tuic { .. } => "tuic",
         ProxyProtocol::Trojan { .. } => "trojan",
         ProxyProtocol::Hysteria2 { .. } => "hy2",
+        ProxyProtocol::Mieru { .. } => "mieru",
         ProxyProtocol::AnyTls { .. } => "anytls",
         ProxyProtocol::Wireguard { .. } => "wireguard",
     }
@@ -75,6 +76,7 @@ impl NodeListCache {
                 "tuic",
                 "hy2",
                 "anytls",
+                "mieru",
                 "wireguard",
             ];
             self.snapshot.protocols = Rc::new(

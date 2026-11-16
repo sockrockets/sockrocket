@@ -103,7 +103,7 @@ pub fn start(outbound: sockrocket_core::SharedOutbound) {
     let Ok(id) = identity(pid) else {
         return;
     }; // Linux router watchdog only.
-    tokio::spawn(async move {
+    crate::spawn_background(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

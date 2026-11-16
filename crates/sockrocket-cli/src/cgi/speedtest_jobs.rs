@@ -136,9 +136,7 @@ pub fn worker(id: &str) -> Result<()> {
     let input = read("input.json")?;
     let _ = fs::remove_file(root().join("input.json"));
     drop(guard);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = CgiRuntime::new()?;
     rt.block_on(async {
         let nodes: Vec<Y> = serde_json::from_value(input["nodes"].clone())?;
         let http = input["mode"] == "http";
@@ -155,21 +153,14 @@ pub fn worker(id: &str) -> Result<()> {
                 tasks.spawn(async move {
                     let key = key(index, &raw);
                     let result = async {
-                        let node: sockrocket_core::Node = serde_yaml::from_value(raw)?;
-                        let protocol = http
-                            || matches!(
-                                &node.protocol,
-                                sockrocket_core::ProxyProtocol::Tuic { .. }
-                                    | sockrocket_core::ProxyProtocol::Hysteria2 { .. }
-                                    | sockrocket_core::ProxyProtocol::Wireguard { .. }
-                            );
-                        if !protocol {
-                            return sockrocket_core::tcp_latency_test(&node.server, node.port, 3)
-                                .await;
-                        }
-                        let _permit = slots.acquire().await?;
-                        let outbound = sockrocket_core::create_outbound_unwarmed(&node)?;
-                        sockrocket_core::quick_http_latency_test(&outbound, 5).await
+                        let node = sockrocket_core::Node::from_yaml_value(raw)?;
+                        let quick = use_tcp_probe(&node, http);
+                        let _permit = if quick {
+                            None
+                        } else {
+                            Some(slots.acquire().await?)
+                        };
+                        probe_node_latency(&node, quick).await
                     }
                     .await;
                     json!({"key":key,"latency":result.map(i64::from).unwrap_or(-1)})

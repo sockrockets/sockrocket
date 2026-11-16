@@ -355,7 +355,14 @@ impl ClientConfig {
     ///
     /// This method takes the current `ClientConfig`, applies the modifications defined by the `FingerprintBuilder` (which is derived from a [`crate::craft::Fingerprint`] or [`crate::craft::FingerprintSet`]), and returns the updated configuration.
     pub fn with_fingerprint(self, fingerprint_builder: FingerprintBuilder) -> Self {
-        fingerprint_builder.patch_config(self)
+        fingerprint_builder.patch_config(self, crate::client_certificate_decompressor)
+    }
+
+    /// Applies a built-in browser fingerprint, registering the Brotli and zlib
+    /// certificate decoders used by those profiles. Use [`Self::with_fingerprint`]
+    /// for custom fingerprints that advertise other algorithms.
+    pub fn with_browser_fingerprint(self, fingerprint_builder: FingerprintBuilder) -> Self {
+        fingerprint_builder.patch_config(self, crate::compression::browser_certificate_decompressor)
     }
 }
 

@@ -136,7 +136,7 @@ pub fn is_singbox_config(content: &str) -> bool {
 /// Parse sing-box JSON config into Node list.
 pub fn parse_singbox_config(json_str: &str) -> Result<Vec<Node>> {
     let config: SingBoxConfig =
-        serde_json::from_str(json_str).context("Failed to parse sing-box JSON")?;
+        serde_json::from_slice(json_str.as_bytes()).context("Failed to parse sing-box JSON")?;
 
     let mut tagged = HashMap::new();
     if config
@@ -182,7 +182,7 @@ pub fn parse_singbox_config(json_str: &str) -> Result<Vec<Node>> {
 /// Parse a single sing-box outbound JSON object.
 pub fn parse_singbox_outbound(json_str: &str) -> Result<Option<Node>> {
     let value: serde_json::Value =
-        serde_json::from_str(json_str).context("Failed to parse sing-box outbound")?;
+        serde_json::from_slice(json_str.as_bytes()).context("Failed to parse sing-box outbound")?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("wireguard") {
         return super::wireguard::from_singbox(&value).map(Some);
     }

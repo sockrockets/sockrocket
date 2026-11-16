@@ -84,6 +84,21 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
         "XHTTP is currently supported only for VLESS"
     );
     match &node.protocol {
+        ProxyProtocol::Mieru { username, password } => {
+            anyhow::ensure!(
+                node.transport.is_none(),
+                "Mieru uses its native TCP transport"
+            );
+            crate::config::model::validate_mieru_endpoint(
+                &node.server,
+                node.port,
+                username,
+                password,
+            )?;
+            Ok(SharedOutbound(Arc::new(super::mieru::Mieru::new(
+                node, username, password,
+            ))))
+        }
         ProxyProtocol::Wireguard { config } => {
             anyhow::ensure!(
                 node.transport.is_none(),

@@ -54,7 +54,19 @@ impl Ipv6Listeners {
     }
 }
 
-pub(super) async fn serve(
+// Keep the listener task graph in core. This future is allocated once per
+// listener startup; DNS packets are handled by the existing socket tasks.
+pub(super) fn serve(
+    bind: &str,
+    port: u16,
+    resolver: DnsResolver,
+    shutdown: Arc<tokio::sync::Notify>,
+    ipv6_open: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    Box::pin(bind_and_serve(bind, port, resolver, shutdown, ipv6_open))
+}
+
+async fn bind_and_serve(
     bind: &str,
     port: u16,
     resolver: DnsResolver,

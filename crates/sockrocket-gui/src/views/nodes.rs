@@ -1684,6 +1684,7 @@ impl AppState {
 
         // UDP support
         let udp_enabled = match &node.protocol {
+            ProxyProtocol::Mieru { .. } => false,
             ProxyProtocol::Wireguard { config } => config.udp,
             ProxyProtocol::Shadowsocks { udp, .. } => *udp,
             ProxyProtocol::VMess { udp, .. } => *udp,
