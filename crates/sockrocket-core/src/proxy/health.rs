@@ -5,7 +5,9 @@
 //! default proxy with HTTPS, independently of domain routing rules. After `failure_threshold`
 //! consecutive failures (and with `auto_switch` on) it latency-tests all
 //! candidate nodes concurrently and swaps the shared outbound to the best
-//! one — the local listeners keep running untouched.
+//! one, provided the active node still fails a final confirmation. Healthy
+//! nodes are kept regardless of candidate latency; recovered nodes are not
+//! replaced after the candidate search. The local listeners keep running untouched.
 //!
 //! On start it runs a short **startup burst** (two probes a few seconds
 //! apart) before settling into `interval_secs`, so a dead active node after
@@ -250,6 +252,24 @@ async fn probe_once(
             };
             match best {
                 Some((index, ms)) => {
+                    // Searching can take tens of seconds. A temporary outage may
+                    // have cleared by now; keep the selected global node if it
+                    // recovered rather than switching just because a backup works.
+                    let recovered = tokio::select! {
+                        result = confirm_probe(true, || https_health_probe(&probe_outbound, PROBE_TIMEOUT_SECS)) => result,
+                        _ = shutdown_rx.changed() => return false,
+                    };
+                    if !Arc::ptr_eq(&snapshot.0, &setup.swappable.current().0) {
+                        return true;
+                    }
+                    if let Ok(latency_ms) = recovered {
+                        tracker.record_success();
+                        if let Some(current) = tracker.current {
+                            tracker.avoided.remove(&current);
+                        }
+                        let _ = events_tx.send(Some(HealthEvent::ProbeOk { latency_ms }));
+                        return true;
+                    }
                     let node = &setup.nodes[index];
                     match (setup.outbound_factory)(node) {
                         Some(outbound) => {
