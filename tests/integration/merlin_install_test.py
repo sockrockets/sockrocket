@@ -319,6 +319,31 @@ for allow_links in (True, False):
                        env=dict(os.environ, SOCKROCKET_DIR=str(root), SOCKROCKET_BIN=str(canonical)))
         check_cgi('v2')
 
+        if allow_links:
+            # Exercise Software Center registration using the same offline installer.
+            ks_scripts = base / 'koolshare/scripts'
+            ks_scripts.mkdir(parents=True, exist_ok=True)
+            (ks_scripts / 'base.sh').touch()
+            dbus_calls = base / 'dbus-calls'
+            commands = ('have() { [ "$1" = dbus ] || which "$1" >/dev/null 2>&1; }\n'
+                        'dbus() { printf "%s\\n" "$2" >> "' + str(dbus_calls) + '"; }\n')
+            install.write_text(install.read_text().replace('ks_install() {', commands + 'ks_install() {')
+                               .replace('/tmp/${MODULE}', str(base) + '/tmp/${MODULE}'))
+            version_binary('1.2.3')
+            payload.chmod(0o600)
+            marker = pkg / 'version'
+            for contents, expected in ((None, '1.2.3'), ('', '1.2.3'), ('2.0.0', '2.0.0')):
+                if contents is None:
+                    marker.unlink()
+                else:
+                    marker.write_text(contents)
+                dbus_calls.write_text('')
+                install_package()
+                assert (root / 'version').read_text().strip() == expected
+                registered = dbus_calls.read_text().splitlines()
+                assert 'sockrocket_version=' + expected in registered
+                assert 'softcenter_module_sockrocket_version=' + expected in registered
+
 with tempfile.TemporaryDirectory(prefix='sockrocket-web-boot-') as directory:
     root = Path(directory)
     (root / 'webui').mkdir()
