@@ -107,7 +107,7 @@ Types: `domain`, `domain-suffix`, `domain-keyword`, `ip-cidr`, `geoip`, `final`.
 
 `health_check:` — `enabled`, `interval_secs` (≥5), `failure_threshold`, `auto_switch`. Probes `www.gstatic.com/generate_204` through current node; on failure switches to best latency node and persists `active_node` in `config.yaml`. State: `/tmp/sockrocket_health.json`.
 
-On start the monitor runs two probes about 3s apart, then settles into `interval_secs`. Merlin template uses `failure_threshold: 1` so a dead exit fails over on the first miss instead of waiting a full interval.
+On start the monitor runs two probes about 3s apart, then settles into `interval_secs`. Merlin template uses `failure_threshold: 2`. Each failed check is retried after 2s; only two consecutive failed rounds trigger a replacement search. The active global node is checked again after the search and retained if it recovered. Healthy nodes are never replaced merely for lower latency; there is no automatic switch back.
 
 ### TUN / DNS toggles
 
@@ -129,7 +129,7 @@ Router check (restores TUN+DNS on exit): `scripts/verify_tun_toggle.sh`.
 
 `proxy_mode` (`rule` | `global` | `direct`, default `rule` when omitted): same routing modes as the Mac client. Web UI shows a Rule / Global / Direct control. `set_proxy_mode` restarts the daemon; Global also clears `cn_ipset_direct`.
 
-`cn_ipset_direct: false` by default. When enabled, domestic IPv4 destinations in `sockrocket_cn` bypass TUN. With dual-stack capture active, domestic IPv6 destinations in `sockrocket_cn6` also bypass TUN. Both sets use the built-in GeoIP CN prefixes. Devices with matching source rules still enter TUN. **Side effect:** per-domain rules for CN-resolved IPs do not apply on that path. Use the “国内 IP 绕过 TUN” switch in the Web UI network settings. With transparent proxy off, the preference takes effect when TUN starts.
+`cn_ipset_direct: true` in the fresh-install template (existing explicit settings are preserved). When enabled, domestic IPv4 destinations in `sockrocket_cn` bypass TUN. With dual-stack capture active, domestic IPv6 destinations in `sockrocket_cn6` also bypass TUN. Both sets use the built-in GeoIP CN prefixes. Devices with matching source rules still enter TUN. **Side effect:** per-domain rules for CN-resolved IPs do not apply on that path. Use the “国内 IP 绕过 TUN” switch in the Web UI network settings. With transparent proxy off, the preference takes effect when TUN starts.
 
 ---
 

@@ -47,9 +47,9 @@ ipv6_mode: compatibility
 #   timeout_secs: 5
 #   direct_domains: []
 
-# Optional: divert China CIDRs around TUN via kernel ipset (hardware NAT).
-# Off by default; Global mode forces this off so domestic traffic still proxies.
-# cn_ipset_direct: false
+# Divert China CIDRs around TUN via kernel ipset (hardware NAT) by default.
+# Global mode forces this off so domestic traffic still proxies.
+cn_ipset_direct: true
 
 # -- Active node ---------------------------------------------------------------
 # Active node index (0 = first node), null = direct mode
@@ -135,9 +135,9 @@ dns_direct_domains:
 health_check:
   enabled: true
   interval_secs: 60
-  # Switch on the first failed probe so a dead exit does not sit for a full
-  # interval before failover (TUN toggle / cold start feel seconds-fast).
-  failure_threshold: 1
+  # Keep the selected global node while it works. Each failed check is retried;
+  # require two consecutive failed rounds before looking for a replacement.
+  failure_threshold: 2
   auto_switch: true
 
 # -- Routing rules -------------------------------------------------------------
