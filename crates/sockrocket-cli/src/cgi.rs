@@ -4835,6 +4835,13 @@ dns_direct_domains:
     #[test]
     fn fresh_merlin_global_routes_follow_selected_node() {
         let _env = TestEnv::new(include_str!("../../../merlin/config.yaml.template"));
+        assert_eq!(act_status()["cn_ipset_direct"], true);
+        let config = sockrocket_core::AppConfig::from_yaml_str(
+            &fs::read_to_string(conf_path()).unwrap(),
+        )
+        .unwrap();
+        assert!(config.health_check.enabled && config.health_check.auto_switch);
+        assert_eq!(config.health_check.failure_threshold, 2);
         let add_node = |name| {
             dispatch(
                 "add_node",
