@@ -12,6 +12,7 @@ SOCKROCKET_DIR="$FIXTURE/plugin"
 SOCKROCKET_RUNTIME_DIR="$FIXTURE/run"
 SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
 mkdir -p "$SOCKROCKET_DIR"
+printf "%s\n" 02:00:00:00:00:01 > "$SOCKROCKET_DIR/uu-devices.txt"
 printf 'ipv6_mode: dual_stack\ndns_hijack: true\n' > "$SOCKROCKET_CONF"
 printf '#!/bin/sh\nexit 0\n' > "$SOCKROCKET_DIR/sockrocket-cli"
 chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
@@ -110,6 +111,16 @@ test "$route_line" -lt "$mark_line" || fail 'traffic exposed before routes'
 grep -q -- '-d 2001:db8:1::1/64 -j RETURN' "$CALLS" || fail 'LAN prefix not exempt'
 if grep -q -- '-p ipv6-icmp.*MARK' "$CALLS"; then fail 'ICMPv6 control traffic captured'; fi
 do_dns_start || fail 'dual-stack DNS install'
+for chain in SOCKROCKET_DNS SOCKROCKET_IPV6_DNS SOCKROCKET_IPV6_MANGLE; do
+    awk -v chain="$chain" '
+        $4 == "-A" && $5 == chain {
+            if (/--mark 0x163 -j RETURN/) marked=NR
+            if (/--mac-source 02:00:00:00:00:01 -j RETURN/) device=NR
+            if (!capture && /-j (MARK|REDIRECT)/) capture=NR
+        }
+        END { exit !(marked && device && capture > marked && capture > device) }
+    ' "$CALLS" || fail "UU exception missing before capture in $chain"
+done
 grep -q -- '-t nat -A SOCKROCKET_DNS -i br0 -s 192.0.2.0/24 -p udp --dport 53 -j REDIRECT' "$CALLS" || fail 'IPv4 DNS escaped primary LAN bridge scope'
 test -f "$FIXTURE/dns" || fail 'IPv6 DNS missing'
 test -f "$(ipv6_state dns_active)" || fail 'IPv6 answers not armed with interception'

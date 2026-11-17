@@ -318,3 +318,9 @@ path above manually — otherwise only registration is cleared and files remain.
 - [merlin-reference.md](./merlin-reference.md) — iptables, DNS, watchdog internals  
 - [fancyss README](https://github.com/hq450/fancyss) — upstream platform / firmware notes  
 - [fw.koolcenter.com](https://fw.koolcenter.com/) — Merlin and 官改 firmware that include Software Center  
+
+### 与网易 UU 加速器共用
+
+Sockrocket 的 TUN 和 DNS 拦截会放行进入本插件防火墙链时已带 UU 标记（`0x163`）的 LAN 包。其余设备继续按 Sockrocket 配置分流。
+
+如果 UU 版本按设备路由、识别顺序较晚，或游戏主机仍被 Sockrocket 接管，可在路由器的 `/jffs/addons/sockrocket/uu-devices.txt` 中每行写一个主机的 LAN MAC 地址（如 `02:00:00:00:00:01`），然后重启 Sockrocket。该设备的全部流量会跳过 Sockrocket 的透明代理和 DNS 重定向，包括停止 UU 加速时；设备主动使用路由器 DNS 时仍使用原有 dnsmasq 配置。IPv6 兼容模式的防泄漏限制保持有效。删除对应行并重启即可恢复接管。
