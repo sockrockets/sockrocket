@@ -48,6 +48,23 @@ get_conf() {
     awk -v key="$1:" 'index($0, key) == 1 { gsub(/"/, "", $2); print $2; exit }' "$SOCKROCKET_CONF" 2>/dev/null || :
 }
 
+# UU uses packet mark 0x163. Only return from our private chain: later
+# firmware/UU hooks must still run. Explicit device exceptions also work
+# when UU classifies the packet later or steers a console by source address.
+uu_returns() {
+    local table_cmd="$1" table="$2" chain="$3" iface="$4" mac
+    "$table_cmd" -t "$table" -A "$chain" -i "$iface" -m mark --mark 0x163 -j RETURN || return 1
+    [ -f "$SOCKROCKET_DIR/uu-devices.txt" ] || return 0
+    while IFS= read -r mac || [ -n "$mac" ]; do
+        case "$mac" in ''|'#'*) continue ;; esac
+        if ! printf '%s\n' "$mac" | grep -Eq '^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$'; then
+            err "Invalid MAC address in uu-devices.txt"
+            return 1
+        fi
+        "$table_cmd" -t "$table" -A "$chain" -i "$iface" -m mac --mac-source "$mac" -j RETURN || return 1
+    done < "$SOCKROCKET_DIR/uu-devices.txt"
+}
+
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
 info()  { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${CYAN}[Sockrocket-iptables] %s${NC}\n" "$*"; }
 ok()    { logger -t sockrocket-iptables -p daemon.info "$*"; printf "${GREEN}[Sockrocket-iptables] ✓ %s${NC}\n" "$*"; }
@@ -483,6 +500,7 @@ ipv6_proxy_start() {
         { ip6tables -t mangle -N "$IPV6_MANGLE" 2>/dev/null || ip6tables -t mangle -F "$IPV6_MANGLE"; } &&
         { ip6tables -N "$IPV6_FORWARD" 2>/dev/null || ip6tables -F "$IPV6_FORWARD"; }
     }; then ipv6_proxy_stop; return 1; fi
+    uu_returns ip6tables mangle "$IPV6_MANGLE" "$iface" || { ipv6_proxy_stop; return 1; }
     # Multicast/link-local/ULA traffic stays on the LAN or firmware path.
     for dest in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
         ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
@@ -701,6 +719,7 @@ ipv6_dns_start() {
         err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
         return 1
     fi
+    uu_returns ip6tables nat "$IPV6_DNS" "$iface" || { ipv6_dns_stop; return 1; }
     # Queries already addressed to this router, including its link-local
     # address, stay on dnsmasq. The address string from `ip` includes the
     # on-link prefix length; matching that would exempt the whole LAN.
@@ -988,6 +1007,7 @@ do_start() {
         err "Cannot create TUN mark chain"
         return 1
     fi
+    uu_returns iptables mangle "$MANGLE_CHAIN" "$LAN_IFACE" || { flush_chains; return 1; }
     local dest proto
     for dest in "$ROUTER_IP" 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 \
         100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 240.0.0.0/4; do
@@ -1127,6 +1147,7 @@ do_dns_start() {
     fi
     if ! {
         { iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || iptables -t nat -F "$DNS_CHAIN"; } &&
+        uu_returns iptables nat "$DNS_CHAIN" "$LAN_IFACE" &&
         iptables -t nat -A "$DNS_CHAIN" -d "$ROUTER_IP" -j RETURN &&
         iptables -t nat -A "$DNS_CHAIN" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p udp --dport 53 -j REDIRECT --to-ports 53 &&
         iptables -t nat -A "$DNS_CHAIN" -i "$LAN_IFACE" -s "$LAN_SUBNET" -p tcp --dport 53 -j REDIRECT --to-ports 53 &&
