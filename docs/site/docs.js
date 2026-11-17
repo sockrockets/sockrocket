@@ -34,32 +34,32 @@ const chrome = {
 
 const titleByPage = {
   docs: {
-    zh: '文档 · Sockrocket',
+    zh: 'Sockrocket 使用文档｜梅林插件安装、订阅与分流教程',
     en: 'Docs · Sockrocket',
     vi: 'Tài liệu · Sockrocket',
   },
   'getting-started': {
-    zh: '使用指南 · Sockrocket',
+    zh: '代理客户端使用教程：安装与订阅导入｜Sockrocket',
     en: 'Getting started · Sockrocket',
     vi: 'Bắt đầu · Sockrocket',
   },
   merlin: {
-    zh: 'Merlin 安装指南 · Sockrocket',
+    zh: '华硕梅林插件安装教程与离线包下载｜Sockrocket',
     en: 'Merlin install guide · Sockrocket',
     vi: 'Hướng dẫn Merlin · Sockrocket',
   },
   routing: {
-    zh: '分流 · Sockrocket',
+    zh: '梅林路由器规则分流与节点分组教程｜Sockrocket',
     en: 'Routing · Sockrocket',
     vi: 'Định tuyến · Sockrocket',
   },
   configuration: {
-    zh: '配置说明 · Sockrocket',
+    zh: '代理配置教程：DNS、IPv6 与订阅设置｜Sockrocket',
     en: 'Configuration · Sockrocket',
     vi: 'Cấu hình · Sockrocket',
   },
   protocols: {
-    zh: '协议与传输 · Sockrocket',
+    zh: '代理协议支持：VLESS、Hysteria2、WireGuard｜Sockrocket',
     en: 'Protocols · Sockrocket',
     vi: 'Giao thức · Sockrocket',
   },
@@ -96,14 +96,8 @@ let saved;
 try {
   saved = localStorage.getItem('sockrocket-language');
 } catch {}
-setLanguage(
-  saved ||
-    (navigator.language.startsWith('zh')
-      ? 'zh'
-      : navigator.language.startsWith('vi')
-        ? 'vi'
-        : 'en'),
-);
+// Match the static Chinese content on first visit.
+setLanguage(saved || 'zh');
 document.getElementById('language')?.addEventListener('change', (e) => {
   setLanguage(e.target.value);
 });

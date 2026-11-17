@@ -187,19 +187,21 @@ Object.assign(translations.vi, {
 const elements = [...document.querySelectorAll('[data-t]')];
 translations.zh = Object.fromEntries(elements.map(el => [el.dataset.t, el.innerHTML]));
 Object.assign(translations.zh,{copied:'已复制',copyFailed:'请选中命令后手动复制'});
+const defaultSeo = { title: document.title, description: document.querySelector('meta[name="description"]').content };
 let locale = 'zh';
 function setLanguage(value) {
  locale = Object.hasOwn(translations,value) ? value : 'zh';
  elements.forEach(el => { el.innerHTML = translations[locale][el.dataset.t] ?? translations.zh[el.dataset.t]; });
  document.documentElement.lang = {zh:'zh-CN',en:'en',vi:'vi'}[locale];
- document.title = 'Sockrocket · ' + document.querySelector('[data-t="heroTitle"]').innerHTML.split('<br>').join(' · ');
- document.querySelector('meta[name="description"]').content = document.querySelector('[data-t="heroLabel"]').textContent + '. ' + document.querySelector('[data-t="heroDescription"]').textContent;
+ document.title = locale === 'zh' ? defaultSeo.title : 'Sockrocket · ' + document.querySelector('[data-t="heroTitle"]').innerHTML.split('<br>').join(' · ');
+ document.querySelector('meta[name="description"]').content = locale === 'zh' ? defaultSeo.description : document.querySelector('[data-t="heroLabel"]').textContent + '. ' + document.querySelector('[data-t="heroDescription"]').textContent;
  document.getElementById('language').value = locale;
  try { localStorage.setItem('sockrocket-language',locale); } catch {}
 }
 let saved;
 try { saved = localStorage.getItem('sockrocket-language'); } catch {}
-setLanguage(saved || (navigator.language.startsWith('zh') ? 'zh' : navigator.language.startsWith('vi') ? 'vi' : 'en'));
+// Keep the default URL in Chinese; visitors can explicitly choose another language.
+setLanguage(saved || 'zh');
 document.getElementById('language').addEventListener('change',e => setLanguage(e.target.value));
 const tabs=[...document.querySelectorAll('[data-screen]')];
 function selectTab(tab) {

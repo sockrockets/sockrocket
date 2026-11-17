@@ -51,3 +51,5 @@ Disallow: /
 # Default: allow other agents (search engines, link checkers, etc.)
 User-agent: *
 Allow: /
+
+Sitemap: https://sockrockets.github.io/sockrocket/sitemap.xml

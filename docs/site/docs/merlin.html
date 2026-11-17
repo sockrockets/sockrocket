@@ -2,23 +2,33 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Sockrocket Merlin 插件安装：按固件平台选包、软件中心离线安装。">
-<title>Merlin 安装指南 · Sockrocket</title>
+<meta name="description" content="华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。">
+<title>华硕梅林插件安装教程与离线包下载｜Sockrocket</title>
 <link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../styles.css">
 <script defer src="../docs.js"></script>
 <script defer src="../release.js"></script>
+<link rel="canonical" href="https://sockrockets.github.io/sockrocket/docs/merlin.html">
+<meta property="og:site_name" content="Sockrocket">
+<meta property="og:title" content="华硕梅林插件安装教程与离线包下载｜Sockrocket">
+<meta property="og:description" content="华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://sockrockets.github.io/sockrocket/docs/merlin.html">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="华硕梅林插件安装教程与离线包下载｜Sockrocket">
+<meta name="twitter:description" content="华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "WebPage", "name": "华硕梅林插件安装教程与离线包下载｜Sockrocket", "description": "华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。", "url": "https://sockrockets.github.io/sockrocket/docs/merlin.html", "inLanguage": "zh-CN", "isPartOf": {"@type": "WebSite", "name": "Sockrocket", "url": "https://sockrockets.github.io/sockrocket/"}}</script>
 </head>
 <body data-page="merlin">
 <a class="skip" href="#main" data-t="skip">跳转到内容</a>
 <header class="header"><div class="nav wrap">
-  <a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
+  <a class="brand" href="../"><img src="../assets/logo-icon.svg" width="34" height="34" alt=""><span>Sockrocket</span></a>
   <nav aria-label="Main navigation">
-    <a href="../index.html#merlin">Merlin</a>
-    <a href="../index.html#download" data-t="navDownload">下载</a>
-    <a href="../index.html#experience" data-t="navExperience">产品体验</a>
+    <a href="../#merlin">Merlin</a>
+    <a href="../#download" data-t="navDownload">下载</a>
+    <a href="../#experience" data-t="navExperience">产品体验</a>
     <a href="./" data-t="navDocs" aria-current="page">文档</a>
-    <a href="../index.html#community" data-t="navCommunity">社区</a>
+    <a href="../#community" data-t="navCommunity">社区</a>
   </nav>
   <div class="nav-tools"><label class="sr-only" for="language">Language</label><select id="language"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select>
   <a class="github" href="https://github.com/sockrockets/sockrocket" aria-label="GitHub"><svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true"><path d="M12 .8a11.2 11.2 0 0 0-3.54 21.83c.56.1.77-.24.77-.54v-2.1c-3.13.68-3.79-1.33-3.79-1.33-.51-1.3-1.25-1.65-1.25-1.65-1.03-.7.08-.69.08-.69 1.13.08 1.72 1.16 1.72 1.16 1 1.72 2.63 1.22 3.27.93.1-.73.39-1.22.71-1.5-2.5-.29-5.13-1.25-5.13-5.54 0-1.22.44-2.22 1.16-3-.12-.28-.5-1.42.11-2.96 0 0 .95-.3 3.08 1.15a10.7 10.7 0 0 1 5.6 0c2.14-1.45 3.08-1.15 3.08-1.15.61 1.54.23 2.68.12 2.96.72.78 1.15 1.78 1.15 3 0 4.3-2.63 5.25-5.14 5.53.4.35.76 1.03.76 2.08v3.1c0 .3.21.65.78.54A11.2 11.2 0 0 0 12 .8Z"/></svg></a></div>
@@ -27,7 +37,7 @@
   <header class="doc-hero">
     <div class="doc-locale" data-locale="zh">
       <p class="eyebrow"><span class="dot"></span>Merlin</p>
-      <h1>按固件平台选包，不是按路由器名字猜。</h1>
+      <h1>华硕梅林软件中心：Sockrocket 插件安装教程</h1>
       <p class="lead">在 AsusWRT-Merlin 上用软件中心离线安装。装错平台是最常见失败原因——尤其是 <code>hnd</code> 与 <code>hnd_v8</code>。</p>
       <p class="lead"><strong>小安装包，低内存占用。</strong> v0.0.19 本地打包对照中，移除重复程序后，ARMv7 离线包为 6.36 MiB，ARM64 为 6.43 MiB，下载体积约减半。另一次 RT-AX86U Pro 实测中，153–172 个活跃会话下，代理进程的常驻内存（RSS）为 29–37 MiB。发行包大小随构建而异，内存占用随负载变化。</p>
     </div>
@@ -90,7 +100,7 @@
           <li>开启 <strong>JFFS</strong> 与自定义脚本（系统管理 → 系统设置）。</li>
           <li><code>uname -m</code> 显示内核架构。核对下表中的型号和固件架构，尤其注意 ARMv7 软浮点与硬浮点的区别。</li>
         </ul>
-        <h2 id="packages">按平台选包</h2>
+        <h2 id="packages">梅林插件离线安装包下载：按固件平台选包</h2>
         <div class="doc-table"><table>
           <thead><tr><th>平台</th><th>固件架构</th><th>软件包</th><th>机型</th></tr></thead>
           <tbody>
@@ -199,6 +209,6 @@
     </article>
   </div>
 </main>
-<footer class="wrap"><a class="brand" href="../index.html"><img src="../assets/logo-icon.svg" width="27" height="27" alt=""><span>Sockrocket</span></a><p data-t="footer">开源 Rust 代理客户端 · Apache-2.0</p><div><a href="./" data-t="docs">文档</a><a href="https://t.me/sockrocket">Telegram</a><a href="https://github.com/sockrockets/sockrocket">GitHub</a></div></footer>
+<footer class="wrap"><a class="brand" href="../"><img src="../assets/logo-icon.svg" width="27" height="27" alt=""><span>Sockrocket</span></a><p data-t="footer">开源 Rust 代理客户端 · Apache-2.0</p><div><a href="./" data-t="docs">文档</a><a href="https://t.me/sockrocket">Telegram</a><a href="https://github.com/sockrockets/sockrocket">GitHub</a></div></footer>
 </body>
 </html>
