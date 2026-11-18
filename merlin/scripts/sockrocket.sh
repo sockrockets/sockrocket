@@ -372,7 +372,7 @@ do_restart() {
         info "Service manually stopped; saved settings will apply on next start"
         return 0
     fi
-    do_stop && do_start
+    do_stop preserve-degraded && do_start
 }
 
 # Installations made before nat-start existed only regain DNS hijack on the
@@ -1336,7 +1336,9 @@ do_stop() {
     remove_cron
     restore_core_pattern
     prune_core_dumps
-    rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
+    if [ "${1:-}" != "preserve-degraded" ]; then
+        rm -f "$DEGRADED_FILE" "$WOUT_FAILS_FILE"
+    fi
     rm -f "$SOCKROCKET_DIR/.memory-pressure-since" "$SOCKROCKET_DIR/.recovery-blocked"
 
     if [ "$cleanup_rc" != 0 ]; then
@@ -2133,8 +2135,9 @@ do_watchdog() {
             issues=$((issues + 1))
         fi
 
-        # Outbound liveness while hijack/TP are supposed to be on: consecutive
-        # probe failures → fail-open; success clears the counter and may recover.
+        # An unreachable node must NOT bypass the user's proxy policy.
+        # Keep capture installed and publish failure for the UI. Only local
+        # daemon/resource failures may trigger the system recovery path.
         if [ ! -f "$DEGRADED_FILE" ] \
             && { [ "$(conf_bool transparent_proxy true)" = "true" ] \
               || [ "$(conf_bool dns_hijack false)" = "true" ]; }; then
@@ -2146,7 +2149,7 @@ do_watchdog() {
                 ofails=$((ofails + 1))
                 echo "$ofails" > "$WOUT_FAILS_FILE"
                 if [ "$ofails" -ge 3 ]; then
-                    enter_lan_degraded "outbound probe failed ${ofails}x (${OUTBOUND_PROBE_FAILURE:-details unavailable})"
+                    log_warn "Proxy outbound unavailable: ${OUTBOUND_PROBE_FAILURE:-details unavailable}; keeping proxy policy (no direct fallback)"
                     issues=$((issues + 1))
                 else
                     log_warn "Watchdog: outbound probe failed (${ofails}/3): ${OUTBOUND_PROBE_FAILURE:-details unavailable}"

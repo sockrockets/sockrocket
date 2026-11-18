@@ -294,12 +294,74 @@ fn run_sh(action: &str) -> Result<()> {
             cmd.stderr(f2);
         }
     }
-    let status = cmd.status().context("Cannot invoke lifecycle controller")?;
+    let status = match lifecycle_status(&mut cmd, Duration::from_secs(45)) {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            // The failed command may have installed only part of the network
+            // policy. Keep the guard from re-arming it while cleanup runs.
+            let _ = fs::write(
+                sockrocket_dir().join(".lan_degraded"),
+                "lifecycle timed out",
+            );
+            let mut recovery = Command::new("sh");
+            recovery
+                .arg(sockrocket_sh())
+                .arg("network-restore")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let restored = lifecycle_status(&mut recovery, Duration::from_secs(10))
+                .is_ok_and(|status| status.success());
+            bail!(
+                "Lifecycle action {action} timed out; direct network recovery {}. Check router LAN IP before retrying",
+                if restored {
+                    "completed"
+                } else {
+                    "could not be confirmed"
+                }
+            );
+        }
+        Err(error) => return Err(error).context("Cannot invoke lifecycle controller"),
+    };
     anyhow::ensure!(
         status.success(),
         "Lifecycle action {action} failed with {status}"
     );
     Ok(())
+}
+
+// Bound both the controller and its descendants. Killing just `sh` leaves
+// stuck service commands (and potentially supervisors) running after timeout.
+fn lifecycle_status(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            unsafe {
+                // The child owns this new process group, never the API's group.
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "lifecycle deadline exceeded",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn tail_lines(path: &PathBuf, n: usize) -> String {
@@ -594,6 +656,7 @@ fn act_status(revision_scope: Option<&str>) -> J {
         .unwrap_or(J::Null);
     json!({
         "running": running,
+        "lan_degraded": sockrocket_dir().join(".lan_degraded").exists(),
         "pid": pid,
         "socks_port": conf_u16(&map, "socks_port", 1080).to_string(),
         "http_port": conf_u16(&map, "http_port", 1087).to_string(),
@@ -3824,6 +3887,33 @@ fn act_diagnose() -> J {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_deadline_kills_stuck_controller_and_descendants() {
+        let marker =
+            std::env::temp_dir().join(format!("sockrocket-deadline-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("(sleep 1; echo leaked > \"$1\") & wait")
+            .arg("test")
+            .arg(&marker);
+        let started = std::time::Instant::now();
+        let error = lifecycle_status(&mut cmd, Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!marker.exists(), "descendant survived controller timeout");
+        let mut healthy = Command::new("sh");
+        healthy.args(["-c", "exit 7"]);
+        assert_eq!(
+            lifecycle_status(&mut healthy, Duration::from_secs(1))
+                .unwrap()
+                .code(),
+            Some(7)
+        );
+    }
 
     #[test]
     fn unpack_space_counts_files_and_detects_tar_failure() {
