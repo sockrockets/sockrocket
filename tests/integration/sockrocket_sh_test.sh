@@ -847,6 +847,23 @@ test_watchdog_selfheals_missing_hijack() {
     teardown
 }
 
+# A bad remote node is not a local daemon crash. Never silently bypass
+# proxy policy after repeated outbound probe failures.
+test_bad_node_keeps_proxy_policy() {
+    printf '\n[28] unreachable node keeps DNS and transparent capture\n'
+    setup
+    spawn_daemon
+    sed 's/--daemon-health) kill -0 "\$2" 2>\/dev\/null; exit \$? ;;/--daemon-health) exit 1 ;;/' "$SOCKROCKET_DIR/sockrocket-cli" > "$SANDBOX/bad-node"
+    cp "$SANDBOX/bad-node" "$SOCKROCKET_DIR/sockrocket-cli"
+    for attempt in 1 2 3 4; do run_sockrocket watchdog; done
+    assert "failed outbound recorded" "4" "$(cat "$SOCKROCKET_DIR/.wout_fails")"
+    assert "no direct fallback for bad node" "absent" "$([ -f "$SOCKROCKET_DIR/.lan_degraded" ] && echo present || echo absent)"
+    assert "DNS capture retained" "present" "$([ -f "$DNS_DIR/sockrocket.conf" ] && echo present || echo absent)"
+    assert "transparent capture retained" "present" "$([ -f "$SANDBOX/mangle_chain" ] && echo present || echo absent)"
+    assert "daemon remains alive" "alive" "$(kill -0 "$FAKE_PID" 2>/dev/null && echo alive || echo dead)"
+    teardown
+}
+
 printf '=== sockrocket.sh stop/watchdog semantics ===\n'
 test_stop_running_cleans_up
 test_stop_dead_daemon_still_cleans
@@ -877,6 +894,7 @@ test_watchdog_dns_port_failure_threshold
 test_kill_half_dead
 test_watchdog_dns_failure_counter_resets
 test_watchdog_selfheals_missing_hijack
+test_bad_node_keeps_proxy_policy
 
 printf '\n=== %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

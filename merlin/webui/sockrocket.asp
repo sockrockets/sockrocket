@@ -1261,7 +1261,7 @@ function refreshStatus(withSysinfo) {
       refreshPending[action] = false;
       if (action === 'status' && generation===statusGeneration) {
         SR_STATE.statusKnown = false;
-        srElement('status-freshness').textContent = '状态读取失败，显示的是上次结果';
+        srElement('status-freshness').textContent = '暂时无法连接路由器管理接口，当前状态未确认。请通过路由器局域网 IP 检查连接，勿重复保存。';
         renderChrome();
       }
     });
@@ -1278,7 +1278,7 @@ function acceptStatus(d) {
     if (!d || typeof d.running !== 'boolean') { SR_STATE.statusKnown = false; renderChrome(); return; }
     var nodeChanged = SR_STATE.status.active_node !== d.active_node;
     SR_STATE.status = d; SR_STATE.statusKnown = true;
-    srElement('status-freshness').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    srElement('status-freshness').textContent = (d.lan_degraded ? '服务故障保护中，请检查诊断。' : '') + '更新于 ' + new Date().toLocaleTimeString();
     renderChrome();
     if (nodeChanged) renderNodes();
     if(SR_STATE.page==='network' && !dnsPolicyPending && !networkPending && !dnsPolicyDirty && d.network_revision && dnsPolicyRevision && d.network_revision!==dnsPolicyRevision)loadNetworkPolicy();
@@ -1337,8 +1337,12 @@ function renderChrome() {
 
   srElement('health-process').textContent = !SR_STATE.statusKnown ? '状态未知' : running ? '运行正常' : '已停止';
   var probe = st.health || {}, age = Date.now() / 1000 - Number(probe.last_probe_at || 0);
-  srElement('health-outbound').textContent = !SR_STATE.statusKnown ? '状态未知' : !running ? '未运行' : age >= 0 && age < 120
-    ? (probe.consecutive_failures > 0 ? '最近探测失败' : '最近检查通过 · ' + Math.round(age) + ' 秒前') : '近期没有探测结果';
+  var watchdog = st.watchdog || {};
+  var outboundFailed = watchdog.outbound_ok === false || (watchdog.outbound_ok !== true && age >= 0 && age < 120 && probe.consecutive_failures > 0);
+  srElement('health-outbound').textContent = !SR_STATE.statusKnown ? '状态未知' : !running ? '未运行' : outboundFailed
+    ? '代理出口连接失败，请检查节点；不会因此自动转为直连' : watchdog.outbound_ok === true
+    ? '最近检查通过 · ' + Math.round(watchdog.age_secs || 0) + ' 秒前' : age >= 0 && age < 120
+    ? '最近检查通过 · ' + Math.round(age) + ' 秒前' : '正在检查代理出口，连通性尚未确认';
   var applyLabels = {applied:'已生效',validating:'正在校验',rejected:'更新被拒绝，沿用原配置',restart_required:'部分设置待重启',policy_pending:'正在应用网络规则',policy_failed:'网络规则应用失败'};
   srElement('config-apply').textContent = !SR_STATE.statusKnown ? '状态未知' : !running ? '待启动' : applyLabels[(probe.config_apply || {}).state] || '待确认';
   var runtime = probe.runtime || {}, tun = runtime.tun || {};
@@ -3637,7 +3641,11 @@ function srSaveConfig() {
     toastResp(d); setTimeout(refreshStatus, 800);
   }, function () {
     done();
-    srElement('config-state').textContent = '保存结果未确认，请保留草稿并重新加载核对。';
+    SR_STATE.statusKnown = false; renderChrome();
+    var message = '保存请求未完成，可能超时或暂时无法连接路由器管理接口；保存结果未确认。请保留草稿，通过路由器局域网 IP 检查连接，恢复后重新加载核对，勿重复保存。';
+    srElement('config-state').textContent = message;
+    srElement('status-freshness').textContent = message;
+    srShowMsg(message, 'err');
   }, 60000);
 }
 window.addEventListener('beforeunload', function (event) {
