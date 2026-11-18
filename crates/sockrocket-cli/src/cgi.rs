@@ -3915,7 +3915,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn unpack_space_counts_files_and_detects_tar_failure() {
         let env = TestEnv::new(SAMPLE);
