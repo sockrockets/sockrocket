@@ -614,7 +614,7 @@ body.bg {min-width:0!important}
                 <option value="reject">拒绝</option>
               </select>
             </div>
-            <div class="fg"><label for="sr-rule-source">设备来源 IP / 网段</label><input type="text" id="sr-rule-source" placeholder="留空作为组内规则" autocomplete="off"><span class="hint">填写固定 DHCP IP；设备组可填 CIDR。Merlin LAN 透明接管仅支持 IPv4。</span></div>
+            <div class="fg"><label for="sr-rule-source">设备来源 IP / 网段</label><input type="text" id="sr-rule-source" placeholder="留空作为组内规则" autocomplete="off"><span class="hint">设备组可填 CIDR。IPv6 双栈生效时，可使用 IPv6 来源；同一设备已关联的 IPv6 地址可在设备规则中查看。</span></div>
             <div class="fg"><label for="sr-rule-priority">优先级</label><input type="number" id="sr-rule-priority" value="0" step="1" min="-2147483648" max="2147483647" placeholder="留空保留现有值"></div>
             <div class="fg"><label>重复规则</label>
               <select id="sr-rule-dup">
@@ -658,6 +658,7 @@ body.bg {min-width:0!important}
               <div class="fg" id="sr-device-manual" hidden><label for="sr-device-source">来源 IP / 网段</label><input id="sr-device-source" placeholder="例如 192.168.50.20" oninput="updateDevicePolicySelection()" onchange="syncEditorToMap()"></div>
             </div>
             <div id="sr-device-settings" hidden>
+              <p class="hint" id="sr-device-ipv6" hidden></p>
               <div class="toolbar" id="sr-device-pause-controls" hidden><button type="button" class="btn btn-sm" id="sr-device-pause" onclick="toggleDevicePause()">暂停设备规则</button><span class="hint" id="sr-device-pause-state"></span></div>
               <div class="toolbar"><h4 id="sr-device-fallback-scope">设备默认出口</h4><span class="hint" id="sr-device-fallback-label"></span><div class="spacer"></div><button type="button" class="btn btn-sm" aria-controls="sr-device-fallback" onclick="switchDevicePanel('fallback')">修改默认出口</button></div>
               <div id="sr-device-fallback" class="rule-inline-editor" hidden><div class="toolbar"><strong>修改未命中规则时的处理方式</strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div><div class="toolbar"><div class="fg"><label for="sr-device-target">处理方式</label><select id="sr-device-target" aria-describedby="sr-device-fallback-help sr-device-effective-policy"></select><span class="hint" id="sr-device-fallback-help">规则模式下，只有前面的规则都未匹配（包括内置国内 / 局域网分组规则），才使用这里的选择。例如选「代理」，未匹配的连接就走代理。</span><span class="hint" id="sr-device-effective-policy" hidden></span></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存</button></div></div>
@@ -1284,7 +1285,7 @@ function acceptStatus(d) {
     if (nodeChanged) renderNodes();
     if(SR_STATE.page==='network' && !dnsPolicyPending && !networkPending && !dnsPolicyDirty && d.network_revision && dnsPolicyRevision && d.network_revision!==dnsPolicyRevision)loadNetworkPolicy();
     if(SR_STATE.page==='network' && !dnsPolicyDirty && !dnsPolicyPending && !networkPending)srElement('network-state').textContent=networkStateText(d);
-    if(SR_STATE.page==='dns' && !rulePending && !RULE_READ_PENDING && !RULE_FLOW_ERROR && RULE_RULE_REVISION && d.rules_revision && d.rules_revision!==RULE_RULE_REVISION)srLoadRules();
+    if(SR_STATE.page==='dns' && !rulePending && !RULE_READ_PENDING && !RULE_FLOW_ERROR && RULE_RULE_REVISION && ((d.rules_revision && d.rules_revision!==RULE_RULE_REVISION) || (d.device_identity_revision && d.device_identity_revision!==RULE_DEVICE_REVISION)))srLoadRules();
 }
 
 function formatTrafficBytes(n) {
@@ -2160,7 +2161,7 @@ function updateProxyGroupMode(){
   if(hint)hint.textContent=manual
     ?'可勾选多个成员，再在下方选择当前使用节点。取消当前节点的勾选后，将默认选中剩余的第一个成员，保存后生效。'
     :ordered
-    ?'可勾选多个。上面的先用，失败再试下一个。上次成功的会暂时沿用，并回头尝试更靠前的；UDP 固定走第一个。'
+    ?'可勾选多个。上面的先用，失败再试下一个。上次成功的会暂时沿用，并回头尝试更靠前的；新 UDP 会话按顺序尝试支持 UDP 的成员。'
     :'可勾选多个。这些节点一起比延迟，五分钟内沿用更快的那个。顺序不决定用哪一个。';
   var tools=srElement('pg-member-tools');
   if(tools)tools.hidden=false;
@@ -2303,6 +2304,9 @@ function updateDevicePolicySelection() {
   if(!valid)return;
   var paused=pausedDeviceScope(source);
   var exactPause=(SR_STATE.pausedSources||[]).some(function(s){return sameDeviceSource(s,source);});
+  var device=deviceRecord(), related=device && device.ipv6 || [], v6Info=srElement('device-ipv6');
+  v6Info.hidden=!related.length;
+  v6Info.textContent=related.length?'关联的 IPv6 地址：'+related.join('、')+'。双栈模式下使用本设备规则，已单独设置的 IPv6 来源策略优先。':'';
   var pauseButton=srElement('device-pause');
   srElement('device-pause-controls').hidden=global;
   pauseButton.textContent=exactPause?'恢复设备规则':'暂停设备规则';
@@ -2798,7 +2802,7 @@ function orderedRules(rules) {
   });
 }
 var RULE_FLOW_ERROR = false, RULE_FLOW_CLIENT = '';
-var RULE_TRACE=null,RULE_TRACE_PENDING=false,RULE_TRACE_GENERATION=0,RULE_RULE_REVISION=null,RULE_TRACE_CONTEXT=null;
+var RULE_TRACE=null,RULE_TRACE_PENDING=false,RULE_TRACE_GENERATION=0,RULE_RULE_REVISION=null,RULE_DEVICE_REVISION=null,RULE_TRACE_CONTEXT=null;
 var RULE_READ_PENDING=false,RULE_LOAD_GENERATION=0,RULE_SNAPSHOT_MODE=null;
 function ruleTraceContext(){var s=SR_STATE.status||{};return JSON.stringify([s.proxy_mode,s.active_node,s.node_count,s.running,s.transparent_proxy,s.cn_ipset_direct]);}
 // Used only for local diagram previews; Rust validates saved selectors.
@@ -2833,6 +2837,13 @@ function hasDeviceAssignment(source) {
   function applies(r){return r.source && sourceContains(r.source,source);}
   return (SR_STATE.deviceBindings||[]).some(applies) || (SR_STATE.ruleRows||[]).some(function(r){return r.enabled!==false && applies(r);});
 }
+function devicePolicySource(source) {
+  if(!source || source.indexOf(':')<0 || !flowHost(source) || pausedDeviceScope(source) || hasDeviceAssignment(source))return source;
+  var parent=(SR_STATE.devices||[]).find(function(device){
+    return (device.ipv6||[]).some(function(address){return sameDeviceSource(source,address);});
+  });
+  return parent?parent.source:source;
+}
 function flowHost(source) {
   var net=sourceNetwork(source);
   return net && net.prefix===net.width ? source.split('/')[0] : '';
@@ -2855,7 +2866,11 @@ function flowDeviceChoices() {
     if(keys.has(key))return;
     keys.add(key);hosts.set(ip,name);
   }
-  (SR_STATE.devices||[]).forEach(function(d){add(d.source,d.alias||d.host||'');});
+  (SR_STATE.devices||[]).forEach(function(d){
+    var label=d.alias||d.host||'';
+    add(d.source,label);
+    (d.ipv6||[]).forEach(function(ip){add(ip,label);});
+  });
   (SR_STATE.deviceBindings||[]).concat(SR_STATE.ruleRows||[]).forEach(function(r){if(r.source)add(r.source,'');});
   (SR_STATE.pausedSources||[]).forEach(function(s){add(s,'');});
   return hosts;
@@ -3147,6 +3162,7 @@ function orderedFlowRules(rows) {
 }
 function byBindingPriority(a,b) {return (b.priority||0)-(a.priority||0);}
 function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
+  if(!configuredOnly)client=devicePolicySource(client);
   var deviceConfig=configuredOnly && client,paused=pausedDeviceScope(client);
   if(mode==='global'||mode==='direct')return deviceConfig?[]:[{kind:'mode',title:mode==='global'?'全局代理':'全部直连',targets:[mode==='global'?'proxy':'direct']}];
   var ordered=orderedRows||orderedFlowRules(rows), result=[];
@@ -3362,13 +3378,15 @@ function srLoadRules(after) {
     SR_STATE.compiledTargets = Array.isArray(d.compiled_targets)?d.compiled_targets:null;
     SR_STATE.ruleRows = rules; RULE_FLOW_ERROR = false;RULE_READ_PENDING=false;
     RULE_SNAPSHOT_MODE=typeof d.proxy_mode==='string'?d.proxy_mode:(SR_STATE.status||{}).proxy_mode||'rule';
-    var revision=d.revision||null, changed=RULE_RULE_REVISION!==revision;
+    var revision=d.revision||null, deviceRevision=d.device_identity_revision||null;
+    var changed=RULE_RULE_REVISION!==revision || RULE_DEVICE_REVISION!==deviceRevision;
+    RULE_DEVICE_REVISION=deviceRevision;
     RULE_RULE_REVISION=revision;
     setProxyGroupTargets(d.proxy_groups, d.nodes || []);
     syncFlowDevicePicker();
     renderDevicePolicies();
     loadRulePresets(d.presets);
-    if(changed && (RULE_TRACE || RULE_TRACE_PENDING))invalidateRuleTrace('规则或模式已更新，请重新检查。');
+    if(changed && (RULE_TRACE || RULE_TRACE_PENDING))invalidateRuleTrace('规则、设备地址或模式已更新，请重新检查。');
     refreshRuleGroupList(rules);
     renderRules(false);
     if(typeof after==='function')after(true);

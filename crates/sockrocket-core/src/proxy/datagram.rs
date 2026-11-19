@@ -1,10 +1,14 @@
 //! Datagram transport preserves message boundaries; it is never a TCP stream.
 use anyhow::Result;
-use std::{future::Future, pin::Pin, time::Duration};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::UdpSocket,
+use std::{
+    future::{Future, poll_fn},
+    pin::Pin,
+    sync::{Mutex, atomic::Ordering},
+    time::Duration,
 };
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
 
 pub type DatagramFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 pub trait Datagram: Send + Sync {
@@ -13,16 +17,54 @@ pub trait Datagram: Send + Sync {
 }
 pub type BoxDatagram = Box<dyn Datagram>;
 
+/// The carrier discarded this individual message before changing association state.
+#[derive(Debug)]
+pub(super) struct PacketRejected(pub &'static str);
+impl std::fmt::Display for PacketRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for PacketRejected {}
+
+pub(super) fn copy_received(data: &[u8], buffer: &mut [u8]) -> Result<usize> {
+    if data.len() > buffer.len() {
+        return Err(PacketRejected("UDP receive buffer too small").into());
+    }
+    buffer[..data.len()].copy_from_slice(data);
+    Ok(data.len())
+}
+
+fn native_packet_error(error: std::io::Error) -> anyhow::Error {
+    // Windows reports WSAEMSGSIZE on truncated receives. Native sends may
+    // also report the path MTU. Neither event closes a connected UDP socket.
+    #[cfg(unix)]
+    const MESSAGE_TOO_LARGE: i32 = libc::EMSGSIZE;
+    #[cfg(windows)]
+    const MESSAGE_TOO_LARGE: i32 = 10040;
+    #[cfg(any(unix, windows))]
+    if error.raw_os_error() == Some(MESSAGE_TOO_LARGE) {
+        return PacketRejected("UDP datagram exceeds the socket payload limit").into();
+    }
+    error.into()
+}
+
 impl Datagram for UdpSocket {
     fn send<'a>(&'a self, packet: &'a [u8]) -> DatagramFuture<'a, ()> {
         Box::pin(async move {
-            let sent = UdpSocket::send(self, packet).await?;
+            let sent = UdpSocket::send(self, packet)
+                .await
+                .map_err(native_packet_error)?;
             anyhow::ensure!(sent == packet.len(), "Partial UDP datagram write");
             Ok(())
         })
     }
     fn recv<'a>(&'a self, packet: &'a mut [u8]) -> DatagramFuture<'a, usize> {
-        Box::pin(async move { Ok(UdpSocket::recv(self, packet).await?) })
+        Box::pin(async move {
+            UdpSocket::recv(self, packet)
+                .await
+                .map_err(native_packet_error)
+        })
     }
 }
 
@@ -42,29 +84,125 @@ pub(super) async fn connect_direct(host: &str, port: u16) -> Result<BoxDatagram>
     } else {
         tokio::net::lookup_host((host, port)).await?.collect()
     };
-    let addr = resolved
-        .into_iter()
-        .find(|addr| crate::dns::fakeip::fake_ipv4(addr.ip()).is_none())
-        .ok_or_else(|| {
-            anyhow::anyhow!("No real UDP destination address (Fake-IP cannot be dialed directly)")
-        })?;
-    let socket = UdpSocket::bind(if addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
+    connect_direct_candidates(resolved, |addr| async move {
+        let socket = UdpSocket::bind(if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .await?;
+        super::outbound_bind::apply_to_udp_socket(&socket, addr.is_ipv6())?;
+        socket.connect(addr).await?;
+        Ok(Box::new(socket) as BoxDatagram)
     })
-    .await?;
-    super::outbound_bind::apply_to_udp_socket(&socket, addr.is_ipv6())?;
-    socket.connect(addr).await?;
-    Ok(Box::new(socket))
+    .await
 }
 
-pub(super) async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
-    client: &mut S,
+async fn connect_direct_candidates<T, F: Future<Output = Result<T>>>(
+    resolved: Vec<std::net::SocketAddr>,
+    connect: impl Fn(std::net::SocketAddr) -> F,
+) -> Result<T> {
+    let mut last_error = None;
+    for addr in resolved {
+        if crate::dns::fakeip::fake_ipv4(addr.ip()).is_some() {
+            continue;
+        }
+        // No application datagram has been sent yet. A local bind or route
+        // error can safely advance to the next address without replaying data.
+        match connect(addr).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("No real UDP destination address (Fake-IP cannot be dialed directly)")
+    }))
+}
+
+pub(super) async fn relay_tun(
+    client: &mut ipstack::IpStackUdpStream,
+    connection: &super::ConnectionGuard,
+    remote: &dyn Datagram,
+) -> Result<()> {
+    let limit = client.max_payload_len();
+    // Both directions only borrow the stream for one nonblocking poll. A
+    // pending send never owns the stream while waiting for queue capacity.
+    let local = Mutex::new(connection.observe(client));
+    relay_packets(&local, limit, remote).await
+}
+
+trait LocalDatagram: Sync {
+    fn receive(&self) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
+    fn send(&self, packet: &[u8]) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl LocalDatagram for Mutex<super::ObservedIo<&mut ipstack::IpStackUdpStream>> {
+    async fn receive(&self) -> Result<Option<Vec<u8>>> {
+        Ok(poll_fn(|cx| {
+            let mut io = self.lock().unwrap();
+            io.stream.poll_recv_datagram(cx).map_ok(|packet| {
+                if let Some(ref p) = packet {
+                    io.counts.0.fetch_add(p.len() as u64, Ordering::Relaxed);
+                    io.record_bytes(p.len() as u64, 0);
+                }
+                packet
+            })
+        })
+        .await?)
+    }
+    async fn send(&self, packet: &[u8]) -> Result<()> {
+        Ok(poll_fn(|cx| {
+            let mut io = self.lock().unwrap();
+            io.stream.poll_send_datagram(cx, packet).map_ok(|()| {
+                io.counts
+                    .1
+                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                io.record_bytes(0, packet.len() as u64);
+            })
+        })
+        .await?)
+    }
+}
+
+// The duplex harness drives stalled reads/writes independently in timer tests.
+#[cfg(test)]
+pub(super) async fn relay(
+    client: &mut tokio::io::DuplexStream,
+    remote: &dyn Datagram,
+) -> Result<()> {
+    struct Duplex<'a> {
+        reader: tokio::sync::Mutex<tokio::io::ReadHalf<&'a mut tokio::io::DuplexStream>>,
+        writer: tokio::sync::Mutex<tokio::io::WriteHalf<&'a mut tokio::io::DuplexStream>>,
+    }
+    impl LocalDatagram for Duplex<'_> {
+        async fn receive(&self) -> Result<Option<Vec<u8>>> {
+            let mut bytes = vec![0; 4096];
+            let n = self.reader.lock().await.read(&mut bytes).await?;
+            bytes.truncate(n);
+            Ok((n != 0).then_some(bytes))
+        }
+        async fn send(&self, packet: &[u8]) -> Result<()> {
+            Ok(self.writer.lock().await.write_all(packet).await?)
+        }
+    }
+    let (reader, writer) = tokio::io::split(client);
+    relay_packets(
+        &Duplex {
+            reader: reader.into(),
+            writer: writer.into(),
+        },
+        4096,
+        remote,
+    )
+    .await
+}
+
+async fn relay_packets(
+    local: &impl LocalDatagram,
+    limit: usize,
     remote: &dyn Datagram,
 ) -> Result<()> {
     const IDLE: Duration = Duration::from_secs(30);
-    let (mut reader, mut writer) = tokio::io::split(client);
     // A blocked/rate-limited upload must not stop draining the bounded QUIC
     // receive queue. Keep each receive future alive until its direction exits.
     #[derive(Clone, Copy)]
@@ -77,21 +215,24 @@ pub(super) async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
         writing: 0,
     });
     let upload = async {
-        let mut outbound = vec![0; 65535];
         loop {
-            let size = reader.read(&mut outbound).await?;
-            if size == 0 {
+            let Some(packet) = local.receive().await? else {
                 return Ok::<_, anyhow::Error>(());
-            }
+            };
             progress.send_modify(|state| {
                 state.last = tokio::time::Instant::now();
                 state.writing += 1;
             });
-            tokio::time::timeout(IDLE, remote.send(&outbound[..size]))
+            let result = tokio::time::timeout(IDLE, remote.send(&packet))
                 .await
                 .map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP upstream write stalled")
-                })??;
+                })?;
+            if let Err(error) = result
+                && !error.is::<PacketRejected>()
+            {
+                return Err(error);
+            }
             progress.send_modify(|state| {
                 state.last = tokio::time::Instant::now();
                 state.writing -= 1;
@@ -100,17 +241,27 @@ pub(super) async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let download = async {
-        let mut inbound = vec![0; 65535];
+        // A native UDP socket can truncate to buffer length. One sentinel
+        // byte distinguishes an exact fit from every oversized message.
+        let mut inbound = vec![0; limit + 1];
         loop {
             let size = match remote.recv(&mut inbound).await {
-                Ok(size) => size,
+                Ok(size) if size <= limit => size,
+                Ok(_) => {
+                    tokio::task::consume_budget().await;
+                    continue;
+                }
+                Err(error) if error.is::<PacketRejected>() => {
+                    tokio::task::consume_budget().await;
+                    continue;
+                }
                 Err(error) => return Err::<(), _>(error),
             };
             progress.send_modify(|state| {
                 state.last = tokio::time::Instant::now();
                 state.writing += 1;
             });
-            tokio::time::timeout(IDLE, writer.write_all(&inbound[..size]))
+            tokio::time::timeout(IDLE, local.send(&inbound[..size]))
                 .await
                 .map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP client write stalled")
@@ -347,6 +498,85 @@ mod tests {
         assert!(error.to_string().contains("UDP client write stalled"));
     }
 
+    #[tokio::test]
+    async fn tun_udp_preserves_empty_packets_and_survives_oversize_replies() {
+        use crate::proxy::stream_datagram::{Framing, StreamDatagram};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for v6 in [false, true] {
+                let mtu = 1400;
+                let ip_header = if v6 { 40 } else { 20 };
+                let limit = usize::from(mtu) - ip_header - 8;
+                let packet = |payload: &[u8]| {
+                    let builder = if v6 {
+                        etherparse::PacketBuilder::ipv6([1; 16], [2; 16], 64)
+                    } else {
+                        etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [192, 0, 2, 2], 64)
+                    };
+                    let mut wire = Vec::new();
+                    builder.udp(40000, 443).write(&mut wire, payload).unwrap();
+                    wire
+                };
+                let mut cfg = ipstack::IpStackConfig::default();
+                cfg.mtu(mtu).unwrap();
+                let (mut device, tun) = tokio::io::duplex(32 * 1024);
+                let mut stack = ipstack::IpStack::new(cfg, tun);
+                device.write_all(&packet(&[])).await.unwrap();
+                let ipstack::IpStackStream::Udp(mut udp) = stack.accept().await.unwrap() else {
+                    panic!("expected TUN UDP flow");
+                };
+                let (wire, mut peer) = tokio::io::duplex(32 * 1024);
+                let remote = StreamDatagram::boxed(Box::new(wire), Framing::Length16);
+                let stats = super::super::ProxyStats::default();
+                let guard = stats.track_active("test".into(), "TUN UDP");
+                let task =
+                    tokio::spawn(async move { relay_tun(&mut udp, &guard, remote.as_ref()).await });
+
+                // The first and subsequent zero-length datagrams must reach the carrier.
+                assert_eq!(peer.read_u16().await.unwrap(), 0);
+                for payload in [&b""[..], &b"up"[..]] {
+                    device.write_all(&packet(payload)).await.unwrap();
+                    assert_eq!(usize::from(peer.read_u16().await.unwrap()), payload.len());
+                    let mut data = vec![0; payload.len()];
+                    peer.read_exact(&mut data).await.unwrap();
+                    assert_eq!(data, payload);
+                }
+                // The first oversize frame fits the sentinel buffer; the second
+                // is rejected by the carrier. Neither can appear on the TUN.
+                for size in [limit + 1, limit + 2, 0, limit, 4] {
+                    peer.write_u16(size as u16).await.unwrap();
+                    peer.write_all(&vec![42; size]).await.unwrap();
+                }
+                for size in [0, limit, 4] {
+                    let mut wire = vec![0; ip_header + 8 + size];
+                    device.read_exact(&mut wire).await.unwrap();
+                    let parsed = etherparse::SlicedPacket::from_ip(&wire).unwrap();
+                    let Some(etherparse::TransportSlice::Udp(reply)) = parsed.transport else {
+                        panic!("expected UDP reply");
+                    };
+                    assert_eq!(reply.payload(), &vec![42; size]);
+                    assert_eq!(
+                        (reply.source_port(), reply.destination_port()),
+                        (443, 40000)
+                    );
+                    if v6 {
+                        let checksum = reply
+                            .to_header()
+                            .calc_checksum_ipv6_raw([2; 16], [1; 16], reply.payload())
+                            .unwrap();
+                        assert_eq!(checksum, reply.checksum());
+                    }
+                }
+                assert_eq!(stats.bytes_sent(), 2);
+                assert_eq!(stats.bytes_received(), (limit + 4) as u64);
+                task.abort();
+                let _ = task.await;
+            }
+        })
+        .await
+        .expect("TUN UDP did not preserve the association");
+    }
+
     struct TcpOnly;
     impl super::super::connector::Outbound for TcpOnly {
         fn connect(
@@ -374,6 +604,32 @@ mod tests {
         let wrapped = SharedOutbound(std::sync::Arc::new(TcpOnly)).with_retry(3);
         let outbound = SwappableOutbound::new(wrapped);
         assert!(outbound.connect_datagram("192.0.2.1", 443).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_udp_tries_next_address_after_local_route_failure() {
+        let real = "127.0.0.1:53".parse().unwrap();
+        let candidates = vec![
+            "198.18.0.3:53".parse().unwrap(),
+            "[2001:db8::1]:53".parse().unwrap(),
+            real,
+        ];
+        let tried = std::cell::RefCell::new(Vec::new());
+        let connected = connect_direct_candidates(candidates, |addr| {
+            tried.borrow_mut().push(addr);
+            std::future::ready(if addr == real {
+                Ok(addr)
+            } else {
+                Err(anyhow::anyhow!("no IPv6 route"))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, real);
+        assert_eq!(
+            tried.into_inner(),
+            ["[2001:db8::1]:53".parse().unwrap(), real]
+        );
     }
 
     #[tokio::test]

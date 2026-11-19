@@ -90,7 +90,7 @@
         <p>在<strong>节点</strong>页新建。它和分流规则里的规则分组不是一回事：规则分组是规则的文件夹，节点分组是出口。</p>
         <ul>
           <li><strong>手动选择</strong>：只会使用选中的那一个节点，保存时也只保留这一个。</li>
-          <li><strong>备用</strong>：可以勾选多个，顺序就是尝试顺序。五分钟内从上次连上的成员开始；之后再从第一个开始。这个成员建连失败，就按顺序试剩下的。UDP 固定走第一个。已经建立的连接不会被搬走。</li>
+          <li><strong>备用</strong>：可以勾选多个，顺序就是尝试顺序。五分钟内从上次连上的成员开始；之后再从第一个开始。这个成员建连失败，就按顺序试剩下的。新 UDP 会话按顺序尝试支持 UDP 的成员。已经建立的连接不会被搬走。</li>
           <li><strong>测速</strong>：可以勾选多个。五分钟内沿用刚才更快的那个；过期后这些节点一起比握手。顺序不决定用哪一个。</li>
         </ul>
         <p>成员失效不会悄悄改走全局节点。分组里切换成员，也不改变顶部当前节点。</p>
@@ -139,7 +139,7 @@
         <p>Create one on the <strong>Nodes</strong> page. A rule group on the Routing page is a folder of rules. A node group is an exit.</p>
         <ul>
           <li><strong>Manual</strong>: one node. Saving keeps only that node.</li>
-          <li><strong>Fallback</strong>: several nodes, in list order. For five minutes, new TCP starts at the last member that connected, then it starts at the first again. If that member fails to connect, the rest are tried in order. UDP stays on the first. An open connection is not moved.</li>
+          <li><strong>Fallback</strong>: several nodes, in list order. For five minutes, new TCP starts at the last member that connected, then it starts at the first again. If that member fails to connect, the rest are tried in order. New UDP associations try UDP-capable members until setup succeeds. An open connection is not moved.</li>
           <li><strong>URL test</strong>: several nodes. For five minutes, new TCP reuses the fastest recent handshake. After that the members race, and order does not choose the winner.</li>
         </ul>
         <p>A missing member is not replaced by the global node.</p>

@@ -414,15 +414,38 @@ ipv6_compat_guard_start() {
 }
 
 ipv6_guard_stop() {
+    rm -f "$SOCKROCKET_RUNTIME_DIR/device-ipv6-map" "$SOCKROCKET_RUNTIME_DIR/device-ipv6-applied" "$SOCKROCKET_RUNTIME_DIR/device-ipv6-last-good"
     ipv6_proxy_stop || return 1
     ipv6_compat_guard_stop || return 1
 }
+
+sync_ipv6_identities() (
+    local iface="$1" map="$SOCKROCKET_RUNTIME_DIR/device-ipv6-map"
+    local applied="$SOCKROCKET_RUNTIME_DIR/device-ipv6-applied" snapshot
+    "$SOCKROCKET_DIR/sockrocket-cli" --refresh-device-ipv6 "$iface" || \
+        err "IPv6 device discovery unavailable; retrying on the next policy check"
+    cn_ipv6 cn_flow_installed || return 0
+    if [ ! -e "$map" ] && [ ! -e "$applied" ]; then return 0; fi
+    cmp -s "$map" "$applied" && return 0
+    umask 077
+    snapshot="$SOCKROCKET_RUNTIME_DIR/device-ipv6-applied.$$"
+    (set -C; : > "$snapshot") || return 1
+    trap 'rm -f "$SOCKROCKET_RUNTIME_DIR/device-ipv6-applied.$$"' 0
+    if [ -e "$map" ]; then cp "$map" "$snapshot" || return 1; fi
+    # A concurrent rotation leaves a different authoritative map, so the
+    # following pass retries. A failed ipset update is never acknowledged.
+    cn_ipv6 sync_cn_sources && mv -f "$snapshot" "$applied"
+)
 
 # Install dual-stack when this host can complete it. Otherwise keep the IPv4
 # proxy and install the compatibility guard. A missing prefix, forwarding
 # flag, or ip6tables target must not flush IPv4 rules.
 ipv6_try_dual_stack() {
-    if ipv6_proxy_verify; then
+    local iface
+    iface=$(ipv6_lan_interface) || return 1
+    # If syncing the kernel shortcut fails, use the normal guarded rebuild.
+    # A missing optional discovery source never disables the IPv4 path.
+    if sync_ipv6_identities "$iface" && ipv6_proxy_verify; then
         ipv6_compat_guard_stop || return 1
         ipv6_clear_fallback
         return 0
@@ -464,6 +487,7 @@ ipv6_guard_verify() {
 # firmware RA/DHCPv6 state, forwarding sysctls or the router's OUTPUT chain.
 ipv6_proxy_stop() {
     local count=0
+    rm -f "$SOCKROCKET_RUNTIME_DIR/ipv6_proxy_prefixes"
     while [ "$count" -lt 32 ] && ip6tables -t mangle -D PREROUTING -j "$IPV6_MANGLE" 2>/dev/null; do count=$((count+1)); done
     ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null && return 1
     ip6tables -t mangle -F "$IPV6_MANGLE" 2>/dev/null || true
@@ -517,11 +541,12 @@ ipv6_proxy_start() {
     for dest in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
         ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
     done
-    router_addresses=$(ip -6 addr show dev "$iface" 2>/dev/null | awk '/inet6 /{print $2}')
+    router_addresses=$(ipv6_onlink_destinations "$iface") || { ipv6_proxy_stop; return 1; }
     for dest in $router_addresses; do
         # Keep on-link LAN traffic out of the transparent internet path.
         ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
     done
+    mkdir -p "$SOCKROCKET_RUNTIME_DIR" && printf '%s\n' "$router_addresses" > "$SOCKROCKET_RUNTIME_DIR/ipv6_proxy_prefixes" || { ipv6_proxy_stop; return 1; }
     proxy_endpoint_returns 6 || { ipv6_proxy_stop; return 1; }
     # Device scopes are marked before other LAN policy so the userspace
     # router sees their source even when a kernel direct shortcut is enabled.
@@ -585,16 +610,30 @@ ipv6_proxy_verify() {
     if [ "$(get_conf cn_ipset_direct)" = true ] && [ ! -f "$SOCKROCKET_RUNTIME_DIR/cn6_via_tun" ]; then
         cn_ipv6 cn_flow_installed || return 1
     fi
+    local installed current
+    installed=$(cat "$SOCKROCKET_RUNTIME_DIR/ipv6_proxy_prefixes" 2>/dev/null) || return 1
+    current=$(ipv6_onlink_destinations "$iface") || return 1
+    [ "$installed" = "$current" ] || return 1
     ipv6_forward_jump_ok "$IPV6_FORWARD" || return 1
     ipv6_reply_return mangle -C "$IPV6_MANGLE" "$iface" 2>/dev/null &&
     ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null &&
     ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p tcp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&
     ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p udp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&
     ip6tables -C FORWARD -j "$IPV6_FORWARD" 2>/dev/null &&
+    ip6tables -C "$IPV6_FORWARD" -i "$iface" -o "$tun" -p udp -j ACCEPT 2>/dev/null &&
+    ip6tables -C "$IPV6_FORWARD" -i "$iface" -o "$tun" -p tcp -j ACCEPT 2>/dev/null &&
     ip6tables -C "$IPV6_FORWARD" -i "$tun" -o "$iface" -j ACCEPT 2>/dev/null &&
     ip -6 rule show 2>/dev/null | grep -Eq "fwmark ${TUN_MARK}(/0xffffffff)? .*lookup ${SOCKROCKET_RT_TABLE}([[:space:]]|$)" || return 1
     ip -6 route show table "$SOCKROCKET_RT_TABLE" 2>/dev/null | grep -Eq "^default dev $tun( |$)" || return 1
     ip -6 route show 2001:2:0:4765::/96 2>/dev/null | grep -Eq "^2001:2:0:4765::/96 dev $tun( |$)"
+}
+
+# Record exactly the LAN address prefixes exempted by mangle. A DHCPv6
+# renewal can change them while all jumps and policy routes remain attached.
+ipv6_onlink_destinations() {
+    local addresses
+    addresses=$(ip -6 addr show dev "$1" scope global 2>/dev/null) || return 1
+    printf '%s\n' "$addresses" | awk '/inet6 / {print $2}' | sort -u
 }
 
 # Client source prefixes for whichever LAN interface this host is using.
@@ -770,7 +809,9 @@ ipv6_dns_start() {
         err "IPv6 DNS interception needs a global on-link LAN prefix"
         return 1
     fi
-    ipv6_dns_installed_prefixes > "$(ipv6_state dns_prefixes)" || {
+    # A DHCPv6 renewal during rule installation must leave the snapshot
+    # describing the rules we actually attached. The next pass sees the change.
+    printf '%s\n' "$prefixes" > "$(ipv6_state dns_prefixes)" || {
         err "IPv6 DNS interception unavailable; refusing incomplete DNS setup"
         return 1
     }
@@ -852,6 +893,7 @@ do_ipv6_apply() {
         return 0
     fi
     ipv6_clear_fallback
+    rm -f "$SOCKROCKET_RUNTIME_DIR/device-ipv6-map" "$SOCKROCKET_RUNTIME_DIR/device-ipv6-applied" "$SOCKROCKET_RUNTIME_DIR/device-ipv6-last-good"
     ipv6_proxy_stop || return 1
     ipv6_dns_stop || return 1
     ipv6_compat_guard_start

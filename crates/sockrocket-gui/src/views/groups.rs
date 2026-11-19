@@ -291,7 +291,7 @@ impl AppState {
                 }
                 GroupType::Select => "Pick the outbound node manually",
                 GroupType::Fallback => {
-                    "TCP keeps the last working member, then retries earlier ones. UDP stays on the first"
+                    "TCP keeps the last working member, then retries earlier ones. New UDP flows try UDP-capable members in order"
                 }
             };
 

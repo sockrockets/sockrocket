@@ -42,7 +42,7 @@ pub(crate) async fn with_direct_destination<F: Future>(host: &str, future: F) ->
         .await
 }
 
-pub(crate) async fn scoped_direct_resolve(host: &str) -> Option<Result<Vec<IpAddr>>> {
+pub(crate) fn direct_resolver(host: &str) -> Option<(DnsResolver, bool)> {
     let canonical = host
         .trim_matches(['[', ']'])
         .trim_end_matches('.')
@@ -58,14 +58,20 @@ pub(crate) async fn scoped_direct_resolve(host: &str) -> Option<Result<Vec<IpAdd
     if resolver.config.node_hosts.contains(&canonical)
         && let Some(bootstrap) = &resolver.bootstrap
     {
-        return Some(bootstrap.resolve_addresses(&canonical).await);
+        return Some((bootstrap.as_ref().clone(), false));
     }
     resolver.direct_resolution = true;
     resolver.fakeip = None;
-    if crate::proxy::routing::tun_ipv6() {
-        return Some(resolver.resolve_with_qtype(&canonical, 28).await);
-    }
-    Some(resolver.resolve_addresses(&canonical).await)
+    Some((resolver, crate::proxy::routing::tun_ipv6()))
+}
+
+pub(crate) async fn scoped_direct_resolve(host: &str) -> Option<Result<Vec<IpAddr>>> {
+    let (resolver, ipv6_only) = direct_resolver(host)?;
+    Some(if ipv6_only {
+        resolver.resolve_qtype_snapshot(host, QTYPE_AAAA).await
+    } else {
+        resolver.resolve_addresses(host).await
+    })
 }
 
 struct Bootstrap {

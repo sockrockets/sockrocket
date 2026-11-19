@@ -669,6 +669,7 @@ fn act_status(revision_scope: Option<&str>) -> J {
         "proxy_mode": conf_str(&map, "proxy_mode")
             .unwrap_or_else(|| "rule".into())
             .to_ascii_lowercase(),
+        "device_identity_revision": crate::device_identity::revision(),
         "rules_revision": (!matches!(revision_scope, Some("none" | "network")))
             .then(|| route_trace::rules_revision(&map)),
         "network_revision": (!matches!(revision_scope, Some("none" | "rules")))
@@ -2684,7 +2685,8 @@ fn act_get_rules() -> J {
         return err_msg("暂停设备配置无效");
     };
     let (groups, nodes) = proxy_groups::rule_catalogs(&map);
-    json!({"ok": true, "paused_device_sources":paused, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(&map), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    let identity_revision = crate::device_identity::revision();
+    json!({"ok": true, "device_identity_revision":identity_revision, "paused_device_sources":paused, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(&map), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is

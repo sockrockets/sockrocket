@@ -1,6 +1,7 @@
 mod cgi;
 mod config_apply;
 mod daemon_health;
+mod device_identity;
 mod http_health;
 mod proxy_http;
 
@@ -24,6 +25,9 @@ use sockrocket_core::{
 fn main() -> Result<()> {
     if let Some(result) = sockrocket_core::network_guardian::run_if_requested() {
         return result;
+    }
+    if env::args().nth(1).as_deref() == Some("--refresh-device-ipv6") {
+        return device_identity::refresh(&env::args().nth(2).context("LAN interface required")?);
     }
     // CGI mode: invoked as `sockrocket.cgi` by the router httpd (AsusWRT-Merlin web
     // UI backend), or explicitly as `sockrocket-cli cgi`. Synchronous, no tokio
@@ -183,7 +187,7 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
         let mut config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
         normalize_node_names(&mut config.nodes);
-        prepare_routing(&config)?;
+        prepare_routing(&config, None)?;
         println!("Configuration compatible");
         return Ok(());
     }
@@ -235,10 +239,16 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
         let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
         if config.proxy_mode == ProxyMode::Rule {
-            let sources = sockrocket_core::router::active_device_networks(
+            let aliases = if ipv6 {
+                device_identity::try_read()?
+            } else {
+                Default::default()
+            };
+            let sources = sockrocket_core::router::active_device_networks_with_aliases(
                 &config.rules,
                 &config.device_rule_groups,
                 &config.paused_device_sources,
+                &aliases,
             );
             for source in sources.into_iter().filter(|s| s.contains(':') == ipv6) {
                 println!("{source}");
@@ -332,7 +342,8 @@ async fn async_main() -> Result<()> {
             && dns_settings.strategy == sockrocket_core::config::dns::AddressStrategy::Ipv6Only),
         "IPv6-only DNS requires dual_stack in Merlin transparent mode"
     );
-    let (active_index, router, outbound) = prepare_routing(&config)?;
+    let device_identities = (enable_tun && !setup_routes).then(watch_device_identities);
+    let (active_index, router, outbound) = prepare_routing(&config, device_identities.as_ref())?;
     tracing::info!(
         "Proxy mode: {}",
         match config.proxy_mode {
@@ -830,7 +841,7 @@ async fn async_main() -> Result<()> {
                         }
                         let mut new_config = reloaded.config;
                         normalize_node_names(&mut new_config.nodes);
-                        match prepare_routing(&new_config) {
+                        match prepare_routing(&new_config, device_identities.as_ref()) {
                             Ok((new_index, new_router, new_outbound)) => {
                                 let mut dns_config = match settings.resolver_config(
                                     new_config.nodes.iter().map(|node| node.server.clone()),
@@ -1223,13 +1234,38 @@ async fn resolve_config(
     Ok((config, changed, refreshed))
 }
 
+type DeviceIdentities =
+    Arc<std::sync::RwLock<std::collections::BTreeMap<std::net::Ipv6Addr, std::net::Ipv4Addr>>>;
+
+/// All routing snapshots observe the same LAN identity map, including after
+/// configuration reload and node failover. Each routing decision uses its own source.
+fn watch_device_identities() -> DeviceIdentities {
+    let identities = Arc::new(std::sync::RwLock::new(device_identity::read()));
+    let active = identities.clone();
+    spawn_background(async move {
+        let mut previous = None;
+        loop {
+            if let Ok(stamp) = device_identity::version()
+                && previous != Some(stamp)
+                && let Ok(snapshot) = device_identity::try_read()
+            {
+                *active.write().unwrap() = snapshot;
+                previous = Some(stamp);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    identities
+}
+
 /// Prepare one routing snapshot for the listeners, TUN and health monitor.
 /// Each config gets a fresh rule cache. A rejected reload drops the snapshot.
 fn prepare_routing(
     config: &AppConfig,
+    identities: Option<&DeviceIdentities>,
 ) -> Result<(Option<usize>, Option<Arc<Router>>, SharedOutbound)> {
     let index = resolve_active_index(config)?;
-    let router = router_for_mode(config);
+    let router = router_for_mode(config, identities);
     let outbound = build_outbound(config, index, router.as_ref())?;
     Ok((index, router, outbound))
 }
@@ -1393,10 +1429,13 @@ fn build_outbound(
 ///   in-binary GeoIP DB. Empty `rules` still yields China-direct.
 /// - **Global** / **Direct**: no router (Global dials the active node; Direct
 ///   uses a direct outbound in [`build_outbound`]).
-fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
+fn router_for_mode(
+    config: &AppConfig,
+    identities: Option<&DeviceIdentities>,
+) -> Option<Arc<Router>> {
     match config.proxy_mode {
-        ProxyMode::Rule => Some(Arc::new(
-            Router::new(
+        ProxyMode::Rule => {
+            let mut router = Router::new(
                 sockrocket_core::router::rule_mode_with_builtin(
                     &config.rules,
                     &config.device_rule_groups,
@@ -1405,8 +1444,12 @@ fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
                 )
                 .with_paused_devices(&config.paused_device_sources),
             )
-            .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
-        )),
+            .with_geoip(Arc::new(sockrocket_core::china_geoip_db()));
+            if let Some(identities) = identities {
+                router = router.with_device_identities(identities.clone());
+            }
+            Some(Arc::new(router))
+        }
         ProxyMode::Global | ProxyMode::Direct => None,
     }
 }

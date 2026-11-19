@@ -1,4 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(test)]
+use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -6,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use etherparse::{Icmpv4Header, Icmpv6Header};
 use ipstack::{IpNumber, IpStackConfig, IpStackStream, TcpConfig, TcpOptions};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tun::AbstractDevice;
@@ -780,7 +784,7 @@ impl TunProxy {
                         // DNS must remain available when data connections fill
                         // their budget; otherwise clients cannot recover even
                         // after an existing connection releases a data slot.
-                        let is_dns = matches!(&stream, IpStackStream::Udp(udp) if udp.peer_addr().port() == 53);
+                        let is_dns = tun_dns_session(&stream);
                         let (active, limit) = if is_dns {
                             (active_dns.clone(), max_dns_streams)
                         } else {
@@ -928,6 +932,14 @@ impl TunProxy {
     }
 }
 
+fn tun_dns_session(stream: &IpStackStream) -> bool {
+    match stream {
+        IpStackStream::Tcp(tcp) => tcp.peer_addr().port() == 53,
+        IpStackStream::Udp(udp) => udp.peer_addr().port() == 53,
+        _ => false,
+    }
+}
+
 /// Handle a single TUN stream (TCP, UDP, or ICMP).
 async fn handle_tun_stream(
     stream: IpStackStream,
@@ -938,6 +950,15 @@ async fn handle_tun_stream(
     stats: super::ProxyStats,
     pressure: (Arc<AtomicUsize>, usize),
 ) -> Result<()> {
+    // DNS upstreams are selected by resolver policy. Handle both transports
+    // before installing the intercepted connection's client/destination scope.
+    if tun_dns_session(&stream) {
+        return match stream {
+            IpStackStream::Tcp(tcp) => crate::dns::serve_tcp_dns_client(tcp, &dns_resolver).await,
+            IpStackStream::Udp(mut udp) => handle_tun_dns(&mut udp, &dns_resolver).await,
+            _ => unreachable!("only TCP and UDP can be DNS sessions"),
+        };
+    }
     let source = match &stream {
         IpStackStream::Tcp(tcp) => Some(tcp.local_addr().ip()),
         IpStackStream::Udp(udp) => Some(udp.local_addr().ip()),
@@ -948,28 +969,19 @@ async fn handle_tun_stream(
         IpStackStream::Udp(udp) => Some(udp.peer_addr().ip()),
         _ => None,
     };
-    let domestic = destination.is_some_and(|ip| {
-        fakeip
-            .as_ref()
-            .is_some_and(|pool| pool.lookup_domestic(ip).is_some())
-    });
+    let names = TunDnsTarget {
+        pool: fakeip.as_deref(),
+        domestic: destination.and_then(|ip| fakeip.as_ref()?.lookup_domestic(ip)),
+    };
     let real_destination = destination.filter(|ip| crate::dns::fakeip::fake_ipv4(*ip).is_none());
     super::routing::with_client_source(
         source,
         super::routing::with_tun_destination(
             real_destination,
-            domestic,
+            names.domestic.is_some(),
             super::routing::with_tun_family(
                 destination.is_some_and(|ip| ip.is_ipv6()),
-                handle_tun_stream_inner(
-                    stream,
-                    outbound,
-                    dns_resolver,
-                    fakeip,
-                    router,
-                    stats,
-                    pressure,
-                ),
+                handle_tun_stream_inner(stream, outbound, names, router, stats, pressure),
             ),
         ),
     )
@@ -979,8 +991,7 @@ async fn handle_tun_stream(
 async fn handle_tun_stream_inner(
     stream: IpStackStream,
     outbound: SharedOutbound,
-    dns_resolver: Arc<DnsResolver>,
-    fakeip: Option<Arc<FakeIpPool>>,
+    names: TunDnsTarget<'_>,
     router: Option<Arc<Router>>,
     stats: super::ProxyStats,
     pressure: (Arc<AtomicUsize>, usize),
@@ -992,26 +1003,28 @@ async fn handle_tun_stream_inner(
             // destination. Dial the mapped DOMAIN so the relay resolves it
             // server-side — the same path SOCKS5 clients use, and the only
             // one an unlock-model exit can actually complete.
-            let (host, port, force_direct) = match tun_dial_target(&dst, &fakeip, router.as_ref()) {
-                Ok(hp) => hp,
+            let port = dst.port();
+            let host = match names.dial_host(dst.ip(), router.as_deref()) {
+                Ok(host) => host,
                 Err(e) => {
                     tracing::debug!("TUN TCP {}: {}", dst, e);
                     let _ = tcp.shutdown().await;
                     return Ok(());
                 }
             };
-            let (host, prefix) =
-                tun_tls_target(&mut tcp, &host, port, force_direct, router.as_ref()).await?;
-            let mut tcp = super::tls_sniff::Replay::new(tcp, prefix);
-            tracing::debug!(
-                "TUN TCP: -> {}:{}{}",
-                host,
+            let (host, prefix) = tun_tls_target(
+                &mut tcp,
+                &host,
                 port,
-                if force_direct { " (direct)" } else { "" }
-            );
+                names.domestic.is_some(),
+                router.as_ref(),
+            )
+            .await?;
+            let mut tcp = super::tls_sniff::Replay::new(tcp, prefix);
+            tracing::debug!("TUN TCP: -> {host}:{port}");
 
             let connection = stats.track_active(format!("{}:{}", host, port), "TUN TCP");
-            match connect_tun_upstream(&outbound, &host, port, force_direct).await {
+            match connect_upstream(&outbound, &host, port).await {
                 Ok(mut remote) => {
                     let result = relay_with_pressure(
                         &mut connection.observe(&mut tcp),
@@ -1037,43 +1050,20 @@ async fn handle_tun_stream_inner(
         IpStackStream::Udp(mut udp) => {
             let dst = udp.peer_addr();
 
-            // Intercept DNS queries (UDP port 53) and resolve locally
-            if dst.port() == 53 {
-                super::routing::with_client_source(
-                    None,
-                    super::routing::with_tun_destination(
-                        None,
-                        false,
-                        handle_tun_dns(&mut udp, &dns_resolver),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let (host, port, force_direct) = match tun_dial_target(&dst, &fakeip, router.as_ref()) {
-                Ok(hp) => hp,
+            let port = dst.port();
+            let host = match names.dial_host(dst.ip(), router.as_deref()) {
+                Ok(host) => host,
                 Err(e) => {
                     tracing::debug!("TUN UDP {}: {}", dst, e);
                     let _ = udp.shutdown().await;
                     return Ok(());
                 }
             };
-            tracing::debug!(
-                "TUN UDP: -> {}:{}{}",
-                host,
-                port,
-                if force_direct { " (direct)" } else { "" }
-            );
+            tracing::debug!("TUN UDP: -> {host}:{port}");
 
-            let transport = if force_direct {
-                SharedOutbound::direct()
-            } else {
-                outbound
-            };
             let remote = match tokio::time::timeout(
                 super::connector::UPSTREAM_CONNECT_TIMEOUT,
-                transport.0.connect_datagram(&host, port),
+                outbound.0.connect_datagram(&host, port),
             )
             .await
             {
@@ -1103,8 +1093,7 @@ async fn handle_tun_stream_inner(
                 }
             };
             let connection = stats.track_active(format!("{}:{}", host, port), "TUN UDP");
-            let result =
-                super::datagram::relay(&mut connection.observe(&mut udp), remote.as_ref()).await;
+            let result = super::datagram::relay_tun(&mut udp, &connection, remote.as_ref()).await;
             let _ = udp.shutdown().await;
             result?;
             connection.finish(0, 0);
@@ -1144,37 +1133,17 @@ async fn handle_tun_stream_inner(
 /// closes instead of shutting the stream down after a single query.
 /// Each query is resolved with the built-in DnsResolver (bypassing the
 /// tunnel) and answered with a synthesized DNS response.
-async fn handle_tun_dns<S>(udp: &mut S, resolver: &DnsResolver) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 1500];
-    loop {
-        let n = udp.read(&mut buf).await?;
-        if n == 0 {
-            break; // association closed
+async fn handle_tun_dns(udp: &mut ipstack::IpStackUdpStream, resolver: &DnsResolver) -> Result<()> {
+    use std::future::poll_fn;
+    while let Some(query) = poll_fn(|cx| udp.poll_recv_datagram(cx)).await? {
+        if query.len() < 12 {
+            continue;
         }
-        if n < 12 {
-            continue; // too short to be a DNS packet — keep the association alive
-        }
-        answer_dns_query(udp, resolver, &buf[..n]).await?;
+        let response = crate::dns::answer_raw_dns_query(resolver, &query).await;
+        let response =
+            crate::dns::wire::udp_response_for_mtu(&query, response, udp.max_payload_len());
+        poll_fn(|cx| udp.poll_send_datagram(cx, &response)).await?;
     }
-
-    let _ = udp.shutdown().await;
-    Ok(())
-}
-
-/// Answer one intercepted DNS query: parse, resolve (5s timeout), respond.
-///
-/// Thin wrapper over [`crate::dns::answer_raw_dns_query`] so the TUN
-/// interception path and the standalone router DNS listener share one
-/// implementation.
-async fn answer_dns_query<S>(udp: &mut S, resolver: &DnsResolver, query: &[u8]) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let resp = crate::dns::answer_raw_dns_query(resolver, query).await;
-    udp.write_all(&resp).await?;
     Ok(())
 }
 
@@ -1184,59 +1153,34 @@ fn addr_to_host_port(addr: &SocketAddr) -> (String, u16) {
     (addr.ip().to_string(), addr.port())
 }
 
-/// Map a TUN destination to a dial target `(host, port, force_direct)`.
-///
-/// - Fake address with a live mapping → the mapped domain, dialed through
-///   the routing outbound (server-side resolution at the relay).
-/// - Real address recently answered for a domestic-group name →
-///   `force_direct`, bypassing routing: geoip databases miss too many CDN
-///   ranges to be trusted for these. Exception: when the user has an
-///   explicit DOMAIN rule (domain/suffix/keyword) matching that name, the
-///   name is dialed through the routing outbound instead, so user rules
-///   (proxy/direct/reject) take precedence over the domestic default.
-/// - Anything else → the plain IP, classic behavior.
-/// - Fake address WITHOUT a mapping (evicted or from an older daemon) →
-///   `Err`: there is no sensible fallback; drop the stream. The client's
-///   short-TTL DNS will re-ask and get a fresh fake address.
-fn tun_dial_target(
-    addr: &SocketAddr,
-    fakeip: &Option<Arc<FakeIpPool>>,
-    router: Option<&Arc<Router>>,
-) -> Result<(String, u16, bool)> {
-    if let Some(pool) = fakeip {
-        if let Some(v4) = crate::dns::fakeip::fake_ipv4(addr.ip()) {
-            return match pool.lookup(v4) {
-                Some(domain) => Ok((domain, addr.port(), false)),
-                None => anyhow::bail!(
-                    "fake-IP {} has no live mapping (evicted?) — dropping stream",
-                    v4
-                ),
-            };
+/// Snapshot the DNS attribution once for both the routing hint and the dial target.
+struct TunDnsTarget<'a> {
+    pool: Option<&'a FakeIpPool>,
+    domestic: Option<String>,
+}
+
+impl TunDnsTarget<'_> {
+    fn dial_host(&self, ip: IpAddr, router: Option<&Router>) -> Result<String> {
+        if let Some(pool) = self.pool
+            && let Some(token) = crate::dns::fakeip::fake_ipv4(ip)
+        {
+            return pool
+                .lookup(token)
+                .with_context(|| format!("fake-IP {ip} has no live mapping"));
         }
-        if let Some(domain) = pool.lookup_domestic(addr.ip()) {
-            // Global and Direct have no rule router. Honor their outbound
-            // mode instead of forcibly bypassing it for domestic answers.
-            if router.is_none() {
-                return Ok((domain, addr.port(), false));
-            }
-            // Device policy must also override domestic-CDN direct shortcuts.
-            // Keep the domain so source-scoped domain/catch-all rules can match.
-            if router.is_some_and(|r| r.route_domestic_hints || r.has_client_rules()) {
-                return Ok((domain, addr.port(), false));
-            }
-            if let Some(action) = router.and_then(|r| r.route_domain_only(&domain)) {
-                tracing::debug!(
-                    "TUN {} (domestic {}): user domain rule → {:?}",
-                    addr,
-                    domain,
-                    action
-                );
-                return Ok((domain, addr.port(), false));
-            }
-            return Ok((addr.ip().to_string(), addr.port(), true));
+        if let Some(name) = &self.domestic
+            && router.is_none_or(|r| {
+                r.route_domestic_hints
+                    || r.has_client_rules()
+                    || r.route_domain_only(name).is_some()
+            })
+        {
+            return Ok(name.clone());
         }
+        // Keep the client's actual CDN endpoint where a domain is unnecessary.
+        // The full routing policy still evaluates IP, port and source rules first.
+        Ok(ip.to_string())
     }
-    Ok((addr.ip().to_string(), addr.port(), false))
 }
 
 /// Recover only an explicit domain policy for an otherwise anonymous TLS flow.
@@ -1246,10 +1190,10 @@ pub(super) async fn tun_tls_target<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
     host: &str,
     port: u16,
-    force_direct: bool,
+    known_domestic: bool,
     router: Option<&Arc<Router>>,
 ) -> Result<(String, Vec<u8>)> {
-    if !force_direct
+    if !known_domestic
         && port == 443
         && host.parse::<IpAddr>().is_ok()
         && let Some(router) = router
@@ -1263,22 +1207,6 @@ pub(super) async fn tun_tls_target<S: tokio::io::AsyncRead + Unpin>(
         return Ok((host.to_owned(), prefix));
     }
     Ok((host.to_owned(), Vec::new()))
-}
-
-/// Dial an upstream for a TUN stream. `force_direct` bypasses the routing
-/// outbound entirely (domestic answers honored as direct, see
-/// [`tun_dial_target`]).
-async fn connect_tun_upstream(
-    outbound: &SharedOutbound,
-    host: &str,
-    port: u16,
-    force_direct: bool,
-) -> Result<super::connector::BoxProxyStream> {
-    if force_direct {
-        connect_upstream(&SharedOutbound::direct(), host, port).await
-    } else {
-        connect_upstream(outbound, host, port).await
-    }
 }
 
 /// Build an ICMPv6 echo reply for a received packet payload, or `None` when
@@ -3623,27 +3551,45 @@ mod tests {
         assert_eq!(tun_tcp_mss(1280), 1220);
     }
 
-    #[test]
-    fn domestic_dns_mapping_respects_the_builtin_group_exit() {
+    #[tokio::test]
+    async fn domestic_hint_obeys_port_and_ip_rules_and_builtin_exit() {
         use crate::config::model::BuiltinRoute;
-        let addr: SocketAddr = "203.0.113.44:443".parse().unwrap();
-        let pool = FakeIpPool::new();
-        pool.record_domestic(addr.ip(), "cdn.example.invalid");
-        let pool = Some(pool);
-        for (exit, direct) in [
-            (BuiltinRoute::Direct, true),
-            (BuiltinRoute::Proxy, false),
-            (BuiltinRoute::Reject, false),
-        ] {
-            let router = Arc::new(Router::new(crate::router::rule_mode_with_builtin(
-                &[],
-                &[],
-                true,
-                exit,
-            )));
-            let (_, _, force_direct) = tun_dial_target(&addr, &pool, Some(&router)).unwrap();
-            assert_eq!(force_direct, direct);
-        }
+        use crate::router::{MatchRule, RouteAction};
+        let ip: IpAddr = "2001:db8::44".parse().unwrap();
+        let names = TunDnsTarget {
+            pool: None,
+            domestic: Some("cdn.example.invalid".into()),
+        };
+        super::super::routing::with_tun_destination(Some(ip), true, async {
+            for (exit, expected) in [
+                (BuiltinRoute::Direct, RouteAction::Direct),
+                (BuiltinRoute::Proxy, RouteAction::Proxy),
+                (BuiltinRoute::Reject, RouteAction::Reject),
+            ] {
+                let router =
+                    Router::new(crate::router::rule_mode_with_builtin(&[], &[], true, exit));
+                let host = names.dial_host(ip, Some(&router)).unwrap();
+                assert_eq!(router.route_resolving(&host, 443).await, expected);
+            }
+            let mut rules = crate::router::RuleSet::new();
+            rules.add_rule(
+                MatchRule::DstPort { min: 443, max: 443 },
+                RouteAction::Proxy,
+            );
+            rules.add_rule(
+                MatchRule::IpCidr {
+                    addr: ip,
+                    prefix_len: 128,
+                },
+                RouteAction::Reject,
+            );
+            rules.add_rule(MatchRule::DomesticHint, RouteAction::Direct);
+            let router = Router::new(rules);
+            let host = names.dial_host(ip, Some(&router)).unwrap();
+            assert_eq!(router.route_resolving(&host, 443).await, RouteAction::Proxy);
+            assert_eq!(router.route_resolving(&host, 80).await, RouteAction::Reject);
+        })
+        .await;
     }
 
     #[test]
@@ -4140,38 +4086,136 @@ mod tests {
 
     #[tokio::test]
     async fn test_tun_dns_multiple_queries_per_association() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let resolver = DnsResolver::new();
-        let handle = tokio::spawn(async move { handle_tun_dns(&mut server, &resolver).await });
-
-        // 13-byte packet: valid ID, then a compression pointer in the
-        // question section — parse_dns_query rejects it.
-        let mut bad = vec![0u8; 13];
-        bad[0] = 0x12;
-        bad[1] = 0x34;
-        bad[12] = 0xFF;
-
-        for _ in 0..2 {
-            client.write_all(&bad).await.unwrap();
-            let mut resp = [0u8; 64];
-            let n = client.read(&mut resp).await.unwrap();
-            assert!(n >= 12, "expected a DNS error response");
-            assert_eq!(&resp[..2], &[0x12, 0x34], "response keeps the query ID");
-            assert_eq!(resp[3] & 0x0F, 1, "rcode should be FORMERR");
+        let (mut device, tun) = tokio::io::duplex(4096);
+        let mut stack = ipstack::IpStack::new(Default::default(), tun);
+        let encode = |bytes: &[u8]| {
+            let mut packet = Vec::new();
+            etherparse::PacketBuilder::ipv6([1; 16], [2; 16], 64)
+                .udp(40000, 53)
+                .write(&mut packet, bytes)
+                .unwrap();
+            packet
+        };
+        // A legal empty UDP message is an invalid DNS query. It must not
+        // close the association carrying the following queries.
+        device.write_all(&encode(&[])).await.unwrap();
+        let ipstack::IpStackStream::Udp(mut udp) = stack.accept().await.unwrap() else {
+            panic!("expected a DNS association");
+        };
+        let handle =
+            tokio::spawn(async move { handle_tun_dns(&mut udp, &DnsResolver::new()).await });
+        let mut bad = [0; 13];
+        bad[12] = 0xff;
+        for id in [0x1234u16, 0x1235] {
+            bad[..2].copy_from_slice(&id.to_be_bytes());
+            device.write_all(&encode(&bad)).await.unwrap();
+            let mut wire = [0; 256];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), device.read(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = etherparse::SlicedPacket::from_ip(&wire[..n]).unwrap();
+            let Some(etherparse::TransportSlice::Udp(response)) = reply.transport else {
+                panic!("expected a UDP response");
+            };
+            assert_eq!(&response.payload()[..2], &id.to_be_bytes());
+            assert_eq!(response.payload()[3] & 15, 1);
         }
+        // TUN shutdown cancels accepted session tasks before dropping the device.
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
 
-        // A short (<12-byte) packet is skipped, not answered, and the
-        // association stays alive for the next query.
-        client.write_all(&[0u8; 5]).await.unwrap();
-        tokio::task::yield_now().await;
-        client.write_all(&bad).await.unwrap();
-        let mut resp = [0u8; 64];
-        let n = client.read(&mut resp).await.unwrap();
-        assert!(n >= 12, "association must survive a short packet");
+    #[tokio::test]
+    async fn tun_dns_retries_truncated_udp_over_local_tcp() {
+        async fn read_packet(device: &mut tokio::io::DuplexStream) -> Vec<u8> {
+            let mut bytes = vec![0; 20];
+            device.read_exact(&mut bytes).await.unwrap();
+            bytes.resize(u16::from_be_bytes([bytes[2], bytes[3]]) as usize, 0);
+            device.read_exact(&mut bytes[20..]).await.unwrap();
+            bytes
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut config = crate::DnsConfig::default();
+            let host = "large.example.test";
+            let ips: Vec<_> = (1..=40)
+                .map(|n| IpAddr::V4(Ipv4Addr::new(192, 0, 2, n)))
+                .collect();
+            config.hosts.insert(host.into(), ips.clone());
+            let resolver = Arc::new(DnsResolver::with_config(config));
+            let spawn = |stream| {
+                tokio::spawn(handle_tun_stream(
+                    stream,
+                    SharedOutbound::direct(),
+                    resolver.clone(),
+                    None,
+                    None,
+                    Default::default(),
+                    (Arc::new(AtomicUsize::new(0)), 16),
+                ))
+            };
+            let (mut device, tun) = tokio::io::duplex(8192);
+            let mut stack = ipstack::IpStack::new(Default::default(), tun);
+            let ip = || etherparse::PacketBuilder::ipv4([192, 0, 2, 4], [192, 0, 2, 53], 64);
+            let query = crate::dns::wire::build_dns_query(host, 1);
+            let mut packet = Vec::new();
+            ip().udp(40000, 53).write(&mut packet, &query).unwrap();
+            device.write_all(&packet).await.unwrap();
+            let udp = spawn(stack.accept().await.unwrap());
+            let bytes = read_packet(&mut device).await;
+            let Some(etherparse::TransportSlice::Udp(reply)) =
+                etherparse::SlicedPacket::from_ip(&bytes).unwrap().transport
+            else {
+                panic!("expected DNS/UDP");
+            };
+            assert_ne!(reply.payload()[2] & 2, 0);
+            assert_eq!(&reply.payload()[..2], &query[..2]);
+            udp.abort();
 
-        // Closing the association ends the handler cleanly.
-        drop(client);
-        handle.await.unwrap().unwrap();
+            let tcp = || ip().tcp(40001, 53, 1001, 32768);
+            packet.clear();
+            ip().tcp(40001, 53, 1000, 32768)
+                .syn()
+                .write(&mut packet, &[])
+                .unwrap();
+            device.write_all(&packet).await.unwrap();
+            let worker = spawn(stack.accept().await.unwrap());
+            let bytes = read_packet(&mut device).await;
+            let Some(etherparse::TransportSlice::Tcp(syn_ack)) =
+                etherparse::SlicedPacket::from_ip(&bytes).unwrap().transport
+            else {
+                panic!("expected SYN/ACK");
+            };
+            assert!(syn_ack.syn() && syn_ack.ack());
+            let ack = syn_ack.sequence_number().wrapping_add(1);
+            let mut frame = (query.len() as u16).to_be_bytes().to_vec();
+            frame.extend_from_slice(&query);
+            packet.clear();
+            tcp().ack(ack).write(&mut packet, &frame).unwrap();
+            device.write_all(&packet).await.unwrap();
+            let mut response = Vec::new();
+            loop {
+                let bytes = read_packet(&mut device).await;
+                let Some(etherparse::TransportSlice::Tcp(segment)) =
+                    etherparse::SlicedPacket::from_ip(&bytes).unwrap().transport
+                else {
+                    panic!("expected DNS/TCP");
+                };
+                response.extend_from_slice(segment.payload());
+                if response.len() >= 2
+                    && response.len()
+                        >= 2 + usize::from(u16::from_be_bytes([response[0], response[1]]))
+                {
+                    break;
+                }
+            }
+            let expected = crate::dns::build_dns_response_with_ttl(&query, &ips, 5).unwrap();
+            assert!(expected.len() > 512);
+            assert_eq!(&response[2..], expected);
+            worker.abort();
+        })
+        .await
+        .expect("local DNS-over-TCP retry should finish");
     }
 
     #[test]

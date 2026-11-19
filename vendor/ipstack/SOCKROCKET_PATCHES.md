@@ -5,6 +5,7 @@ Original copyright and license notices are retained. Library sources are vendore
 
 Sockrocket changes in src/lib.rs:
 
+- Keep a pending device write and its deadline alive while continuing to read ingress packets and process session removals.
 - Recover the packet from a closed session sender and recreate a valid session without discarding its first datagram.
 - Associate delayed removal notifications with the original channel; an old notification cannot delete a replacement session sharing the same tuple.
 - Ignore expected late removal notifications during stack shutdown rather than reporting them as independent errors.

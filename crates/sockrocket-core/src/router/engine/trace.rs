@@ -43,6 +43,7 @@ impl Router {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
             _ => ip,
         });
+        let source = self.effective_source(source);
         let literal = host.parse::<IpAddr>().ok();
         let mut ip = literal.or(destination_ip);
         let mut attempted = ip.is_some();
@@ -66,7 +67,7 @@ impl Router {
         let lower = host.to_lowercase();
         let mut builtin_misses = 0;
         let mut builtin_needs_ip = false;
-        for entry in self.rules.entries_for(source) {
+        for entry in self.rules.entries_for(source, true) {
             let source_ok = source_matches(entry.source, source);
             let needs_ip = matches!(entry.rule, MatchRule::IpCidr { .. } | MatchRule::GeoIp(_));
             if source_ok && needs_ip && !attempted {
@@ -85,7 +86,7 @@ impl Router {
                 trace.definitive = false;
                 "needs_ip"
             } else if !matches!(entry.rule, MatchRule::DomesticHint)
-                && self.rule_matches(&entry.rule, &lower, ip, port)
+                && self.rule_matches(entry.rule, &lower, ip, port)
             {
                 "matched"
             } else {
@@ -144,8 +145,8 @@ fn push_builtin(trace: &mut RouteTrace, checked: usize, needs_ip: bool) {
     }
 }
 
-fn step(entry: &RuleEntry, outcome: &'static str) -> RouteTraceStep {
-    let (rule_type, pattern) = match &entry.rule {
+fn step(entry: RuleView<'_>, outcome: &'static str) -> RouteTraceStep {
+    let (rule_type, pattern) = match entry.rule {
         MatchRule::Domain(p) => ("domain", p.clone()),
         MatchRule::DomainSuffix(p) => ("domain-suffix", p.trim_start_matches('.').into()),
         MatchRule::DomainKeyword(p) => ("domain-keyword", p.clone()),

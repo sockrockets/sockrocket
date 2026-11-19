@@ -340,12 +340,7 @@ impl Datagram for Session {
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("UDP association closed"))?;
-            ensure!(
-                packet.data.len() <= buffer.len(),
-                "UDP receive buffer too small"
-            );
-            buffer[..packet.data.len()].copy_from_slice(&packet.data);
-            Ok(packet.data.len())
+            super::datagram::copy_received(&packet.data, buffer)
         })
     }
 }

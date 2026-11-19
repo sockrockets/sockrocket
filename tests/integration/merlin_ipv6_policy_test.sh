@@ -53,6 +53,8 @@ ip6tables() {
             if [ "$2 $3" = 'mangle -F' ]; then rm -f "$FIXTURE/mangle_reply"; fi;;
         '-t mangle -A SOCKROCKET_IPV6_MANGLE -i br0 -m conntrack --ctdir REPLY -j RETURN') touch "$FIXTURE/mangle_reply";;
         '-t mangle -C SOCKROCKET_IPV6_MANGLE -i br0 -m conntrack --ctdir REPLY -j RETURN') test -f "$FIXTURE/mangle_reply";;
+        '-A SOCKROCKET_IPV6_FORWARD -i br0 -o sockrocket-tun -p udp -j ACCEPT') touch "$FIXTURE/forward_udp";;
+        '-C SOCKROCKET_IPV6_FORWARD -i br0 -o sockrocket-tun -p udp -j ACCEPT') test -f "$FIXTURE/forward_udp";;
         '-S FORWARD')
             test ! -f "$FIXTURE/foreign_top" || echo '-A FORWARD -i wg0 -j SKYNET'
             while read -r chain; do echo "-A FORWARD -j $chain"; done < "$FORWARD_LIST";;
@@ -76,7 +78,11 @@ ip6tables() {
         '-t nat -A PREROUTING -j SOCKROCKET_IPV6_DNS') touch "$FIXTURE/dns";;
         '-t nat -C PREROUTING -j SOCKROCKET_IPV6_DNS') test -f "$FIXTURE/dns";;
         '-t nat -D PREROUTING -j SOCKROCKET_IPV6_DNS') test -f "$FIXTURE/dns" || return 1; rm "$FIXTURE/dns";;
-        '-t nat -A SOCKROCKET_IPV6_DNS '*) test "$FAIL_DNS" = 0;;
+        '-t nat -A SOCKROCKET_IPV6_DNS '*)
+            if [ "${RENUMBER_ON_REDIRECT:-0}" = 1 ]; then
+                case "$*" in *'-j REDIRECT'*) PREFIX_SET=2; RENUMBER_ON_REDIRECT=0;; esac
+            fi
+            test "$FAIL_DNS" = 0;;
         *) return 0;;
     esac
 }
@@ -145,9 +151,23 @@ test ! -f "$(ipv6_state fallback)" || fail 'successful dual-stack left a fallbac
 same=$(grep -c 'REDIRECT --to-ports 5300' "$CALLS" || true)
 do_ipv6_apply || fail 'unchanged prefix reapply'
 test "$same" = "$(grep -c 'REDIRECT --to-ports 5300' "$CALLS" || true)" || fail 'unchanged prefixes rebuilt DNS redirects'
+# A lease renewal while REDIRECTs are being installed cannot mark new
+# prefixes healthy using a snapshot from later than the installed rules.
+ipv6_dns_stop || fail 'DNS reset before delegated prefix rollover'
+RENUMBER_ON_REDIRECT=1
+ipv6_dns_start || fail 'DNS install across delegated prefix rollover'
+! ipv6_dns_attached || fail 'stale redirects considered healthy after mid-install rollover'
+test ! -f "$(ipv6_state dns_active)" || fail 'AAAA enabled with stale redirects'
 PREFIX_SET=2
 do_ipv6_apply || fail 'changed LAN prefix was not reapplied'
 grep -q -- '-s 2001:db8:9::/64 -p udp --dport 53 -j REDIRECT --to-ports 5300' "$CALLS" || fail 'new LAN prefix not intercepted'
+grep -q -- '-t mangle -A SOCKROCKET_IPV6_MANGLE -d 2001:db8:9::1/64 -j RETURN' "$CALLS" || fail 'new LAN prefix missing from mangle'
+grep -qx '2001:db8:9::1/64' "$SOCKROCKET_RUNTIME_DIR/ipv6_proxy_prefixes" || fail 'stale on-link prefix snapshot'
+rm "$FIXTURE/forward_udp"
+if ipv6_proxy_verify; then fail 'missing LAN-to-TUN UDP forward not detected'; fi
+do_ipv6_apply || fail 'failed to repair missing UDP forward'
+test -f "$FIXTURE/forward_udp" || fail 'missing UDP forward was not restored'
+test -f "$(ipv6_state dns_active)" || fail 'IPv6 DNS not restored after UDP repair'
 PREFIX_SET=1
 ipv6_guard_stop || fail 'stop cleanup'
 do_dns_stop || fail 'DNS cleanup'
@@ -209,6 +229,7 @@ printf 'ipv6_mode: dual_stack\ndns_hijack: true\ntransparent_proxy: true\nproxy_
 /bin/cat > "$SOCKROCKET_DIR/sockrocket-cli" <<'EOF'
 #!/bin/sh
 case "$1" in
+    --refresh-device-ipv6) test ! -f "$0.fail-collect"; exit $? ;;
     --dump-rule-sources-v6) printf '2001:db8:9::/64\n'; exit 0 ;;
     --dump-cn-cidrs) printf '192.0.2.0/24\n'; exit 0 ;;
     --dump-cn-cidrs-v6) printf '2001:250::/30\n'; exit 0 ;;
@@ -251,6 +272,20 @@ for proto in tcp udp; do
     grep -q -- "-A SOCKROCKET_CN6_FLOW -i br0 -p $proto .* ! --match-set sockrocket_cn6_sources src -j CONNMARK" "$CALLS" || fail 'device policy bypassed'
     grep -q -- "-A SOCKROCKET_CN6_FLOW -i br0 -p $proto .*--ctdir ORIGINAL .* -j MARK" "$CALLS" || fail 'device traffic did not enter TUN'
 done
+# A new NDP snapshot refreshes the live device set without detaching the TUN.
+printf '2001:db8::1 192.0.2.1\n' > "$SOCKROCKET_RUNTIME_DIR/device-ipv6-map"
+: > "$CALLS"
+do_ipv6_apply || fail 'IPv6 source refresh'
+grep -q 'ipset swap sr_cn_src_.* sockrocket_cn6_sources' "$CALLS" || fail 'IPv6 sources not refreshed'
+cmp -s "$SOCKROCKET_RUNTIME_DIR/device-ipv6-applied" "$SOCKROCKET_RUNTIME_DIR/device-ipv6-map" || fail 'applied IPv6 source snapshot stale'
+! grep -q -- '-D FORWARD -j SOCKROCKET_IPV6_FORWARD' "$CALLS" || fail 'IPv6 source refresh tore down live routing'
+# A failed inventory collector must leave dual-stack available when routing
+# and its previously installed kernel set are still sound.
+touch "$SOCKROCKET_DIR/sockrocket-cli.fail-collect"
+do_ipv6_apply || fail 'collector failure disabled dual-stack'
+test -f "$FIXTURE/forward_udp" || fail 'collector failure affected UDP forwarding'
+! guard_installed || fail 'collector failure installed a compatibility guard'
+rm "$SOCKROCKET_DIR/sockrocket-cli.fail-collect"
 cn_ipv6 do_ipset_stop || fail 'live disable'
 ! cn_ipv6 cn_flow_installed || fail 'CN acceleration still active'
 test -f "$FIXTURE/mangle" || fail 'live disable detached IPv6 capture'

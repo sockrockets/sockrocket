@@ -2,7 +2,8 @@
 use super::*;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
     sync::watch,
 };
 
@@ -205,7 +206,7 @@ async fn serve_tcp(
                 }
                 if clients.len() >= limit { continue; }
                 let resolver = resolver.clone();
-                clients.spawn(async move { let _ = serve_client(stream, resolver).await; });
+                clients.spawn(async move { let _ = serve_tcp_dns_client(stream, &resolver).await; });
             }
         }
     }
@@ -213,17 +214,20 @@ async fn serve_tcp(
     while clients.join_next().await.is_some() {}
     Ok(())
 }
-async fn serve_client(mut stream: TcpStream, resolver: DnsResolver) -> Result<()> {
+/// Share DNS-over-TCP framing and per-client limits with port 53 inside TUN.
+pub(crate) async fn serve_tcp_dns_client(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    resolver: &DnsResolver,
+) -> Result<()> {
     for _ in 0..64 {
         let len = tokio::time::timeout(Duration::from_secs(10), stream.read_u16()).await?? as usize;
         anyhow::ensure!(len >= 12, "Invalid TCP DNS frame");
         let mut query = vec![0; len];
         tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut query)).await??;
-        let reply = answer_raw_dns_query(&resolver, &query).await;
+        let reply = answer_raw_dns_query(resolver, &query).await;
+        let reply_len = u16::try_from(reply.len())?;
         tokio::time::timeout(Duration::from_secs(5), async {
-            stream
-                .write_all(&(reply.len() as u16).to_be_bytes())
-                .await?;
+            stream.write_u16(reply_len).await?;
             stream.write_all(&reply).await
         })
         .await??;

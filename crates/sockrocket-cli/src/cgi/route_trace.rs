@@ -170,7 +170,10 @@ pub(super) fn act_trace_route(post: &J) -> J {
         let router = Router::new(
             rule_mode_with_builtin(&rules, &links, true, builtin).with_paused_devices(&paused),
         )
-        .with_geoip(std::sync::Arc::new(china_geoip_db()));
+        .with_geoip(std::sync::Arc::new(china_geoip_db()))
+        .with_device_identities(std::sync::Arc::new(std::sync::RwLock::new(
+            crate::device_identity::read(),
+        )));
         let rt = match CgiRuntime::new() {
             Ok(rt) => rt,
             Err(_) => return failure("route_trace_unavailable", "无法启动分流查询，请稍后重试"),

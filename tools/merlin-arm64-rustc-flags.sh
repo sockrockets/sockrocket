@@ -1,6 +1,8 @@
 # Shared by the local and cross ARM64 builds.
-# YAML and log filter parsing run outside the packet forwarding path.
+# Optimize the CLI management code for size. Keep the core forwarding and
+# protocol crates at the workspace optimization level.
 merlin_arm64_cargo_flags=(
+  --config 'profile.release.package.sockrocket-cli.opt-level="s"'
   --config 'profile.release.package.serde_yaml.opt-level="z"'
   --config 'profile.release.package.unsafe-libyaml.opt-level="z"'
   --config 'profile.release.package.regex-syntax.opt-level="z"'

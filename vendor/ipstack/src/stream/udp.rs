@@ -21,7 +21,7 @@ use tokio::{
 ///
 /// This type represents a UDP connection and implements `AsyncRead` and `AsyncWrite`
 /// for bidirectional data transfer. UDP streams have a configurable timeout and
-/// automatically handle packet fragmentation based on MTU.
+/// reject payloads that exceed the configured MTU.
 ///
 /// # Examples
 ///
@@ -76,7 +76,7 @@ impl IpStackUdpStream {
             stream_sender,
             stream_receiver,
             up_pkt_sender,
-            first_payload: Some(payload.into()),
+            first_payload: Some(payload),
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
             mtu,
@@ -296,6 +296,41 @@ impl IpStackUdpStream {
         })
     }
 
+    /// Largest UDP payload this flow can return to the client without fragmentation.
+    pub fn max_payload_len(&self) -> usize {
+        usize::from(self.mtu).saturating_sub(if self.src_addr.is_ipv6() { 48 } else { 28 })
+    }
+
+    /// Receive one complete message, including empty messages. None means the
+    /// packet channel closed. Ingress payload ownership moves to the caller.
+    pub fn poll_recv_datagram(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<Option<Vec<u8>>>> {
+        let payload = if let Some(first) = self.first_payload.take() {
+            first
+        } else {
+            if self.timeout.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+            }
+            let Some(packet) = std::task::ready!(self.stream_receiver.poll_recv(cx)) else {
+                return std::task::Poll::Ready(Ok(None));
+            };
+            packet.payload.unwrap_or_default().into_vec()
+        };
+        self.reset_timeout();
+        std::task::Poll::Ready(Ok(Some(payload)))
+    }
+
+    /// Send exactly one complete message. An empty slice sends an empty UDP packet.
+    pub fn poll_send_datagram(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(self).poll_write(cx, data).map_ok(|_| ())
+    }
+
     fn reset_timeout(&mut self) {
         let deadline = tokio::time::Instant::now() + self.timeout_interval;
         self.timeout.as_mut().reset(deadline);
@@ -315,38 +350,17 @@ impl AsyncRead for IpStackUdpStream {
         if buf.remaining() == 0 {
             return std::task::Poll::Ready(Ok(()));
         }
-        if let Some(p) = self.first_payload.take() {
-            if p.len() > buf.remaining() {
+        match std::task::ready!(self.poll_recv_datagram(cx))? {
+            Some(data) if data.len() > buf.remaining() => {
                 return std::task::Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "UDP read buffer too small",
                 )));
             }
-            buf.put_slice(&p);
-            self.reset_timeout();
-            return std::task::Poll::Ready(Ok(()));
+            Some(data) => buf.put_slice(&data),
+            None => {}
         }
-        if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
-            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-        }
-
-        match self.stream_receiver.poll_recv(cx) {
-            std::task::Poll::Ready(Some(p)) => {
-                if let Some(payload) = p.payload {
-                    if payload.len() > buf.remaining() {
-                        return std::task::Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "UDP read buffer too small",
-                        )));
-                    }
-                    buf.put_slice(&payload);
-                    self.reset_timeout();
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -356,8 +370,7 @@ impl AsyncWrite for IpStackUdpStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let header_len = if self.src_addr.is_ipv4() { 28 } else { 48 };
-        if buf.len() > self.mtu.saturating_sub(header_len) as usize {
+        if buf.len() > self.max_payload_len() {
             return std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "UDP datagram exceeds TUN MTU",

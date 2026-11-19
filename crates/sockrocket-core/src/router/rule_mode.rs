@@ -126,56 +126,42 @@ pub fn rule_mode_with_builtin(
     // Explicit device exceptions precede linked groups. Keep the original index
     // for trace/edit and resolve overlapping prefixes most-specific first on ties.
     let configured_sources = device_policy_sources(rules, links);
-    let mut links: Vec<_> = links.iter().collect();
-    links.sort_by_key(|link| {
-        std::cmp::Reverse(
-            link.source
-                .split_once('/')
-                .and_then(|(_, p)| p.parse::<u8>().ok())
-                .unwrap_or(0),
-        )
-    });
-    let mut by_group = std::collections::HashMap::new();
-    for link in links {
-        if explicit || !link.source.is_empty() {
-            by_group
-                .entry(link.group.as_str())
-                .or_insert_with(Vec::new)
-                .push(link);
-        }
+    set.bind_devices(&non_final, links);
+    let mut global_links = std::collections::HashMap::new();
+    for link in links
+        .iter()
+        .filter(|link| explicit && link.source.is_empty())
+    {
+        global_links
+            .entry(link.group.as_str())
+            .or_insert_with(Vec::new)
+            .push(link);
     }
     let mut tiers = std::collections::BTreeMap::new();
-    for (index, member) in &non_final {
+    for (index, member) in non_final {
         if !explicit || member.group.trim().is_empty() {
             tiers
-                .entry((false, 0))
+                .entry(0)
                 .or_insert_with(Vec::new)
-                .push((*index, (*member).clone()));
+                .push((index, member.clone()));
         }
-        for link in by_group.get(member.group.trim()).into_iter().flatten() {
-            let mut rule = (*member).clone();
-            rule.source.clone_from(&link.source);
+        for link in global_links.get(member.group.trim()).into_iter().flatten() {
+            let mut rule = member.clone();
             if !link.target.is_empty() {
                 rule.target.clone_from(&link.target);
             }
             tiers
-                .entry((!link.source.is_empty(), link.priority))
+                .entry(link.priority)
                 .or_insert_with(Vec::new)
-                .push((*index, rule));
+                .push((index, rule));
         }
     }
-    // Each tier retains the normal member priority, config index and prefix tie-break.
-    let mut global_start = None;
-    for ((device, _), scoped) in tiers.iter().rev() {
-        if !device {
-            global_start.get_or_insert(set.rules().len());
-        }
+    for scoped in tiers.values().rev() {
         set.extend(RuleSet::from_indexed_config(
             scoped.iter().map(|(i, r)| (*i, r)),
         ));
     }
-
-    let end = set.rules().len();
+    let end = set.base_len();
 
     // Built-in China-direct without its catch-all. Placed after user
     // non-final rules so an explicit user `geoip:CN → proxy` (or a CN
@@ -188,7 +174,7 @@ pub fn rule_mode_with_builtin(
     }
 
     set.extend(RuleSet::from_indexed_config(device_finals));
-    set.isolate_devices(global_start.unwrap_or(end)..end, configured_sources);
+    set.isolate_devices(end, configured_sources);
     if finals.is_empty() {
         set.add_rule(MatchRule::MatchAll, RouteAction::Proxy);
     } else {
@@ -368,6 +354,117 @@ mod device_tests {
             enabled: true,
         }
     }
+    #[tokio::test]
+    async fn device_identity_changes_preserve_explicit_policy_and_cached_decisions() {
+        use crate::config::model::PausedDeviceSources;
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let rules = [
+            rule("192.0.2.1", "domain", "192.0.2.200", "reject", 5),
+            rule("192.0.2.2", "domain", "192.0.2.200", "direct", 5),
+            rule("192.0.2.3", "domain", "192.0.2.200", "reject", 5),
+            rule("2001:db8::a", "domain", "192.0.2.200", "direct", 5),
+            rule("", "final", "*", "proxy", 0),
+        ];
+        let paused: PausedDeviceSources =
+            serde_yaml::from_str("['2001:db8::b','192.0.2.3']").unwrap();
+        let identities = Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new()));
+        let router = Router::new(rule_mode_ruleset(&rules).with_paused_devices(&paused))
+            .with_device_identities(identities.clone());
+        let dest = "192.0.2.200";
+        for (source, mapped, expected) in [
+            ("2001:db8::c", "192.0.2.1", RouteAction::Reject),
+            ("2001:db8::c", "192.0.2.2", RouteAction::Direct),
+            ("2001:db8::c", "192.0.2.3", RouteAction::Proxy),
+            ("2001:db8::c", "", RouteAction::Proxy),
+            ("2001:db8::a", "192.0.2.1", RouteAction::Direct),
+            ("2001:db8::b", "192.0.2.1", RouteAction::Proxy),
+        ] {
+            let v6: Ipv6Addr = source.parse().unwrap();
+            if mapped.is_empty() {
+                identities.write().unwrap().remove(&v6);
+            } else {
+                identities
+                    .write()
+                    .unwrap()
+                    .insert(v6, mapped.parse::<Ipv4Addr>().unwrap());
+            }
+            let source = Some(v6.into());
+            with_client_source(source, async {
+                assert_eq!(router.route_resolving(dest, 443).await, expected);
+                assert_eq!(router.route(dest, 443), expected);
+                assert_eq!(router.has_client_rules(), expected != RouteAction::Proxy);
+                assert_eq!(
+                    router.route_domain_only(dest),
+                    (expected != RouteAction::Proxy).then_some(expected.clone())
+                );
+                assert_eq!(
+                    router
+                        .trace_route(dest, 443, source, None, false)
+                        .await
+                        .action,
+                    expected
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_members_preserve_cross_group_order_and_trace_source_misses() {
+        use crate::config::model::DeviceRuleGroup;
+        let mut rules = vec![
+            rule("", "domain", "first.invalid", "direct", 5),
+            rule("", "domain", "first.invalid", "reject", 5),
+            rule("", "domain", "last.invalid", "direct", 1),
+        ];
+        for (r, group) in rules.iter_mut().zip(["A", "B", "A"]) {
+            r.group = group.into();
+        }
+        let link = |group: &str, source: &str, priority, target: &str| DeviceRuleGroup {
+            group: group.into(),
+            source: source.into(),
+            priority,
+            target: target.into(),
+        };
+        let links = [
+            link("B", "192.0.2.0/24", 2, "reject"),
+            link("A", "192.0.2.0/24", 2, "direct"),
+            link("A", "192.0.2.1/32", 2, "group:Home"),
+            link("B", "192.0.2.2/32", 9, "group:Other"),
+        ];
+        let set = rule_mode_with_bindings(&rules, &links, true);
+        let views: Vec<_> = set
+            .rules()
+            .iter()
+            .filter(|r| r.source.is_some())
+            .map(|r| (r.config_index.unwrap(), r.source.unwrap().1))
+            .collect();
+        assert_eq!(
+            views,
+            [(1, 32), (0, 32), (0, 24), (1, 24), (2, 32), (2, 24)]
+        );
+        let router = Router::new(set);
+        for (ip, want, index) in [
+            ("192.0.2.1", RouteAction::Group("Home".into()), 0),
+            ("192.0.2.2", RouteAction::Group("Other".into()), 1),
+            ("192.0.2.3", RouteAction::Direct, 0),
+        ] {
+            let source = Some(ip.parse().unwrap());
+            with_client_source(source, async {
+                assert_eq!(router.route("first.invalid", 443), want);
+                let trace = router
+                    .trace_route("first.invalid", 443, source, None, false)
+                    .await;
+                assert_eq!(trace.matched_rule, Some(index));
+                assert_eq!(trace.action, want);
+                if ip == "192.0.2.1" {
+                    assert_eq!(trace.steps[0].outcome, "source_mismatch");
+                }
+            })
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn paused_device_uses_global_rules_even_inside_an_assigned_subnet() {
         use crate::config::model::{DeviceRuleGroup, PausedDeviceSources};
