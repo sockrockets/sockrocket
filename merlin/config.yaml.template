@@ -143,7 +143,7 @@ health_check:
 # -- Routing rules -------------------------------------------------------------
 # Evaluation: higher `priority` first; equal priority keeps list order.
 # Types: domain | domain-suffix | domain-keyword | ip-cidr | geoip | dst-port | final
-# Built-in geoip:CN covers mainland China IPv4 CIDRs (refresh: scripts/update-china-cidrs.sh).
+# Built-in geoip:CN covers IPv4 and IPv6 (refresh: scripts/update-china-cidrs.sh and scripts/update-china-ipv6.py).
 # User non-final rules first, then built-in China-direct, then final → proxy.
 # Global bindings are installed once with a fresh configuration. Selecting a
 # different node only changes active_node. The final proxy action follows it.
