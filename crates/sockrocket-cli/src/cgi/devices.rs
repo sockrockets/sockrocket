@@ -1,7 +1,7 @@
 //! Merlin LAN inventory and live links from a device to named routing rules.
 use super::*;
 use serde::{Deserialize, Serialize};
-use sockrocket_core::config::model::DeviceRuleGroup;
+use sockrocket_core::config::model::{DeviceRuleGroup, PausedDeviceSources};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
@@ -159,6 +159,58 @@ pub(super) fn save_binding(post: &J) -> J {
     store_links(&mut map, &bindings);
     proxy_groups::applied(&map)
 }
+pub(super) fn paused_sources(map: &Mapping) -> Result<PausedDeviceSources> {
+    Ok(map
+        .get("paused_device_sources")
+        .cloned()
+        .map(serde_yaml::from_value)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn store_paused_sources(map: &mut Mapping, paused: &PausedDeviceSources) {
+    if paused.is_empty() {
+        map.remove("paused_device_sources");
+    } else {
+        map.insert(
+            ykey("paused_device_sources"),
+            serde_yaml::to_value(paused).unwrap(),
+        );
+    }
+}
+
+pub(super) fn set_paused(post: &J) -> J {
+    let Ok(mut map) = load_conf() else {
+        return err_msg("配置读取失败");
+    };
+    if !proxy_groups::check_revision(&map, post) {
+        return err_msg("规则已变化，请刷新后重试");
+    }
+    let Some(source) = requested_rule_source(post, "")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    else {
+        return err_msg("请选择要暂停或恢复的设备 IP 或网段");
+    };
+    let Some(pause) = post["paused"].as_bool() else {
+        return err_msg("请选择暂停或恢复设备规则");
+    };
+    let Ok(mut paused) = paused_sources(&map) else {
+        return err_msg("暂停设备配置无效");
+    };
+    let changed = if pause {
+        paused.0.insert(source)
+    } else {
+        paused.0.remove(&source)
+    };
+    if !changed {
+        return ok_msg("设备规则已是所选状态");
+    }
+    let previous_sources = accelerated_rule_sources(&map);
+    store_paused_sources(&mut map, &paused);
+    save_hot_rules(&map, previous_sources)
+}
+
 fn checked_rules(map: &Mapping) -> Result<Vec<sockrocket_core::RoutingRule>> {
     Ok(sockrocket_core::config::model::routing_rules_from_yaml(
         map,
@@ -278,6 +330,14 @@ pub(super) fn delete(post: &J) -> J {
     let Ok(mut bindings) = links(&map) else {
         return err_msg("绑定读取失败");
     };
+    let Ok(mut paused) = paused_sources(&map) else {
+        return err_msg("暂停设备配置无效");
+    };
+    if let Ok(network) = source.parse()
+        && paused.0.remove(&network)
+    {
+        store_paused_sources(&mut map, &paused);
+    }
     rules.retain(|r| r.source != source);
     bindings.retain(|b| b.source != source);
     store_links(&mut map, &bindings);

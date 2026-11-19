@@ -3471,6 +3471,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "ipstack"
@@ -6384,7 +6387,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-cli"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "base64",
@@ -6404,7 +6407,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6428,6 +6431,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "ipstack",
  "libc",
  "log 0.4.29",
@@ -6472,7 +6476,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-gui"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "chrono",

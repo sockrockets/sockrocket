@@ -654,10 +654,11 @@ body.bg {min-width:0!important}
           <div class="toolbar"><h3 id="sr-rule-application-title">设备分流策略</h3><div class="spacer"></div><button class="btn btn-sm" onclick="srLoadRules()">刷新设备</button></div>
           <fieldset id="sr-device-form" disabled style="border:0;padding:0;margin:0;min-width:0">
             <div class="form-grid">
-              <div class="fg"><label for="sr-device-picker">选择设备</label><select id="sr-device-picker" aria-describedby="sr-device-scope-note" onchange="keepRulePickerPosition(this, () => { selectPolicyDevice();syncEditorToMap(); })"><option value="global">全局设备</option></select><span class="hint" id="sr-device-scope-note">适用于未单独配置策略的设备</span></div>
+              <div class="fg"><label for="sr-device-picker">选择设备</label><select id="sr-device-picker" aria-describedby="sr-device-scope-note" onchange="keepRulePickerPosition(this, () => { selectPolicyDevice();syncEditorToMap(); })"><option value="global">全局设备</option></select><span class="hint" id="sr-device-scope-note">未单独配置策略或已暂停专属规则的设备，默认使用这里的全部设备规则。</span></div>
               <div class="fg" id="sr-device-manual" hidden><label for="sr-device-source">来源 IP / 网段</label><input id="sr-device-source" placeholder="例如 192.168.50.20" oninput="updateDevicePolicySelection()" onchange="syncEditorToMap()"></div>
             </div>
             <div id="sr-device-settings" hidden>
+              <div class="toolbar" id="sr-device-pause-controls" hidden><button type="button" class="btn btn-sm" id="sr-device-pause" onclick="toggleDevicePause()">暂停设备规则</button><span class="hint" id="sr-device-pause-state"></span></div>
               <div class="toolbar"><h4 id="sr-device-fallback-scope">设备默认出口</h4><span class="hint" id="sr-device-fallback-label"></span><div class="spacer"></div><button type="button" class="btn btn-sm" aria-controls="sr-device-fallback" onclick="switchDevicePanel('fallback')">修改默认出口</button></div>
               <div id="sr-device-fallback" class="rule-inline-editor" hidden><div class="toolbar"><strong>修改未命中规则时的处理方式</strong><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="cancelDevicePanel()">取消</button></div><div class="toolbar"><div class="fg"><label for="sr-device-target">处理方式</label><select id="sr-device-target" aria-describedby="sr-device-fallback-help sr-device-effective-policy"></select><span class="hint" id="sr-device-fallback-help">规则模式下，只有前面的规则都未匹配（包括内置国内 / 局域网分组规则），才使用这里的选择。例如选「代理」，未匹配的连接就走代理。</span><span class="hint" id="sr-device-effective-policy" hidden></span></div><button class="btn btn-sm" onclick="saveDevicePolicy()">保存</button></div></div>
               <div class="toolbar"><h4 id="sr-device-binding-title">使用的规则组</h4><div class="spacer"></div><button type="button" class="btn btn-sm" onclick="switchDevicePanel('add')">关联规则组</button></div>
@@ -2221,9 +2222,10 @@ function renderDevicePolicies() {
   }
   (SR_STATE.devices || []).forEach(function(d){addSource(d.source,d.alias || d.host || '设备');});
   (SR_STATE.ruleRows || []).concat(SR_STATE.deviceBindings || []).forEach(function(r){addSource(r.source,'已配置');});
+  (SR_STATE.pausedSources||[]).forEach(function(s){addSource(s,'已配置');});
   if(previous && previous!=='global' && previous!=='manual')addSource(previous,'已选择');
   picker.innerHTML=deviceOption('global','全局设备')+
-    Array.from(known,function(entry){return deviceOption(entry[0],entry[1]+' · '+entry[0].replace(entry[0].indexOf(':')<0?/\/32$/:/\/128$/,''));}).join('')+
+    Array.from(known,function(entry){return deviceOption(entry[0],entry[1]+(pausedDeviceScope(entry[0])?' · 已暂停':'')+' · '+entry[0].replace(entry[0].indexOf(':')<0?/\/32$/:/\/128$/,''));}).join('')+
     deviceOption('manual','手动输入 IP / 网段');
   picker.value=previous==='manual'||previous==='global'?previous:
     (Array.from(known.keys()).find(function(source){return sameDeviceSource(source,previous);})||'global');
@@ -2299,6 +2301,13 @@ function updateDevicePolicySelection() {
   }
   editor._source=source;
   if(!valid)return;
+  var paused=pausedDeviceScope(source);
+  var exactPause=(SR_STATE.pausedSources||[]).some(function(s){return sameDeviceSource(s,source);});
+  var pauseButton=srElement('device-pause');
+  srElement('device-pause-controls').hidden=global;
+  pauseButton.textContent=exactPause?'恢复设备规则':'暂停设备规则';
+  pauseButton.disabled=!!paused && !exactPause;
+  srElement('device-pause-state').textContent=exactPause?'已暂停，当前使用全部设备规则。':paused?'当前使用全部设备规则。要恢复，请在网段 '+paused+' 上恢复设备规则。':'暂停后使用全部设备规则，保留当前配置。';
   var rows=orderedRules(SR_STATE.ruleRows||[]);
   var policy=rows.find(function(r){return isFinalRule(r) && r.enabled!==false && sameDeviceSource(r.source||'',source);});
   var exit=srElement('device-target');
@@ -2312,7 +2321,7 @@ function updateDevicePolicySelection() {
   var bindings=(SR_STATE.deviceBindings||[]).filter(function(b){return sameDeviceSource(source,b.source);}).sort(byBindingPriority);
   var inherited=(SR_STATE.globalBindings||[]).slice().sort(byBindingPriority);
   var groupCount=bindings.length;
-  srElement('device-binding-title').textContent='使用的规则组'+(groupCount?' · '+groupCount+' 组':'');
+  srElement('device-binding-title').textContent=(paused?'已暂停的设备规则组':'使用的规则组')+(groupCount?' · '+groupCount+' 组':'');
   srElement('device-inherited').hidden=global || hasDeviceAssignment(source) || !inherited.length;
   srElement('device-inherited-title').textContent='当前使用全局设备规则 · '+inherited.length+' 组';
   srElement('device-inherited-list').innerHTML=inherited.map(function(b){
@@ -2320,7 +2329,7 @@ function updateDevicePolicySelection() {
   }).join('');
   var globalFinal=rows.find(function(r){return !r.source && isFinalRule(r) && r.enabled!==false;});
   var assigned=hasDeviceAssignment(source);
-  var matchingFinal=source && rows.find(function(r){return r.source && isFinalRule(r) && r.enabled!==false && sourceContains(r.source,source);});
+  var matchingFinal=!paused && source && rows.find(function(r){return r.source && isFinalRule(r) && r.enabled!==false && sourceContains(r.source,source);});
   var effectiveNote=srElement('device-effective-policy');
   effectiveNote.hidden=!matchingFinal || matchingFinal===policy;
   effectiveNote.textContent=effectiveNote.hidden?'':'当前按匹配顺序使用网段 '+matchingFinal.source+' 的出口。';
@@ -2434,6 +2443,11 @@ function saveDeviceBinding(remove) {
   var who=source||'全局设备';
   var ask=remove?'解除 '+who+' 与「'+group+'」的关联？':'将「'+group+'」用于 '+who+'，优先级 '+priority+'，命中后'+(RULE_TARGET_LABEL[target]?'使用「'+RULE_TARGET_LABEL[target]+'」':'沿用各条规则的出口')+'？';
   if(confirm(ask))ruleApi('save_device_binding',{revision:RULE_RULE_REVISION,source:source,all_devices:picker==='global',group:group,target:target,priority:priority,remove:remove},toastResp);
+}
+function toggleDevicePause() {
+  var source=deviceSource(), button=srElement('device-pause');
+  if(ruleWorkspaceLocked() || button.disabled || !sourceNetwork(source))return;
+  ruleApi('set_device_paused',{revision:RULE_RULE_REVISION,source:source,paused:!pausedDeviceScope(source)},toastResp);
 }
 function deletePolicyDevice() {
   var source=deviceSource();
@@ -2811,8 +2825,11 @@ function sourceContains(scope,client) {
   return !!(net&&ip&&net.width===ip.width&&net.prefix<=ip.prefix&&(net.value>>BigInt(net.width-net.prefix))===(ip.value>>BigInt(net.width-net.prefix)));
 }
 // Hosts can be simulated; a configured subnet describes a branch, not a client IP.
+function pausedDeviceScope(source) {
+  return source && (SR_STATE.pausedSources||[]).find(function(scope){return sourceContains(scope,source);});
+}
 function hasDeviceAssignment(source) {
-  if(!source)return false;
+  if(!source || pausedDeviceScope(source))return false;
   function applies(r){return r.source && sourceContains(r.source,source);}
   return (SR_STATE.deviceBindings||[]).some(applies) || (SR_STATE.ruleRows||[]).some(function(r){return r.enabled!==false && applies(r);});
 }
@@ -2840,6 +2857,7 @@ function flowDeviceChoices() {
   }
   (SR_STATE.devices||[]).forEach(function(d){add(d.source,d.alias||d.host||'');});
   (SR_STATE.deviceBindings||[]).concat(SR_STATE.ruleRows||[]).forEach(function(r){if(r.source)add(r.source,'');});
+  (SR_STATE.pausedSources||[]).forEach(function(s){add(s,'');});
   return hosts;
 }
 function syncFlowDevicePicker() {
@@ -2966,7 +2984,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   var choice=srElement('rule-flow-device').value;
   var selected=FLOW_EDIT_NETWORK||RULE_FLOW_CLIENT||(choice==='global'?'':null);
   // Router status polls reuse the topology until a snapshot or selection changes.
-  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.globalBindings,SR_STATE.compiledTargets,SR_STATE.builtinRoute,ruleActiveNodeName(),SR_PROXY_GROUPS,SR_RULE_NODES];
+  var inputs=[all,mode,selected,FLOW_EDIT_GROUP,winner,RULE_TRACE,SR_STATE.pausedSources,SR_STATE.devices,SR_STATE.deviceBindings,SR_STATE.globalBindings,SR_STATE.compiledTargets,SR_STATE.builtinRoute,ruleActiveNodeName(),SR_PROXY_GROUPS,SR_RULE_NODES];
   if(sharedMapCache && inputs.every(function(value,i){return sharedMapCache.inputs[i]===value;}))return sharedMapCache.html;
   var names=new Map(),scopes=new Map([['','']]),groups=new Map(),exits=new Map(),edges=new Map();
   (SR_STATE.devices||[]).forEach(function(d){
@@ -2976,6 +2994,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   });
   var ordered=orderedFlowRules(all);
   (SR_STATE.deviceBindings||[]).concat(all).forEach(function(r){if(r.source)scopes.set(flowSourceKey(r.source),flowHost(r.source)||r.source);});
+  (SR_STATE.pausedSources||[]).forEach(function(s){scopes.set(flowSourceKey(s),flowHost(s)||s);});
   if(selected!==null)scopes.set(flowSourceKey(selected),selected);
   var sources=Array.from(scopes.values()), original=new Map(all.map(function(r){return [Number(r.index),r];}));
   function groupKey(stage,scope){
@@ -3035,7 +3054,7 @@ function sharedFlowGraph(all,mode,activeStages,winner) {
   }
   var nodes=sources.map(function(scope,i){
     var name=names.get(flowSourceKey(scope));
-    return box('source',center(i,sources.length),name||scope||'全局设备',scope?(name?scope:'配置此来源'):'全局规则',scope===selected?' selected':'','data-source="'+srEsc(scope)+'" onclick="pickMapSource(this.dataset.source)"');
+    return box('source',center(i,sources.length),name||scope||'全局设备',pausedDeviceScope(scope)?'已暂停 · 使用全部设备规则':scope?(name?scope:'配置此来源'):'全局规则',scope===selected?' selected':'','data-source="'+srEsc(scope)+'" onclick="pickMapSource(this.dataset.source)"');
   }).join('');
   groups.forEach(function(g){
     nodes+=box('group',center(g.index,groups.size),g.title,g.enabled?(g.bindingPriority!=null?'关联优先级 '+g.bindingPriority+' · ':'')+Array.from(g.phases).join(' / '):'已停用',g.selected?' selected':g.enabled?'':' inactive',g.globalFallback?'onclick="openMapGlobalFallback()"':g.kind==='builtin'?'onclick="openBuiltinSettings()"':g.ruleIndex==null?'':'data-index="'+g.ruleIndex+'" onclick="openMapGroup(this.dataset.index)"');
@@ -3128,7 +3147,7 @@ function orderedFlowRules(rows) {
 }
 function byBindingPriority(a,b) {return (b.priority||0)-(a.priority||0);}
 function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
-  var deviceConfig=configuredOnly && client;
+  var deviceConfig=configuredOnly && client,paused=pausedDeviceScope(client);
   if(mode==='global'||mode==='direct')return deviceConfig?[]:[{kind:'mode',title:mode==='global'?'全局代理':'全部直连',targets:[mode==='global'?'proxy':'direct']}];
   var ordered=orderedRows||orderedFlowRules(rows), result=[];
   // Each call receives one routing phase, with adjacent members in display order.
@@ -3149,7 +3168,7 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
     });
   }
   function applies(source) {
-    return client && source && (configuredOnly?sameDeviceSource(source,client):sourceContains(source,client));
+    return client && !paused && source && (configuredOnly?sameDeviceSource(source,client):sourceContains(source,client));
   }
   var devices=ordered.filter(function(r){return applies(r.source);});
   group('device_rule','设备专属规则',devices.filter(function(r){return !isFinalRule(r);}));
@@ -3335,6 +3354,7 @@ function srLoadRules(after) {
     if (!d || d.ok === false || !Array.isArray(d.rules)) {fail('规则读取失败，请刷新后重试。');return;}
     var rules = d.rules;
     SR_STATE.devices = d.devices || [];
+    SR_STATE.pausedSources = d.paused_device_sources || [];
     SR_STATE.globalBindings = d.global_rule_groups || null;
     SR_STATE.deviceBindings = (d.device_rule_groups || []).concat(SR_STATE.globalBindings || []);
     SR_STATE.builtinRoute=d.builtin_route||null;

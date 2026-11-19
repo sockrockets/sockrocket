@@ -66,6 +66,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 sysproxy = { workspace = true }
 tun = { workspace = true }
+ipnet = { version = "2", features = ["serde"] }
 ipstack = { workspace = true }
 etherparse = { workspace = true }
 

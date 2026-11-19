@@ -4,6 +4,7 @@ merlin_arm64_cargo_flags=(
   --config 'profile.release.package.serde_yaml.opt-level="z"'
   --config 'profile.release.package.unsafe-libyaml.opt-level="z"'
   --config 'profile.release.package.regex-syntax.opt-level="z"'
+  --config 'profile.release.package.regex-automata.opt-level="z"'
   # Use the same virtual source root for cross builds and key the dependency
   # cache separately from a build with unmodified source paths.
   --config 'target.aarch64-unknown-linux-musl.rustflags=["--remap-path-prefix=/project=/src"]'

@@ -235,14 +235,12 @@ async fn async_main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
         let config = AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
         if config.proxy_mode == ProxyMode::Rule {
-            let sources: std::collections::BTreeSet<_> =
-                sockrocket_core::router::device_policy_sources(
-                    &config.rules,
-                    &config.device_rule_groups,
-                )
-                .filter(|source| source.contains(':') == ipv6)
-                .collect();
-            for source in sources {
+            let sources = sockrocket_core::router::active_device_networks(
+                &config.rules,
+                &config.device_rule_groups,
+                &config.paused_device_sources,
+            );
+            for source in sources.into_iter().filter(|s| s.contains(':') == ipv6) {
                 println!("{source}");
             }
         }
@@ -1398,12 +1396,15 @@ fn build_outbound(
 fn router_for_mode(config: &AppConfig) -> Option<Arc<Router>> {
     match config.proxy_mode {
         ProxyMode::Rule => Some(Arc::new(
-            Router::new(sockrocket_core::router::rule_mode_with_builtin(
-                &config.rules,
-                &config.device_rule_groups,
-                config.explicit_group_bindings,
-                config.builtin_route,
-            ))
+            Router::new(
+                sockrocket_core::router::rule_mode_with_builtin(
+                    &config.rules,
+                    &config.device_rule_groups,
+                    config.explicit_group_bindings,
+                    config.builtin_route,
+                )
+                .with_paused_devices(&config.paused_device_sources),
+            )
             .with_geoip(Arc::new(sockrocket_core::china_geoip_db())),
         )),
         ProxyMode::Global | ProxyMode::Direct => None,

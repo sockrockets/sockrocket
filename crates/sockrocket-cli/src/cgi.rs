@@ -417,6 +417,7 @@ fn load_conf() -> Result<Mapping> {
 }
 
 fn save_conf(map: &Mapping) -> Result<()> {
+    devices::paused_sources(map)?;
     let groups = sockrocket_core::config::model::proxy_groups_from_yaml(map)
         .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
     let rules = load_routing_rules(map);
@@ -612,6 +613,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "delete_proxy_group" => proxy_groups::delete(post),
         "save_device_binding" => devices::save_binding(post),
         "save_device_alias" => devices::save_alias(post),
+        "set_device_paused" => devices::set_paused(post),
         "delete_device" => devices::delete(post),
         "save_builtin_route" => proxy_groups::save_builtin_route(post),
         "save_device_policy" => proxy_groups::device(post),
@@ -2678,8 +2680,11 @@ fn act_get_rules() -> J {
         .and_then(|node| node.get("name"))
         .and_then(Y::as_str)
         .map(str::to_owned);
+    let Ok(paused) = devices::paused_sources(&map) else {
+        return err_msg("暂停设备配置无效");
+    };
     let (groups, nodes) = proxy_groups::rule_catalogs(&map);
-    json!({"ok": true, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(&map), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
+    json!({"ok": true, "paused_device_sources":paused, "active_node_name":active_node_name, "builtin_route":builtin_route, "devices":devices::catalog(&map), "device_rule_groups":links.iter().filter(|b| !b.source.is_empty()).collect::<Vec<_>>(), "global_rule_groups":links.iter().filter(|b| b.source.is_empty()).collect::<Vec<_>>(), "rules": rules, "compiled_targets":compiled_targets, "revision": revision, "presets":rule_presets::catalog(), "proxy_groups":groups, "nodes":nodes, "proxy_mode":conf_str(&map,"proxy_mode").unwrap_or_else(||"rule".into()).to_ascii_lowercase()})
 }
 
 /// Add a rule. User rules go FIRST in the sequence: evaluation is
@@ -3269,10 +3274,14 @@ fn accelerated_rule_sources(map: &Mapping) -> std::collections::BTreeSet<String>
     let links = devices::links(map).unwrap_or_default();
     let rules = load_routing_rules(map);
     let dual_stack = conf_str(map, "ipv6_mode").as_deref() == Some("dual_stack");
-    sockrocket_core::router::device_policy_sources(&rules, &links)
-        .filter(|source| dual_stack || !source.contains(':'))
-        .map(str::to_owned)
-        .collect()
+    sockrocket_core::router::active_device_networks(
+        &rules,
+        &links,
+        &devices::paused_sources(map).unwrap_or_default(),
+    )
+    .into_iter()
+    .filter(|source| dual_stack || !source.contains(':'))
+    .collect()
 }
 
 /// Existing streams keep their outbound. The daemon's config watcher publishes
@@ -5494,6 +5503,84 @@ dns_direct_domains:
         assert_eq!(act_get_rules()["ok"], false);
         fs::write(env.dir.join("config.yaml"), "rules: [").unwrap();
         assert_eq!(act_get_rules()["ok"], false);
+    }
+
+    #[test]
+    fn pause_and_resume_preserve_device_configuration() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            r#"rules:
+  - {rule_type: domain, group: Media, pattern: example.com, target: direct}
+  - {rule_type: final, source: 192.0.2.8, pattern: '*', target: reject, enabled: false}
+device_rule_groups:
+  - {source: 192.0.2.8, group: Media, target: proxy, priority: 4}"#,
+        ));
+        let original = act_get_rules();
+        let trace = || {
+            dispatch(
+                "trace_route",
+                &json!({
+                    "source":"192.0.2.8","destination":"example.com","resolve_dns":false
+                }),
+            )["trace"]["action"]
+                .clone()
+        };
+        assert_eq!(trace(), "proxy");
+        let set = |source: &str, paused: J, revision: &J| {
+            dispatch(
+                "set_device_paused",
+                &json!({"source":source,"paused":paused,"revision":revision}),
+            )
+        };
+        assert_eq!(original["paused_device_sources"], json!([]));
+        for (source, paused) in [
+            ("", json!(true)),
+            ("TV", json!(true)),
+            ("192.0.2.8", json!("true")),
+        ] {
+            assert_eq!(set(source, paused, &original["revision"])["ok"], false);
+        }
+        assert_eq!(
+            set("192.0.2.8", json!(true), &original["revision"])["saved"],
+            true
+        );
+        let snapshot = act_get_rules();
+        assert_eq!(trace(), "direct");
+        assert_eq!(snapshot["paused_device_sources"], json!(["192.0.2.8/32"]));
+        assert_eq!(
+            set("192.0.2.8", json!(false), &original["revision"])["ok"],
+            false
+        );
+        assert_eq!(
+            set("192.0.2.8/32", json!(true), &snapshot["revision"])["ok"],
+            true
+        );
+        assert_eq!(
+            set("192.0.2.8", json!(false), &snapshot["revision"])["ok"],
+            true
+        );
+        let restored = act_get_rules();
+        assert_eq!(trace(), "proxy");
+        for key in [
+            "rules",
+            "device_rule_groups",
+            "paused_device_sources",
+            "revision",
+        ] {
+            assert_eq!(restored[key], original[key]);
+        }
+        assert_eq!(
+            set("192.0.2.8", json!(true), &restored["revision"])["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                "delete_device",
+                &json!({"source":"192.0.2.8","revision":act_get_rules()["revision"]})
+            )["ok"],
+            true
+        );
+        assert_eq!(act_get_rules()["paused_device_sources"], json!([]));
     }
 
     #[test]

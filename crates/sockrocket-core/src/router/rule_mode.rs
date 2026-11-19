@@ -52,6 +52,36 @@ pub fn device_policy_sources<'a>(
         .filter(|source| !source.is_empty())
 }
 
+/// The firewall accepts positive CIDRs. Split an assigned network only where
+/// a paused host or subnet creates a hole in its coverage.
+pub fn active_device_networks(
+    rules: &[RoutingRule],
+    links: &[crate::config::model::DeviceRuleGroup],
+    paused: &crate::config::model::PausedDeviceSources,
+) -> std::collections::BTreeSet<String> {
+    let sources = device_policy_sources(rules, links);
+    if paused.is_empty() {
+        return sources.map(str::to_owned).collect();
+    }
+    let networks = sources
+        .filter_map(|s| s.parse::<ipnet::IpNet>().ok())
+        .collect();
+    let mut pending = ipnet::IpNet::aggregate(&networks);
+    let mut active = std::collections::BTreeSet::new();
+    while let Some(net) = pending.pop() {
+        if paused.0.iter().any(|excluded| excluded.contains(&net)) {
+            continue;
+        }
+        if paused.0.iter().any(|excluded| net.contains(excluded)) {
+            // A strict subnet exists, so the next prefix length is valid.
+            pending.extend(net.subnets(net.prefix_len() + 1).unwrap());
+        } else {
+            active.insert(net.to_string());
+        }
+    }
+    active
+}
+
 pub fn rule_mode_with_bindings(
     rules: &[RoutingRule],
     links: &[crate::config::model::DeviceRuleGroup],
@@ -338,6 +368,63 @@ mod device_tests {
             enabled: true,
         }
     }
+    #[tokio::test]
+    async fn paused_device_uses_global_rules_even_inside_an_assigned_subnet() {
+        use crate::config::model::{DeviceRuleGroup, PausedDeviceSources};
+        let mut shared = rule("", "domain", "media.invalid", "proxy", 0);
+        shared.group = "Media".into();
+        let rules = [
+            shared,
+            rule("192.0.2.8", "domain", "device.invalid", "reject", 0),
+            rule("192.0.2.8", "final", "*", "reject", 0),
+            rule("", "final", "*", "direct", 0),
+        ];
+        let binding = |source: &str, target: &str| DeviceRuleGroup {
+            source: source.into(),
+            group: "Media".into(),
+            target: target.into(),
+            priority: 0,
+        };
+        let links = [
+            binding("", "direct"),
+            binding("192.0.2.8/31", "reject"),
+            binding("2001:db8::/127", "reject"),
+        ];
+        let paused: PausedDeviceSources =
+            serde_yaml::from_str("['::ffff:192.0.2.8', '2001:db8::1/128']").unwrap();
+        let sources = active_device_networks(&rules, &links, &paused);
+        assert_eq!(
+            sources.into_iter().collect::<Vec<_>>(),
+            ["192.0.2.9/32", "2001:db8::/128"]
+        );
+        let router =
+            Router::new(rule_mode_with_bindings(&rules, &links, true).with_paused_devices(&paused));
+        for client in ["192.0.2.8", "2001:db8::1"] {
+            let ip = Some(client.parse().unwrap());
+            with_client_source(ip, async {
+                assert!(!router.has_client_rules());
+                assert_eq!(router.route_domain_only("device.invalid"), None);
+                assert_eq!(
+                    router.route_resolving("media.invalid", 443).await,
+                    RouteAction::Direct
+                );
+                assert_eq!(router.route("device.invalid", 443), RouteAction::Direct);
+                let trace = router
+                    .trace_route("device.invalid", 443, ip, None, false)
+                    .await;
+                assert_eq!(trace.matched_rule, Some(3));
+            })
+            .await;
+        }
+        for client in ["192.0.2.9", "2001:db8::"] {
+            with_client_source(Some(client.parse().unwrap()), async {
+                assert!(router.has_client_rules());
+                assert_eq!(router.route("media.invalid", 443), RouteAction::Reject);
+            })
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn disabled_members_do_not_remove_the_device_assignment() {
         let mut member = rule("", "domain", "local.invalid", "reject", 0);
