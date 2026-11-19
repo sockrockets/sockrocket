@@ -36,7 +36,7 @@
   <header class="doc-hero">
     <div class="doc-locale" data-locale="zh">
       <p class="eyebrow"><span class="dot"></span>分流</p>
-      <h1>先选规则模式，再决定这条流量走哪。</h1>
+      <h1>梅林路由器分流：网站规则、设备与节点分组</h1>
       <p class="lead">分组建好以后不会自己接管流量。只有规则模式会看规则，并且规则的出口要写成这个分组或这个节点。</p>
     </div>
     <div class="doc-locale" data-locale="en" hidden>
@@ -62,7 +62,7 @@
         <a href="#en-enable">Use a group</a>
         <a href="#en-presets">Presets and devices</a>
       </div>
-      <div class="toc-group"><strong>MORE</strong>
+      <div class="doc-locale" data-locale="zh"><a href="#routing-faq">常见问题</a></div><div class="toc-group"><strong>MORE</strong>
         <a href="configuration.html">配置</a>
         <a href="merlin.html">Merlin</a>
         <a href="./">文档首页</a>
@@ -70,7 +70,7 @@
     </aside>
     <article class="doc-article">
       <div class="doc-locale" data-locale="zh">
-        <h2 id="modes">三种模式</h2>
+        <h2 id="modes">规则模式、全局代理与直连模式</h2>
         <ul>
           <li><strong>规则</strong>：按分流规则决定出口。节点分组和「钉在某一个节点」只在这个模式里生效。</li>
           <li><strong>全局</strong>：代理流量都走概览顶部当前选中的节点。</li>
@@ -86,7 +86,7 @@
           </tbody>
         </table></div>
         <p>某一条规则要固定在一条线上，直接选「节点 · 名字」就够了。好几处规则要共用同一个出口、以后想一处改掉，再用手动分组。</p>
-        <h2 id="groups">节点分组</h2>
+        <h2 id="groups">节点分组：手动选择、备用切换与自动测速</h2>
         <p>在<strong>节点</strong>页新建。它和分流规则里的规则分组不是一回事：规则分组是规则的文件夹，节点分组是出口。</p>
         <ul>
           <li><strong>手动选择</strong>：只会使用选中的那一个节点，保存时也只保留这一个。</li>
@@ -108,6 +108,15 @@
           <li><strong>去向检查</strong>：输入网站，看命中哪一条、为什么、走哪个出口。不修改规则，不发起代理连接，也不保存查询记录。</li>
         </ul>
         <p>已配置专属策略的设备依次检查设备规则、关联组、内置国内直连，再走设备兜底。其余设备检查全局设备的规则、内置国内直连，再走全局兜底。</p>
+        <h2 id="routing-faq">华硕路由器按网站、设备分流常见问题</h2>
+        <h3>梅林科学上网如何设置国内直连、指定网站代理？</h3>
+        <p>在规则模式下，给需要直连的域名配置直连出口，给需要代理的网站指定节点或节点分组。可从国内站点等常用预设开始，检查内容后再启用。添加规则后，用「去向检查」确认命中的规则和出口。</p>
+        <h3>华硕路由器能让不同设备使用不同代理规则吗？</h3>
+        <p>可以配置设备规则和设备默认出口。先为设备固定 DHCP 地址，再按设备地址配置策略；没有专属策略的设备使用共享规则。全局模式、设备规则与最终出口的关系应按上文说明核对。</p>
+        <h3>备用节点切换和自动测速有什么区别？</h3>
+        <p>备用策略按列表顺序尝试；测速策略比较节点握手表现。两者不是带宽测速，也不保证已建立的连接在切换后继续不断线。具体缓存、TCP 和 UDP 行为见本页节点分组说明。</p>
+        <h3>NAS、路由器管理页或内网设备不通怎么排查？</h3>
+        <p>先确认目标 IP、网段及是否跨网段，再检查规则是否误把目标送到代理。对自己管理的内网地址配置准确的直连规则，并用「去向检查」核对。异地组网还依赖系统路由、防火墙和回程路由，不能只靠代理规则解决。</p>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <h2 id="en-modes">Three modes</h2>

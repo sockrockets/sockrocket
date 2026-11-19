@@ -2,22 +2,22 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。">
-<title>华硕梅林插件安装教程与离线包下载｜Sockrocket</title>
+<meta name="description" content="华硕路由器如何安装梅林科学上网插件？Sockrocket 教程介绍软件中心、JFFS、hnd 与 hnd_v8 离线包选择、安装步骤及节点订阅配置。需要带软件中心的兼容固件及自行准备的节点。">
+<title>梅林科学上网插件安装教程｜华硕路由器 Sockrocket</title>
 <link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../styles.css">
 <script defer src="../docs.js"></script>
 <script defer src="../release.js"></script>
 <link rel="canonical" href="https://sockrockets.github.io/sockrocket/docs/merlin.html">
 <meta property="og:site_name" content="Sockrocket">
-<meta property="og:title" content="华硕梅林插件安装教程与离线包下载｜Sockrocket">
-<meta property="og:description" content="华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。">
+<meta property="og:title" content="梅林科学上网插件安装教程｜华硕路由器 Sockrocket">
+<meta property="og:description" content="华硕路由器如何安装梅林科学上网插件？Sockrocket 教程介绍软件中心、JFFS、hnd 与 hnd_v8 离线包选择、安装步骤及节点订阅配置。需要带软件中心的兼容固件及自行准备的节点。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sockrockets.github.io/sockrocket/docs/merlin.html">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="华硕梅林插件安装教程与离线包下载｜Sockrocket">
-<meta name="twitter:description" content="华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "WebPage", "name": "华硕梅林插件安装教程与离线包下载｜Sockrocket", "description": "华硕路由器如何安装 Sockrocket 梅林代理插件？查看带软件中心的固件要求、JFFS 设置、hnd 与 hnd_v8 等平台选包、离线安装步骤及安装后配置。", "url": "https://sockrockets.github.io/sockrocket/docs/merlin.html", "inLanguage": "zh-CN", "isPartOf": {"@type": "WebSite", "name": "Sockrocket", "url": "https://sockrockets.github.io/sockrocket/"}}</script>
+<meta name="twitter:title" content="梅林科学上网插件安装教程｜华硕路由器 Sockrocket">
+<meta name="twitter:description" content="华硕路由器如何安装梅林科学上网插件？Sockrocket 教程介绍软件中心、JFFS、hnd 与 hnd_v8 离线包选择、安装步骤及节点订阅配置。需要带软件中心的兼容固件及自行准备的节点。">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "WebPage", "name": "梅林科学上网插件安装教程｜华硕路由器 Sockrocket", "description": "华硕路由器如何安装梅林科学上网插件？Sockrocket 教程介绍软件中心、JFFS、hnd 与 hnd_v8 离线包选择、安装步骤及节点订阅配置。需要带软件中心的兼容固件及自行准备的节点。", "url": "https://sockrockets.github.io/sockrocket/docs/merlin.html", "inLanguage": "zh-CN", "isPartOf": {"@type": "WebSite", "name": "Sockrocket", "url": "https://sockrockets.github.io/sockrocket/"}}</script>
 </head>
 <body data-page="merlin">
 <a class="skip" href="#main" data-t="skip">跳转到内容</a>
@@ -37,7 +37,7 @@
   <header class="doc-hero">
     <div class="doc-locale" data-locale="zh">
       <p class="eyebrow"><span class="dot"></span>Merlin</p>
-      <h1>华硕梅林软件中心：Sockrocket 插件安装教程</h1>
+      <h1>华硕路由器科学上网：梅林插件安装教程</h1>
       <p class="lead">在 AsusWRT-Merlin 上用软件中心离线安装。装错平台是最常见失败原因——尤其是 <code>hnd</code> 与 <code>hnd_v8</code>。</p>
       <p class="lead"><strong>小安装包，低内存占用。</strong> v0.0.19 本地打包对照中，移除重复程序后，ARMv7 离线包为 6.36 MiB，ARM64 为 6.43 MiB，下载体积约减半。另一次 RT-AX86U Pro 实测中，153–172 个活跃会话下，代理进程的常驻内存（RSS）为 29–37 MiB。发行包大小随构建而异，内存占用随负载变化。</p>
     </div>
@@ -52,11 +52,13 @@
     <aside class="doc-toc">
       <strong>ON THIS PAGE</strong>
       <div class="doc-locale" data-locale="zh">
+        <a href="#before-install">安装条件</a>
         <a href="#firmware">固件</a>
         <a href="#requirements">准备</a>
         <a href="#packages">选包</a>
         <a href="#install">安装</a>
         <a href="#pages">页面</a>
+        <a href="#connection-check">连接排查</a>
         <a href="#after">安装后</a>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
@@ -75,7 +77,11 @@
     </aside>
     <article class="doc-article">
       <div class="doc-locale" data-locale="zh">
-        <h2 id="firmware">先刷出软件中心</h2>
+        <h2 id="before-install">梅林科学上网插件安装前，先确认什么？</h2>
+        <p>Sockrocket 是开源代理客户端与梅林软件中心插件，负责节点订阅、DNS 和流量分流，不提供节点、订阅或联网线路。安装插件本身不会自动获得可用的代理连接。</p>
+        <p>华硕原厂固件、原版 AsusWRT-Merlin 和带软件中心的改版固件并不相同。本教程的离线安装方式要求固件已经有软件中心；仅有“华硕路由器”或“梅林固件”这个名称不足以判断兼容性。</p>
+        <p>先核对完整型号和固件平台，再到 <a href="#packages">离线安装包对照表</a> 选包。RT-AX86U、RT-AX86U Pro 等机型也应结合所装固件核对，不能只看 CPU 名称。</p>
+        <h2 id="firmware">先确认固件带有软件中心</h2>
         <p>插件在<strong>软件中心</strong>里离线安装。原版 <a href="https://www.asuswrt-merlin.net/download">AsusWRT-Merlin</a> 没有这个菜单。带软件中心的固件在 KoolCenter 下载服务器，按机型进目录：</p>
         <p><a href="https://fw.koolcenter.com/">https://fw.koolcenter.com/</a></p>
         <div class="doc-table"><table>
@@ -131,6 +137,14 @@
           <li><strong>网络与 DNS</strong>：默认 IPv4 兼容。只有固件已经有 IPv6 地址和 LAN 前缀时，再考虑双栈。</li>
         </ul>
         <p>分组要接管流量，概览保持规则模式，并把分流规则的出口选成它。见 <a href="routing.html">分流</a>。</p>
+        <h2 id="connection-check">梅林插件装好了，为什么还不能连接？</h2>
+        <ol>
+          <li>确认节点或订阅已导入且可用。支持的协议及传输限制见 <a href="protocols.html">协议说明</a>，导入成功不代表所有传输参数均受支持。</li>
+          <li>在概览选择节点并启动，查看日志是否报错，再检查 DNS 接管和透明代理状态。</li>
+          <li>如果只有部分网站不通，检查 <a href="routing.html">规则分流与出口</a>。分组不会自动接管流量，需要规则指向该分组。</li>
+          <li>如果域名解析异常，先检查 <a href="configuration.html">DNS 与 IPv6 设置</a>，不要同时改动多个选项；记录改动前后的现象便于排查。</li>
+        </ol>
+        <p>反馈时附软件版本、路由器完整型号、固件平台和脱敏日志，不要公开订阅链接、密码或 UUID。</p>
         <h2 id="after">安装后注意</h2>
         <ul>
           <li>默认 IPv6 模式为<strong>兼容</strong>：不依赖运营商是否开通 IPv6；只有固件已有 IPv6 时再考虑双栈。</li>

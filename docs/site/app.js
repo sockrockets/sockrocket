@@ -19,7 +19,7 @@ Object.assign(translations.en, {
  anytlsDetail:'TCP and UDP interoperability verified against an independent server.',
  wireguardDescription:'A native userspace tunnel with one peer per node. Supports preshared keys, DNS inside the tunnel and WireGuard profile import.',
  wireguardDetail:'No additional OS interface; UDP payloads must fit the tunnel MTU.',
- protocolLimits:'Compatibility: VLESS Vision supports TLS 1.3 / REALITY over TCP and XUDP (standard flow excludes UDP/443). gRPC / XHTTP remain unsupported and fail explicitly. WireGuard does not yet support multiple peers, IP fragmentation or profile scripts.',
+ protocolLimits:'VLESS Vision uses TLS 1.3 / REALITY TCP and XUDP. Current source supports gRPC, VLESS XHTTP and WireGuard multi-peer; see the protocol guide for limits. Mieru v3 is experimental and TCP-only.',
  protocolGuide:'Protocol and transport guide →',
  heroLabel:'Small download · Low memory use · Open-source Rust',
  desktopShortcut:'Download for desktop',
@@ -103,7 +103,7 @@ Object.assign(translations.vi, {
  anytlsDetail:'Đã kiểm tra tương thích TCP và UDP với máy chủ độc lập.',
  wireguardDescription:'Đường hầm native trong tiến trình, mỗi node có một peer. Hỗ trợ khóa chia sẻ trước, DNS trong đường hầm và nhập tệp cấu hình WireGuard.',
  wireguardDetail:'Không tạo thêm giao diện mạng hệ thống; gói UDP phải nằm trong MTU của đường hầm.',
- protocolLimits:'Giới hạn: VLESS Vision hỗ trợ TLS 1.3 / REALITY qua TCP và XUDP (flow tiêu chuẩn chặn UDP/443). gRPC / XHTTP chưa được triển khai và sẽ bị từ chối rõ ràng. WireGuard chưa hỗ trợ nhiều peer, phân mảnh IP hoặc script cấu hình.',
+ protocolLimits:'VLESS Vision uses TLS 1.3 / REALITY TCP and XUDP. Current source supports gRPC, VLESS XHTTP and WireGuard multi-peer; see the protocol guide for limits. Mieru v3 is experimental and TCP-only.',
  protocolGuide:'Hướng dẫn giao thức và transport →',
  heroLabel:'Gói cài nhỏ · Ít tốn RAM · Lõi Rust mã nguồn mở',
  desktopShortcut:'Tải ứng dụng máy tính',
@@ -183,6 +183,14 @@ Object.assign(translations.en, {
 Object.assign(translations.vi, {
  traceChoose:'Chọn yêu cầu mẫu để xem đường đi', traceTitle:'Mô phỏng định tuyến', traceLan:'Truy cập LAN', traceMedia:'Phát video', traceAds:'Tải quảng cáo',
  trace_direct:'Kết nối trực tiếp', trace_proxy:'Kết nối qua proxy', trace_reject:'Chặn kết nối', traceDoc:'Tìm hiểu quy tắc định tuyến →'
+});
+Object.assign(translations.en, {
+ faqRouterQ: 'What firmware does the ASUS router plugin require?',
+ faqRouterA: 'Sockrocket requires compatible firmware with Software Center, a package matching the firmware platform, and your own working nodes or subscription. Stock ASUS firmware and upstream AsusWRT-Merlin do not necessarily include Software Center. See the <a href="docs/merlin.html">Merlin installation guide</a>.'
+});
+Object.assign(translations.vi, {
+ faqRouterQ: 'Plugin cho router ASUS yêu cầu firmware nào?',
+ faqRouterA: 'Sockrocket cần firmware tương thích có Software Center, gói cài đặt đúng nền tảng và node hoặc subscription của bạn. Xem <a href="docs/merlin.html">hướng dẫn cài đặt Merlin</a>.'
 });
 const elements = [...document.querySelectorAll('[data-t]')];
 translations.zh = Object.fromEntries(elements.map(el => [el.dataset.t, el.innerHTML]));

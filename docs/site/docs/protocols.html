@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS 与 WireGuard 的支持情况、订阅格式及传输限制。">
+<meta name="description" content="查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS、Mieru 与 WireGuard 的支持情况、订阅格式及传输限制。">
 <title>代理协议支持：VLESS、Hysteria2、WireGuard｜Sockrocket</title>
 <link rel="icon" href="../assets/logo-icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../styles.css">
@@ -10,13 +10,13 @@
 <link rel="canonical" href="https://sockrockets.github.io/sockrocket/docs/protocols.html">
 <meta property="og:site_name" content="Sockrocket">
 <meta property="og:title" content="代理协议支持：VLESS、Hysteria2、WireGuard｜Sockrocket">
-<meta property="og:description" content="查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS 与 WireGuard 的支持情况、订阅格式及传输限制。">
+<meta property="og:description" content="查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS、Mieru 与 WireGuard 的支持情况、订阅格式及传输限制。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sockrockets.github.io/sockrocket/docs/protocols.html">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="代理协议支持：VLESS、Hysteria2、WireGuard｜Sockrocket">
-<meta name="twitter:description" content="查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS 与 WireGuard 的支持情况、订阅格式及传输限制。">
-<script type="application/ld+json">{"@context": "https://schema.org", "@type": "WebPage", "name": "代理协议支持：VLESS、Hysteria2、WireGuard｜Sockrocket", "description": "查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS 与 WireGuard 的支持情况、订阅格式及传输限制。", "url": "https://sockrockets.github.io/sockrocket/docs/protocols.html", "inLanguage": "zh-CN", "isPartOf": {"@type": "WebSite", "name": "Sockrocket", "url": "https://sockrockets.github.io/sockrocket/"}}</script>
+<meta name="twitter:description" content="查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS、Mieru 与 WireGuard 的支持情况、订阅格式及传输限制。">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "WebPage", "name": "代理协议支持：VLESS、Hysteria2、WireGuard｜Sockrocket", "description": "查看 Sockrocket 对 Shadowsocks、VMess、VLESS、Trojan、TUIC、Hysteria2、AnyTLS、Mieru 与 WireGuard 的支持情况、订阅格式及传输限制。", "url": "https://sockrockets.github.io/sockrocket/docs/protocols.html", "inLanguage": "zh-CN", "isPartOf": {"@type": "WebSite", "name": "Sockrocket", "url": "https://sockrockets.github.io/sockrocket/"}}</script>
 </head>
 <body data-page="protocols">
 <a class="skip" href="#main" data-t="skip">跳转到内容</a>
@@ -36,7 +36,7 @@
   <header class="doc-hero">
     <div class="doc-locale" data-locale="zh">
       <p class="eyebrow"><span class="dot"></span>协议</p>
-      <h1>一个 Rust 内核，桌面与路由器共用。</h1>
+      <h1>梅林与桌面客户端的代理协议支持</h1>
       <p class="lead">运行时不依赖外部代理可执行文件。下表描述<strong>当前源码</strong>能力；已下载的发行包以对应版本说明为准。</p>
     </div>
     <div class="doc-locale" data-locale="en" hidden>
@@ -49,14 +49,14 @@
     <aside class="doc-toc">
       <strong>ON THIS PAGE</strong>
       <div class="doc-locale" data-locale="zh">
-        <a href="#table">协议一览</a>
+        <a href="#mieru" class="doc-locale" data-locale="zh">Mieru 实验性支持</a><a href="#table">协议一览</a>
         <a href="#limits">兼容边界</a>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <a href="#en-table">Protocol matrix</a>
         <a href="#en-limits">Limits</a>
       </div>
-      <div class="toc-group"><strong>MORE</strong>
+      <div class="doc-locale" data-locale="zh"><a href="#protocol-faq">常见问题</a></div><div class="toc-group"><strong>MORE</strong>
         <a href="configuration.html">配置</a>
         <a href="getting-started.html">使用指南</a>
         <a href="./">文档首页</a>
@@ -64,7 +64,7 @@
     </aside>
     <article class="doc-article">
       <div class="doc-locale" data-locale="zh">
-        <h2 id="table">协议一览</h2>
+        <h2 id="table">Shadowsocks、VLESS、Hysteria2、Mieru 等协议支持表</h2>
         <div class="doc-table"><table>
           <thead><tr><th>协议</th><th>TCP</th><th>UDP</th><th>说明</th></tr></thead>
           <tbody>
@@ -75,17 +75,26 @@
             <tr><td>TUIC v5</td><td>是</td><td>是</td><td>原生 QUIC</td></tr>
             <tr><td>Hysteria2</td><td>是</td><td>是</td><td>原生 QUIC；混淆与端口跳跃未实现</td></tr>
             <tr><td>AnyTLS v2</td><td>是</td><td>是</td><td>原生 TLS 会话复用；UDP-over-TCP v2</td></tr>
-            <tr><td>WireGuard</td><td>是</td><td>是</td><td>用户态单 Peer；UDP 需符合隧道 MTU</td></tr>
+            <tr><td>Mieru v3</td><td>实验性 / Experimental</td><td>不支持 / No</td><td>TCP carrier · single fixed port · Clash / mierus://</td></tr>
+            <tr><td>WireGuard</td><td>是</td><td>是</td><td>用户态，最多 64 个 Peer；UDP 需符合隧道 MTU</td></tr>
           </tbody>
         </table></div>
         <h2 id="limits">兼容边界</h2>
         <ul>
           <li>VLESS Vision：TLS 1.3 / REALITY TCP 与 XUDP；标准 flow 拒绝 UDP/443，便于客户端回退 TCP。</li>
-          <li>gRPC / XHTTP 等未实现的传输会<strong>明确拒绝</strong>，不会悄悄改成裸 TCP。</li>
-          <li>WireGuard：暂不支持多 Peer、IP 分片与配置脚本。</li>
+          <li>当前源码已实现 HTTPUpgrade、gRPC 和 VLESS XHTTP；具体协议组合与参数限制见仓库协议文档，发行包以对应版本说明为准。</li>
+          <li>WireGuard：当前源码支持每节点最多 64 个 Peer；不支持 IP 分片、AmneziaWG 与系统接口脚本。</li>
           <li>默认校验证书；节点的 <code>udp</code> 开关也会限制 UDP。</li>
         </ul>
         <p>更细的 Vision / AnyTLS / WireGuard 说明见仓库：<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/protocols.md">docs/protocols.md</a>。</p>
+        <h2 id="mieru">梅林路由器 Mieru 协议支持与导入</h2><p>Sockrocket 已加入实验性 Mieru v3 支持：TCP carrier、单一固定端口、标准握手、每条连接一个会话。可导入 Clash 节点或简单的 <code>mierus://</code> 链接。当前不支持 UDP；Mieru 会同时关闭双向连接，因此不支持等待 TCP FIN 后才回复的目标服务。已完成 macOS 上与 Mihomo v1.19.31 的 TCP echo 测试，不能据此视为所有梅林机型均已验证。</p><p>使用前核对已安装版本的发行说明。完整实现与测试范围见<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/protocols.md">协议支持文档</a>。</p>
+        <h2 id="protocol-faq">梅林代理插件的协议与客户端兼容性</h2>
+        <h3>Shadowsocks、VMess、VLESS、Trojan 节点怎么选？</h3>
+        <p>先按现有节点提供的协议和参数导入，再核对上表的支持范围。协议名称相同不代表每一种传输组合都支持；遇到不支持的参数应查阅发行说明，而不是直接删除参数尝试连接。</p>
+        <h3>梅林路由器支持 Hysteria2、TUIC、AnyTLS 和 WireGuard 吗？</h3>
+        <p>Sockrocket 的协议表包含这些协议，但应以所安装发行版及其限制为准。还要检查服务端配置、UDP 连通性和固件环境。安装教程负责固件选包，本页负责协议与传输兼容性。</p>
+        <h3>VLESS REALITY 与 Vision 的支持范围是什么？</h3>
+        <p>本页列出的 VLESS Vision 能力包括 TLS 1.3 / REALITY TCP 与 XUDP；标准 flow 拒绝 UDP/443。当前源码支持 VLESS XHTTP，但 Vision 不能叠加在 XHTTP 上；不支持的参数会明确拒绝。请核对节点的完整传输配置，不要只根据 VLESS 标签判断可用。</p>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <h2 id="en-table">Protocol matrix</h2>
@@ -99,14 +108,15 @@
             <tr><td>TUIC v5</td><td>Yes</td><td>Yes</td><td>Native QUIC</td></tr>
             <tr><td>Hysteria2</td><td>Yes</td><td>Yes</td><td>Native QUIC; obfuscation / port hopping not implemented</td></tr>
             <tr><td>AnyTLS v2</td><td>Yes</td><td>Yes</td><td>Native TLS reuse; UDP-over-TCP v2</td></tr>
-            <tr><td>WireGuard</td><td>Yes</td><td>Yes</td><td>Userspace, one peer; UDP must fit tunnel MTU</td></tr>
+            <tr><td>Mieru v3</td><td>实验性 / Experimental</td><td>不支持 / No</td><td>TCP carrier · single fixed port · Clash / mierus://</td></tr>
+            <tr><td>WireGuard</td><td>Yes</td><td>Yes</td><td>Userspace, up to 64 peers; UDP must fit tunnel MTU</td></tr>
           </tbody>
         </table></div>
         <h2 id="en-limits">Limits</h2>
         <ul>
           <li>VLESS Vision: TLS 1.3 / REALITY TCP and XUDP; standard flow rejects UDP/443 for TCP fallback.</li>
-          <li>Unsupported transports such as gRPC / XHTTP are rejected explicitly.</li>
-          <li>WireGuard: no multi-peer, IP fragmentation or profile scripts yet.</li>
+          <li>Current source supports HTTPUpgrade, gRPC and VLESS XHTTP; consult the repository protocol guide for supported combinations and release notes for installed packages.</li>
+          <li>WireGuard: up to 64 peers per node in current source; no IP fragmentation, AmneziaWG or OS interface hooks.</li>
         </ul>
         <p>Details: <a href="https://github.com/sockrockets/sockrocket/blob/main/docs/protocols.md">docs/protocols.md</a>.</p>
       </div>

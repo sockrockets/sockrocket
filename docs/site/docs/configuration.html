@@ -36,7 +36,7 @@
   <header class="doc-hero">
     <div class="doc-locale" data-locale="zh">
       <p class="eyebrow"><span class="dot"></span>配置</p>
-      <h1>先改常用项，完整字段表按需再翻。</h1>
+      <h1>梅林代理配置：DNS、IPv6 与流量统计</h1>
       <p class="lead">桌面、CLI 与 Merlin 共用同一份配置思路。下面是日常会碰到的部分；完整 YAML 字段说明仍在仓库文档里。</p>
     </div>
     <div class="doc-locale" data-locale="en" hidden>
@@ -62,7 +62,7 @@
         <a href="#en-traffic">Traffic</a>
         <a href="#en-cli">CLI</a>
       </div>
-      <div class="toc-group"><strong>MORE</strong>
+      <div class="doc-locale" data-locale="zh"><a href="#network-faq">常见问题</a></div><div class="toc-group"><strong>MORE</strong>
         <a href="getting-started.html">使用指南</a>
         <a href="protocols.html">协议</a>
         <a href="./">文档首页</a>
@@ -76,7 +76,7 @@
           <li><code>subscriptions</code>：订阅列表；<code>nodes</code>：手动节点；<code>active_node</code>：当前出口。</li>
           <li><code>proxy_mode</code>：<code>rule</code>（规则）、<code>global</code>、<code>direct</code>。</li>
         </ul>
-        <h2 id="dns">DNS 与 IPv6（Merlin）</h2>
+        <h2 id="dns">梅林路由器 DNS 接管与 IPv6 设置</h2>
         <ul>
           <li><strong>IPv4 兼容（推荐）</strong>：不确定运营商是否开通 IPv6 时保持此项。代理走 IPv4；固件若已开 IPv6，则拒绝外网 IPv6 转发。</li>
           <li><strong>双栈（可选）</strong>：仅当固件已拿到 IPv6 地址与 LAN 前缀时再开。做不完会保住 IPv4 代理并自动重试。</li>
@@ -90,6 +90,13 @@
         <pre><code>sockrocket-cli --init config.yaml
 sockrocket-cli config.yaml</code></pre>
         <p>完整字段、健康检查、分组等见仓库：<a href="https://github.com/sockrockets/sockrocket/blob/main/docs/configuration.md">docs/configuration.md</a>。</p>
+        <h2 id="network-faq">梅林 DNS、IPv6 与透明代理常见问题</h2>
+        <h3>DNS 接管和透明代理有什么区别？</h3>
+        <p>DNS 接管负责域名解析请求，透明代理负责接管并转发网络流量。Sockrocket 启动时会同时打开两者，运行中可以分别关闭；打开透明代理时会一并打开 DNS 接管。它们不是同一个开关。</p>
+        <h3>开启路由器代理后，IPv6 无法访问怎么办？</h3>
+        <p>先核对当前 IPv6 模式。IPv4 兼容模式和双栈模式的行为不同，只有固件已有 IPv6 地址与 LAN 前缀时才考虑双栈。若问题仅出现在异地组网或跨网段设备，应同时检查目标地址、直连规则和系统路由。</p>
+        <h3>如何查看梅林插件的节点流量与订阅用量？</h3>
+        <p>概览中的节点流量按本次代理进程启动累计，重启后重新计数；订阅页面展示近三个自然月，按当前属于订阅的节点汇总。这些是本地统计，不应当作订阅服务商的剩余额度或账单。</p>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <h2 id="en-basics">Basics</h2>

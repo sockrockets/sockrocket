@@ -37,7 +37,7 @@
   <header class="doc-hero">
     <div class="doc-locale" data-locale="zh">
       <p class="eyebrow"><span class="dot"></span>使用指南</p>
-      <h1>三步建立连接。</h1>
+      <h1>节点与订阅导入教程：从安装到连接</h1>
       <p class="lead">先下载对应平台的发行包，导入你自己的订阅或节点，再验证系统代理是否工作。需要接管更多流量时再开 TUN。</p>
     </div>
     <div class="doc-locale" data-locale="en" hidden>
@@ -61,7 +61,7 @@
         <a href="#en-connect">3. Connect</a>
         <a href="#en-verify">Verify</a>
       </div>
-      <div class="toc-group"><strong>MORE</strong>
+      <div class="doc-locale" data-locale="zh"><a href="#subscription-faq">常见问题</a></div><div class="toc-group"><strong>MORE</strong>
         <a href="routing.html">分流</a>
         <a href="merlin.html">Merlin</a>
         <a href="configuration.html">配置 / Config</a>
@@ -83,7 +83,7 @@
           </tbody>
         </table></div>
         <p>升级前请先退出旧版及其后台进程，避免端口或路由被重复占用。</p>
-        <h2 id="import">2. 导入订阅或节点</h2>
+        <h2 id="import">2. 导入 Clash、V2Ray、sing-box 订阅或节点</h2>
         <p><strong>桌面端：</strong>打开配置页，粘贴订阅 URL 并导入；或手动添加节点。支持节点链接以及 Clash、V2Ray、sing-box 订阅格式。</p>
         <p><strong>命令行：</strong></p>
         <pre><code>sockrocket-cli --init config.yaml
@@ -101,6 +101,15 @@ sockrocket-cli config.yaml</code></pre>
         <pre><code>curl -x socks5://127.0.0.1:1080 https://www.google.com -I
 curl -x http://127.0.0.1:1087 https://www.google.com -I</code></pre>
         <p>默认监听：SOCKS5 <code>127.0.0.1:1080</code>，HTTP <code>127.0.0.1:1087</code>。</p>
+        <h2 id="subscription-faq">Clash、V2Ray 与 sing-box 订阅导入常见问题</h2>
+        <h3>梅林路由器可以导入 Clash 订阅吗？</h3>
+        <p>Sockrocket 支持 Clash、V2Ray 和 sing-box 订阅格式，也支持节点链接。梅林插件在「订阅」页管理订阅，在「节点」页选择出口。先完成<a href="merlin.html">软件中心离线安装</a>，再添加自己的订阅。</p>
+        <h3>支持 Clash 订阅，是否等于运行 Clash 内核？</h3>
+        <p>不等于。Sockrocket 使用自己的 Rust 代理内核，支持订阅格式不代表完整执行另一客户端的全部配置。导入后应检查节点协议和传输参数，并按 Sockrocket 的<a href="routing.html">分流规则</a>配置出口。</p>
+        <h3>订阅更新失败或导入后没有节点怎么办？</h3>
+        <p>先确认填写的是订阅地址而不是服务商登录页面，检查订阅是否过期、返回内容是否为支持格式，以及日志里的解析错误。不要把完整订阅地址发到公开论坛；反馈时只提供脱敏错误和格式说明。</p>
+        <h3>节点延迟测试成功，为什么网页仍打不开？</h3>
+        <p>延迟测试不能证明所有网站和应用都能访问。继续检查当前节点、代理模式、规则出口和 DNS。桌面端确认应用是否使用系统代理；梅林端确认服务、DNS 接管和透明代理状态。</p>
       </div>
       <div class="doc-locale" data-locale="en" hidden>
         <h2 id="en-install">1. Install</h2>

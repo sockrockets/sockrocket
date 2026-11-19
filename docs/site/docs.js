@@ -44,7 +44,7 @@ const titleByPage = {
     vi: 'Bắt đầu · Sockrocket',
   },
   merlin: {
-    zh: '华硕梅林插件安装教程与离线包下载｜Sockrocket',
+    zh: '梅林科学上网插件安装教程｜华硕路由器 Sockrocket',
     en: 'Merlin install guide · Sockrocket',
     vi: 'Hướng dẫn Merlin · Sockrocket',
   },
