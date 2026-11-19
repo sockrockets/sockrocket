@@ -249,7 +249,9 @@ mod tests {
         publish_sample(dir, Ok(known.clone())).unwrap();
         publish_sample(dir, Err(anyhow::anyhow!("neighbor sample unavailable"))).unwrap();
         assert!(!fs::read(&path).unwrap().is_empty());
-        fs::File::open(dir.join("device-ipv6-last-good"))
+        fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("device-ipv6-last-good"))
             .unwrap()
             .set_modified(UNIX_EPOCH)
             .unwrap();
