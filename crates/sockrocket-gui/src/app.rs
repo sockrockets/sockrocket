@@ -158,6 +158,7 @@ pub struct AppState {
     router_rules: Vec<(usize, RoutingRule)>,
     explicit_group_bindings: bool,
     builtin_route: sockrocket_core::config::model::BuiltinRoute,
+    paused_device_sources: sockrocket_core::config::model::PausedDeviceSources,
     device_rule_groups: Vec<sockrocket_core::config::model::DeviceRuleGroup>,
     pub(crate) rule_group_input: Entity<InputState>,
     pub(crate) rule_pattern_input: Entity<InputState>,
@@ -772,6 +773,7 @@ impl AppState {
             router_rules,
             explicit_group_bindings: persisted.explicit_group_bindings,
             builtin_route: persisted.builtin_route,
+            paused_device_sources: persisted.paused_device_sources.clone(),
             device_rule_groups: persisted.device_rule_groups.clone(),
             rule_group_input,
             rule_pattern_input,
@@ -3583,6 +3585,7 @@ impl AppState {
             rules: sockrocket_gui::desktop_rules::for_storage(&self.rules, &self.router_rules),
             explicit_group_bindings: self.explicit_group_bindings,
             builtin_route: self.builtin_route,
+            paused_device_sources: self.paused_device_sources.clone(),
             device_rule_groups: self.device_rule_groups.clone(),
             auto_connect: self.proxy_running,
             tun_was_enabled: self.tun_enabled,
@@ -3717,6 +3720,7 @@ impl AppState {
                         this.nodes = config.nodes;
                         this.subscriptions = config.subscriptions;
                         this.groups = config.groups;
+                        this.paused_device_sources = config.paused_device_sources;
                         this.device_rule_groups = config.device_rule_groups;
                         (this.rules, this.router_rules) =
                             sockrocket_gui::desktop_rules::split(config.rules);
@@ -4007,6 +4011,7 @@ impl AppState {
                     sockrocket_gui::desktop_rules::split(new_config.rules.clone());
                 self.explicit_group_bindings = new_config.explicit_group_bindings;
                 self.builtin_route = new_config.builtin_route;
+                self.paused_device_sources = new_config.paused_device_sources.clone();
                 self.device_rule_groups = new_config.device_rule_groups.clone();
                 self.dns = new_config.dns.clone();
                 self.ipv6_mode = new_config.ipv6_mode;

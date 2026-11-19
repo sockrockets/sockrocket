@@ -115,6 +115,7 @@ pub struct RuleSet {
     rules: Vec<RuleEntry>,
     default_action: RouteAction,
     device_scopes: Vec<(IpAddr, u8)>,
+    paused_sources: crate::config::model::PausedDeviceSources,
     global_destinations: std::ops::Range<usize>,
     global_final_start: Option<usize>,
 }
@@ -125,6 +126,7 @@ impl RuleSet {
             rules: Vec::new(),
             default_action: RouteAction::Proxy,
             device_scopes: Vec::new(),
+            paused_sources: Default::default(),
             global_destinations: 0..0,
             global_final_start: None,
         }
@@ -243,6 +245,23 @@ impl RuleSet {
         self.device_scopes.dedup();
     }
 
+    pub fn with_paused_devices(
+        mut self,
+        paused: &crate::config::model::PausedDeviceSources,
+    ) -> Self {
+        self.paused_sources = paused.clone();
+        self
+    }
+
+    fn is_paused(&self, source: Option<IpAddr>) -> bool {
+        source.is_some_and(|ip| {
+            self.paused_sources
+                .0
+                .iter()
+                .any(|network| network.contains(&ip))
+        })
+    }
+
     fn has_device_scope(&self, source: Option<IpAddr>) -> bool {
         source.is_some()
             && self
@@ -252,7 +271,8 @@ impl RuleSet {
     }
 
     fn entries_for(&self, source: Option<IpAddr>) -> impl Iterator<Item = &RuleEntry> {
-        let (skip, end) = if self.has_device_scope(source) {
+        let paused = self.is_paused(source);
+        let (skip, end) = if !paused && self.has_device_scope(source) {
             (
                 self.global_destinations.clone(),
                 self.global_final_start.unwrap_or(self.rules.len()),
@@ -263,6 +283,7 @@ impl RuleSet {
         self.rules[..skip.start]
             .iter()
             .chain(&self.rules[skip.end..end])
+            .filter(move |entry| !paused || entry.source.is_none())
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
@@ -330,6 +351,9 @@ impl Router {
     /// Whether the current client has any enabled device-specific policy.
     pub fn has_client_rules(&self) -> bool {
         let source = crate::proxy::routing::client_source();
+        if self.rules.is_paused(source) {
+            return false;
+        }
         self.rules.has_device_scope(source)
             || self
                 .rules

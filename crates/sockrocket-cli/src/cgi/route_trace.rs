@@ -10,7 +10,7 @@ pub(super) fn rules_revision(map: &Mapping) -> String {
 }
 
 pub(super) fn revision_for_rules(map: &Mapping, rules: &[sockrocket_core::RoutingRule]) -> String {
-    let input = json!({"builtin_route":map.get("builtin_route"),"device_rule_groups":map.get("device_rule_groups"),"groups":map.get("groups"), "nodes":map.get("nodes"), "rules": rules,
+    let input = json!({"paused_device_sources":map.get("paused_device_sources"),"builtin_route":map.get("builtin_route"),"device_rule_groups":map.get("device_rule_groups"),"groups":map.get("groups"), "nodes":map.get("nodes"), "rules": rules,
         "mode": conf_str(map,"proxy_mode").unwrap_or_else(||"rule".into()).to_lowercase(),
         "active_node": conf_usize(map,"active_node"), "dns":map.get("dns"),"dns_direct_server":map.get("dns_direct_server"),"dns_direct_domains":map.get("dns_direct_domains"),"ipv6_mode":map.get("ipv6_mode")});
     format!(
@@ -164,8 +164,13 @@ pub(super) fn act_trace_route(post: &J) -> J {
         let Ok(builtin) = proxy_groups::builtin_route(&map) else {
             return failure("route_trace_config", "内置分组出口配置无效");
         };
-        let router = Router::new(rule_mode_with_builtin(&rules, &links, true, builtin))
-            .with_geoip(std::sync::Arc::new(china_geoip_db()));
+        let Ok(paused) = super::devices::paused_sources(&map) else {
+            return failure("route_trace_config", "暂停设备配置无效");
+        };
+        let router = Router::new(
+            rule_mode_with_builtin(&rules, &links, true, builtin).with_paused_devices(&paused),
+        )
+        .with_geoip(std::sync::Arc::new(china_geoip_db()));
         let rt = match CgiRuntime::new() {
             Ok(rt) => rt,
             Err(_) => return failure("route_trace_unavailable", "无法启动分流查询，请稍后重试"),

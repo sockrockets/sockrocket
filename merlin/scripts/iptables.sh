@@ -371,8 +371,14 @@ ipv6_compat_guard_stop() {
     ip6tables -X "$IPV6_CHAIN" 2>/dev/null || true
 }
 
-# Reject forwarded LAN IPv6 so clients fall back to the IPv4 proxy.
-# This does not touch IPv4 rules.
+# Replies to inbound IPv6 sessions must keep the firmware's return path.
+# RETURN leaves the router's own forwarding and access policies in charge.
+ipv6_reply_return() {
+    local table="$1" op="$2" chain="$3" iface="$4"
+    ip6tables -t "$table" "$op" "$chain" -i "$iface" -m conntrack --ctdir REPLY -j RETURN
+}
+
+# Reject LAN-originated external IPv6 so clients fall back to the IPv4 proxy.
 ipv6_compat_guard_present() {
     local iface
     iface=$(ipv6_lan_interface) || return 1
@@ -386,10 +392,16 @@ ipv6_compat_guard_start() {
     local iface
     iface=$(ipv6_lan_interface) || { err "Invalid LAN interface for IPv6 protection"; return 1; }
     # Re-inserting an intact guard would open a window with no guard at all.
-    ipv6_compat_guard_present && return 0
+    if ipv6_compat_guard_present; then
+        # Upgrade an already attached guard without detaching its reject rule.
+        ipv6_reply_return filter -C "$IPV6_CHAIN" "$iface" 2>/dev/null ||
+            ipv6_reply_return filter -I "$IPV6_CHAIN" "$iface"
+        return $?
+    fi
     ipv6_compat_guard_stop || return 1
     if ! {
         { ip6tables -N "$IPV6_CHAIN" 2>/dev/null || ip6tables -F "$IPV6_CHAIN"; } &&
+        ipv6_reply_return filter -A "$IPV6_CHAIN" "$iface" &&
         ip6tables -A "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
             -j REJECT --reject-with icmp6-adm-prohibited &&
         ip6tables -I FORWARD 1 -j "$IPV6_CHAIN"
@@ -442,11 +454,10 @@ ipv6_guard_verify() {
         return $?
     fi
     ipv6_guard_needed || return 0
-    local iface first
+    local iface
     iface=$(ipv6_lan_interface) || return 1
-    ip6tables -C "$IPV6_CHAIN" -i "$iface" ! -o "$iface" \
-        -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null || return 1
-    ipv6_forward_jump_ok "$IPV6_CHAIN"
+    ipv6_reply_return filter -C "$IPV6_CHAIN" "$iface" 2>/dev/null &&
+    ipv6_compat_guard_present
 }
 
 # IPv6 has independent policy tables. Never change the WAN default route,
@@ -501,6 +512,7 @@ ipv6_proxy_start() {
         { ip6tables -N "$IPV6_FORWARD" 2>/dev/null || ip6tables -F "$IPV6_FORWARD"; }
     }; then ipv6_proxy_stop; return 1; fi
     uu_returns ip6tables mangle "$IPV6_MANGLE" "$iface" || { ipv6_proxy_stop; return 1; }
+    ipv6_reply_return mangle -A "$IPV6_MANGLE" "$iface" || { ipv6_proxy_stop; return 1; }
     # Multicast/link-local/ULA traffic stays on the LAN or firmware path.
     for dest in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
         ip6tables -t mangle -A "$IPV6_MANGLE" -d "$dest" -j RETURN || { ipv6_proxy_stop; return 1; }
@@ -574,6 +586,7 @@ ipv6_proxy_verify() {
         cn_ipv6 cn_flow_installed || return 1
     fi
     ipv6_forward_jump_ok "$IPV6_FORWARD" || return 1
+    ipv6_reply_return mangle -C "$IPV6_MANGLE" "$iface" 2>/dev/null &&
     ip6tables -t mangle -C PREROUTING -j "$IPV6_MANGLE" 2>/dev/null &&
     ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p tcp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&
     ip6tables -t mangle -C "$IPV6_MANGLE" -i "$iface" -p udp -j MARK --set-mark "$TUN_MARK" 2>/dev/null &&

@@ -54,6 +54,32 @@ pub enum BuiltinRoute {
     Reject,
 }
 
+/// Sources that temporarily inherit the all-devices routing policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct PausedDeviceSources(pub std::collections::BTreeSet<ipnet::IpNet>);
+
+impl TryFrom<Vec<String>> for PausedDeviceSources {
+    type Error = String;
+
+    fn try_from(values: Vec<String>) -> Result<Self, Self::Error> {
+        let mut sources = Self::default();
+        for value in values {
+            let source = crate::router::normalize_rule_source(&value)?;
+            sources
+                .0
+                .insert(source.parse().map_err(|_| "暂停设备需要有效的 IP 或网段")?);
+        }
+        Ok(sources)
+    }
+}
+
+impl PausedDeviceSources {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Unified application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -81,6 +107,8 @@ pub struct AppConfig {
     pub rules: Vec<RoutingRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_rule_groups: Vec<DeviceRuleGroup>,
+    #[serde(default, skip_serializing_if = "PausedDeviceSources::is_empty")]
+    pub paused_device_sources: PausedDeviceSources,
     #[serde(default)]
     pub explicit_group_bindings: bool,
     #[serde(default)]
@@ -124,6 +152,7 @@ impl Default for AppConfig {
             subscriptions: Vec::new(),
             rules: Vec::new(),
             device_rule_groups: Vec::new(),
+            paused_device_sources: Default::default(),
             explicit_group_bindings: false,
             builtin_route: BuiltinRoute::default(),
             auto_connect: false,

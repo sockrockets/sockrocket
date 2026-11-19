@@ -49,7 +49,10 @@ ip6tables() {
         '-t mangle -I SOCKROCKET_IPV6_MANGLE 2 -m set --match-set sockrocket_cn6 dst -g SOCKROCKET_CN6_FLOW')
             touch "$FIXTURE/cn6";;
         '-t mangle -D SOCKROCKET_IPV6_MANGLE -m set --match-set sockrocket_cn6 dst -g SOCKROCKET_CN6_FLOW'|'-t mangle -F SOCKROCKET_IPV6_MANGLE')
-            rm -f "$FIXTURE/cn6";;
+            rm -f "$FIXTURE/cn6"
+            if [ "$2 $3" = 'mangle -F' ]; then rm -f "$FIXTURE/mangle_reply"; fi;;
+        '-t mangle -A SOCKROCKET_IPV6_MANGLE -i br0 -m conntrack --ctdir REPLY -j RETURN') touch "$FIXTURE/mangle_reply";;
+        '-t mangle -C SOCKROCKET_IPV6_MANGLE -i br0 -m conntrack --ctdir REPLY -j RETURN') test -f "$FIXTURE/mangle_reply";;
         '-S FORWARD')
             test ! -f "$FIXTURE/foreign_top" || echo '-A FORWARD -i wg0 -j SKYNET'
             while read -r chain; do echo "-A FORWARD -j $chain"; done < "$FORWARD_LIST";;
@@ -64,7 +67,9 @@ ip6tables() {
             forward_changed;;
         '-A SOCKROCKET_IPV6_GUARD '*) touch "$FIXTURE/guard_rule";;
         '-C SOCKROCKET_IPV6_GUARD '*) test -f "$FIXTURE/guard_rule";;
-        '-F SOCKROCKET_IPV6_GUARD'|'-X SOCKROCKET_IPV6_GUARD') rm -f "$FIXTURE/guard_rule"; forward_changed;;
+        '-t filter -A SOCKROCKET_IPV6_GUARD -i br0 -m conntrack --ctdir REPLY -j RETURN'|'-t filter -I SOCKROCKET_IPV6_GUARD -i br0 -m conntrack --ctdir REPLY -j RETURN') touch "$FIXTURE/guard_reply";;
+        '-t filter -C SOCKROCKET_IPV6_GUARD -i br0 -m conntrack --ctdir REPLY -j RETURN') test -f "$FIXTURE/guard_reply";;
+        '-F SOCKROCKET_IPV6_GUARD'|'-X SOCKROCKET_IPV6_GUARD') rm -f "$FIXTURE/guard_rule" "$FIXTURE/guard_reply"; forward_changed;;
         '-t mangle -A PREROUTING -j SOCKROCKET_IPV6_MANGLE') touch "$FIXTURE/mangle";;
         '-t mangle -C PREROUTING -j SOCKROCKET_IPV6_MANGLE') test -f "$FIXTURE/mangle";;
         '-t mangle -D PREROUTING -j SOCKROCKET_IPV6_MANGLE') test -f "$FIXTURE/mangle" || return 1; rm "$FIXTURE/mangle";;
@@ -215,8 +220,10 @@ chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
 : > "$CALLS"
 FORWARDING=1
 ipv6_guard_start || fail 'IPv6 device rules did not install'
-device_line=$(awk '/SOCKROCKET_IPV6_DEVICES/{print NR; exit}' "$CALLS")
+device_line=$(awk '/-A SOCKROCKET_IPV6_MANGLE -i br0 -j SOCKROCKET_IPV6_DEVICES/{print NR; exit}' "$CALLS")
 test -n "$device_line" || fail 'IPv6 device policy is missing'
+reply_line=$(awk '/-A SOCKROCKET_IPV6_MANGLE -i br0 -m conntrack --ctdir REPLY -j RETURN/{print NR; exit}' "$CALLS")
+test -n "$reply_line" && test "$reply_line" -lt "$device_line" || fail 'inbound IPv6 replies captured by device rules'
 ! grep -q -- '--dport 443 -j RETURN' "$CALLS" || fail 'IPv6 real-address QUIC bypassed userspace'
 grep -q -- '-A SOCKROCKET_IPV6_DEVICES -s 2001:db8:9::/64 -p udp -j MARK' "$CALLS" || fail 'IPv6 device UDP was not marked'
 ipv6_proxy_stop || fail 'IPv6 device chain cleanup'
@@ -271,6 +278,15 @@ printf 'ipv6_mode: compatibility\ntransparent_proxy: true\n' > "$SOCKROCKET_CONF
 ipv6_guard_stop || fail 'clear guard before compatibility check'
 do_ipv6_guard || fail 'compatibility guard when firmware IPv6 is enabled'
 guard_installed || fail 'enabling firmware IPv6 left LAN IPv6 unguarded'
+awk '/-A SOCKROCKET_IPV6_GUARD .*--ctdir REPLY -j RETURN/ {reply=NR}
+     /-A SOCKROCKET_IPV6_GUARD .* -j REJECT/ {ok=reply && reply<NR}
+     END {exit !ok}' "$CALLS" || fail 'compatibility guard rejects replies to remote peers'
+# An installed guard from the previous version has only the reject rule.
+rm "$FIXTURE/guard_reply"
+: > "$CALLS"
+do_ipv6_guard && ipv6_guard_verify || fail 'upgrade of existing compatibility guard'
+grep -q -- '-I SOCKROCKET_IPV6_GUARD -i br0 -m conntrack --ctdir REPLY -j RETURN' "$CALLS" || fail 'reply exception not inserted before existing reject'
+! grep -q -- '-D FORWARD -j SOCKROCKET_IPV6_GUARD' "$CALLS" || fail 'upgrade detached live reject guard'
 nvram() { case "$2" in lan_ifname) echo br0 ;; lan_netmask) echo 255.255.255.0 ;; ipv6_service) echo disabled ;; *) echo 192.0.2.1 ;; esac; }
 do_ipv6_guard || fail 'compatibility guard while firmware IPv6 is disabled'
 ! guard_installed || fail 'guard kept after firmware IPv6 was disabled'
