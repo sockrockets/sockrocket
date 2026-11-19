@@ -42,7 +42,7 @@ assert.match(routing, /Device default/);
 const merlin = fs.readFileSync(path.join(root, 'docs', 'merlin.html'), 'utf8');
 assert.match(merlin, /装好之后，页面上有什么/);
 assert.match(merlin, /What the pages do/);
-assert.match(merlin, /先刷出软件中心/);
+assert.match(merlin, /<h2 id="firmware">[^<]*软件中心[^<]*<\/h2>/);
 assert.match(merlin, /fw\.koolcenter\.com/);
 assert.match(home, /firmwareLead/);
 
