@@ -59,11 +59,13 @@ impl Datagram for StreamDatagram {
     fn send<'a>(&'a self, packet: &'a [u8]) -> DatagramFuture<'a, ()> {
         Box::pin(async move {
             ensure!(packet.len() <= 65535, "UDP payload too large");
-            if let Framing::NativeChunks(max) = self.framing {
-                ensure!(
-                    !packet.is_empty() && packet.len() <= max,
-                    "VMess UDP packet exceeds negotiated chunk size or is empty"
-                );
+            if let Framing::NativeChunks(max) = self.framing
+                && (packet.is_empty() || packet.len() > max)
+            {
+                return Err(super::datagram::PacketRejected(
+                    "VMess UDP packet exceeds negotiated chunk size or is empty",
+                )
+                .into());
             }
             let mut writer = self.writer.lock().await;
             ensure!(
@@ -109,9 +111,7 @@ impl Datagram for StreamDatagram {
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("UDP stream closed"))??;
-            ensure!(packet.len() <= buffer.len(), "UDP receive buffer too small");
-            buffer[..packet.len()].copy_from_slice(&packet);
-            Ok(packet.len())
+            super::datagram::copy_received(&packet, buffer)
         })
     }
 }

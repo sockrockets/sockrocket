@@ -156,17 +156,6 @@ fn active_index(config: &AppConfig) -> Result<Option<usize>, &'static str> {
     }
 }
 
-/// UDP stays on a fallback group's first member. Select uses the stored
-/// pick. url-test's live choice can move after a handshake race; this check
-/// uses the stored pick, or the first member when nothing is stored.
-fn group_udp_member(group: &ProxyGroupConfig, nodes: &[Node]) -> Option<usize> {
-    if group.gtype == GroupType::Fallback {
-        resolve_members(group, nodes).first().copied()
-    } else {
-        selected_member(group, nodes)
-    }
-}
-
 fn rule_group_supports_udp(target: &str, config: &AppConfig) -> bool {
     let Some(name) = target.strip_prefix("group:") else {
         return false;
@@ -174,7 +163,12 @@ fn rule_group_supports_udp(target: &str, config: &AppConfig) -> bool {
     let Some(group) = config.groups.iter().find(|group| group.name == name) else {
         return false;
     };
-    group_udp_member(group, &config.nodes)
+    if group.gtype == GroupType::Fallback {
+        return resolve_members(group, &config.nodes)
+            .into_iter()
+            .any(|index| config.nodes[index].protocol.supports_udp());
+    }
+    selected_member(group, &config.nodes)
         .and_then(|index| config.nodes.get(index))
         .is_some_and(|node| node.protocol.supports_udp())
 }
@@ -469,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn lan_wide_udp_uses_fallback_first_member_not_a_later_pick() {
+    fn lan_wide_udp_checks_later_fallback_members() {
         let nodes = vec![
             stream_only("primary", "1.1.1.1"),
             stream_only("first", "2.2.2.2"),
@@ -485,7 +479,7 @@ mod tests {
             vec![media],
             vec![domain_rule("", "group:media", true)],
         );
-        assert!(!lan_wide_udp(&config).unwrap());
+        assert!(lan_wide_udp(&config).unwrap());
     }
 
     #[test]

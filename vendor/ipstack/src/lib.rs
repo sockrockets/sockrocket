@@ -369,7 +369,7 @@ impl Drop for IpStack {
 
 fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: IpStackConfig,
-    mut device: Device,
+    device: Device,
     accept_sender: mpsc::Sender<IpStackStream>,
     dns_accept_sender: mpsc::Sender<IpStackStream>,
     packet_budget: Arc<queue::Budget>,
@@ -384,9 +384,30 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (up_pkt_sender, mut up_pkt_receiver) = queue::channel(4 * 1024 * 1024, packet_budget);
 
     tokio::spawn(async move {
+        let (mut reader, mut writer) = tokio::io::split(device);
+        // Keep a partially written packet and its deadline alive across ingress events.
+        let writes = async move {
+            while let Some(packet) = up_pkt_receiver.recv().await {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    process_upstream_recv(
+                        packet,
+                        &mut writer,
+                        &mut write_buffer,
+                        #[cfg(unix)]
+                        pi,
+                    ),
+                )
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN device write timed out"))??;
+            }
+            Ok(())
+        };
+        tokio::pin!(writes);
         loop {
             select! {
-                received = device.read(&mut buffer) => {
+                result = &mut writes => return result,
+                received = reader.read(&mut buffer) => {
                     let n = received?;
                     if n == 0 { return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()); }
                     if n < offset { continue; }
@@ -403,10 +424,6 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     // A closed flow may already have been replaced by a new
                     // one with the same tuple. Remove only this generation.
                     remove_session(&mut sessions, network_tuple, &sender);
-                }
-                Some(packet) = up_pkt_receiver.recv() => {
-                    tokio::time::timeout(std::time::Duration::from_secs(10), process_upstream_recv(packet, &mut device, &mut write_buffer, #[cfg(unix)]pi))
-                        .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut,"TUN device write timed out"))??;
                 }
             }
         }
@@ -566,4 +583,45 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     // device.flush().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    fn udp_packet(port: u16) -> Vec<u8> {
+        let mut packet = Vec::new();
+        etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64)
+            .udp(port, 53)
+            .write(&mut packet, b"query")
+            .unwrap();
+        packet
+    }
+
+    #[tokio::test]
+    async fn stalled_device_write_preserves_ingress_and_pending_response() {
+        let (device, mut peer) = tokio::io::duplex(64);
+        let mut stack = IpStack::new(IpStackConfig::default(), device);
+        peer.write_all(&udp_packet(5000)).await.unwrap();
+        let IpStackStream::Udp(mut first) = stack.accept().await.unwrap() else {
+            panic!("expected UDP");
+        };
+        let payload = [42; 256];
+        first.write_all(&payload).await.unwrap();
+
+        // The response is larger than the device buffer. Seeing its first byte
+        // ensures the packet writer has started before we inject another flow.
+        let mut response = vec![0; 20 + 8 + payload.len()];
+        peer.read_exact(&mut response[..1]).await.unwrap();
+        peer.write_all(&udp_packet(5001)).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), stack.accept())
+            .await
+            .expect("stalled write prevented another DNS flow")
+            .unwrap();
+        assert!(matches!(second, IpStackStream::Udp(_)));
+        peer.read_exact(&mut response[1..]).await.unwrap();
+        assert_eq!(&response[28..], &payload);
+        drop(peer);
+        assert!(stack.accept().await.is_err());
+    }
 }

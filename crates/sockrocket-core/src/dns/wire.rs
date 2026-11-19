@@ -295,6 +295,22 @@ mod tests {
     }
 
     #[test]
+    fn tun_udp_response_respects_both_edns_and_link_payload_limits() {
+        let mut query = build_dns_query("example.org", 28);
+        query[11] = 1;
+        // OPT RR with a 4096-byte UDP payload size.
+        query.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+        let ips = vec!["2001:db8::1".parse().unwrap(); 50];
+        let reply = build_dns_response(&query, &ips).unwrap();
+        assert!((1353..4096).contains(&reply.len()));
+        assert_eq!(udp_response(&query, reply.clone()), reply);
+        let short = udp_response_for_mtu(&query, reply, 1352);
+        assert!(short.len() <= 1352);
+        assert_ne!(short[2] & 2, 0);
+        assert_eq!(&short[..2], &query[..2]);
+    }
+
+    #[test]
     fn invalid_question_count_and_labels_are_rejected() {
         let query = build_dns_query("example.com", 1);
         for count in [0u16, 2, 65535] {
@@ -373,8 +389,22 @@ pub(super) fn cap_ttl(message: &mut [u8], max: u32) -> Result<()> {
     Ok(())
 }
 
+/// A client may retain any address in the response. Keep the wire lifetime
+/// and reverse attribution lifetime aligned, including across CNAME chains.
+pub(super) fn cap_real_answer_ttls(message: &mut [u8]) -> Result<u32> {
+    let ttl = answer_ttl(message)?.min(30);
+    // Preserve the negative-cache SOA lifetime for NODATA and NXDOMAIN.
+    let cap = if message[6..8] == [0, 0] { 30 } else { ttl };
+    cap_ttl(message, cap)?;
+    Ok(ttl)
+}
+
 /// Honor classic 512-byte DNS and a bounded EDNS UDP payload size.
 pub(super) fn udp_response(query: &[u8], reply: Vec<u8>) -> Vec<u8> {
+    udp_response_for_mtu(query, reply, 4096)
+}
+
+pub(crate) fn udp_response_for_mtu(query: &[u8], reply: Vec<u8>, max_payload: usize) -> Vec<u8> {
     let mut limit = 512usize;
     if let Ok(q) = question(query) {
         let mut pos = q.end;
@@ -399,7 +429,7 @@ pub(super) fn udp_response(query: &[u8], reply: Vec<u8>) -> Vec<u8> {
             pos += 10 + len;
         }
     }
-    if reply.len() <= limit {
+    if reply.len() <= limit.min(max_payload) {
         return reply;
     }
     let mut truncated = build_dns_error_response(query, reply.get(3).copied().unwrap_or(2) & 15);

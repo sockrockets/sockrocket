@@ -15,12 +15,13 @@ mod policy_tests;
 #[cfg(test)]
 mod wire_dedup_tests;
 pub use listener::check_listener as check_dns_listener;
+pub(crate) use listener::serve_tcp_dns_client;
 mod runtime;
 mod upstream;
 pub use runtime::configure_bootstrap;
 pub(crate) use runtime::{
-    bootstrap_is_default, bootstrap_resolver, scoped_direct_resolve, scoped_resolve,
-    with_direct_destination, with_resolver,
+    bootstrap_is_default, bootstrap_resolver, direct_resolver, scoped_direct_resolve,
+    scoped_resolve, with_direct_destination, with_resolver,
 };
 pub(crate) mod wire;
 pub use wire::{
@@ -678,7 +679,11 @@ impl DnsResolver {
             .await
     }
 
-    async fn resolve_qtype_snapshot(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
+    pub(crate) async fn resolve_qtype_snapshot(
+        &self,
+        domain: &str,
+        qtype: u16,
+    ) -> Result<Vec<IpAddr>> {
         // DNS names are case-insensitive. Canonicalize before policy, cache
         // and fake-IP lookup so uppercase/trailing-dot names cannot bypass
         // the domestic group or create unrelated cache entries.
@@ -691,24 +696,7 @@ impl DnsResolver {
         {
             bail!("Invalid DNS name length");
         }
-        let domain = canonical.as_str();
-        let result = self.resolve_qtype_inner(domain, qtype).await;
-        // Domestic-group answers are real addresses; remember them on EVERY
-        // return path (fresh resolve, cache hit, stale serve) so the TUN
-        // layer can dial them direct instead of trusting geoip for bare-IP
-        // traffic — and so a hot name keeps its recency refreshed instead of
-        // being LRU-evicted by one-off CDN churn (see
-        // [`FakeIpPool::record_domestic`]). Primary-group answers are fake
-        // pool addresses (or nothing), never real IPs, so they must not be
-        // recorded here.
-        if let (Ok(addrs), Some(pool)) = (&result, &self.fakeip)
-            && self.match_domain_group(domain) == DnsGroup::Fallback
-        {
-            for addr in addrs {
-                pool.record_domestic(*addr, domain);
-            }
-        }
-        result
+        self.resolve_qtype_inner(&canonical, qtype).await
     }
 
     fn hosts_answer(&self, domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
@@ -736,7 +724,14 @@ impl DnsResolver {
         ) {
             return Ok(Vec::new());
         }
+        let direct_pool = self
+            .fakeip
+            .as_ref()
+            .filter(|_| self.match_domain_group(domain) == DnsGroup::Fallback);
         if let Some(addresses) = self.hosts_answer(domain, qtype) {
+            if let Some(pool) = &self.fakeip {
+                self.record_real_answers(domain, pool, &addresses, 5, direct_pool.is_some());
+            }
             return Ok(addresses);
         }
         // IP literals short-circuit; only the queried family answers.
@@ -755,14 +750,15 @@ impl DnsResolver {
         // → real IPs + domestic direct table; otherwise → fake-IP so the TUN
         // dials by name (DNS-unlock exits).
         if let Some(pool) = &self.fakeip
-            && self.match_domain_group(domain) == DnsGroup::Primary
+            && direct_pool.is_none()
         {
             if self.config.dual_stack_fakeip && qtype == QTYPE_AAAA {
-                let addresses = self.resolve_dedup(domain, qtype).await?;
+                let answer = self.resolve_dedup(domain, qtype).await?;
+                let addresses = answer.addresses;
                 return Ok(if addresses.is_empty() {
                     vec![]
                 } else if self.ips_are_cn(&addresses) {
-                    self.record_probe_domestic(domain, pool, &addresses);
+                    self.record_real_answers(domain, pool, &addresses, answer.ttl, false);
                     addresses
                 } else {
                     vec![IpAddr::V6(pool.allocate_v6(domain))]
@@ -786,20 +782,29 @@ impl DnsResolver {
                 let cache = self.cache.read().await;
                 cache.peek(&key).and_then(|entry| {
                     if entry.expires_at > now {
-                        Some((entry.addresses.clone(), false))
+                        Some((
+                            entry.addresses.clone(),
+                            false,
+                            entry.expires_at.duration_since(now).as_secs() as u32,
+                        ))
                     } else if !entry.addresses.is_empty()
                         && now.duration_since(entry.expires_at) < STALE_WHILE_REVALIDATE
                     {
                         // Positive entry past TTL but within the stale window.
-                        Some((entry.addresses.clone(), true))
+                        Some((entry.addresses.clone(), true, 0))
                     } else {
                         None
                     }
                 })
             };
             match cached {
-                Some((addrs, false)) => return Ok(addrs),
-                Some((addrs, true)) => {
+                Some((addrs, false, ttl)) => {
+                    if let Some(pool) = direct_pool {
+                        self.record_real_answers(domain, pool, &addrs, ttl, true);
+                    }
+                    return Ok(addrs);
+                }
+                Some((addrs, true, _)) => {
                     // Stale-while-revalidate: serve the stale answer now and
                     // refresh in the background through the normal resolve
                     // path so in-flight dedup applies (no duplicate query if
@@ -818,7 +823,11 @@ impl DnsResolver {
             }
         }
 
-        self.resolve_dedup(domain, qtype).await
+        let answer = self.resolve_dedup(domain, qtype).await?;
+        if let Some(pool) = direct_pool {
+            self.record_real_answers(domain, pool, &answer.addresses, answer.ttl, true);
+        }
+        Ok(answer.addresses)
     }
 
     /// Primary + fake-IP + GeoIP: resolve-then-geoip, then real CN or fake.
@@ -832,14 +841,14 @@ impl DnsResolver {
         // exchange_raw retains the upstream TTL, deduplicates via resolve_dedup,
         // and refreshes expired answers before we choose real versus fake IPs.
         let probe = self.resolve_dedup(domain, QTYPE_A).await?;
-        let cn = self.ips_are_cn(&probe);
-
-        if cn {
-            self.record_probe_domestic(domain, pool, &probe);
-            if qtype == QTYPE_A {
-                return Ok(probe);
-            }
-            return self.answer_cn_direct(domain, qtype, pool).await;
+        if self.ips_are_cn(&probe.addresses) {
+            let answer = if qtype == QTYPE_A {
+                probe
+            } else {
+                self.resolve_dedup(domain, qtype).await?
+            };
+            self.record_real_answers(domain, pool, &answer.addresses, answer.ttl, false);
+            return Ok(answer.addresses);
         }
         Ok(Self::answer_fakeip(pool, domain, qtype))
     }
@@ -853,17 +862,6 @@ impl DnsResolver {
         }
     }
 
-    async fn answer_cn_direct(
-        &self,
-        domain: &str,
-        qtype: u16,
-        pool: &FakeIpPool,
-    ) -> Result<Vec<IpAddr>> {
-        let addrs = self.resolve_dedup(domain, qtype).await?;
-        self.record_probe_domestic(domain, pool, &addrs);
-        Ok(addrs)
-    }
-
     fn ips_are_cn(&self, addrs: &[IpAddr]) -> bool {
         let Some(geo) = self.geoip.as_ref() else {
             return false;
@@ -871,16 +869,30 @@ impl DnsResolver {
         addrs.iter().any(|ip| geo.is_cn(*ip))
     }
 
-    fn record_probe_domestic(&self, domain: &str, pool: &FakeIpPool, addrs: &[IpAddr]) {
-        for addr in addrs {
-            pool.record_domestic(*addr, domain);
+    /// Explicit direct-domain policy covers all its addresses. For names
+    /// classified by GeoIP, only the individual CN addresses are direct.
+    fn record_real_answers(
+        &self,
+        domain: &str,
+        pool: &FakeIpPool,
+        addrs: &[IpAddr],
+        ttl: u32,
+        direct_domain: bool,
+    ) {
+        for &addr in addrs {
+            let domestic = direct_domain || self.geoip.as_ref().is_some_and(|geo| geo.is_cn(addr));
+            pool.record_real_answer(
+                addr,
+                domestic.then_some(domain),
+                Duration::from_secs(ttl.into()),
+            );
         }
     }
 
     /// Resolve with in-flight dedup: concurrent resolves for the same
     /// (domain, qtype) share one upstream query. Writes the outcome
     /// (positive or negative) to the cache.
-    async fn resolve_dedup(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
+    async fn resolve_dedup(&self, domain: &str, qtype: u16) -> Result<LookupAnswer> {
         let key: CacheKey = (domain.to_string(), qtype, self.direct_resolution);
         let cell = {
             let mut inflight = self.inflight.lock().unwrap();
@@ -937,7 +949,7 @@ impl DnsResolver {
                 );
             }
         }
-        result.map(|answer| answer.addresses)
+        result
     }
 
     async fn resolve_uncached(&self, domain: &str, qtype: u16) -> Result<LookupAnswer> {
@@ -968,6 +980,20 @@ impl DnsResolver {
                 _ => None,
             })
             .ok_or_else(|| anyhow::anyhow!("No IPv4 address for {}", domain))
+    }
+
+    /// Families to dial for a request with a frozen DNS policy.
+    pub(crate) fn dial_query_types(&self, tun_ipv6: bool) -> (u16, Option<u16>) {
+        use crate::config::dns::AddressStrategy::*;
+        if tun_ipv6 {
+            return (QTYPE_AAAA, None);
+        }
+        match self.config.strategy {
+            Ipv4Only => (QTYPE_A, None),
+            Ipv6Only => (QTYPE_AAAA, None),
+            PreferIpv4 => (QTYPE_A, Some(QTYPE_AAAA)),
+            PreferIpv6 => (QTYPE_AAAA, Some(QTYPE_A)),
+        }
     }
 
     /// Real addresses in configured order; resolution does not allocate Fake-IP.
@@ -1224,6 +1250,15 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     let (domain, qtype) = parse_dns_query(query)?;
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
     if let Some(addresses) = resolver.hosts_answer(&domain, qtype) {
+        if let Some(pool) = &resolver.fakeip {
+            resolver.record_real_answers(
+                &domain,
+                pool,
+                &addresses,
+                5,
+                resolver.match_domain_group(&domain) == DnsGroup::Fallback,
+            );
+        }
         return build_dns_response_with_ttl(query, &addresses, 5);
     }
     let Some(pool) = &resolver.fakeip else {
@@ -1239,9 +1274,9 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
             return Ok(reply);
         }
         if resolver.ips_are_cn(&addresses) {
-            resolver.record_probe_domestic(&domain, pool, &addresses);
             let mut reply = reply;
-            wire::cap_ttl(&mut reply, 30)?;
+            let ttl = wire::cap_real_answer_ttls(&mut reply)?;
+            resolver.record_real_answers(&domain, pool, &addresses, ttl, false);
             return Ok(reply);
         }
         return build_dns_response_with_ttl(query, &[IpAddr::V6(pool.allocate_v6(&domain))], 5);
@@ -1256,9 +1291,9 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     }
     if resolver.match_domain_group(&domain) == DnsGroup::Fallback {
         let mut reply = resolver.exchange_raw(query).await?;
-        wire::cap_ttl(&mut reply, 30)?;
+        let ttl = wire::cap_real_answer_ttls(&mut reply)?;
         if let Ok(addresses) = parse_dns_response(&reply) {
-            resolver.record_probe_domestic(&domain, pool, &addresses);
+            resolver.record_real_answers(&domain, pool, &addresses, ttl, true);
         }
         return Ok(reply);
     }
@@ -1277,14 +1312,15 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     }
     let addresses = parse_dns_response(&probe)?;
     if resolver.ips_are_cn(&addresses) {
-        wire::cap_ttl(&mut probe, 30)?;
-        resolver.record_probe_domestic(&domain, pool, &addresses);
         if qtype == 1 {
+            let ttl = wire::cap_real_answer_ttls(&mut probe)?;
+            resolver.record_real_answers(&domain, pool, &addresses, ttl, false);
             return Ok(probe);
         }
-        let reply = resolver.exchange_raw(query).await?;
+        let mut reply = resolver.exchange_raw(query).await?;
+        let ttl = wire::cap_real_answer_ttls(&mut reply)?;
         if let Ok(addresses) = parse_dns_response(&reply) {
-            resolver.record_probe_domestic(&domain, pool, &addresses);
+            resolver.record_real_answers(&domain, pool, &addresses, ttl, false);
         }
         return Ok(reply);
     }

@@ -23,18 +23,19 @@ Browser → DNS www.example.com
   → Split DNS: not in domestic suffix list → primary group → fake-IP 198.18.0.x (TTL ~5s)
 
 Browser → TCP 198.18.0.x:443
-  → PREROUTING / SOCKROCKET_MANGLE (private ranges RETURN, optional UDP/443 RETURN, optional cn ipset RETURN)
+  → PREROUTING / SOCKROCKET_MANGLE (private ranges RETURN, optional CN ipset bypass)
   → MARK 0x4765 → policy table 5370 → dev sockrocket-tun → ipstack
   → Fake IP → domain lookup → router rules → proxy outbound (dial by domain)
 
 Domestic example (e.g. example.cn / curated China suffixes):
   → Fallback resolvers → real IP, cached in domestic direct table
-  → Traffic may RETURN before TUN (cn ipset) or hit direct table inside TUN
+  → Eligible IPs can bypass TUN via the CN ipset. Inside TUN, the router evaluates the configured rules.
 
 DNS Fallback suffixes and routing China-direct suffixes share one list
 (`china_domain_suffix_list`) as a fast path. For everything else, Fake-IP
 mode runs **resolve-then-geoip**: clean primary upstream (DoT via node) →
-if any A is `geoip:CN`, return the real address (domestic direct table);
+if any address in an A or dual-stack AAAA answer matches `geoip:CN`,
+return the real answer and attach a domestic hint to each matching address;
 otherwise allocate a fake-IP so TUN still dials by name for unlock exits.
 ```
 
@@ -54,24 +55,24 @@ Watchdog cron restarts the daemon; `sockrocket.sh start` rebuilds iptables/ipset
 
 ### Groups
 
-- **Primary:** default; fake-IP for A records in TUN mode; desktop may use DoT via proxy.
+- **Primary** handles other names. With Fake-IP and CN lookup enabled, it classifies the upstream answer before choosing real or synthetic addresses.
 - **Fallback:** domestic suffix list + **server_domains** (node hostnames always fallback).
 
 Priority: server domain match → longest suffix → primary.
 
 ### fake-IP (`dns/fakeip.rs`)
 
-- Pool **198.18.0.0/16**, 8192 LRU entries, ~5s TTL (dnsmasq `min-cache-ttl=5`).
-- Primary-group **A** only; AAAA → NODATA (push clients to A + domain dial).
+- The pool holds up to 8,192 names. IPv4 tokens come from **198.18.0.0/16**. Dual-stack IPv6 tokens encode the same allocation. Synthetic answers have a five-second TTL.
+- Merlin dual-stack mode supports both A and AAAA. In IPv4 compatibility mode, the client DNS listener suppresses AAAA answers.
 - Evicted mapping → drop flow; short TTL refreshes.
 
 ### Domestic direct table
 
-Stores real IPs from fallback answers (LRU ~16384) so geoip gaps still direct correctly.
+A bounded cache of 16,384 addresses associates explicit fallback domains and individual CN addresses from primary answers with their recent names. Entries follow the answer TTL, capped at 30 seconds. If two live names share an address, TUN uses the destination IP for routing until the ambiguity expires.
 
 ### Proxy DNS pool
 
-Four-slot TCP/TLS pool; mostly idle on router fake-IP (international A answered locally).
+A four-slot TCP/TLS pool reuses upstream connections for DNS queries.
 
 ### Anti-poisoning
 
@@ -83,17 +84,16 @@ DoT via proxy for primary; transaction ID check; node domains via bootstrap UDP 
 
 - Device `sockrocket-tun`, IPv4 `10.10.0.2`, IPv6 ULA `fd9a:4c2e:17b0::2/64`.
 - ipstack TCP idle **3600s** (long-lived push/chat).
-- **SOCKROCKET_MANGLE:** private/LAN RETURN; UDP/443 RETURN (QUIC bypass); optional `sockrocket_cn` ipset RETURN; then MARK → table **5370** (not 100 — Merlin aliases 100 to WAN).
+- **SOCKROCKET_MANGLE:** private/LAN RETURN; optional CN ipset bypass for eligible connections; then MARK → table **5370** (not 100 — Merlin aliases 100 to WAN).
 - **rp_filter=2** on tun and all; **FORWARD** accept from tun.
 - **Dead route trap:** after manual kill, `ip route replace default dev sockrocket-tun table 5370`.
-- UDP over TUN is limited (QUIC exempt at iptables); full UDP relay is future work.
+- UDP, including QUIC, follows the selected outbound. Its node must support the destination and UDP transport. Individual oversized responses are discarded within the existing association.
 
 ### TUN routing order
 
-1. Fake IP → domain → domain-only rules → dial.  
-2. Real IP with known domain → user rules then direct.  
-3. In domestic table → direct.  
-4. Full rules + geoip → default proxy.
+1. Restore Fake-IP tokens to their domain. Keep the real destination available for IP and port rules on real-address flows.
+2. Use a live, unambiguous DNS attribution when available. Anonymous TCP/443 can use an applicable SNI rule.
+3. Evaluate the device and global policy in its configured order. The built-in domestic hint participates alongside the other built-in rules.
 
 ---
 
@@ -207,11 +207,11 @@ No `command -v`, `sysctl`, or `timeout`; use `/proc`, awk; explicit `PATH`; ash 
 
 ## 9. Known limits
 
-1. UDP semantics through TUN (QUIC bypass at firewall).  
+1. TUN UDP sessions require a UDP-capable outbound. Response payloads must fit the link MTU.
 2. Rare daemon segfaults — use crash history + core.  
 3. Reject = timeout UX.  
 4. Node latency tests include cold QUIC handshake (conservative numbers).  
-5. Static CN CIDR list; gaps covered by TUN direct table.
+5. CN lookup uses the bundled prefix list. An explicit direct-domain policy can also cover recent DNS answers outside that list. IP-only connections depend on the prefix data and configured routing rules.
 
 ---
 
@@ -219,10 +219,8 @@ No `command -v`, `sysctl`, or `timeout`; use `/proc`, awk; explicit `PATH`; ash 
 
 | Item | Notes |
 |------|-------|
-| Hysteria2 UDP + TUN UDP sessions | High effort; games/WebRTC |
-| Router hot-reload (ArcSwap) | Low effort when touching rules |
 | Auto-update CN ipset | Medium |
 | Reject as RST | UX polish |
-| TUN regression tests | Medium term |
+| Router throughput measurements | Compare IPv4 and IPv6 TCP/UDP on supported hardware |
 
 Performance baselines in lab vary by node; treat latency tables as order-of-magnitude only.

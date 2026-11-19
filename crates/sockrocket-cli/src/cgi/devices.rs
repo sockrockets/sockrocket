@@ -294,11 +294,15 @@ pub(super) fn catalog(map: &Mapping) -> Vec<J> {
     let arp = fs::read_to_string("/proc/net/arp").unwrap_or_default();
     let mut rows = BTreeMap::new();
     let mut visible = std::collections::HashSet::new();
+    let mut ipv6 = BTreeMap::<Ipv4Addr, Vec<std::net::Ipv6Addr>>::new();
+    for (v6, v4) in crate::device_identity::read() {
+        ipv6.entry(v4).or_default().push(v6);
+    }
     for (ip, c) in clients(&leases, &arp) {
         let source = format!("{ip}/32");
         let key = format!("mac:{}", c.mac);
         let alias = aliases.get(&key).or_else(|| aliases.get(&source));
-        rows.insert(source.clone(),json!({"source":source,"key":key,"host":c.host,"alias":alias.map(|a|a.name.as_str()).unwrap_or(""),"alias_key":if aliases.contains_key(&key)||alias.is_none(){&key}else{&source}}));
+        rows.insert(source.clone(),json!({"source":source,"ipv6":ipv6.remove(&ip).unwrap_or_default(),"key":key,"host":c.host,"alias":alias.map(|a|a.name.as_str()).unwrap_or(""),"alias_key":if aliases.contains_key(&key)||alias.is_none(){&key}else{&source}}));
         visible.insert(key);
     }
     for (key, alias) in aliases {

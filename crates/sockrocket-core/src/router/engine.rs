@@ -1,4 +1,5 @@
-use std::net::IpAddr;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 
@@ -7,6 +8,8 @@ use lru::LruCache;
 use super::geoip::{GeoIpDb, parse_cidr};
 use crate::config::model::RoutingRule;
 
+mod bindings;
+use bindings::{DeviceBindings, RuleView};
 mod trace;
 pub use trace::{RouteTrace, RouteTraceStep};
 
@@ -66,6 +69,22 @@ pub enum RouteAction {
     Reject,
 }
 
+impl RouteAction {
+    fn from_target(target: &str) -> Self {
+        if let Some(name) = target.strip_prefix("group:") {
+            RouteAction::Group(name.to_owned())
+        } else if let Some(id) = target.strip_prefix("node:") {
+            RouteAction::Node(id.to_ascii_lowercase())
+        } else {
+            match target.to_lowercase().as_str() {
+                "direct" => RouteAction::Direct,
+                "reject" | "block" => RouteAction::Reject,
+                _ => RouteAction::Proxy,
+            }
+        }
+    }
+}
+
 impl serde::Serialize for RouteAction {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -109,14 +128,71 @@ pub struct RuleEntry {
     pub action: RouteAction,
 }
 
+impl RuleEntry {
+    fn compile(index: usize, r: &RoutingRule) -> Option<Self> {
+        let action = RouteAction::from_target(&r.target);
+
+        let rule = match r.rule_type.to_lowercase().as_str() {
+            "domain" => MatchRule::Domain(r.pattern.to_lowercase()),
+            "domain-suffix" => {
+                let suffix = r.pattern.to_lowercase();
+                MatchRule::DomainSuffix(if suffix.starts_with('.') {
+                    suffix
+                } else {
+                    format!(".{}", suffix)
+                })
+            }
+            "domain-keyword" => MatchRule::DomainKeyword(r.pattern.to_lowercase()),
+            "ip-cidr" => match parse_cidr(&r.pattern) {
+                Some((addr, prefix_len)) => MatchRule::IpCidr { addr, prefix_len },
+                None => {
+                    tracing::warn!("Invalid CIDR: {}", r.pattern);
+                    return None;
+                }
+            },
+            "geoip" => MatchRule::GeoIp(r.pattern.to_uppercase()),
+            "dst-port" | "port" => match parse_port_range(&r.pattern) {
+                Some((min, max)) => MatchRule::DstPort { min, max },
+                None => {
+                    tracing::warn!("Invalid dst-port pattern: {}", r.pattern);
+                    return None;
+                }
+            },
+            "match" | "final" => MatchRule::MatchAll,
+            _ => {
+                tracing::warn!("Unknown rule type: {}", r.rule_type);
+                return None;
+            }
+        };
+
+        let source = if r.source.is_empty() {
+            None
+        } else {
+            let Ok(normalized) = normalize_rule_source(&r.source) else {
+                return None;
+            };
+            parse_cidr(&normalized)
+        };
+        Some(Self {
+            config_index: Some(index),
+            source,
+            rule,
+            action,
+        })
+    }
+}
+
 /// A set of routing rules, compiled for efficient matching.
 #[derive(Debug, Clone)]
 pub struct RuleSet {
     rules: Vec<RuleEntry>,
     default_action: RouteAction,
+    bindings: DeviceBindings,
+    bindings_start: usize,
+    expanded: std::sync::OnceLock<Vec<RuleEntry>>,
     device_scopes: Vec<(IpAddr, u8)>,
     paused_sources: crate::config::model::PausedDeviceSources,
-    global_destinations: std::ops::Range<usize>,
+    builtin_start: usize,
     global_final_start: Option<usize>,
 }
 
@@ -125,9 +201,12 @@ impl RuleSet {
         Self {
             rules: Vec::new(),
             default_action: RouteAction::Proxy,
+            bindings: Default::default(),
+            bindings_start: 0,
+            expanded: Default::default(),
             device_scopes: Vec::new(),
             paused_sources: Default::default(),
-            global_destinations: 0..0,
+            builtin_start: 0,
             global_final_start: None,
         }
     }
@@ -139,6 +218,7 @@ impl RuleSet {
 
     /// Add a rule to the set.
     pub fn add_rule(&mut self, rule: MatchRule, action: RouteAction) {
+        self.expanded.take();
         self.rules.push(RuleEntry {
             config_index: None,
             source: None,
@@ -164,78 +244,20 @@ impl RuleSet {
 
     fn from_enabled_rules(mut indexed: Vec<(usize, &RoutingRule)>) -> Self {
         let mut set = Self::new();
-        indexed.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
-
-        for (index, r) in indexed {
-            let action = if let Some(name) = r.target.strip_prefix("group:") {
-                RouteAction::Group(name.to_owned())
-            } else if let Some(id) = r.target.strip_prefix("node:") {
-                RouteAction::Node(id.to_ascii_lowercase())
-            } else {
-                match r.target.to_lowercase().as_str() {
-                    "direct" => RouteAction::Direct,
-                    "reject" | "block" => RouteAction::Reject,
-                    _ => RouteAction::Proxy,
-                }
-            };
-
-            let rule = match r.rule_type.to_lowercase().as_str() {
-                "domain" => MatchRule::Domain(r.pattern.to_lowercase()),
-                "domain-suffix" => {
-                    let suffix = r.pattern.to_lowercase();
-                    MatchRule::DomainSuffix(if suffix.starts_with('.') {
-                        suffix
-                    } else {
-                        format!(".{}", suffix)
-                    })
-                }
-                "domain-keyword" => MatchRule::DomainKeyword(r.pattern.to_lowercase()),
-                "ip-cidr" => match parse_cidr(&r.pattern) {
-                    Some((addr, prefix_len)) => MatchRule::IpCidr { addr, prefix_len },
-                    None => {
-                        tracing::warn!("Invalid CIDR: {}", r.pattern);
-                        continue;
-                    }
-                },
-                "geoip" => MatchRule::GeoIp(r.pattern.to_uppercase()),
-                "dst-port" | "port" => match parse_port_range(&r.pattern) {
-                    Some((min, max)) => MatchRule::DstPort { min, max },
-                    None => {
-                        tracing::warn!("Invalid dst-port pattern: {}", r.pattern);
-                        continue;
-                    }
-                },
-                "match" | "final" => MatchRule::MatchAll,
-                _ => {
-                    tracing::warn!("Unknown rule type: {}", r.rule_type);
-                    continue;
-                }
-            };
-
-            let source = if r.source.is_empty() {
-                None
-            } else {
-                let Ok(normalized) = normalize_rule_source(&r.source) else {
-                    continue;
-                };
-                parse_cidr(&normalized)
-            };
-            set.rules.push(RuleEntry {
-                config_index: Some(index),
-                source,
-                rule,
-                action,
-            });
-        }
+        indexed.sort_by_key(|(index, r)| (std::cmp::Reverse(r.priority), *index));
+        set.rules = indexed
+            .into_iter()
+            .filter_map(|(index, r)| RuleEntry::compile(index, r))
+            .collect();
         set
     }
 
     pub(crate) fn isolate_devices<'a>(
         &mut self,
-        global_destinations: std::ops::Range<usize>,
+        builtin_start: usize,
         sources: impl Iterator<Item = &'a str>,
     ) {
-        self.global_destinations = global_destinations;
+        self.builtin_start = builtin_start;
         self.global_final_start = Some(self.rules.len());
         self.device_scopes = sources
             .filter(|s| !s.is_empty())
@@ -270,28 +292,70 @@ impl RuleSet {
                 .any(|scope| source_matches(Some(*scope), source))
     }
 
-    fn entries_for(&self, source: Option<IpAddr>) -> impl Iterator<Item = &RuleEntry> {
+    fn entries_for(
+        &self,
+        source: Option<IpAddr>,
+        trace: bool,
+    ) -> impl Iterator<Item = RuleView<'_>> {
         let paused = self.is_paused(source);
-        let (skip, end) = if !paused && self.has_device_scope(source) {
-            (
-                self.global_destinations.clone(),
-                self.global_final_start.unwrap_or(self.rules.len()),
-            )
+        let assigned = !paused && self.has_device_scope(source);
+        let globals_start = if assigned {
+            self.builtin_start
         } else {
-            (0..0, self.rules.len())
+            self.bindings_start
         };
-        self.rules[..skip.start]
+        let end = if assigned {
+            self.global_final_start.unwrap_or(self.rules.len())
+        } else {
+            self.rules.len()
+        };
+        self.rules[..self.bindings_start]
             .iter()
-            .chain(&self.rules[skip.end..end])
+            .map(RuleView::from)
+            .chain(self.bindings.entries(source, trace, paused))
+            .chain(self.rules[globals_start..end].iter().map(RuleView::from))
             .filter(move |entry| !paused || entry.source.is_none())
     }
 
+    pub(crate) fn bind_devices(
+        &mut self,
+        rules: &[(usize, &RoutingRule)],
+        links: &[crate::config::model::DeviceRuleGroup],
+    ) {
+        self.bindings_start = self.rules.len();
+        self.bindings = DeviceBindings::compile(rules, links);
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
+        self.expanded.take();
         self.rules.extend(other.rules);
     }
 
+    pub(crate) fn base_len(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Inspect the complete ruleset including every binding in evaluation order.
+    /// The routing and trace paths read shared group members directly.
     pub fn rules(&self) -> &[RuleEntry] {
-        &self.rules
+        if self.bindings.is_empty() {
+            return &self.rules;
+        }
+        self.expanded.get_or_init(|| {
+            let mut entries = self.rules[..self.bindings_start].to_vec();
+            entries.extend(
+                self.bindings
+                    .entries(None, true, false)
+                    .map(|view| RuleEntry {
+                        config_index: view.config_index,
+                        source: view.source,
+                        rule: view.rule.clone(),
+                        action: view.action.clone(),
+                    }),
+            );
+            entries.extend_from_slice(&self.rules[self.bindings_start..]);
+            entries
+        })
     }
 }
 
@@ -311,11 +375,11 @@ struct RouteCacheKey {
     destination: (Option<IpAddr>, bool),
 }
 
-fn client_cache_key(host: &str, port: u16) -> RouteCacheKey {
+fn client_cache_key(host: &str, port: u16, source: Option<IpAddr>) -> RouteCacheKey {
     RouteCacheKey {
         host: host.to_lowercase(),
         port,
-        source: crate::proxy::routing::client_source(),
+        source,
         destination: crate::proxy::routing::tun_destination(),
     }
 }
@@ -325,6 +389,7 @@ pub struct Router {
     rules: RuleSet,
     pub(crate) route_domestic_hints: bool,
     geoip: Option<Arc<GeoIpDb>>,
+    device_identities: Option<Arc<RwLock<BTreeMap<Ipv6Addr, Ipv4Addr>>>>,
     /// LRU route cache: evicts least-recently-used entries when full (avoids thundering-herd on full flush).
     /// Keyed by lowercased host, port, and the complete client/TUN context.
     cache: RwLock<LruCache<RouteCacheKey, RouteAction>>,
@@ -332,13 +397,14 @@ pub struct Router {
 
 impl Router {
     pub fn new(rules: RuleSet) -> Self {
-        let route_domestic_hints = rules.rules().iter().any(|entry| {
+        let route_domestic_hints = rules.rules.iter().any(|entry| {
             matches!(entry.rule, MatchRule::DomesticHint) && entry.action != RouteAction::Direct
         });
         Self {
             route_domestic_hints,
             rules,
             geoip: None,
+            device_identities: None,
             cache: RwLock::new(LruCache::new(NonZeroUsize::new(ROUTE_CACHE_CAP).unwrap())),
         }
     }
@@ -348,24 +414,59 @@ impl Router {
         self
     }
 
+    /// Share the live LAN IPv6-to-IPv4 identity mapping across routing snapshots.
+    pub fn with_device_identities(
+        mut self,
+        identities: Arc<RwLock<BTreeMap<Ipv6Addr, Ipv4Addr>>>,
+    ) -> Self {
+        self.device_identities = Some(identities);
+        self
+    }
+
+    fn has_source_policy(&self, source: Option<IpAddr>) -> bool {
+        self.rules.has_device_scope(source)
+            || (self.rules.global_final_start.is_none()
+                && self
+                    .rules
+                    .rules
+                    .iter()
+                    .any(|entry| entry.source.is_some() && source_matches(entry.source, source)))
+    }
+
+    fn effective_source(&self, source: Option<IpAddr>) -> Option<IpAddr> {
+        let (Some(IpAddr::V6(v6)), Some(identities)) = (source, &self.device_identities) else {
+            return source;
+        };
+        if self.rules.is_paused(source) || self.has_source_policy(source) {
+            return source;
+        }
+        let v4 = identities
+            .read()
+            .ok()
+            .and_then(|map| map.get(&v6).copied())
+            .map(IpAddr::V4);
+        if v4.is_some() && (self.rules.is_paused(v4) || self.has_source_policy(v4)) {
+            v4
+        } else {
+            source
+        }
+    }
+
+    fn client_source(&self) -> Option<IpAddr> {
+        self.effective_source(crate::proxy::routing::client_source())
+    }
+
     /// Whether the current client has any enabled device-specific policy.
     pub fn has_client_rules(&self) -> bool {
-        let source = crate::proxy::routing::client_source();
-        if self.rules.is_paused(source) {
-            return false;
-        }
-        self.rules.has_device_scope(source)
-            || self
-                .rules
-                .rules
-                .iter()
-                .any(|entry| entry.source.is_some() && source_matches(entry.source, source))
+        let source = self.client_source();
+        !self.rules.is_paused(source) && self.has_source_policy(source)
     }
 
     /// Evaluate routing rules for a given destination.
     /// `host` can be a domain name or IP address string.
     pub fn route(&self, host: &str, port: u16) -> RouteAction {
-        let key = client_cache_key(host, port);
+        let source = self.client_source();
+        let key = client_cache_key(host, port, source);
         // get() (not peek()) so a hit promotes the entry in LRU order —
         // without promotion a hot route stays evictable under cache churn.
         // This needs the write lock, but it is a std RwLock held only for
@@ -376,7 +477,7 @@ impl Router {
             return action.clone();
         }
 
-        let action = self.route_uncached(host, port);
+        let action = self.route_uncached(host, port, source);
 
         // Store in cache — LruCache::put auto-evicts the LRU entry when full
         if let Ok(mut cache) = self.cache.write() {
@@ -387,19 +488,18 @@ impl Router {
     }
 
     /// Perform rule matching without cache.
-    fn route_uncached(&self, host: &str, port: u16) -> RouteAction {
+    fn route_uncached(&self, host: &str, port: u16, source: Option<IpAddr>) -> RouteAction {
         let host_lower = host.to_lowercase();
         let ip: Option<IpAddr> = host
             .parse()
             .ok()
             .or(crate::proxy::routing::tun_destination().0);
 
-        let source = crate::proxy::routing::client_source();
-        for entry in self.rules.entries_for(source) {
+        for entry in self.rules.entries_for(source, false) {
             if !source_matches(entry.source, source) {
                 continue;
             }
-            if self.rule_matches(&entry.rule, &host_lower, ip, port) {
+            if self.rule_matches(entry.rule, &host_lower, ip, port) {
                 tracing::debug!(
                     "Route match: {}:{} -> {:?} (rule: {:?})",
                     host,
@@ -426,14 +526,14 @@ impl Router {
     /// evaluation is pure string matching.
     pub fn route_domain_only(&self, host: &str) -> Option<RouteAction> {
         let host_lower = host.to_lowercase();
-        let source = crate::proxy::routing::client_source();
-        for entry in self.rules.entries_for(source) {
+        let source = self.client_source();
+        for entry in self.rules.entries_for(source, false) {
             if !source_matches(entry.source, source) {
                 continue;
             }
-            let matched = match &entry.rule {
+            let matched = match entry.rule {
                 MatchRule::Domain(_) | MatchRule::DomainSuffix(_) | MatchRule::DomainKeyword(_) => {
-                    self.rule_matches(&entry.rule, &host_lower, None, 0)
+                    self.rule_matches(entry.rule, &host_lower, None, 0)
                 }
                 _ => false,
             };
@@ -453,19 +553,20 @@ impl Router {
     /// against the TTL-aware DNS cache so address changes and transient DNS
     /// failures cannot pin a host to an obsolete route.
     pub async fn route_resolving(&self, host: &str, port: u16) -> RouteAction {
+        let source = self.client_source();
         // Only concrete destinations are safe to cache without a DNS TTL.
         // Also avoid consuming a synchronous route() decision made without DNS.
         if host.parse::<IpAddr>().is_err() && crate::proxy::routing::tun_destination().0.is_none() {
-            return self.route_uncached_resolving(host, port).await;
+            return self.route_uncached_resolving(host, port, source).await;
         }
-        let key = client_cache_key(host, port);
+        let key = client_cache_key(host, port, source);
         if let Ok(mut cache) = self.cache.write()
             && let Some(action) = cache.get(&key)
         {
             return action.clone();
         }
 
-        let action = self.route_uncached_resolving(host, port).await;
+        let action = self.route_uncached_resolving(host, port, source).await;
 
         if let Ok(mut cache) = self.cache.write() {
             cache.put(key, action.clone());
@@ -474,7 +575,12 @@ impl Router {
         action
     }
 
-    async fn route_uncached_resolving(&self, host: &str, port: u16) -> RouteAction {
+    async fn route_uncached_resolving(
+        &self,
+        host: &str,
+        port: u16,
+        source: Option<IpAddr>,
+    ) -> RouteAction {
         let host_lower = host.to_lowercase();
         let mut ip: Option<IpAddr> = host
             .parse()
@@ -482,8 +588,7 @@ impl Router {
             .or(crate::proxy::routing::tun_destination().0);
         let mut dns_attempted = ip.is_some();
 
-        let source = crate::proxy::routing::client_source();
-        for entry in self.rules.entries_for(source) {
+        for entry in self.rules.entries_for(source, false) {
             if !source_matches(entry.source, source) {
                 continue;
             }
@@ -496,7 +601,7 @@ impl Router {
                 ip = resolve_host(&host_lower).await;
             }
 
-            if self.rule_matches(&entry.rule, &host_lower, ip, port) {
+            if self.rule_matches(entry.rule, &host_lower, ip, port) {
                 tracing::debug!(
                     "Route match: {}:{} -> {:?} (rule: {:?})",
                     host,
@@ -1022,7 +1127,11 @@ mod tests {
 
         // Cached under lowercased host:port.
         let cache = router.cache.read().unwrap();
-        assert!(cache.peek(&client_cache_key("example.com", 80)).is_some());
+        assert!(
+            cache
+                .peek(&client_cache_key("example.com", 80, None))
+                .is_some()
+        );
         assert_eq!(cache.iter().next().unwrap().0.host, "example.com");
         assert_eq!(cache.len(), 1);
     }
@@ -1050,7 +1159,7 @@ mod tests {
         let cache = router.cache.read().unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(
-            cache.peek(&client_cache_key("www.example.com", 443)),
+            cache.peek(&client_cache_key("www.example.com", 443, None)),
             Some(&RouteAction::Direct)
         );
     }

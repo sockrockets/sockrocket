@@ -19,7 +19,7 @@ Pinning one node is enough when a single rule should stay on that line. A manual
 Create a group under **Nodes**. The name may contain letters (including Chinese), numbers, hyphens and underscores. There are three strategies:
 
 - **Manual.** One node. New connections use it. Merlin saves only that node. On the desktop you can keep several members and pick which one is current; the others are not a priority list.
-- **Fallback.** Several nodes, in list order. For five minutes, new TCP starts at the last member that connected, then it starts at the first member again. If a member fails to establish, the rest are tried in order. UDP stays on the first member. An open connection is not moved.
+- **Fallback.** Several nodes, in list order. For five minutes, new TCP starts at the last member that connected, then it starts at the first member again. If a member fails to establish, the rest are tried in order. New UDP associations try UDP-capable members in order until setup succeeds. An open connection is not moved.
 - **URL test.** Several nodes. For five minutes, new TCP reuses the fastest recent handshake. After that the members race, and list order does not choose the winner. UDP uses that same pick.
 
 A missing member fails closed. It is not silently replaced by the global node. Up to 64 groups, and 256 members in a fallback or URL-test group.

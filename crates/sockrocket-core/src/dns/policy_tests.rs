@@ -287,7 +287,12 @@ async fn default_service_policy_pairs_domestic_dns_with_direct_routing() {
         let query = build_dns_query(host, 1);
         let reply = answer_raw_dns_query(&resolver, &query).await;
         assert_eq!(parse_dns_response(&reply).unwrap(), [direct_ip], "{host}");
-        assert!(pool.lookup_domestic(direct_ip).is_some());
+        // Each domain policy still resolves and routes direct. A shared CDN
+        // address alone identifies only the first name until another is seen.
+        assert_eq!(
+            pool.lookup_domestic(direct_ip).as_deref(),
+            (host == "kimi.com").then_some(host)
+        );
     }
     assert!(direct_queries.load(Ordering::SeqCst) >= 5);
     assert_eq!(proxy_queries.load(Ordering::SeqCst), 0);
@@ -471,5 +476,69 @@ async fn custom_hosts_answer_exact_names_before_fakeip() {
     }
     for invalid in ["invalid nas.home.arpa", "127.0.0.1 *.example", "127.0.0.1"] {
         assert!(DnsSettings::from_json(serde_json::json!({"hosts":[invalid]})).is_err());
+    }
+}
+
+#[tokio::test]
+async fn mixed_primary_answers_keep_per_ip_hints_on_wire_and_internal_paths() {
+    async fn check_answer(
+        resolver: &DnsResolver,
+        wire: bool,
+        host: &str,
+        qtype: u16,
+        addrs: &[IpAddr],
+    ) {
+        let query = build_dns_query(host, qtype);
+        let reply = build_dns_response_with_ttl(&query, addrs, 15).unwrap();
+        let mut key = query.clone();
+        key[..2].fill(0);
+        key.push(0);
+        resolver
+            .wire_cache
+            .lock()
+            .await
+            .put(key, reply, Instant::now() + Duration::from_secs(15));
+        let result = if wire {
+            parse_dns_response(&answer_raw_dns_query(resolver, &query).await).unwrap()
+        } else {
+            resolver.resolve_with_qtype(host, qtype).await.unwrap()
+        };
+        assert_eq!(result, addrs);
+    }
+
+    for wire in [true, false] {
+        for (qtype, cn, foreign) in [
+            (QTYPE_A, "114.114.114.114", "8.8.8.8"),
+            (QTYPE_AAAA, "240e::1", "2001:4860:4860::8888"),
+        ] {
+            let (cn, foreign) = (cn.parse().unwrap(), foreign.parse().unwrap());
+            let pool = FakeIpPool::new();
+            pool.record_domestic(foreign, "previous.example.cn");
+            let mut resolver = DnsResolver::with_config(DnsConfig {
+                dual_stack_fakeip: true,
+                ..DnsConfig::default()
+            });
+            resolver.set_fakeip(pool.clone());
+            resolver.set_geoip(Arc::new(crate::china_geoip_db()));
+            let host = "mixed.example.test";
+            check_answer(&resolver, wire, host, qtype, &[cn, foreign]).await;
+            assert_eq!(pool.lookup_domestic(cn).as_deref(), Some(host));
+            assert_eq!(pool.lookup_domestic(foreign), None);
+
+            // The same address on an explicitly direct domain keeps a direct
+            // hint when it is unique, including when GeoIP has no CN match.
+            let explicit = "direct.example.test";
+            Arc::make_mut(&mut resolver.config)
+                .domain_rules
+                .insert(explicit.into(), DnsGroup::Fallback);
+            let other: IpAddr = if qtype == QTYPE_A {
+                "192.0.2.27".parse().unwrap()
+            } else {
+                "2001:db8::27".parse().unwrap()
+            };
+            check_answer(&resolver, wire, explicit, qtype, &[foreign, other]).await;
+            assert_eq!(pool.lookup_domestic(other).as_deref(), Some(explicit));
+            assert_eq!(pool.lookup_domestic(foreign), None);
+        }
     }
 }

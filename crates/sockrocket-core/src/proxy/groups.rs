@@ -1,6 +1,6 @@
 //! Immutable group snapshots. Connections keep their selected outbound across
 //! reloads. Missing groups/members fail closed, never use the global node.
-use super::connector::{BoxProxyStream, Outbound, SharedOutbound};
+use super::connector::{BoxProxyStream, Outbound, SharedOutbound, UdpUnsupported, udp_unsupported};
 use super::datagram::{BoxDatagram, DatagramFuture};
 use crate::config::{
     group::NodeIndex,
@@ -52,6 +52,7 @@ struct GroupOutbound {
     selection: tokio::sync::Mutex<()>,
     generation: std::sync::atomic::AtomicUsize,
     next_probe: std::sync::atomic::AtomicUsize,
+    next_udp: std::sync::atomic::AtomicUsize,
     probe_slots: Arc<tokio::sync::Semaphore>,
 }
 impl GroupOutbound {
@@ -182,7 +183,10 @@ impl Outbound for GroupOutbound {
                     return self.connect_fastest(&host, port).await;
                 }
                 let start = if self.kind == GroupKind::Fallback {
-                    self.sticky_index().unwrap_or(0)
+                    self.sticky_index().unwrap_or_else(|| {
+                        self.next_probe.load(std::sync::atomic::Ordering::Relaxed)
+                            % self.members.len()
+                    })
                 } else {
                     0
                 };
@@ -200,9 +204,23 @@ impl Outbound for GroupOutbound {
                     let index = (start + offset) % self.members.len();
                     if let Ok(stream) = self.connect_at(index, &host, port, per_try).await {
                         if self.kind == GroupKind::Fallback {
+                            self.next_probe
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
                             self.remember(index);
                         }
                         return Ok(stream);
+                    }
+                    if self.kind == GroupKind::Fallback {
+                        // Carry confirmed failures past this request's overall deadline.
+                        self.next_probe.store(
+                            (index + 1) % self.members.len(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if let Ok(mut sticky) = self.sticky_until.lock()
+                            && self.preferred.load(std::sync::atomic::Ordering::Relaxed) == index
+                        {
+                            *sticky = None;
+                        }
                     }
                 }
                 anyhow::bail!(
@@ -216,11 +234,50 @@ impl Outbound for GroupOutbound {
     fn connect_datagram(&self, host: &str, port: u16) -> DatagramFuture<'_, BoxDatagram> {
         let host = host.to_owned();
         Box::pin(async move {
-            // UDP session creation is not a reachability test. Fallback stays
-            // on the first member. url-test follows the TCP pick and does not
-            // migrate an association that is already open.
             if self.members.is_empty() {
                 anyhow::bail!("Proxy group has no selected member");
+            }
+            if self.kind == GroupKind::Fallback {
+                return tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut failure = None;
+                    let start = self.next_udp.load(std::sync::atomic::Ordering::Relaxed)
+                        % self.members.len();
+                    for offset in 0..self.members.len() {
+                        let index = (start + offset) % self.members.len();
+                        let member = &self.members[index];
+                        if !member.node.protocol.supports_udp() {
+                            continue;
+                        }
+                        let result = tokio::time::timeout(Duration::from_secs(3), async {
+                            member.get()?.0.connect_datagram(&host, port).await
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("Proxy group UDP member timed out"))
+                        });
+                        match result {
+                            Ok(datagram) => {
+                                self.next_udp.store(0, std::sync::atomic::Ordering::Relaxed);
+                                crate::traffic::note_node(&member.node);
+                                return Ok(datagram);
+                            }
+                            Err(error) => {
+                                self.next_udp.store(
+                                    (index + 1) % self.members.len(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if !udp_unsupported(&error) {
+                                    failure = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    Err(failure.unwrap_or_else(|| {
+                        UdpUnsupported::new("No group member supports this UDP association").into()
+                    }))
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Proxy group UDP setup timed out"))?;
             }
             let index = if self.kind == GroupKind::UrlTest {
                 self.preferred.load(std::sync::atomic::Ordering::Relaxed) % self.members.len()
@@ -350,6 +407,7 @@ pub fn build_groups(
                     selection: tokio::sync::Mutex::new(()),
                     generation: std::sync::atomic::AtomicUsize::new(0),
                     next_probe: std::sync::atomic::AtomicUsize::new(0),
+                    next_udp: std::sync::atomic::AtomicUsize::new(0),
                     probe_slots: probe_budget().clone(),
                 })),
             )
@@ -387,15 +445,30 @@ mod tests {
         fn connect_datagram(&self, _: &str, _: u16) -> DatagramFuture<'_, BoxDatagram> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                anyhow::bail!("synthetic UDP failure")
+                if self.hang {
+                    std::future::pending::<()>().await;
+                }
+                if self.fail {
+                    anyhow::bail!("synthetic UDP failure")
+                }
+                Ok(Box::new(ProbeDatagram) as BoxDatagram)
             })
         }
         fn name(&self) -> &str {
             "fixture"
         }
     }
+    struct ProbeDatagram;
+    impl super::super::datagram::Datagram for ProbeDatagram {
+        fn send<'a>(&'a self, _: &'a [u8]) -> DatagramFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn recv<'a>(&'a self, _: &'a mut [u8]) -> DatagramFuture<'a, usize> {
+            Box::pin(std::future::pending())
+        }
+    }
     fn node() -> Node {
-        serde_json::from_value(serde_json::json!({"name":"Example","server":"proxy.example.invalid","port":443,"protocol":{"type":"vless","uuid":"00000000-0000-0000-0000-000000000000"},"transport":null})).unwrap()
+        serde_json::from_value(serde_json::json!({"name":"Example","server":"proxy.example.invalid","port":443,"protocol":{"type":"vless","udp":true,"uuid":"00000000-0000-0000-0000-000000000000"},"transport":null})).unwrap()
     }
     fn member(fail: bool, hang: bool) -> (Arc<Member>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -470,6 +543,7 @@ mod tests {
             selection: tokio::sync::Mutex::new(()),
             generation: AtomicUsize::new(0),
             next_probe: AtomicUsize::new(0),
+            next_udp: AtomicUsize::new(0),
             probe_slots: probe_budget().clone(),
         })
     }
@@ -534,7 +608,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fallback_is_bounded_and_udp_does_not_change_member() {
+    async fn fallback_retries_new_udp_associations_independently_of_tcp() {
         let (first, a) = member(true, true);
         let (second, b) = member(false, false);
         let group = GroupOutbound {
@@ -546,6 +620,7 @@ mod tests {
             selection: tokio::sync::Mutex::new(()),
             generation: std::sync::atomic::AtomicUsize::new(0),
             next_probe: std::sync::atomic::AtomicUsize::new(0),
+            next_udp: std::sync::atomic::AtomicUsize::new(0),
             // Virtual-time fixtures must not wait on permits held by another
             // test runtime: their clock can advance while that runtime sleeps.
             probe_slots: Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)),
@@ -555,22 +630,72 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_secs(3));
         assert_eq!(a.load(Ordering::SeqCst), 1);
         assert_eq!(b.load(Ordering::SeqCst), 1);
-        assert!(
-            group
-                .connect_datagram("example.invalid", 443)
-                .await
-                .is_err()
-        );
-        assert_eq!(a.load(Ordering::SeqCst), 2);
-        assert_eq!(b.load(Ordering::SeqCst), 1);
-        assert!(group.connect("example.invalid", 443).await.is_ok());
+        assert!(group.connect_datagram("example.invalid", 443).await.is_ok());
         assert_eq!(a.load(Ordering::SeqCst), 2);
         assert_eq!(b.load(Ordering::SeqCst), 2);
+        assert!(group.connect("example.invalid", 443).await.is_ok());
+        assert_eq!(a.load(Ordering::SeqCst), 2);
+        assert_eq!(b.load(Ordering::SeqCst), 3);
         tokio::time::advance(Duration::from_secs(300)).await;
         assert!(group.connect("example.invalid", 443).await.is_ok());
         assert_eq!(a.load(Ordering::SeqCst), 3);
-        assert_eq!(b.load(Ordering::SeqCst), 3);
+        assert_eq!(b.load(Ordering::SeqCst), 4);
     }
+    #[tokio::test(start_paused = true)]
+    async fn fallback_reaches_members_beyond_the_first_deadline() {
+        let mut group = counting_group(counting_probe(false));
+        let group = Arc::get_mut(&mut group).unwrap();
+        group.kind = GroupKind::Fallback;
+        let (members, calls) = (0..5).map(|i| member(i < 4, i < 4)).unzip();
+        let calls: Vec<Arc<AtomicUsize>> = calls;
+        group.members = members;
+        assert!(group.connect("example.invalid", 443).await.is_err());
+        assert_eq!(calls[4].load(Ordering::SeqCst), 0);
+        assert!(group.connect("example.invalid", 443).await.is_ok());
+        assert_eq!(calls[4].load(Ordering::SeqCst), 1);
+        let started = tokio::time::Instant::now();
+        let error = group
+            .connect_datagram("example.invalid", 443)
+            .await
+            .err()
+            .unwrap();
+        assert!(!udp_unsupported(&error));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert!(group.connect_datagram("example.invalid", 443).await.is_ok());
+        assert_eq!(calls[4].load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn udp_fallback_skips_stream_only_nodes_and_keeps_established_association() {
+        let (mut first, first_calls) = member(false, false);
+        if let crate::config::model::ProxyProtocol::VLess { udp, .. } =
+            &mut Arc::get_mut(&mut first).unwrap().node.protocol
+        {
+            *udp = false;
+        }
+        let (second, second_calls) = member(false, false);
+        let mut group = counting_group(counting_probe(false));
+        let group = Arc::get_mut(&mut group).unwrap();
+        group.kind = GroupKind::Fallback;
+        group.members = vec![first, second];
+        let datagram = group
+            .connect_datagram("example.invalid", 443)
+            .await
+            .unwrap();
+        datagram.send(b"one").await.unwrap();
+        group.members.pop();
+        assert!(udp_unsupported(
+            &group
+                .connect_datagram("example.invalid", 443)
+                .await
+                .err()
+                .unwrap()
+        ));
+        datagram.send(b"two").await.unwrap();
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn url_test_uses_the_fastest_member_until_the_result_expires() {
         let (first, a) = member(false, true);
@@ -584,6 +709,7 @@ mod tests {
             selection: tokio::sync::Mutex::new(()),
             generation: std::sync::atomic::AtomicUsize::new(0),
             next_probe: std::sync::atomic::AtomicUsize::new(0),
+            next_udp: std::sync::atomic::AtomicUsize::new(0),
             // Virtual-time fixtures must not wait on permits held by another
             // test runtime: their clock can advance while that runtime sleeps.
             probe_slots: Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)),
@@ -594,12 +720,7 @@ mod tests {
         assert!(group.connect("example.invalid", 443).await.is_ok());
         assert_eq!(a.load(Ordering::SeqCst), 1);
         assert_eq!(b.load(Ordering::SeqCst), 2);
-        assert!(
-            group
-                .connect_datagram("example.invalid", 443)
-                .await
-                .is_err()
-        );
+        assert!(group.connect_datagram("example.invalid", 443).await.is_ok());
         assert_eq!(b.load(Ordering::SeqCst), 3);
         assert_eq!(a.load(Ordering::SeqCst), 1);
     }
@@ -616,6 +737,7 @@ mod tests {
             selection: tokio::sync::Mutex::new(()),
             generation: std::sync::atomic::AtomicUsize::new(0),
             next_probe: std::sync::atomic::AtomicUsize::new(0),
+            next_udp: std::sync::atomic::AtomicUsize::new(0),
             // Virtual-time fixtures must not wait on permits held by another
             // test runtime: their clock can advance while that runtime sleeps.
             probe_slots: Arc::new(tokio::sync::Semaphore::new(GLOBAL_PROBE_CONCURRENCY)),

@@ -105,7 +105,15 @@ struct Inner {
     order: VecDeque<String>,
     /// Real addresses (v4 and v6) recently answered for domestic-group
     /// (China) names, mapped to the name that produced them.
-    domestic: LruCache<IpAddr, String>,
+    domestic: LruCache<IpAddr, DomesticHint>,
+}
+
+/// Keep the longest-lived direct name and the latest expiry of competing
+/// observations. Shared CDN addresses cannot identify a connection's name.
+struct DomesticHint {
+    domain: Option<String>,
+    valid_until: Instant,
+    conflict_until: Instant,
 }
 
 impl FakeIpPool {
@@ -306,24 +314,65 @@ impl FakeIpPool {
             .cloned()
     }
 
-    /// Remember that `ip` was just answered for the domestic-group name
-    /// `domain` (see [`Inner::domestic`]).
+    /// Register a short-lived direct hint for callers without a DNS TTL.
     pub fn record_domestic(&self, ip: IpAddr, domain: &str) {
-        self.inner
-            .lock()
-            .expect("fake-ip pool poisoned")
-            .domestic
-            .put(ip, domain.to_ascii_lowercase());
+        self.record_real_answer(ip, Some(domain), Duration::from_secs(30));
     }
 
-    /// The domestic-group name that most recently resolved to `ip`, if any.
+    /// A real address returned without a direct policy also conflicts with a
+    /// prior direct observation. Fake addresses never enter this table.
+    pub(super) fn record_real_answer(&self, ip: IpAddr, domain: Option<&str>, ttl: Duration) {
+        let mut inner = self.inner.lock().expect("fake-ip pool poisoned");
+        if ttl.is_zero() {
+            // A client may immediately dial an uncachable answer. Never
+            // attribute that flow to a different name already cached here.
+            if let Some(hint) = inner.domestic.get_mut(&ip)
+                && !domain
+                    .zip(hint.domain.as_deref())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                hint.conflict_until = hint.conflict_until.max(hint.valid_until);
+            }
+            return;
+        }
+        let now = Instant::now();
+        let until = now + ttl.min(Duration::from_secs(30));
+        let hint = inner.domestic.get_or_insert_mut(ip, || DomesticHint {
+            domain: None,
+            valid_until: now,
+            conflict_until: now,
+        });
+        match domain {
+            Some(name)
+                if hint
+                    .domain
+                    .as_ref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case(name)) =>
+            {
+                hint.valid_until = hint.valid_until.max(until);
+            }
+            Some(name) if until >= hint.valid_until => {
+                hint.conflict_until = hint.conflict_until.max(hint.valid_until);
+                hint.domain = Some(name.to_ascii_lowercase());
+                hint.valid_until = until;
+            }
+            _ => hint.conflict_until = hint.conflict_until.max(until),
+        }
+    }
+
+    /// Return a direct name only for an unambiguous, unexpired observation.
     pub fn lookup_domestic(&self, ip: IpAddr) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("fake-ip pool poisoned")
-            .domestic
-            .peek(&ip)
-            .cloned()
+        self.lookup_domestic_at(ip, Instant::now())
+    }
+
+    fn lookup_domestic_at(&self, ip: IpAddr, now: Instant) -> Option<String> {
+        let inner = self.inner.lock().expect("fake-ip pool poisoned");
+        let hint = inner.domestic.peek(&ip)?;
+        if now < hint.valid_until && now >= hint.conflict_until {
+            hint.domain.clone()
+        } else {
+            None
+        }
     }
 
     /// Number of live mappings (diagnostics/tests).
@@ -432,6 +481,27 @@ mod tests {
         let v6 = IpAddr::V6("2001:db8::1".parse().unwrap());
         pool.record_domestic(v6, "example.cn");
         assert_eq!(pool.lookup_domestic(v6).as_deref(), Some("example.cn"));
+    }
+
+    #[test]
+    fn domestic_hints_expire_and_a_shared_ip_has_no_domain() {
+        let pool = FakeIpPool::new();
+        let ip = "240e::10".parse().unwrap();
+        pool.record_real_answer(ip, Some("zero.test"), Duration::ZERO);
+        assert_eq!(pool.lookup_domestic(ip), None);
+        pool.record_real_answer(ip, Some("a.test"), Duration::from_secs(30));
+        pool.record_real_answer(ip, Some("b.test"), Duration::from_secs(1));
+        assert_eq!(pool.lookup_domestic(ip), None);
+        let now = Instant::now();
+        assert_eq!(
+            pool.lookup_domestic_at(ip, now + Duration::from_secs(2))
+                .as_deref(),
+            Some("a.test")
+        );
+        assert_eq!(
+            pool.lookup_domestic_at(ip, now + Duration::from_secs(31)),
+            None
+        );
     }
 
     #[test]

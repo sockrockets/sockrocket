@@ -271,12 +271,7 @@ impl super::datagram::Datagram for SsDatagram {
                         continue;
                     }
                 }
-                anyhow::ensure!(
-                    size <= packet.len(),
-                    "Shadowsocks UDP receive buffer too small"
-                );
-                packet[..size].copy_from_slice(&wire[..size]);
-                return Ok(size);
+                return super::datagram::copy_received(&wire[..size], packet);
             }
         })
     }

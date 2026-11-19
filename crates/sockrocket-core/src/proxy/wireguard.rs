@@ -415,10 +415,9 @@ impl Datagram for OwnedDatagram {
                 self._state
                     .mtu
                     .saturating_sub(if self.peer.is_ipv6() { 48 } else { 28 });
-            ensure!(
-                packet.len() <= max_payload,
-                "WireGuard UDP payload exceeds the tunnel MTU; IP fragmentation is not supported"
-            );
+            if packet.len() > max_payload {
+                return Err(super::datagram::PacketRejected("WireGuard UDP payload exceeds the tunnel MTU; IP fragmentation is not supported").into());
+            }
             let n = self.socket.send_to(packet, self.peer).await?;
             ensure!(n == packet.len(), "Partial WireGuard datagram write");
             Ok(())
@@ -432,12 +431,7 @@ impl Datagram for OwnedDatagram {
                 if peer != self.peer {
                     continue;
                 }
-                ensure!(
-                    n <= buffer.len(),
-                    "WireGuard datagram exceeds receive buffer"
-                );
-                buffer[..n].copy_from_slice(&bytes[..n]);
-                return Ok(n);
+                return super::datagram::copy_received(&bytes[..n], buffer);
             }
             anyhow::bail!("WireGuard received too many unrelated datagrams")
         })

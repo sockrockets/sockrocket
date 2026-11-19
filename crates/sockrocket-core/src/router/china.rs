@@ -402,5 +402,8 @@ mod tests {
             crate::router::Router::new(rs).with_geoip(std::sync::Arc::new(china_geoip_db()));
         assert_eq!(router.route("1.0.1.1", 80), RouteAction::Direct);
         assert_eq!(router.route("8.8.8.8", 80), RouteAction::Proxy);
+        // Operator route absent from the APNIC CN allocations.
+        assert_eq!(router.route("2a0e:b107:74f::1", 443), RouteAction::Direct);
+        assert_eq!(router.route("2a0e:b107:750::1", 443), RouteAction::Proxy);
     }
 }

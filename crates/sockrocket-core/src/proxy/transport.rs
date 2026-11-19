@@ -160,8 +160,9 @@ async fn connect_tcp_inner(addr: &str, proxy_endpoint: bool) -> Result<TcpStream
                     .await
                     .context("Proxy server DNS lookup failed")?,
             )
-        } else if let Some(result) = crate::dns::scoped_direct_resolve(bare).await {
-            Some(result?) // An explicit direct DNS failure must not use proxy/system DNS.
+        } else if let Some((resolver, ipv6_only)) = crate::dns::direct_resolver(bare) {
+            // The scoped direct policy owns both lookups, including their failures.
+            return connect_direct_families(&resolver, bare, port, ipv6_only).await;
         } else {
             resolve_server_ips(host).await
         };
@@ -187,6 +188,67 @@ async fn connect_tcp_inner(addr: &str, proxy_endpoint: bool) -> Result<TcpStream
         .with_context(|| format!("TCP connection to {} failed", addr))
 }
 
+/// Resolve both allowed families concurrently. The preferred family may dial
+/// immediately. Its failure releases the alternative without waiting out the
+/// stagger. Dropping the losing future cancels its DNS wait and socket attempts.
+async fn connect_direct_families(
+    resolver: &crate::dns::DnsResolver,
+    host: &str,
+    port: u16,
+    ipv6_only: bool,
+) -> Result<TcpStream> {
+    let (first, other) = resolver.dial_query_types(ipv6_only);
+    let dial = |ips: Vec<IpAddr>| async move {
+        let addrs: Vec<_> = ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        Ok::<_, anyhow::Error>(connect_staggered(&addrs).await?)
+    };
+    let preferred = async { dial(resolver.resolve_qtype_snapshot(host, first).await?).await };
+    let Some(other) = other else {
+        return preferred.await;
+    };
+    race_dial_families(
+        preferred,
+        resolver.resolve_qtype_snapshot(host, other),
+        dial,
+    )
+    .await
+}
+
+async fn race_dial_families<T, F: Future<Output = Result<T>>>(
+    preferred: impl Future<Output = Result<T>>,
+    other_addresses: impl Future<Output = Result<Vec<IpAddr>>>,
+    dial: impl FnOnce(Vec<IpAddr>) -> F,
+) -> Result<T> {
+    let (release, failed) = tokio::sync::oneshot::channel::<()>();
+    let delay = tokio::time::sleep(CONNECT_STAGGER);
+    let alternative = async {
+        let ips = other_addresses.await?;
+        tokio::select! {
+            _ = delay => {}
+            _ = failed => {}
+        }
+        dial(ips).await
+    };
+    tokio::pin!(preferred, alternative);
+    tokio::select! {
+        biased;
+        result = &mut preferred => match result {
+            Ok(stream) => Ok(stream),
+            Err(preferred_error) => {
+                let _ = release.send(());
+                alternative.await.or(Err(preferred_error))
+            }
+        },
+        result = &mut alternative => match result {
+            Ok(stream) => Ok(stream),
+            Err(_) => preferred.await,
+        },
+    }
+}
+
 /// Connect to a single address via an explicitly built socket so the
 /// TUN-mode outbound-interface binding (IP_UNICAST_IF / SO_BINDTODEVICE /
 /// IP_BOUND_IF) can be applied before connecting — without it, our own
@@ -207,6 +269,8 @@ async fn connect_bound(sa: SocketAddr) -> std::io::Result<TcpStream> {
     socket.connect(sa).await
 }
 
+const CONNECT_STAGGER: Duration = Duration::from_millis(300);
+
 /// Happy-eyeballs-style connect over multiple resolved addresses.
 ///
 /// CDN-fronted proxy nodes often resolve to a mix of live and dead IPs; a
@@ -214,17 +278,31 @@ async fn connect_bound(sa: SocketAddr) -> std::io::Result<TcpStream> {
 /// Instead, attempts start staggered 300ms apart and the first success wins.
 pub(super) async fn connect_staggered(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
     use tokio::task::JoinSet;
-    const STAGGER: Duration = Duration::from_millis(300);
 
     let mut set: JoinSet<std::io::Result<TcpStream>> = JoinSet::new();
     let mut last_err: Option<std::io::Error> = None;
-    for (i, sa) in addrs.iter().copied().enumerate() {
+    // Keep the first answer preferred, then give the other family its turn
+    // before trying the second address from the same family.
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let mut preferred = addrs.iter().copied().filter(|a| a.is_ipv6() == first_v6);
+    let mut other = addrs.iter().copied().filter(|a| a.is_ipv6() != first_v6);
+    let mut next_preferred = true;
+    let order = std::iter::from_fn(|| {
+        let next = if next_preferred {
+            preferred.next().or_else(|| other.next())
+        } else {
+            other.next().or_else(|| preferred.next())
+        };
+        next_preferred = !next_preferred;
+        next
+    });
+    for (i, sa) in order.enumerate() {
         if i > 0 {
             // Wait out the stagger delay, but bail early if a previous
             // attempt already succeeded, and skip the rest of the delay if
             // one already failed (fast failover).
             tokio::select! {
-                _ = tokio::time::sleep(STAGGER) => {}
+                _ = tokio::time::sleep(CONNECT_STAGGER) => {}
                 Some(res) = set.join_next() => {
                     match res {
                         Ok(Ok(stream)) => {
@@ -1482,6 +1560,73 @@ impl ConnFactory for TlsConnFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_family_stagger_allows_early_winners_and_fast_failure() {
+        use std::future::{pending, ready};
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let dial = |ips: Vec<IpAddr>| ready(Ok(ips[0]));
+        let start = tokio::time::Instant::now();
+        let winner = race_dial_families(ready(Ok(ip)), pending(), dial)
+            .await
+            .unwrap();
+        assert_eq!(winner, ip);
+        let winner = race_dial_families(
+            ready(Err(anyhow::anyhow!("no route"))),
+            ready(Ok(vec![ip])),
+            dial,
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, ip);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        let winner = race_dial_families(pending(), ready(Ok(vec![ip])), dial)
+            .await
+            .unwrap();
+        assert_eq!(winner, ip);
+        assert_eq!(start.elapsed(), CONNECT_STAGGER);
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_can_connect_while_other_dns_family_is_pending() {
+        use crate::config::dns::AddressStrategy;
+        use crate::dns::{DnsConfig, DnsResolver, DnsServer};
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = udp.local_addr().unwrap();
+        let dns_task = tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            loop {
+                let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                let (_, qtype) = crate::dns::parse_dns_query(&buf[..n]).unwrap();
+                if qtype == 1 {
+                    let reply =
+                        crate::dns::build_dns_response(&buf[..n], &["127.0.0.1".parse().unwrap()])
+                            .unwrap();
+                    udp.send_to(&reply, peer).await.unwrap();
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for strategy in [AddressStrategy::PreferIpv4, AddressStrategy::PreferIpv6] {
+            let resolver = DnsResolver::with_config(DnsConfig {
+                fallback: vec![DnsServer::Udp(server)],
+                servers: vec![DnsServer::Udp(server)],
+                strategy,
+                timeout_secs: 10,
+                ..DnsConfig::default()
+            });
+            let host = "early-dial.example.test";
+            let addr = format_host_port(host, listener.local_addr().unwrap().port());
+            resolver
+                .scope(crate::dns::with_direct_destination(
+                    host,
+                    connect_tcp(&addr, Duration::from_secs(2)),
+                ))
+                .await
+                .unwrap();
+        }
+        dns_task.abort();
+    }
 
     #[tokio::test]
     async fn node_dns_keeps_real_addresses_from_mixed_answers() {

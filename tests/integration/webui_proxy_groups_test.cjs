@@ -65,7 +65,7 @@ assert.equal(el('edit-rule-target').options.at(-1).textContent, '已失效 · gr
 assert.equal(c.RULE_TARGET_LABEL['node:'+targetId], undefined);
 el('device-available-groups').querySelectorAll=()=>el('device-available-groups').options.filter(box=>box.checked);
 c.ruleApi=(...args)=>requests.push(args);
-c.SR_STATE.devices=[{source:'192.0.2.8/32',key:'mac:00:11:22:33:44:55',alias_key:'mac:00:11:22:33:44:55',alias:'电视',host:'living-room'}];
+c.SR_STATE.devices=[{source:'192.0.2.8/32',key:'mac:00:11:22:33:44:55',alias_key:'mac:00:11:22:33:44:55',alias:'电视',host:'living-room',ipv6:['2001:db8::8']}];
 c.SR_STATE.ruleRows=[
   {index:0,rule_type:'final',source:'192.0.2.8',target:'direct'},
   {index:1,rule_type:'domain',source:'',group:'Emby',enabled:true,pattern:'media.invalid',target:'proxy'},
@@ -85,6 +85,13 @@ assert.equal(el('device-picker').options.filter(o=>o.value.startsWith('192.0.2.8
 el('device-picker').value='192.0.2.8/32';c.selectPolicyDevice();c.renderDevicePolicies();
 assert.equal(el('device-scope-note').hidden,true);
 assert.equal(el('device-picker').value,'192.0.2.8/32');
+assert.match(el('device-ipv6').textContent,/2001:db8::8/);
+assert.equal(c.devicePolicySource('2001:db8::8'),'192.0.2.8/32');
+assert.equal(c.devicePolicySource('2001:db8::9'),'2001:db8::9');
+assert.equal(c.flowDeviceChoices().get('2001:db8::8'),'电视');
+c.SR_STATE.pausedSources=['2001:db8::8/128'];
+assert.equal(c.devicePolicySource('2001:db8::8'),'2001:db8::8');
+c.SR_STATE.pausedSources=[];
 assert.equal(el('device-target').value,'direct');
 assert.equal(el('device-fallback-label').textContent,'未命中规则时直连');
 const subnetFinal={index:8,rule_type:'final',source:'192.0.2.0/24',priority:10,target:'reject'};
