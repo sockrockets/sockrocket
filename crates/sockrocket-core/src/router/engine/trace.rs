@@ -45,7 +45,8 @@ impl Router {
         });
         let source = self.effective_source(source);
         let literal = host.parse::<IpAddr>().ok();
-        let mut ip = literal.or(destination_ip);
+        let ip = literal.or(destination_ip);
+        let mut resolved = Vec::new();
         let mut attempted = ip.is_some();
         let mut trace = RouteTrace {
             action: self.rules.default_action.clone(),
@@ -69,24 +70,35 @@ impl Router {
         let mut builtin_needs_ip = false;
         for entry in self.rules.entries_for(source, true) {
             let source_ok = source_matches(entry.source, source);
-            let needs_ip = matches!(entry.rule, MatchRule::IpCidr { .. } | MatchRule::GeoIp(_));
+            let needs_ip = entry.rule.needs_ip();
             if source_ok && needs_ip && !attempted {
                 attempted = true;
                 if resolve_dns {
-                    ip = resolve_trace_host(&lower).await;
-                    trace.resolved_ip = ip;
-                    trace.dns = if ip.is_some() { "resolved" } else { "failed" };
+                    resolved = resolve_trace_host(&lower).await;
+                    trace.resolved_ip = resolved.first().copied();
+                    trace.dns = if resolved.is_empty() { "failed" } else { "resolved" };
                 } else {
                     trace.dns = "skipped";
                 }
             }
+            let ips = if ip.is_some() { ip.as_slice() } else { &resolved };
             let outcome = if !source_ok {
                 "source_mismatch"
-            } else if needs_ip && ip.is_none() {
+            } else if needs_ip && ips.is_empty() {
                 trace.definitive = false;
                 "needs_ip"
+            } else if needs_ip {
+                if let Some(matched) = ips
+                    .iter()
+                    .find(|candidate| self.rule_matches(entry.rule, &lower, Some(**candidate), port))
+                {
+                    trace.resolved_ip = Some(*matched);
+                    "matched"
+                } else {
+                    "not_matched"
+                }
             } else if !matches!(entry.rule, MatchRule::DomesticHint)
-                && self.rule_matches(entry.rule, &lower, ip, port)
+                && self.rule_matches(entry.rule, &lower, None, port)
             {
                 "matched"
             } else {
@@ -125,7 +137,7 @@ impl Router {
 }
 
 // A diagnostic lookup shares core's resolver code without instantiating it in the CLI.
-fn resolve_trace_host(host: &str) -> Pin<Box<dyn Future<Output = Option<IpAddr>> + Send + '_>> {
+fn resolve_trace_host(host: &str) -> Pin<Box<dyn Future<Output = Vec<IpAddr>> + Send + '_>> {
     Box::pin(resolve_host(host))
 }
 

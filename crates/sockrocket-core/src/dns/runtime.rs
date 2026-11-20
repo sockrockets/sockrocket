@@ -15,17 +15,21 @@ pub(crate) async fn with_resolver<F: Future>(
     }
 }
 pub(crate) async fn scoped_resolve(host: &str) -> Option<Result<Vec<IpAddr>>> {
+    scoped_resolve_for_family(host, crate::proxy::routing::tun_family()).await
+}
+
+pub(crate) async fn scoped_resolve_for_family(
+    host: &str,
+    family: Option<TunFamily>,
+) -> Option<Result<Vec<IpAddr>>> {
     let resolver = REQUEST_DNS.try_with(Clone::clone).ok()?;
     let canonical = host.trim_end_matches('.').to_ascii_lowercase();
     if resolver.config.node_hosts.contains(&canonical)
         && let Some(bootstrap) = &resolver.bootstrap
     {
-        return Some(bootstrap.resolve_addresses(host).await);
+        return Some(bootstrap.resolve_addresses_for_family(host, family).await);
     }
-    if crate::proxy::routing::tun_ipv6() {
-        return Some(resolver.resolve_with_qtype(host, 28).await);
-    }
-    Some(resolver.resolve_addresses(host).await)
+    Some(resolver.resolve_addresses_for_family(host, family).await)
 }
 
 // Only the direct connection's target inherits this intent; nested DNS server
@@ -42,36 +46,45 @@ pub(crate) async fn with_direct_destination<F: Future>(host: &str, future: F) ->
         .await
 }
 
-pub(crate) fn direct_resolver(host: &str) -> Option<(DnsResolver, bool)> {
+fn is_direct_destination(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']).trim_end_matches('.');
+    DIRECT_DESTINATION
+        .try_with(|target| target.eq_ignore_ascii_case(host))
+        .unwrap_or(false)
+}
+
+pub(crate) fn direct_destination_family(host: &str) -> Option<TunFamily> {
+    crate::proxy::routing::tun_family().filter(|_| is_direct_destination(host))
+}
+
+pub(crate) fn direct_resolver(host: &str) -> Option<(DnsResolver, Option<TunFamily>)> {
+    if !is_direct_destination(host) {
+        return None;
+    }
     let canonical = host
         .trim_matches(['[', ']'])
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if canonical.parse::<IpAddr>().is_ok()
-        || !DIRECT_DESTINATION
-            .try_with(|target| target == &canonical)
-            .unwrap_or(false)
-    {
+    if canonical.parse::<IpAddr>().is_ok() {
         return None;
     }
     let mut resolver = REQUEST_DNS.try_with(Clone::clone).ok()?.query_snapshot();
     if resolver.config.node_hosts.contains(&canonical)
         && let Some(bootstrap) = &resolver.bootstrap
     {
-        return Some((bootstrap.as_ref().clone(), false));
+        return Some((
+            bootstrap.as_ref().clone(),
+            crate::proxy::routing::tun_family(),
+        ));
     }
     resolver.direct_resolution = true;
     resolver.fakeip = None;
-    Some((resolver, crate::proxy::routing::tun_ipv6()))
+    Some((resolver, crate::proxy::routing::tun_family()))
 }
 
 pub(crate) async fn scoped_direct_resolve(host: &str) -> Option<Result<Vec<IpAddr>>> {
-    let (resolver, ipv6_only) = direct_resolver(host)?;
-    Some(if ipv6_only {
-        resolver.resolve_qtype_snapshot(host, QTYPE_AAAA).await
-    } else {
-        resolver.resolve_addresses(host).await
-    })
+    let (resolver, family) = direct_resolver(host)?;
+    Some(resolver.resolve_addresses_for_family(host, family).await)
 }
 
 struct Bootstrap {

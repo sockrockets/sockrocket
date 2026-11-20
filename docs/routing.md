@@ -2,6 +2,12 @@
 
 Rule mode is the only mode that consults rules. Global sends every proxied connection to the node selected at the top of the page. Direct does not use a proxy node. A node group, and a rule pinned to one node, take effect only in rule mode.
 
+## Automatic CN preference
+
+In Rule mode, the default China-direct policy can find a mainland CDN address without a domain rule. For an A or AAAA answer that contains only addresses outside the built-in CN ranges, Sockrocket briefly checks the configured direct DNS servers for the same name and address family. If they return a CN address, the client can use it directly. If the check times out or finds no CN address, Sockrocket keeps the primary result. This lookup also discloses the queried name to the direct DNS provider.
+
+IP-based direct rules dial an address that matched the rule. Domain-based direct rules continue to use the direct DNS group. Global proxy mode and policies with device-specific or conflicting routing overrides use their configured DNS paths.
+
 ## Three exits
 
 A rule exit is one of these:

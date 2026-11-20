@@ -357,8 +357,7 @@ async fn async_main() -> Result<()> {
     // Swappable wrapper: health-check failover and config hot-reload replace
     // the inner outbound without rebinding the local listeners.
     let swappable = Arc::new(SwappableOutbound::new(outbound.clone()));
-    let mut dns_config =
-        dns_settings.resolver_config(config.nodes.iter().map(|node| node.server.clone()))?;
+    let mut dns_config = dns_settings.resolver_for_app(&config)?;
     set_transparent_dns_flags(
         &mut dns_config,
         enable_tun && !setup_routes,
@@ -413,16 +412,8 @@ async fn async_main() -> Result<()> {
     };
     service.stats().set_ledger(Some(traffic_ledger.clone()));
     sync_traffic_node(&traffic_ledger, &config, active_index);
-    service
-        .start(&config.listen_addr, config.socks_port, config.http_port)
-        .await?;
-
-    // Fake-IP pool, shared by the DNS listener (hands out fake addresses for
-    // international names) and the TUN proxy (maps them back to domains and
-    // dials by name). TUN mode only: socks/http clients must keep receiving
-    // real addresses. Persist like Clash Meta so TUN toggle/restart reuses
-    // the same 198.18.x.x → domain map (clients with cached Fake-IPs recover
-    // immediately instead of waiting on DNS TTL).
+    // Clients may pass a gateway DNS answer to SOCKS5 or dial it through TUN.
+    // Both listeners share the DNS pool, including mappings retained across restarts.
     let fakeip_store = {
         let p = std::path::Path::new(&config_path);
         p.parent()
@@ -430,6 +421,14 @@ async fn async_main() -> Result<()> {
             .join("fakeip.store")
     };
     let fakeip_pool = enable_tun.then(|| sockrocket_core::FakeIpPool::load_or_new(&fakeip_store));
+    service
+        .start_with_fakeip(
+            &config.listen_addr,
+            config.socks_port,
+            config.http_port,
+            fakeip_pool.clone(),
+        )
+        .await?;
 
     // Proxy-server hostnames, shared with the DNS resolver so node servers
     // always resolve direct/real (never fake-IP). Repopulated on config
@@ -843,9 +842,7 @@ async fn async_main() -> Result<()> {
                         normalize_node_names(&mut new_config.nodes);
                         match prepare_routing(&new_config, device_identities.as_ref()) {
                             Ok((new_index, new_router, new_outbound)) => {
-                                let mut dns_config = match settings.resolver_config(
-                                    new_config.nodes.iter().map(|node| node.server.clone()),
-                                ) {
+                                let mut dns_config = match settings.resolver_for_app(&new_config) {
                                     Ok(config) => config,
                                     Err(error) => {
                                         tracing::error!(

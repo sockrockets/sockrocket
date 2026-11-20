@@ -384,6 +384,29 @@ fn client_cache_key(host: &str, port: u16, source: Option<IpAddr>) -> RouteCache
     }
 }
 
+/// IP-based Direct decisions carry only addresses that matched the winning rule.
+/// Other decisions leave DNS selection to the chosen outbound.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteDecision {
+    pub(crate) action: RouteAction,
+    pub(crate) direct_ips: Vec<IpAddr>,
+}
+
+impl RouteDecision {
+    fn unbound(action: &RouteAction) -> Self {
+        Self {
+            action: action.clone(),
+            direct_ips: Vec::new(),
+        }
+    }
+}
+
+impl MatchRule {
+    fn needs_ip(&self) -> bool {
+        matches!(self, Self::IpCidr { .. } | Self::GeoIp(_))
+    }
+}
+
 /// Router evaluates rules against connection targets.
 pub struct Router {
     rules: RuleSet,
@@ -392,7 +415,7 @@ pub struct Router {
     device_identities: Option<Arc<RwLock<BTreeMap<Ipv6Addr, Ipv4Addr>>>>,
     /// LRU route cache: evicts least-recently-used entries when full (avoids thundering-herd on full flush).
     /// Keyed by lowercased host, port, and the complete client/TUN context.
-    cache: RwLock<LruCache<RouteCacheKey, RouteAction>>,
+    cache: RwLock<LruCache<RouteCacheKey, RouteDecision>>,
 }
 
 impl Router {
@@ -465,53 +488,28 @@ impl Router {
     /// Evaluate routing rules for a given destination.
     /// `host` can be a domain name or IP address string.
     pub fn route(&self, host: &str, port: u16) -> RouteAction {
-        let source = self.client_source();
-        let key = client_cache_key(host, port, source);
-        // get() (not peek()) so a hit promotes the entry in LRU order —
-        // without promotion a hot route stays evictable under cache churn.
-        // This needs the write lock, but it is a std RwLock held only for
-        // the lookup, so it is cheap.
-        if let Ok(mut cache) = self.cache.write()
-            && let Some(action) = cache.get(&key)
-        {
-            return action.clone();
-        }
-
-        let action = self.route_uncached(host, port, source);
-
-        // Store in cache — LruCache::put auto-evicts the LRU entry when full
-        if let Ok(mut cache) = self.cache.write() {
-            cache.put(key, action.clone());
-        }
-
-        action
+        self.cached_decision(host, port, self.client_source()).action
     }
 
-    /// Perform rule matching without cache.
-    fn route_uncached(&self, host: &str, port: u16, source: Option<IpAddr>) -> RouteAction {
-        let host_lower = host.to_lowercase();
-        let ip: Option<IpAddr> = host
-            .parse()
-            .ok()
-            .or(crate::proxy::routing::tun_destination().0);
-
-        for entry in self.rules.entries_for(source, false) {
-            if !source_matches(entry.source, source) {
-                continue;
-            }
-            if self.rule_matches(entry.rule, &host_lower, ip, port) {
-                tracing::debug!(
-                    "Route match: {}:{} -> {:?} (rule: {:?})",
-                    host,
-                    port,
-                    entry.action,
-                    entry.rule
-                );
-                return entry.action.clone();
-            }
+    fn cached_decision(&self, host: &str, port: u16, source: Option<IpAddr>) -> RouteDecision {
+        let key = client_cache_key(host, port, source);
+        if let Ok(mut cache) = self.cache.write()
+            && let Some(decision) = cache.get(&key)
+        {
+            return decision.clone();
         }
 
-        self.rules.default_action.clone()
+        let ip = host.parse::<IpAddr>().ok().or(key.destination.0);
+        let decision = self
+            .rules
+            .entries_for(source, false)
+            .filter(|entry| source_matches(entry.source, source))
+            .find_map(|entry| self.match_decision(entry, &key.host, ip.as_slice(), port))
+            .unwrap_or_else(|| RouteDecision::unbound(&self.rules.default_action));
+        if let Ok(mut cache) = self.cache.write() {
+            cache.put(key, decision.clone());
+        }
+        decision
     }
 
     /// Evaluate only the DOMAIN rules (domain / domain-suffix /
@@ -553,67 +551,60 @@ impl Router {
     /// against the TTL-aware DNS cache so address changes and transient DNS
     /// failures cannot pin a host to an obsolete route.
     pub async fn route_resolving(&self, host: &str, port: u16) -> RouteAction {
-        let source = self.client_source();
-        // Only concrete destinations are safe to cache without a DNS TTL.
-        // Also avoid consuming a synchronous route() decision made without DNS.
-        if host.parse::<IpAddr>().is_err() && crate::proxy::routing::tun_destination().0.is_none() {
-            return self.route_uncached_resolving(host, port, source).await;
-        }
-        let key = client_cache_key(host, port, source);
-        if let Ok(mut cache) = self.cache.write()
-            && let Some(action) = cache.get(&key)
-        {
-            return action.clone();
-        }
-
-        let action = self.route_uncached_resolving(host, port, source).await;
-
-        if let Ok(mut cache) = self.cache.write() {
-            cache.put(key, action.clone());
-        }
-
-        action
+        self.decision_resolving(host, port).await.action
     }
 
-    async fn route_uncached_resolving(
-        &self,
-        host: &str,
-        port: u16,
-        source: Option<IpAddr>,
-    ) -> RouteAction {
-        let host_lower = host.to_lowercase();
-        let mut ip: Option<IpAddr> = host
-            .parse()
-            .ok()
-            .or(crate::proxy::routing::tun_destination().0);
-        let mut dns_attempted = ip.is_some();
-
+    pub(crate) async fn decision_resolving(&self, host: &str, port: u16) -> RouteDecision {
+        let source = self.client_source();
+        // A concrete destination is authoritative, including when its hostname
+        // was recovered by the TUN. Its decision can safely outlive a DNS TTL.
+        if host.parse::<IpAddr>().is_ok() || crate::proxy::routing::tun_destination().0.is_some() {
+            return self.cached_decision(host, port, source);
+        }
+        let lower = host.to_lowercase();
+        let mut answers = None;
         for entry in self.rules.entries_for(source, false) {
             if !source_matches(entry.source, source) {
                 continue;
             }
-            // Lazily resolve the first time evaluation reaches an IP-based
-            // rule for a domain target.
-            if !dns_attempted
-                && matches!(entry.rule, MatchRule::IpCidr { .. } | MatchRule::GeoIp(_))
-            {
-                dns_attempted = true;
-                ip = resolve_host(&host_lower).await;
+            if entry.rule.needs_ip() && answers.is_none() {
+                answers = Some(resolve_host(&lower).await);
             }
-
-            if self.rule_matches(entry.rule, &host_lower, ip, port) {
-                tracing::debug!(
-                    "Route match: {}:{} -> {:?} (rule: {:?})",
-                    host,
-                    port,
-                    entry.action,
-                    entry.rule
-                );
-                return entry.action.clone();
+            if let Some(decision) =
+                self.match_decision(entry, &lower, answers.as_deref().unwrap_or_default(), port)
+            {
+                return decision;
             }
         }
+        RouteDecision::unbound(&self.rules.default_action)
+    }
 
-        self.rules.default_action.clone()
+    fn match_decision(
+        &self,
+        entry: RuleView<'_>,
+        host: &str,
+        ips: &[IpAddr],
+        port: u16,
+    ) -> Option<RouteDecision> {
+        let mut direct_ips = Vec::new();
+        if entry.rule.needs_ip() {
+            let mut matches = ips
+                .iter()
+                .copied()
+                .filter(|ip| self.rule_matches(entry.rule, host, Some(*ip), port));
+            let first = matches.next()?;
+            if entry.action == &RouteAction::Direct && host.parse::<IpAddr>().is_err() {
+                direct_ips.push(first);
+                direct_ips.extend(matches);
+            }
+        } else if !self.rule_matches(entry.rule, host, None, port) {
+            return None;
+        }
+        tracing::debug!(%host, port, action = ?entry.action, rule = ?entry.rule, "Route match");
+        Some(RouteDecision {
+            action: entry.action.clone(),
+            direct_ips,
+        })
     }
 
     fn rule_matches(
@@ -655,44 +646,55 @@ impl Router {
     }
 }
 
-/// Resolve a host via the system resolver, preferring IPv4 (the GeoIP
-/// database is primarily v4). None on failure/timeout — IP-based rules then
-/// simply don't match, and evaluation falls through to the default action.
-async fn resolve_host(host: &str) -> Option<IpAddr> {
+/// Classification uses real, family-eligible answers. Resolver order controls
+/// the dial preference within a matching rule, never rule precedence.
+async fn resolve_host(host: &str) -> Vec<IpAddr> {
+    use crate::proxy::routing::{TunFamily, tun_family};
+    let family = tun_family();
+    let eligible = |ip: IpAddr| {
+        crate::dns::fakeip::fake_ipv4(ip).is_none() && family.is_none_or(|family| family.matches(ip))
+    };
     if let Some(result) = crate::dns::scoped_resolve(host).await {
-        return result.ok().and_then(|ips| ips.into_iter().next());
+        let mut ips = result.unwrap_or_default();
+        ips.retain(|ip| eligible(*ip));
+        return ips;
     }
     let lookup = tokio::net::lookup_host((host, 0));
-    let addrs = match tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await {
-        Ok(Ok(iter)) => iter,
-        _ => return None,
+    let Ok(Ok(addrs)) = tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await else {
+        return Vec::new();
     };
-    let addrs: Vec<_> = addrs.collect();
-    let ip = addrs
-        .iter()
-        .find(|sa| sa.is_ipv4())
-        .or_else(|| addrs.first())
-        .map(|sa| sa.ip())?;
-
-    // On Merlin, system DNS is hijacked into Sockrocket. A Primary-group
-    // name therefore comes back as a fake-IP (198.18/16). Feeding that into
-    // geoip:CN always misses, so Rule mode incorrectly Proxies domestic
-    // sites that were only missing from the domain list. Re-query a
-    // mainland resolver for a real address before GeoIP matching.
-    if let IpAddr::V4(v4) = ip
-        && crate::dns::fakeip::is_fake_ip(v4)
-    {
+    let mut ips = Vec::new();
+    let mut saw_fake = false;
+    for addr in addrs {
+        let ip = addr.ip();
+        saw_fake |= crate::dns::fakeip::fake_ipv4(ip).is_some();
+        if eligible(ip) && !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    // Merlin can redirect OS lookups back to the Fake-IP listener. Recover
+    // real records for the original family (both for ordinary proxy requests).
+    if ips.is_empty() && saw_fake {
         const DOMESTIC_NS: &[&str] = &["223.5.5.5:53", "119.29.29.29:53"];
-        for ns in DOMESTIC_NS {
-            if let Ok(server) = ns.parse()
-                && let Some(real) = crate::dns::lookup_a_udp(server, host).await
-            {
-                return Some(real);
+        for server in DOMESTIC_NS.iter().filter_map(|ns| ns.parse().ok()) {
+            let lookup = |qtype| crate::dns::lookup_ips_udp(server, host, qtype);
+            let mut real = match family {
+                Some(TunFamily::V4) => lookup(1).await.unwrap_or_default(),
+                Some(TunFamily::V6) => lookup(28).await.unwrap_or_default(),
+                None => {
+                    let (v4, v6) = tokio::join!(lookup(1), lookup(28));
+                    let mut v4 = v4.unwrap_or_default();
+                    v4.extend(v6.unwrap_or_default());
+                    v4
+                }
+            };
+            real.retain(|ip| eligible(*ip));
+            if !real.is_empty() {
+                return real;
             }
         }
-        return None;
     }
-    Some(ip)
+    ips
 }
 
 /// Parse a CIDR string like "192.168.0.0/16" or "::1/128".
@@ -797,6 +799,74 @@ fn cidr_match(ip: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolved_candidates_follow_rule_precedence_and_pin_only_matching_direct_addresses() {
+        use crate::dns::{DnsConfig, DnsResolver};
+        use crate::proxy::routing::with_tun_destination;
+
+        let host = "mixed.example";
+        let subnet = |network: &str| {
+            let (addr, prefix_len) = parse_cidr(network).unwrap();
+            MatchRule::IpCidr { addr, prefix_len }
+        };
+        let resolver_for = |ips: &[&str]| {
+            let mut config = DnsConfig::default();
+            config.hosts.insert(
+                host.into(),
+                ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+            );
+            DnsResolver::with_config(config)
+        };
+        let mut rules = RuleSet::new();
+        rules.add_rule(
+            MatchRule::Domain("explicit.example".into()),
+            RouteAction::Direct,
+        );
+        rules.add_rule(subnet("203.0.113.0/24"), RouteAction::Reject);
+        rules.add_rule(subnet("192.0.2.0/24"), RouteAction::Direct);
+        let router = Router::new(rules);
+        let preferred: IpAddr = "192.0.2.3".parse().unwrap();
+        let other: IpAddr = "192.0.2.4".parse().unwrap();
+        let reject: IpAddr = "203.0.113.7".parse().unwrap();
+        for addresses in [["192.0.2.3", "203.0.113.7"], ["203.0.113.7", "192.0.2.3"]] {
+            resolver_for(&addresses)
+                .scope(async {
+                    assert_eq!(router.route_resolving(host, 443).await, RouteAction::Reject);
+                    let trace = router.trace_route(host, 443, None, None, true).await;
+                    assert_eq!(trace.action, RouteAction::Reject);
+                    assert_eq!(trace.resolved_ip, Some(reject));
+                })
+                .await;
+        }
+        resolver_for(&["198.18.0.2", "198.51.100.10", "192.0.2.3", "192.0.2.4"])
+            .scope(async {
+                let decision = router.decision_resolving(host, 443).await;
+                assert_eq!(decision.action, RouteAction::Direct);
+                assert_eq!(decision.direct_ips, [preferred, other]);
+                let trace = router.trace_route(host, 443, None, None, true).await;
+                assert_eq!(trace.resolved_ip, Some(preferred));
+
+                with_tun_destination(Some(other), false, async {
+                    assert_eq!(router.route(host, 443), RouteAction::Direct);
+                    assert_eq!(
+                        router.decision_resolving(host, 443).await.direct_ips,
+                        [other]
+                    );
+                    let explicit = router.decision_resolving("explicit.example", 443).await;
+                    assert_eq!(explicit.action, RouteAction::Direct);
+                    assert!(explicit.direct_ips.is_empty());
+                })
+                .await;
+            })
+            .await;
+        // The earlier named decisions must not survive a changed DNS answer.
+        resolver_for(&["198.51.100.10"])
+            .scope(async {
+                assert_eq!(router.route_resolving(host, 443).await, RouteAction::Proxy);
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn cache_preserves_client_destination_hint_and_port_isolation() {
@@ -1159,7 +1229,9 @@ mod tests {
         let cache = router.cache.read().unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(
-            cache.peek(&client_cache_key("www.example.com", 443, None)),
+            cache
+                .peek(&client_cache_key("www.example.com", 443, None))
+                .map(|decision| &decision.action),
             Some(&RouteAction::Direct)
         );
     }

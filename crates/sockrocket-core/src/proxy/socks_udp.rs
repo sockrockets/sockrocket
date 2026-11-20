@@ -73,6 +73,7 @@ pub(super) async fn serve(
     requested_host: String,
     requested_port: u16,
     stats: ProxyStats,
+    fakeip: Option<&crate::dns::fakeip::FakeIpPool>,
 ) -> Result<()> {
     let peer = control.peer_addr()?;
     let requested: IpAddr = requested_host
@@ -126,6 +127,12 @@ pub(super) async fn serve(
             let key = (host, port);
             flows.retain(|_, flow| !flow.task.is_finished());
             if !flows.contains_key(&key) {
+                // Keep the request's original address in the flow key and reply header.
+                // Only the upstream connection uses the restored domain.
+                let Ok((target, original_ip)) = super::socks5::restore_destination(&key.0, fakeip)
+                else {
+                    continue;
+                };
                 if flows.len() >= 16
                     && let Some(oldest) = flows
                         .iter()
@@ -143,7 +150,9 @@ pub(super) async fn serve(
                     .unwrap_or_else(|| outbound.clone());
                 let Ok(Ok(remote)) = tokio::time::timeout(
                     UPSTREAM_CONNECT_TIMEOUT,
-                    snapshot.0.connect_datagram(&key.0, port),
+                    super::routing::with_tun_family(original_ip, async {
+                        snapshot.0.connect_datagram(&target, port).await
+                    }),
                 )
                 .await
                 else {

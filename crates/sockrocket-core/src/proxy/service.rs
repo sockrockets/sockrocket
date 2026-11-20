@@ -82,6 +82,18 @@ impl ProxyService {
         socks_port: u16,
         http_port: u16,
     ) -> Result<()> {
+        self.start_with_fakeip(listen_addr, socks_port, http_port, None)
+            .await
+    }
+
+    /// Start the listeners with the same synthetic address map as the gateway DNS.
+    pub async fn start_with_fakeip(
+        &mut self,
+        listen_addr: &str,
+        socks_port: u16,
+        http_port: u16,
+        fakeip: Option<std::sync::Arc<crate::dns::fakeip::FakeIpPool>>,
+    ) -> Result<()> {
         if self.shutdown_tx.is_some() {
             anyhow::bail!("Proxy service is already running");
         }
@@ -120,7 +132,7 @@ impl ProxyService {
         let socks_state = self.state_tx.clone();
         let socks_stop = shutdown_tx.clone();
         self.socks5_handle = Some(tokio::spawn(async move {
-            if let Err(e) = socks5.run(socks5_rx).await {
+            if let Err(e) = socks5.run_with_fakeip(socks5_rx, fakeip).await {
                 tracing::error!("SOCKS5 server error: {}", e);
                 let _ = socks_state.send(ProxyState::Error(format!("SOCKS5 listener failed: {e}")));
                 let _ = socks_stop.send(true);

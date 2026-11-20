@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::{borrow::Cow, net::IpAddr, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -6,6 +7,7 @@ use tokio::sync::watch;
 use super::ProxyStats;
 use super::connector::{SharedOutbound, connect_upstream};
 use super::relay::relay_bidirectional;
+use crate::dns::fakeip::{FakeIpPool, fake_ipv4};
 
 /// SOCKS5 proxy server.
 pub struct Socks5Server {
@@ -34,7 +36,15 @@ impl Socks5Server {
         self.listener.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
-    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        self.run_with_fakeip(shutdown, None).await
+    }
+
+    pub(super) async fn run_with_fakeip(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        fakeip: Option<Arc<FakeIpPool>>,
+    ) -> Result<()> {
         let mut connections = tokio::task::JoinSet::new();
         let mut rejected = 0u64;
         loop {
@@ -61,9 +71,13 @@ impl Socks5Server {
                     stream.set_nodelay(true).ok();
                     let outbound = self.outbound.clone();
                     let stats = self.stats.clone();
+                    let pool = fakeip.clone();
                     connections.spawn(async move {
                         let _slot = slot;
-                        let result = super::routing::with_client_source(Some(peer.ip()), crate::traffic::with_traffic_scope(handle_socks5(stream, outbound, stats.clone()))).await;
+                        let result = super::routing::with_client_source(
+                            Some(peer.ip()),
+                            crate::traffic::with_traffic_scope(handle_socks5(stream, outbound, stats, pool)),
+                        ).await;
                         if let Err(e) = result {
                             tracing::debug!("SOCKS5 connection from {} error: {}", peer, e);
                         }
@@ -75,6 +89,24 @@ impl Socks5Server {
         while connections.join_next().await.is_some() {}
         Ok(())
     }
+}
+
+/// A client can resolve through the gateway before sending its SOCKS request.
+/// Its synthetic address identifies both the original domain and its DNS family.
+pub(super) fn restore_destination<'a>(
+    host: &'a str,
+    pool: Option<&FakeIpPool>,
+) -> Result<(Cow<'a, str>, Option<IpAddr>)> {
+    if let Some(pool) = pool
+        && let Ok(ip) = host.parse::<IpAddr>()
+        && let Some(token) = fake_ipv4(ip)
+    {
+        let domain = pool
+            .lookup(token)
+            .with_context(|| format!("fake-IP {ip} has no live mapping"))?;
+        return Ok((Cow::Owned(domain), Some(ip)));
+    }
+    Ok((Cow::Borrowed(host), None))
 }
 
 /// Parse the SOCKS5 destination address from a stream.
@@ -114,6 +146,7 @@ async fn handle_socks5(
     mut stream: TcpStream,
     outbound: SharedOutbound,
     stats: ProxyStats,
+    fakeip: Option<Arc<FakeIpPool>>,
 ) -> Result<()> {
     let (cmd, host, port) = tokio::time::timeout(super::PROXY_HANDSHAKE_TIMEOUT, async {
         // --- Auth Negotiation ---
@@ -156,10 +189,18 @@ async fn handle_socks5(
     match cmd {
         0x01 => {
             // CONNECT
+            let (host, original_ip) = match restore_destination(&host, fakeip.as_deref()) {
+                Ok(target) => target,
+                Err(error) => {
+                    stream.write_all(&socks5_reply(0x04)).await?;
+                    return Err(error);
+                }
+            };
             tracing::debug!("SOCKS5 CONNECT to {}:{}", host, port);
             let connection = stats.track(format!("{}:{}", host, port), "SOCKS5");
 
-            match connect_upstream(&outbound, &host, port).await {
+            let connect = connect_upstream(&outbound, &host, port);
+            match super::routing::with_tun_family(original_ip, connect).await {
                 Ok(mut remote) => {
                     stream.write_all(&socks5_reply(0x00)).await?; // success
                     let (up, down) =
@@ -192,7 +233,7 @@ async fn handle_socks5(
             bail!("SOCKS5 BIND not supported");
         }
         0x03 => {
-            super::socks_udp::serve(stream, outbound, host, port, stats).await?;
+            super::socks_udp::serve(stream, outbound, host, port, stats, fakeip.as_deref()).await?;
         }
         _ => {
             stream.write_all(&socks5_reply(0x07)).await?;
@@ -207,8 +248,98 @@ async fn handle_socks5(
 mod tests {
     use super::*;
     use crate::proxy::connector::DirectOutbound;
-    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn connect_and_udp_restore_fake_destinations_before_routing() {
+        use crate::proxy::connector::{BoxProxyStream, Outbound};
+        use crate::proxy::datagram::{BoxDatagram, DatagramFuture};
+        use crate::proxy::routing::{TunFamily, tun_family};
+        use tokio::sync::mpsc;
+
+        struct Recorder(mpsc::UnboundedSender<(String, Option<TunFamily>)>);
+        impl Outbound for Recorder {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+            fn connect(&self, host: &str, _: u16) -> DatagramFuture<'_, BoxProxyStream> {
+                self.0.send((host.to_owned(), tun_family())).unwrap();
+                Box::pin(async { bail!("recorded") })
+            }
+            fn connect_datagram(&self, host: &str, _: u16) -> DatagramFuture<'_, BoxDatagram> {
+                self.0.send((host.to_owned(), tun_family())).unwrap();
+                Box::pin(async { bail!("recorded") })
+            }
+        }
+        async fn request(port: u16, cmd: u8, address: &[u8]) -> (TcpStream, [u8; 10]) {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut bytes = vec![5, 1, 0, 5, cmd, 0];
+            bytes.extend_from_slice(address);
+            stream.write_all(&bytes).await.unwrap();
+            let mut auth = [0; 2];
+            stream.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth, [5, 0]);
+            let mut reply = [0; 10];
+            stream.read_exact(&mut reply).await.unwrap();
+            (stream, reply)
+        }
+
+        let pool = FakeIpPool::new();
+        let domain = "chat.example.test";
+        let v4 = pool.allocate(domain);
+        let v6 = pool.allocate_v6(domain);
+        let (tx, mut seen) = mpsc::unbounded_channel();
+        let server = Socks5Server::bind(
+            "127.0.0.1",
+            0,
+            SharedOutbound(Arc::new(Recorder(tx))),
+            ProxyStats::default(),
+        )
+        .await
+        .unwrap();
+        let port = server.local_port();
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(server.run_with_fakeip(rx, Some(pool)));
+        let (control, relay) = request(port, 3, &[1, 0, 0, 0, 0, 0, 0]).await;
+        assert_eq!(relay[1], 0);
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = u16::from_be_bytes([relay[8], relay[9]]);
+        for (atyp, octets, host, family) in [
+            (1, v4.octets().to_vec(), domain, Some(TunFamily::V4)),
+            (4, v6.octets().to_vec(), domain, Some(TunFamily::V6)),
+            (1, vec![192, 0, 2, 1], "192.0.2.1", None),
+            (
+                3,
+                [vec![domain.len() as u8], domain.as_bytes().to_vec()].concat(),
+                domain,
+                None,
+            ),
+        ] {
+            let mut address = vec![atyp];
+            address.extend(octets);
+            address.extend(443u16.to_be_bytes());
+            let (_, reply) = request(port, 1, &address).await;
+            assert_eq!(reply[1], 4);
+            assert_eq!(seen.try_recv().unwrap(), (host.into(), family));
+            let mut packet = vec![0; 3];
+            packet.extend(address);
+            packet.push(42);
+            udp.send_to(&packet, ("127.0.0.1", relay_port))
+                .await
+                .unwrap();
+            let target = tokio::time::timeout(std::time::Duration::from_secs(2), seen.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(target, (host.into(), family));
+        }
+        let (_, unknown) = request(port, 1, &[1, 198, 18, 255, 1, 1, 187]).await;
+        assert_eq!(unknown[1], 4);
+        assert!(seen.try_recv().is_err());
+        drop(control);
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
 
     /// Helper: start a simple echo server.
     async fn echo_server() -> (u16, tokio::task::JoinHandle<()>) {

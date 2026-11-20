@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use super::model::{AppConfig, BuiltinRoute, DeviceRuleGroup, Node, ProxyMode, RoutingRule};
 use crate::dns::{DnsConfig, DnsGroup, DnsServer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +308,43 @@ impl DnsSettings {
         Ok(())
     }
 
+    pub fn resolver_for_app(&self, app: &AppConfig) -> Result<DnsConfig> {
+        self.resolver_for_routing(
+            &app.nodes,
+            &app.proxy_mode,
+            app.builtin_route,
+            &app.rules,
+            &app.device_rule_groups,
+        )
+    }
+
+    /// LAN clients share a DNS answer before their source and destination port
+    /// reach the router. A device binding or explicit proxy/reject destination
+    /// keeps the existing DNS policy for those shared answers.
+    pub fn resolver_for_routing(
+        &self,
+        nodes: &[Node],
+        mode: &ProxyMode,
+        builtin: BuiltinRoute,
+        rules: &[RoutingRule],
+        links: &[DeviceRuleGroup],
+    ) -> Result<DnsConfig> {
+        let mut dns = self.resolver_config(nodes.iter().map(|node| node.server.clone()))?;
+        dns.prefer_cn_answers = *mode == ProxyMode::Rule
+            && builtin == BuiltinRoute::Direct
+            && links.iter().all(|link| {
+                link.source.is_empty()
+                    && (link.target.is_empty() || link.target.eq_ignore_ascii_case("direct"))
+            })
+            && rules.iter().filter(|rule| rule.enabled).all(|rule| {
+                rule.source.is_empty()
+                    && (rule.target.eq_ignore_ascii_case("direct")
+                        || (!rule.is_global_destination()
+                            && rule.target.eq_ignore_ascii_case("proxy")))
+            });
+        Ok(dns)
+    }
+
     pub fn resolver_config(&self, node_hosts: impl Iterator<Item = String>) -> Result<DnsConfig> {
         self.validate()?;
         let mut config = crate::dns::china_split_dns_config();
@@ -380,6 +418,52 @@ impl DnsSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cn_preference_follows_routing_changes_and_the_merlin_template() {
+        let settings = DnsSettings::default();
+        let prefers_cn = |app: &AppConfig| settings.resolver_for_app(app).unwrap().prefer_cn_answers;
+        assert!(prefers_cn(&AppConfig::default()));
+        let mut app =
+            AppConfig::from_yaml_str(include_str!("../../../../merlin/config.yaml.template")).unwrap();
+        assert!(prefers_cn(&app));
+
+        for mode in [ProxyMode::Global, ProxyMode::Direct] {
+            app.proxy_mode = mode;
+            assert!(!prefers_cn(&app));
+        }
+        app.proxy_mode = ProxyMode::Rule;
+        app.builtin_route = BuiltinRoute::Reject;
+        assert!(!prefers_cn(&app));
+        app.builtin_route = BuiltinRoute::Direct;
+        for target in ["proxy", "reject", "group:custom"] {
+            app.device_rule_groups[0].target = target.into();
+            assert!(!prefers_cn(&app));
+        }
+        app.device_rule_groups[0].target = "direct".into();
+        app.device_rule_groups[0].source = "192.0.2.1/32".into();
+        assert!(!prefers_cn(&app));
+        app.device_rule_groups[0].source.clear();
+        assert!(prefers_cn(&app));
+
+        let mut override_rule = app.rules[0].clone();
+        override_rule.group.clear();
+        for (kind, pattern, target) in [
+            ("domain", "example.com", "proxy"),
+            ("ip-cidr", "203.0.113.0/24", "reject"),
+            ("dst-port", "443", "group:custom"),
+        ] {
+            override_rule.rule_type = kind.into();
+            override_rule.pattern = pattern.into();
+            override_rule.target = target.into();
+            app.rules.push(override_rule.clone());
+            assert!(!prefers_cn(&app));
+            app.rules.pop();
+        }
+        override_rule.enabled = false;
+        app.rules.push(override_rule);
+        assert!(prefers_cn(&app));
+    }
+
     #[test]
     fn legacy_migration_explicit_override_and_private_errors() {
         let value = serde_yaml::from_str(

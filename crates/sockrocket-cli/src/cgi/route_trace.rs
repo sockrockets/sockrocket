@@ -183,8 +183,7 @@ pub(super) fn act_trace_route(post: &J) -> J {
                 let raw = Y::Mapping(map.clone());
                 let settings = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw)?;
                 let config = sockrocket_core::AppConfig::decode_yaml_fields(raw)?;
-                let dns = settings
-                    .resolver_config(config.nodes.iter().map(|node| node.server.clone()))?;
+                let dns = settings.resolver_for_app(&config)?;
                 let mut resolver = sockrocket_core::DnsResolver::with_config(dns);
                 let outbound = match config.nodes.get(config.active_node.unwrap_or(0)) {
                     Some(node) => sockrocket_core::create_outbound_unwarmed(node)?,

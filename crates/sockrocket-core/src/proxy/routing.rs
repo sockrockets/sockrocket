@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,14 +12,37 @@ use crate::router::{RouteAction, Router};
 // and is never inherited by detached DNS/health tasks or read from HTTP headers.
 tokio::task_local! { static CLIENT_SOURCE: Option<std::net::IpAddr>; }
 tokio::task_local! { static TUN_DESTINATION: (Option<std::net::IpAddr>, bool); }
-tokio::task_local! { static TUN_IPV6: bool; }
-pub(crate) fn tun_ipv6() -> bool {
-    TUN_IPV6.try_with(|value| *value).unwrap_or(false)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TunFamily {
+    V4,
+    V6,
+}
+
+impl TunFamily {
+    pub(crate) fn matches(self, ip: IpAddr) -> bool {
+        matches!(
+            (self, ip),
+            (Self::V4, IpAddr::V4(_)) | (Self::V6, IpAddr::V6(_))
+        )
+    }
+}
+
+tokio::task_local! { static TUN_FAMILY: Option<TunFamily>; }
+pub(crate) fn tun_family() -> Option<TunFamily> {
+    TUN_FAMILY.try_with(|family| *family).ok().flatten()
 }
 // Return the Tokio scope directly: an async wrapper retains both its input
 // future and scoped await state, multiplying large TUN frames at each layer.
-pub(crate) fn with_tun_family<F: Future>(ipv6: bool, future: F) -> impl Future<Output = F::Output> {
-    TUN_IPV6.scope(ipv6, future)
+pub(crate) fn with_tun_family<F: Future>(
+    destination: Option<IpAddr>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    let family = match destination {
+        Some(IpAddr::V6(_)) => Some(TunFamily::V6),
+        Some(IpAddr::V4(ip)) if crate::dns::fakeip::is_fake_ip(ip) => Some(TunFamily::V4),
+        _ => None,
+    };
+    TUN_FAMILY.scope(family, future)
 }
 pub(crate) fn tun_destination() -> (Option<std::net::IpAddr>, bool) {
     TUN_DESTINATION
@@ -88,6 +112,12 @@ impl RoutingOutbound {
 }
 
 impl RoutingOutbound {
+    #[cfg(test)]
+    pub(super) fn with_test_direct(mut self, direct: SharedOutbound) -> Self {
+        self.direct_outbound = direct;
+        self
+    }
+
     pub fn with_groups(
         mut self,
         groups: &[crate::config::model::ProxyGroupConfig],
@@ -119,10 +149,10 @@ impl Outbound for RoutingOutbound {
         // so it cannot borrow the caller's `host` string.
         let host = host.to_string();
         Box::pin(async move {
-            let action = self.router.route_resolving(&host, port).await;
-            tracing::debug!("Route: {}:{} -> {:?}", host, port, action);
+            let decision = self.router.decision_resolving(&host, port).await;
+            tracing::debug!("Route: {}:{} -> {:?}", host, port, decision.action);
 
-            match action {
+            match decision.action {
                 RouteAction::Proxy => {
                     if let Some(target) = crate::traffic::active_traffic_target() {
                         crate::traffic::note_traffic(target);
@@ -133,7 +163,14 @@ impl Outbound for RoutingOutbound {
                 RouteAction::Node(id) => self.node(&id)?.0.connect(&host, port).await,
                 RouteAction::Direct => {
                     crate::traffic::note_traffic(crate::traffic::direct_traffic_target());
-                    self.direct_outbound.0.connect(&host, port).await
+                    if decision.direct_ips.is_empty() {
+                        self.direct_outbound.0.connect(&host, port).await
+                    } else {
+                        self.direct_outbound
+                            .0
+                            .connect_ips(&decision.direct_ips, port)
+                            .await
+                    }
                 }
                 RouteAction::Reject => {
                     anyhow::bail!("Connection rejected by routing rule: {}:{}", host, port)
@@ -149,10 +186,32 @@ impl Outbound for RoutingOutbound {
     ) -> super::datagram::DatagramFuture<'_, super::datagram::BoxDatagram> {
         let host = host.to_owned();
         Box::pin(async move {
-            match self.router.route_resolving(&host, port).await {
+            let decision = self.router.decision_resolving(&host, port).await;
+            match decision.action {
                 RouteAction::Direct => {
                     crate::traffic::note_traffic(crate::traffic::direct_traffic_target());
-                    self.direct_outbound.0.connect_datagram(&host, port).await
+                    let Some((last, earlier)) = decision.direct_ips.split_last() else {
+                        return self.direct_outbound.0.connect_datagram(&host, port).await;
+                    };
+                    // Only association setup may advance to the next address.
+                    // A successful socket retains one peer for its entire lifetime.
+                    tokio::time::timeout(super::connector::UPSTREAM_CONNECT_TIMEOUT, async {
+                        for ip in earlier {
+                            if let Ok(socket) = self
+                                .direct_outbound
+                                .0
+                                .connect_datagram(&ip.to_string(), port)
+                                .await
+                            {
+                                return Ok(socket);
+                            }
+                        }
+                        self.direct_outbound
+                            .0
+                            .connect_datagram(&last.to_string(), port)
+                            .await
+                    })
+                    .await?
                 }
                 RouteAction::Proxy => {
                     if let Some(target) = crate::traffic::active_traffic_target() {
@@ -216,6 +275,70 @@ mod tests {
         let second = Arc::new(Router::new(RuleSet::new()));
         state.replace(Some(second.clone()));
         assert!(Arc::ptr_eq(&reader.snapshot().unwrap(), &second));
+    }
+
+    #[tokio::test]
+    async fn failed_direct_candidates_never_retry_other_answers_or_the_hostname() {
+        use super::super::datagram::{BoxDatagram, DatagramFuture};
+        use crate::dns::{DnsConfig, DnsResolver};
+
+        #[derive(Default)]
+        struct Refusals(std::sync::Mutex<Vec<String>>);
+        impl Refusals {
+            fn refuse<T: 'static>(&self, host: &str) -> DatagramFuture<'_, T> {
+                self.0.lock().unwrap().push(host.to_owned());
+                let message = format!("unreachable {host}");
+                Box::pin(async move { anyhow::bail!(message) })
+            }
+        }
+        impl Outbound for Refusals {
+            fn connect(&self, host: &str, _: u16) -> DatagramFuture<'_, BoxProxyStream> {
+                self.refuse(host)
+            }
+            fn connect_datagram(&self, host: &str, _: u16) -> DatagramFuture<'_, BoxDatagram> {
+                self.refuse(host)
+            }
+            fn name(&self) -> &str {
+                "refusals"
+            }
+        }
+
+        let direct = Arc::new(Refusals::default());
+        let proxy = Arc::new(Refusals::default());
+        let mut rules = RuleSet::new();
+        rules.add_rule(
+            MatchRule::IpCidr {
+                addr: "192.0.2.0".parse().unwrap(),
+                prefix_len: 24,
+            },
+            RouteAction::Direct,
+        );
+        let outbound = RoutingOutbound::new(
+            Arc::new(Router::new(rules)),
+            SharedOutbound(proxy.clone()),
+        )
+        .with_test_direct(SharedOutbound(direct.clone()));
+        let host = "mixed.example";
+        let mut config = DnsConfig::default();
+        config.hosts.insert(
+            host.into(),
+            ["198.51.100.1", "192.0.2.2", "203.0.113.3", "192.0.2.4"]
+                .map(|ip| ip.parse().unwrap())
+                .to_vec(),
+        );
+        DnsResolver::with_config(config)
+            .scope(async {
+                let tcp = outbound.connect(host, 443).await.err().unwrap();
+                let udp = outbound.connect_datagram(host, 443).await.err().unwrap();
+                assert_eq!(tcp.to_string(), "unreachable 192.0.2.4");
+                assert_eq!(udp.to_string(), tcp.to_string());
+            })
+            .await;
+        assert_eq!(
+            *direct.0.lock().unwrap(),
+            ["192.0.2.2", "192.0.2.4", "192.0.2.2", "192.0.2.4"]
+        );
+        assert!(proxy.0.lock().unwrap().is_empty());
     }
 
     struct Tagged(&'static str);
@@ -504,7 +627,7 @@ mod async_context_memory_review {
                 tun_destination(),
                 (Some("198.51.100.7".parse().unwrap()), true)
             );
-            assert!(tun_ipv6());
+            assert_eq!(tun_family(), Some(TunFamily::V6));
         };
         let inner = std::mem::size_of_val(&future);
         let scoped = crate::traffic::with_traffic_scope(with_client_source(
@@ -512,7 +635,7 @@ mod async_context_memory_review {
             with_tun_destination(
                 Some("198.51.100.7".parse().unwrap()),
                 true,
-                with_tun_family(true, future),
+                with_tun_family(Some("2001:db8::1".parse().unwrap()), future),
             ),
         ));
         let actual = std::mem::size_of_val(&scoped);
@@ -524,6 +647,6 @@ mod async_context_memory_review {
         scoped.await;
         assert_eq!(client_source(), None);
         assert_eq!(tun_destination(), (None, false));
-        assert!(!tun_ipv6());
+        assert_eq!(tun_family(), None);
     }
 }

@@ -445,6 +445,19 @@ pub(crate) fn apply_proxy_mode(
 }
 
 impl AppState {
+    fn desktop_dns_config(
+        &self,
+        settings: &sockrocket_core::config::dns::DnsSettings,
+    ) -> anyhow::Result<sockrocket_core::DnsConfig> {
+        settings.resolver_for_routing(
+            &self.nodes,
+            &self.proxy_mode,
+            self.builtin_route,
+            &self.rules,
+            &self.device_rule_groups,
+        )
+    }
+
     fn desktop_ruleset(&self) -> sockrocket_core::router::RuleSet {
         let shared: Vec<_> = self
             .device_rule_groups
@@ -1560,7 +1573,7 @@ impl AppState {
             cx.notify();
             return;
         }
-        match settings.resolver_config(self.nodes.iter().map(|n| n.server.clone())) {
+        match self.desktop_dns_config(&settings) {
             Ok(config) => swappable.publish(final_outbound, std::sync::Arc::new(config)),
             Err(error) => {
                 self.proxy_status = format!("DNS configuration error: {error}");
@@ -2958,7 +2971,7 @@ impl AppState {
             cx.notify();
             return;
         }
-        match settings.resolver_config(self.nodes.iter().map(|n| n.server.clone())) {
+        match self.desktop_dns_config(&settings) {
             Ok(config) => tun_swappable.publish(final_outbound, std::sync::Arc::new(config)),
             Err(error) => {
                 self.tun_status = format!("DNS configuration error: {error}");
@@ -3347,8 +3360,7 @@ impl AppState {
             }
         }
         let settings = self.dns.clone().unwrap_or_default();
-        let Ok(dns_config) = settings.resolver_config(self.nodes.iter().map(|n| n.server.clone()))
-        else {
+        let Ok(dns_config) = self.desktop_dns_config(&settings) else {
             return false;
         };
         if sockrocket_core::dns::configure_bootstrap(

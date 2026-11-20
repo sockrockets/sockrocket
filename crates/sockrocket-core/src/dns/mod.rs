@@ -6,6 +6,7 @@
 //! - DNS-over-HTTPS (DoH) via standard wireformat
 //! - DNS split: route China domains to local DNS, others to remote DNS
 
+mod cn_preference;
 pub mod fakeip;
 #[cfg(test)]
 mod integration_tests;
@@ -20,8 +21,9 @@ mod runtime;
 mod upstream;
 pub use runtime::configure_bootstrap;
 pub(crate) use runtime::{
-    bootstrap_is_default, bootstrap_resolver, direct_resolver, scoped_direct_resolve,
-    scoped_resolve, with_direct_destination, with_resolver,
+    bootstrap_is_default, bootstrap_resolver, direct_destination_family, direct_resolver,
+    scoped_direct_resolve, scoped_resolve, scoped_resolve_for_family, with_direct_destination,
+    with_resolver,
 };
 pub(crate) mod wire;
 pub use wire::{
@@ -42,6 +44,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::proxy::connector::{BoxProxyStream, SharedOutbound, connect_upstream};
+use crate::proxy::routing::TunFamily;
 use crate::router::GeoIpDb;
 
 use self::fakeip::FakeIpPool;
@@ -55,6 +58,9 @@ pub struct DnsConfig {
     pub node_hosts: std::collections::HashSet<String>,
     pub client_ipv4_only: bool,
     pub dual_stack_fakeip: bool,
+    /// In default rule mode, look for a public mainland address on the direct
+    /// upstream when the primary returned only overseas addresses.
+    pub prefer_cn_answers: bool,
     /// Explicit proxy group. None retains the historical runtime defaults.
     pub proxy_servers: Option<Vec<DnsServer>>,
     pub strategy: crate::config::dns::AddressStrategy,
@@ -85,6 +91,7 @@ impl Default for DnsConfig {
             node_hosts: Default::default(),
             client_ipv4_only: false,
             dual_stack_fakeip: false,
+            prefer_cn_answers: false,
             proxy_servers: None,
             strategy: Default::default(),
             cache_capacity: DNS_CACHE_MAX_ENTRIES,
@@ -684,6 +691,15 @@ impl DnsResolver {
         domain: &str,
         qtype: u16,
     ) -> Result<Vec<IpAddr>> {
+        self.resolve_qtype_for_family(domain, qtype, None).await
+    }
+
+    pub(crate) async fn resolve_qtype_for_family(
+        &self,
+        domain: &str,
+        qtype: u16,
+        family: Option<TunFamily>,
+    ) -> Result<Vec<IpAddr>> {
         // DNS names are case-insensitive. Canonicalize before policy, cache
         // and fake-IP lookup so uppercase/trailing-dot names cannot bypass
         // the domestic group or create unrelated cache entries.
@@ -696,7 +712,23 @@ impl DnsResolver {
         {
             bail!("Invalid DNS name length");
         }
-        self.resolve_qtype_inner(&canonical, qtype).await
+        use crate::config::dns::AddressStrategy;
+        // An IPv4-only client may have been issued a Fake-A even under Ipv6Only.
+        // Mirror that wire policy only for the restored IPv4 destination.
+        if matches!(
+            (self.config.strategy, qtype),
+            (AddressStrategy::Ipv4Only, QTYPE_AAAA)
+        ) || (self.config.strategy == AddressStrategy::Ipv6Only
+            && qtype == QTYPE_A
+            && !(self.client_ipv4_only && family == Some(TunFamily::V4)))
+        {
+            return Ok(Vec::new());
+        }
+        let mut addresses = self.resolve_qtype_inner(&canonical, qtype).await?;
+        if family.is_some() {
+            addresses.retain(|ip| fakeip::fake_ipv4(*ip).is_none());
+        }
+        Ok(addresses)
     }
 
     fn hosts_answer(&self, domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
@@ -717,13 +749,6 @@ impl DnsResolver {
     /// Inner resolution path: IP-literal short-circuit, fake-IP hook,
     /// cache, dedup. See [`Self::resolve_with_qtype`] for the contract.
     async fn resolve_qtype_inner(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        use crate::config::dns::AddressStrategy;
-        if matches!(
-            (self.config.strategy, qtype),
-            (AddressStrategy::Ipv4Only, 28) | (AddressStrategy::Ipv6Only, 1)
-        ) {
-            return Ok(Vec::new());
-        }
         let direct_pool = self
             .fakeip
             .as_ref()
@@ -740,6 +765,18 @@ impl DnsResolver {
                 (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_)) => vec![ip],
                 _ => vec![],
             });
+        }
+
+        if self.can_prefer_cn(domain, qtype) {
+            let query = build_dns_query(domain, qtype);
+            let reply = self.cn_preferred_reply(&query, domain, qtype).await?;
+            return Ok(parse_dns_response(&reply)?
+                .into_iter()
+                .filter(|ip| {
+                    (qtype == QTYPE_A && ip.is_ipv4()) || (qtype == QTYPE_AAAA && ip.is_ipv6())
+                })
+                .take(128)
+                .collect());
         }
 
         // Fake-IP interception (transparent proxy) for Primary-group names.
@@ -983,10 +1020,16 @@ impl DnsResolver {
     }
 
     /// Families to dial for a request with a frozen DNS policy.
-    pub(crate) fn dial_query_types(&self, tun_ipv6: bool) -> (u16, Option<u16>) {
+    pub(crate) fn dial_query_types(&self, family: Option<TunFamily>) -> (u16, Option<u16>) {
         use crate::config::dns::AddressStrategy::*;
-        if tun_ipv6 {
-            return (QTYPE_AAAA, None);
+        if let Some(family) = family {
+            return (
+                match family {
+                    TunFamily::V4 => QTYPE_A,
+                    TunFamily::V6 => QTYPE_AAAA,
+                },
+                None,
+            );
         }
         match self.config.strategy {
             Ipv4Only => (QTYPE_A, None),
@@ -998,23 +1041,36 @@ impl DnsResolver {
 
     /// Real addresses in configured order; resolution does not allocate Fake-IP.
     pub async fn resolve_addresses(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        self.resolve_addresses_for_family(domain, None).await
+    }
+
+    async fn resolve_addresses_for_family(
+        &self,
+        domain: &str,
+        family: Option<TunFamily>,
+    ) -> Result<Vec<IpAddr>> {
         let mut snapshot = self.query_snapshot();
         snapshot.fakeip = None;
-        let (a, aaaa) = tokio::join!(
-            snapshot.resolve_qtype_snapshot(domain, 1),
-            snapshot.resolve_qtype_snapshot(domain, 28)
+        let (first, other) = snapshot.dial_query_types(family);
+        let Some(other) = other else {
+            let ips = snapshot
+                .resolve_qtype_for_family(domain, first, family)
+                .await?;
+            anyhow::ensure!(
+                !ips.is_empty(),
+                "DNS returned no addresses for configured family"
+            );
+            return Ok(ips);
+        };
+        let (preferred, alternate) = tokio::join!(
+            snapshot.resolve_qtype_snapshot(domain, first),
+            snapshot.resolve_qtype_snapshot(domain, other)
         );
-        let mut ips: Vec<_> = a
+        let ips: Vec<_> = preferred
             .into_iter()
             .flatten()
-            .chain(aaaa.into_iter().flatten())
+            .chain(alternate.into_iter().flatten())
             .collect();
-        let prefer_v6 = matches!(
-            snapshot.config.strategy,
-            crate::config::dns::AddressStrategy::PreferIpv6
-                | crate::config::dns::AddressStrategy::Ipv6Only
-        );
-        ips.sort_by_key(|ip| ip.is_ipv6() != prefer_v6);
         anyhow::ensure!(
             !ips.is_empty(),
             "DNS returned no addresses for configured strategy"
@@ -1141,17 +1197,30 @@ pub fn china_domain_suffixes() -> Vec<String> {
 /// Used when system DNS would return a Sockrocket fake-IP (Merlin LAN
 /// hijack loops back into this daemon) and GeoIP needs a real address.
 pub(crate) async fn lookup_a_udp(server: SocketAddr, domain: &str) -> Option<IpAddr> {
-    let query = build_dns_query(domain, QTYPE_A);
-    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    crate::proxy::outbound_bind::apply_to_udp_socket(&socket, server.is_ipv6()).ok()?;
-    socket.send_to(&query, server).await.ok()?;
-    let mut buf = [0u8; 512];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+    lookup_ips_udp(server, domain, QTYPE_A)
         .await
         .ok()?
-        .ok()?;
-    let addrs = parse_dns_response(&buf[..n]).ok()?;
-    addrs.into_iter().find(|a| a.is_ipv4())
+        .into_iter()
+        .next()
+}
+
+/// Query one nameserver directly when the system resolver only returned synthetic addresses.
+pub(crate) async fn lookup_ips_udp(
+    server: SocketAddr,
+    domain: &str,
+    qtype: u16,
+) -> Result<Vec<IpAddr>> {
+    let query = build_dns_query(domain, qtype);
+    let socket = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+    crate::proxy::outbound_bind::apply_to_udp_socket(&socket, server.is_ipv6())?;
+    socket.connect(server).await?;
+    socket.send(&query).await?;
+    let mut buf = [0u8; 4096];
+    let size = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf)).await??;
+    validate_response(&query, &buf[..size])?;
+    let mut ips = parse_dns_response(&buf[..size])?;
+    ips.retain(|ip| matches!((qtype, ip), (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))));
+    Ok(ips)
 }
 
 /// Create a DnsConfig with China DNS splitting.
@@ -1260,6 +1329,9 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
             );
         }
         return build_dns_response_with_ttl(query, &addresses, 5);
+    }
+    if resolver.can_prefer_cn(&domain, qtype) && !cn_preference::requests_dnssec(query) {
+        return resolver.cn_preferred_reply(query, &domain, qtype).await;
     }
     let Some(pool) = &resolver.fakeip else {
         return resolver.exchange_raw(query).await;

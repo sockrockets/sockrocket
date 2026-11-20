@@ -22,6 +22,8 @@ use crate::dns::DnsResolver;
 use crate::dns::fakeip::FakeIpPool;
 use crate::router::Router;
 
+#[cfg(test)]
+mod cdn_routing_tests;
 pub mod mtu;
 
 // ─── Global TUN exit state for emergency cleanup ───
@@ -980,7 +982,7 @@ async fn handle_tun_stream(
             real_destination,
             names.domestic.is_some(),
             super::routing::with_tun_family(
-                destination.is_some_and(|ip| ip.is_ipv6()),
+                destination,
                 handle_tun_stream_inner(stream, outbound, names, router, stats, pressure),
             ),
         ),
@@ -3480,6 +3482,80 @@ pub async fn ensure_wintun_dll() -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovered_fake_family_controls_route_and_direct_dials() {
+        use crate::config::dns::AddressStrategy::{Ipv6Only, PreferIpv4, PreferIpv6};
+        use crate::dns::{
+            DnsConfig, direct_resolver, scoped_direct_resolve, with_direct_destination,
+        };
+        use crate::router::{MatchRule, RouteAction, RuleSet};
+
+        let host = "dual.test";
+        let real_v4: IpAddr = "192.0.2.10".parse().unwrap();
+        let real_v6: IpAddr = "2001:db8::10".parse().unwrap();
+        let pool = FakeIpPool::new();
+        let fake_v4 = IpAddr::V4(pool.allocate(host));
+        let fake_v6 = IpAddr::V6(pool.allocate_v6(host));
+        let names = TunDnsTarget {
+            pool: Some(&pool),
+            domestic: None,
+        };
+        let mut rules = RuleSet::new();
+        rules.add_rule(
+            MatchRule::IpCidr {
+                addr: real_v4,
+                prefix_len: 32,
+            },
+            RouteAction::Direct,
+        );
+        rules.add_rule(MatchRule::MatchAll, RouteAction::Proxy);
+        let router = Router::new(rules);
+        for (strategy, client_ipv4_only, token, real, action, qtype) in [
+            (PreferIpv6, false, fake_v4, real_v4, RouteAction::Direct, 1),
+            (PreferIpv4, false, fake_v6, real_v6, RouteAction::Proxy, 28),
+            (Ipv6Only, true, fake_v4, real_v4, RouteAction::Direct, 1),
+        ] {
+            let mut resolver = DnsResolver::with_config(DnsConfig {
+                hosts: [(host.to_owned(), vec![fake_v6, fake_v4, real_v6, real_v4])]
+                    .into_iter()
+                    .collect(),
+                strategy,
+                client_ipv4_only,
+                ..Default::default()
+            });
+            resolver.set_fakeip(pool.clone());
+            let name = names.dial_host(token, Some(&router)).unwrap();
+            assert_eq!(name, host);
+            resolver
+                .scope(super::super::routing::with_tun_family(Some(token), async {
+                    assert_eq!(router.route_resolving(&name, 443).await, action);
+                    with_direct_destination(&name, async {
+                        assert_eq!(scoped_direct_resolve(&name).await.unwrap().unwrap(), [real]);
+                        let (resolver, family) = direct_resolver(&name).unwrap();
+                        assert_eq!(resolver.dial_query_types(family), (qtype, None));
+                        assert_eq!(
+                            resolver
+                                .resolve_qtype_for_family(&name, qtype, family)
+                                .await
+                                .unwrap(),
+                            [real]
+                        );
+                    })
+                    .await;
+                }))
+                .await;
+            if client_ipv4_only {
+                assert!(
+                    resolver
+                        .resolve_with_qtype(host, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_tun_supported() {

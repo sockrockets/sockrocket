@@ -20,6 +20,7 @@ use crate::config::model::{RealityConfig, TlsConfig, TransportConfig, TransportT
 
 use super::connector::BoxProxyStream;
 use super::pool::ConnFactory;
+use super::routing::TunFamily;
 
 /// Default timeout for TCP connect + TLS handshake.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -160,9 +161,9 @@ async fn connect_tcp_inner(addr: &str, proxy_endpoint: bool) -> Result<TcpStream
                     .await
                     .context("Proxy server DNS lookup failed")?,
             )
-        } else if let Some((resolver, ipv6_only)) = crate::dns::direct_resolver(bare) {
+        } else if let Some((resolver, family)) = crate::dns::direct_resolver(bare) {
             // The scoped direct policy owns both lookups, including their failures.
-            return connect_direct_families(&resolver, bare, port, ipv6_only).await;
+            return connect_direct_families(&resolver, bare, port, family).await;
         } else {
             resolve_server_ips(host).await
         };
@@ -195,9 +196,9 @@ async fn connect_direct_families(
     resolver: &crate::dns::DnsResolver,
     host: &str,
     port: u16,
-    ipv6_only: bool,
+    family: Option<TunFamily>,
 ) -> Result<TcpStream> {
-    let (first, other) = resolver.dial_query_types(ipv6_only);
+    let (first, other) = resolver.dial_query_types(family);
     let dial = |ips: Vec<IpAddr>| async move {
         let addrs: Vec<_> = ips
             .into_iter()
@@ -205,7 +206,14 @@ async fn connect_direct_families(
             .collect();
         Ok::<_, anyhow::Error>(connect_staggered(&addrs).await?)
     };
-    let preferred = async { dial(resolver.resolve_qtype_snapshot(host, first).await?).await };
+    let preferred = async {
+        dial(
+            resolver
+                .resolve_qtype_for_family(host, first, family)
+                .await?,
+        )
+        .await
+    };
     let Some(other) = other else {
         return preferred.await;
     };
@@ -592,7 +600,26 @@ fn finish_reality_probe(server: &str, port: u16, notify: Arc<tokio::sync::Notify
 /// 60s cache. Returns `None` on any failure (callers fall back to the
 /// uncached path).
 pub(crate) async fn resolve_server_ips(host: &str) -> Option<Vec<IpAddr>> {
-    resolve_host_ips(host, false).await
+    let ips = resolve_host_ips(host, false).await;
+    // Public listeners may run without a request DNS policy. Apply the pin
+    // after the shared host cache so a flow cannot change bootstrap answers.
+    let Some(family) = crate::dns::direct_destination_family(host) else {
+        return ips;
+    };
+    let bare = host.trim_matches(['[', ']']);
+    if bare.parse::<IpAddr>().is_ok() {
+        return ips;
+    }
+    let ips = match ips {
+        Some(ips) => ips,
+        None if crate::dns::bootstrap_resolver(bare).is_some_and(|(_, node)| node) => Vec::new(),
+        None => resolve_via_system(bare).await.unwrap_or_default(),
+    };
+    Some(
+        ips.into_iter()
+            .filter(|ip| family.matches(*ip) && crate::dns::fakeip::fake_ipv4(*ip).is_none())
+            .collect(),
+    )
 }
 
 async fn resolve_host_ips(host: &str, proxy_endpoint: bool) -> Option<Vec<IpAddr>> {
@@ -607,7 +634,9 @@ async fn resolve_host_ips(host: &str, proxy_endpoint: bool) -> Option<Vec<IpAddr
     // Destinations follow per-request DNS policy. Node hostnames do not: they
     // must resolve the same way whatever flow first dials them.
     if !node_host
-        && let Some(Ok(ips)) = crate::dns::scoped_resolve(host).await
+        && let Some(Ok(ips)) =
+            crate::dns::scoped_resolve_for_family(host, crate::dns::direct_destination_family(host))
+                .await
         && !ips.is_empty()
     {
         return Some(ips);
@@ -1560,6 +1589,29 @@ impl ConnFactory for TlsConnFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovered_fake_family_filters_only_direct_fallback() {
+        let host = "family-fallback-cache.invalid";
+        let real_v4: IpAddr = "192.0.2.10".parse().unwrap();
+        let real_v6: IpAddr = "2001:db8::10".parse().unwrap();
+        server_addr_cache().insert(host, vec![real_v6, real_v4], Instant::now());
+        for (token, real) in [
+            ("198.18.1.1".parse().unwrap(), real_v4),
+            ("2001:2:0:4765::c612:101".parse().unwrap(), real_v6),
+        ] {
+            super::super::routing::with_tun_family(Some(token), async {
+                assert_eq!(
+                    crate::dns::with_direct_destination(host, resolve_server_ips(host))
+                        .await
+                        .unwrap(),
+                    [real]
+                );
+                assert_eq!(resolve_server_ips(host).await.unwrap(), [real_v6, real_v4]);
+            })
+            .await;
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn dial_family_stagger_allows_early_winners_and_fast_failure() {

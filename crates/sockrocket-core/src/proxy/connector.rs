@@ -23,6 +23,25 @@ pub trait Outbound: Send + Sync + 'static {
         port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + '_>>;
 
+    /// Direct dials constrained by an IP-based routing rule. An established
+    /// connection must target one of these addresses without resolving the name.
+    fn connect_ips<'a>(
+        &'a self,
+        ips: &'a [std::net::IpAddr],
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut last = None;
+            for ip in ips {
+                match self.connect(&ip.to_string(), port).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last = Some(error),
+                }
+            }
+            Err(last.unwrap_or_else(|| anyhow::anyhow!("No matching destination address")))
+        })
+    }
+
     /// One stable decision object per accepted request.
     fn runtime_snapshot(&self) -> Option<SharedOutbound> {
         None
@@ -140,6 +159,29 @@ impl Outbound for DirectOutbound {
                 super::transport::connect_tcp(&addr, DIRECT_CONNECT_TIMEOUT),
             )
             .await?;
+            Ok(Box::new(stream) as BoxProxyStream)
+        })
+    }
+
+    fn connect_ips<'a>(
+        &'a self,
+        ips: &'a [std::net::IpAddr],
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxProxyStream>> + Send + 'a>> {
+        if let [ip] = ips {
+            return self.connect(&ip.to_string(), port);
+        }
+        Box::pin(async move {
+            let addrs: Vec<_> = ips
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(*ip, port))
+                .collect();
+            let stream = tokio::time::timeout(
+                DIRECT_CONNECT_TIMEOUT,
+                super::transport::connect_staggered(&addrs),
+            )
+            .await??;
+            super::transport::tune_socket(&stream);
             Ok(Box::new(stream) as BoxProxyStream)
         })
     }
