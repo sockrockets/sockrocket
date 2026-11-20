@@ -6,7 +6,9 @@ Rule mode is the only mode that consults rules. Global sends every proxied conne
 
 In Rule mode, the default China-direct policy can find a mainland CDN address without a domain rule. For an A or AAAA answer that contains only addresses outside the built-in CN ranges, Sockrocket briefly checks the configured direct DNS servers for the same name and address family. If they return a CN address, the client can use it directly. If the check times out or finds no CN address, Sockrocket keeps the primary result. This lookup also discloses the queried name to the direct DNS provider.
 
-IP-based direct rules dial an address that matched the rule. Domain-based direct rules continue to use the direct DNS group. Global proxy mode and policies with device-specific or conflicting routing overrides use their configured DNS paths.
+Exact-domain, suffix and keyword routes keep their existing DNS upstreams for matching names. Other names remain eligible for the check. In transparent mode, a Fake-IP preserves the name of a destination covered by a proxy, node, group or reject rule. This lets the router distinguish two names that share a mainland CDN address. Global proxy mode, device-specific policies and non-direct IP, GeoIP or port rules disable the extra lookup for all names.
+
+IP-based direct rules dial an address that matched the rule. Domain-based direct rules continue to use the direct DNS group.
 
 ## Three exits
 

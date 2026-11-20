@@ -235,7 +235,7 @@ fn concurrent_last_callers_remove_wire_entry_even_with_extra_arc_owners() {
 
 #[test]
 fn lookup_last_caller_cleanup_does_not_depend_on_arc_destructor_order() {
-    let key: CacheKey = ("cleanup.example.test".into(), 1, false);
+    let key: CacheKey = ("cleanup.example.test".into(), 1, AddressPolicy::Primary);
     let cell = Arc::new(InflightLookup {
         reply: tokio::sync::OnceCell::new(),
         users: std::sync::atomic::AtomicUsize::new(2),

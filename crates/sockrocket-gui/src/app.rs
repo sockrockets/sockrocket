@@ -455,6 +455,7 @@ impl AppState {
             self.builtin_route,
             &self.rules,
             &self.device_rule_groups,
+            self.explicit_group_bindings,
         )
     }
 

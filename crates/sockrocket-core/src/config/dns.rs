@@ -6,7 +6,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::model::{AppConfig, BuiltinRoute, DeviceRuleGroup, Node, ProxyMode, RoutingRule};
-use crate::dns::{DnsConfig, DnsGroup, DnsServer};
+use crate::dns::{DnsConfig, DnsDomainRoute, DnsGroup, DnsServer};
+use crate::router::MatchRule;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,12 +316,12 @@ impl DnsSettings {
             app.builtin_route,
             &app.rules,
             &app.device_rule_groups,
+            app.explicit_group_bindings,
         )
     }
 
-    /// LAN clients share a DNS answer before their source and destination port
-    /// reach the router. A device binding or explicit proxy/reject destination
-    /// keeps the existing DNS policy for those shared answers.
+    /// LAN clients share DNS answers. Only domain selectors can exclude
+    /// individual queries before the client opens a connection.
     pub fn resolver_for_routing(
         &self,
         nodes: &[Node],
@@ -328,20 +329,16 @@ impl DnsSettings {
         builtin: BuiltinRoute,
         rules: &[RoutingRule],
         links: &[DeviceRuleGroup],
+        explicit_bindings: bool,
     ) -> Result<DnsConfig> {
         let mut dns = self.resolver_config(nodes.iter().map(|node| node.server.clone()))?;
-        dns.prefer_cn_answers = *mode == ProxyMode::Rule
+        if *mode == ProxyMode::Rule
             && builtin == BuiltinRoute::Direct
-            && links.iter().all(|link| {
-                link.source.is_empty()
-                    && (link.target.is_empty() || link.target.eq_ignore_ascii_case("direct"))
-            })
-            && rules.iter().filter(|rule| rule.enabled).all(|rule| {
-                rule.source.is_empty()
-                    && (rule.target.eq_ignore_ascii_case("direct")
-                        || (!rule.is_global_destination()
-                            && rule.target.eq_ignore_ascii_case("proxy")))
-            });
+            && let Some(domains) = cn_preference_domain_routes(rules, links, explicit_bindings)
+        {
+            dns.prefer_cn_answers = true;
+            dns.domain_routes = domains.into();
+        }
         Ok(dns)
     }
 
@@ -415,6 +412,60 @@ impl DnsSettings {
     }
 }
 
+/// Use the same global group membership and target overrides as rule mode.
+/// A device policy or a non-direct IP/port rule needs more than the DNS name.
+fn cn_preference_domain_routes(
+    rules: &[RoutingRule],
+    links: &[DeviceRuleGroup],
+    explicit_bindings: bool,
+) -> Option<Vec<DnsDomainRoute>> {
+    let mut global = HashMap::new();
+    for link in links {
+        if !link.source.is_empty() {
+            return None;
+        }
+        if explicit_bindings
+            && global
+                .insert(link.group.as_str(), link.target.as_str())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    let mut domains = Vec::new();
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        if !rule.source.is_empty() {
+            return None;
+        }
+        let mut target = rule.target.as_str();
+        if !rule.is_global_destination() {
+            if !target.eq_ignore_ascii_case("proxy") && !target.eq_ignore_ascii_case("direct") {
+                return None;
+            }
+            continue;
+        }
+        if explicit_bindings && !rule.group.trim().is_empty() {
+            let Some(&bound_target) = global.get(rule.group.trim()) else {
+                continue;
+            };
+            if !bound_target.is_empty() {
+                target = bound_target;
+            }
+        }
+        if let Some(selector) =
+            MatchRule::compile_domain(&rule.rule_type.to_lowercase(), &rule.pattern)
+        {
+            domains.push(DnsDomainRoute {
+                selector,
+                preserve_identity: !target.eq_ignore_ascii_case("direct"),
+            });
+        } else if !target.eq_ignore_ascii_case("direct") {
+            return None;
+        }
+    }
+    Some(domains)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,7 +501,7 @@ mod tests {
         let mut override_rule = app.rules[0].clone();
         override_rule.group.clear();
         for (kind, pattern, target) in [
-            ("domain", "example.com", "proxy"),
+            ("geoip", "DE", "proxy"),
             ("ip-cidr", "203.0.113.0/24", "reject"),
             ("dst-port", "443", "group:custom"),
         ] {
@@ -464,6 +515,84 @@ mod tests {
         override_rule.enabled = false;
         app.rules.push(override_rule);
         assert!(prefers_cn(&app));
+    }
+
+    #[test]
+    fn domain_exclusions_match_only_the_effective_global_names() {
+        let settings = DnsSettings::default();
+        let mut app = AppConfig {
+            explicit_group_bindings: true,
+            rules: serde_yaml::from_str(
+                r#"
+- {rule_type: domain, pattern: Exact.Example, target: proxy}
+- {rule_type: domain-suffix, pattern: .Intl.Example, target: direct, group: Foreign}
+- {rule_type: domain-keyword, pattern: mEDIA, target: reject}
+- {rule_type: domain, pattern: disabled.example, target: proxy, enabled: false}
+- {rule_type: dst-port, pattern: '443', target: proxy, group: Unused}
+"#,
+            )
+            .unwrap(),
+            device_rule_groups: serde_yaml::from_str(
+                r#"[{source: "", group: Foreign, target: "group:Streaming"}]"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let dns = settings.resolver_for_app(&app).unwrap();
+        assert!(dns.prefer_cn_answers);
+        for host in [
+            "exact.example",
+            "intl.example",
+            "www.intl.example",
+            "mymedia.net",
+        ] {
+            assert!(dns.excludes_cn_preference(host), "{host}");
+            assert!(dns.requires_domain_fakeip(host), "{host}");
+        }
+        for host in [
+            "child.exact.example",
+            "notintl.example",
+            "intl.example.org",
+            "disabled.example",
+            "chat.deepseek.com",
+        ] {
+            assert!(!dns.excludes_cn_preference(host), "{host}");
+            assert!(!dns.requires_domain_fakeip(host), "{host}");
+        }
+
+        // A global group can change a port rule from direct to a named proxy.
+        app.rules[4].group = "Foreign".into();
+        app.rules[4].target = "direct".into();
+        assert!(!settings.resolver_for_app(&app).unwrap().prefer_cn_answers);
+        app.device_rule_groups[0].target = "direct".into();
+        let direct = settings.resolver_for_app(&app).unwrap();
+        assert!(direct.prefer_cn_answers);
+        assert!(direct.excludes_cn_preference("www.intl.example"));
+        assert!(!direct.requires_domain_fakeip("www.intl.example"));
+        app.rules[0].source = "192.0.2.2/32".into();
+        assert!(!settings.resolver_for_app(&app).unwrap().prefer_cn_answers);
+    }
+
+    #[test]
+    fn overlapping_direct_and_non_direct_rules_preserve_domain_identity() {
+        let app = AppConfig {
+            rules: serde_yaml::from_str(
+                r#"
+- {rule_type: domain-suffix, pattern: shared.example, target: direct, priority: 200}
+- {rule_type: domain, pattern: auth.shared.example, target: reject}
+- {rule_type: domain-keyword, pattern: video, target: 'node:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'}
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        let dns = DnsSettings::default().resolver_for_app(&app).unwrap();
+        assert!(dns.prefer_cn_answers);
+        assert!(dns.requires_domain_fakeip("auth.shared.example"));
+        assert!(dns.requires_domain_fakeip("video.shared.example"));
+        assert!(dns.excludes_cn_preference("cdn.shared.example"));
+        assert!(!dns.requires_domain_fakeip("cdn.shared.example"));
+        assert!(!dns.requires_domain_fakeip("elsewhere.example"));
     }
 
     #[test]

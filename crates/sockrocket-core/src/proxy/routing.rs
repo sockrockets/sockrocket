@@ -523,6 +523,35 @@ mod device_ingress_tests {
     use crate::proxy::{ProxyStats, http::HttpProxyServer, socks5::Socks5Server};
     use crate::{RoutingRule, rule_mode_ruleset};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Keep the routed target outside the built-in LAN-direct ranges while
+    // making successful proxy dials observable without an external network.
+    struct LoopbackProxy(u16);
+
+    impl Outbound for LoopbackProxy {
+        fn name(&self) -> &str {
+            "loopback test proxy"
+        }
+        fn connect(
+            &self,
+            _: &str,
+            _: u16,
+        ) -> super::super::datagram::DatagramFuture<'_, BoxProxyStream> {
+            Box::pin(async move {
+                Ok(
+                    Box::new(tokio::net::TcpStream::connect(("127.0.0.1", self.0)).await?)
+                        as BoxProxyStream,
+                )
+            })
+        }
+        fn connect_datagram(
+            &self,
+            _: &str,
+            _: u16,
+        ) -> super::super::datagram::DatagramFuture<'_, super::super::datagram::BoxDatagram>
+        {
+            Box::pin(super::super::datagram::connect_direct("127.0.0.1", self.0))
+        }
+    }
     #[tokio::test]
     async fn actual_http_socks_and_udp_use_socket_source_instead_of_destination_only() {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -540,7 +569,7 @@ mod device_ingress_tests {
         let policy = Arc::new(Router::new(rule_mode_ruleset(&[scoped])));
         let outbound = SharedOutbound(Arc::new(RoutingOutbound::new(
             policy,
-            SharedOutbound::direct(),
+            SharedOutbound(Arc::new(LoopbackProxy(target_addr.port()))),
         )));
         let (stop, rx) = tokio::sync::watch::channel(false);
         let http = HttpProxyServer::bind("127.0.0.1", 0, outbound.clone(), ProxyStats::default())

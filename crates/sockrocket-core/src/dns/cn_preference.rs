@@ -4,21 +4,15 @@
 use super::*;
 use std::sync::OnceLock;
 
+const PROBE_BUDGET: Duration = Duration::from_millis(250);
+const PROBE_FAILURE_TTL: Duration = Duration::from_secs(3);
+
 impl DnsResolver {
-    pub(super) fn can_prefer_cn(&self, domain: &str, qtype: u16) -> bool {
-        if !self.config.prefer_cn_answers
-            || self.direct_resolution
-            || !matches!(qtype, QTYPE_A | QTYPE_AAAA)
-            || self.config.hosts.contains_key(domain)
-            || domain.parse::<IpAddr>().is_ok()
-            || self.is_server_domain(domain)
-        {
-            return false;
-        }
+    fn public_policy_name(&self, domain: &str) -> bool {
         let Some((_, tld)) = domain.rsplit_once('.') else {
             return false;
         };
-        if matches!(
+        !matches!(
             tld,
             "localhost"
                 | "local"
@@ -30,22 +24,77 @@ impl DnsResolver {
                 | "invalid"
                 | "example"
                 | "test"
-        ) {
+        ) && domain.parse::<IpAddr>().is_err()
+            && !self.is_server_domain(domain)
+            && !domain_suffixes(domain).any(|suffix| self.config.node_hosts.contains(suffix))
+    }
+
+    pub(super) fn domain_identity_pool(&self, domain: &str, qtype: u16) -> Option<&FakeIpPool> {
+        let pool = self.fakeip.as_deref()?;
+        (matches!(qtype, QTYPE_A | QTYPE_AAAA | 64 | 65)
+            && !self.direct_resolution
+            && self.config.requires_domain_fakeip(domain)
+            && self.public_policy_name(domain))
+        .then_some(pool)
+    }
+
+    /// A real CDN address may already be bypassed by the gateway for a different
+    /// domain. Preserve the explicit route until the actual client is known.
+    pub(super) async fn domain_identity_reply(
+        &self,
+        query: &[u8],
+        domain: &str,
+        qtype: u16,
+        pool: &FakeIpPool,
+    ) -> Result<Vec<u8>> {
+        if matches!(qtype, 64 | 65)
+            || (qtype == QTYPE_AAAA && (!self.config.dual_stack_fakeip || self.client_ipv4_only))
+        {
+            return build_dns_response_with_ttl(query, &[], 5);
+        }
+        let real = |ip: &IpAddr| {
+            !ip.is_unspecified() && !ip.is_multicast() && fakeip::fake_ipv4(*ip).is_none()
+        };
+        if let Some(addresses) = self.hosts_answer(domain, qtype) {
+            if !addresses.iter().any(real) {
+                return build_dns_response_with_ttl(query, &[], 5);
+            }
+        } else {
+            // Ask the configured DNS group for this exact family. Preserve the
+            // upstream's NXDOMAIN and CNAME-only/NODATA answers, including SOA.
+            let reply = self.exchange_raw(query).await?;
+            if reply[3] & 15 != 0 {
+                return Ok(reply);
+            }
+            if !address_records(&reply, qtype)?.iter().any(real) {
+                if parse_dns_response(&reply)?.is_empty() {
+                    return Ok(reply);
+                }
+                return build_dns_response_with_ttl(query, &[], 0);
+            }
+        }
+        let address = if qtype == QTYPE_AAAA {
+            IpAddr::V6(pool.allocate_v6(domain))
+        } else {
+            IpAddr::V4(pool.allocate(domain))
+        };
+        build_dns_response_with_ttl(query, &[address], 5)
+    }
+
+    pub(super) fn can_prefer_cn(&self, domain: &str, qtype: u16) -> bool {
+        if !self.config.prefer_cn_answers
+            || self.direct_resolution
+            || !matches!(qtype, QTYPE_A | QTYPE_AAAA)
+            || self.config.hosts.contains_key(domain)
+            || self.config.excludes_cn_preference(domain)
+            || !self.public_policy_name(domain)
+        {
             return false;
         }
         // An explicit primary DNS suffix is just as intentional as a direct
         // suffix. Match at label boundaries without creating suffix strings.
-        let suffixes = std::iter::once(domain).chain(
-            domain
-                .match_indices('.')
-                .map(|(offset, _)| &domain[offset + 1..]),
-        );
-        for suffix in suffixes {
-            if self.config.domain_rules.contains_key(suffix)
-                || self.config.node_hosts.contains(suffix)
-            {
-                return false;
-            }
+        if domain_suffixes(domain).any(|suffix| self.config.domain_rules.contains_key(suffix)) {
+            return false;
         }
         self.outbound.as_ref().is_none_or(|outbound| {
             !outbound.0.is_direct()
@@ -57,28 +106,28 @@ impl DnsResolver {
     }
 
     /// Both client-facing requests and real-address route resolution enter
-    /// here, before the parsed-address cache. Only the original wire replies
-    /// are cached, so policy changes cannot reuse a selected/fake address.
+    /// here. The second return value bounds how long to cache the parsed selection;
+    /// a failed optional lookup can be retried before the original wire TTL expires.
     pub(super) async fn cn_preferred_reply(
         &self,
         query: &[u8],
         domain: &str,
         qtype: u16,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, u32)> {
         let budget = Duration::from_secs(self.config.timeout_secs.clamp(1, 12));
         let latest_probe = tokio::time::Instant::now() + budget - Duration::from_millis(20);
         let primary = self.exchange_raw(query).await?;
         if primary[3] & 15 != 0 {
-            return Ok(primary);
+            return Ok((primary, 0));
         }
         let original = address_records(&primary, qtype).unwrap_or_default();
         if original.is_empty() {
             // A CNAME-only or negative answer retains its authority section.
             // Unrelated addresses must not be returned as a successful route.
             if parse_dns_response(&primary)?.is_empty() {
-                return Ok(primary);
+                return Ok((primary, 0));
             }
-            return build_dns_response_with_ttl(query, &[], 0);
+            return Ok((build_dns_response_with_ttl(query, &[], 0)?, 0));
         }
         static MAINLAND: OnceLock<GeoIpDb> = OnceLock::new();
         let geo = self
@@ -97,23 +146,11 @@ impl DnsResolver {
             && !self.config.fallback.is_empty()
             && primary_servers != &self.config.fallback
         {
-            // The primary has already succeeded. Leave the LAN listener time
-            // to deliver its response even when every optional resolver stalls.
-            let now = tokio::time::Instant::now();
-            if now < latest_probe {
-                let mut direct = self.clone();
-                direct.direct_resolution = true;
-                // Do not copy the client's EDNS subnet/cookie into the optional probe.
-                let probe = build_dns_query(domain, qtype);
-                let deadline = latest_probe.min(now + Duration::from_millis(250));
-                if let Ok(Ok(reply)) =
-                    tokio::time::timeout_at(deadline, direct.exchange_raw(&probe)).await
-                    && let Ok(ips) = address_records(&reply, qtype)
-                {
-                    selected = ips.into_iter().filter(qualifies).collect();
-                    ttl = ttl.min(wire::answer_ttl(&reply)?);
-                }
-            }
+            let (ips, probe_ttl) = self
+                .direct_cn_candidates(domain, qtype, geo, latest_probe)
+                .await;
+            selected = ips;
+            ttl = ttl.min(probe_ttl);
         }
         if !selected.is_empty() {
             selected.truncate(128);
@@ -130,22 +167,25 @@ impl DnsResolver {
                 // was already suitable. Changing TTL does not alter DNS owners.
                 let mut reply = primary;
                 wire::cap_ttl(&mut reply, ttl)?;
-                return Ok(reply);
+                return Ok((reply, ttl));
             }
-            return build_dns_response_with_ttl(query, &selected, ttl);
+            return Ok((build_dns_response_with_ttl(query, &selected, ttl)?, ttl));
         }
         let Some(pool) = &self.fakeip else {
             if parse_dns_response(&primary)? == original && original.len() <= 128 {
-                return Ok(primary);
+                return Ok((primary, ttl));
             }
             // A response may contain addresses belonging to an unrelated
             // owner. Keep those out of both the wire answer and route input.
             let count = original.len().min(128);
-            return build_dns_response_with_ttl(
-                query,
-                &original[..count],
-                wire::answer_ttl(&primary)?,
-            );
+            return Ok((
+                build_dns_response_with_ttl(
+                    query,
+                    &original[..count],
+                    wire::answer_ttl(&primary)?,
+                )?,
+                ttl,
+            ));
         };
         let fake = if qtype == QTYPE_A {
             vec![IpAddr::V4(pool.allocate(domain))]
@@ -154,8 +194,69 @@ impl DnsResolver {
         } else {
             Vec::new()
         };
-        build_dns_response_with_ttl(query, &fake, 5)
+        Ok((build_dns_response_with_ttl(query, &fake, 5)?, 5))
     }
+
+    async fn direct_cn_candidates(
+        &self,
+        domain: &str,
+        qtype: u16,
+        geo: &GeoIpDb,
+        latest: tokio::time::Instant,
+    ) -> (Vec<IpAddr>, u32) {
+        let now = tokio::time::Instant::now();
+        if now >= latest {
+            return (Vec::new(), 0);
+        }
+        // Fresh query omits the client's EDNS subnet and cookie.
+        let query = build_dns_query(domain, qtype);
+        let cooldown = self.config.cache_enabled.then(|| {
+            let mut key = query.clone();
+            key[..2].fill(0);
+            // Raw wire keys use 0 for primary and 1 for direct. A failure
+            // marker shares their bounded LRU and policy-generation lifetime.
+            key.push(2);
+            key
+        });
+        if let Some(key) = &cooldown
+            && let Some((_, expiry)) = self.wire_cache.lock().await.entries.get(key)
+            && let Some(remaining) = expiry.checked_duration_since(Instant::now())
+        {
+            return (Vec::new(), remaining.as_secs() as u32);
+        }
+        let mut direct = self.clone();
+        direct.direct_resolution = true;
+        let probe =
+            tokio::time::timeout_at(latest.min(now + PROBE_BUDGET), direct.exchange_raw(&query))
+                .await;
+        if let Ok(Ok(reply)) = probe
+            && let Ok(ips) = address_records(&reply, qtype)
+            && let Ok(ttl) = wire::answer_ttl(&reply)
+            && !ips.is_empty()
+        {
+            // Successful non-CN answers retain the upstream's normal cache TTL.
+            let cn: Vec<_> = ips
+                .into_iter()
+                .filter(|ip| public_address(*ip) && geo.is_cn(*ip))
+                .collect();
+            return (cn, ttl);
+        }
+        if let Some(key) = cooldown {
+            self.wire_cache
+                .lock()
+                .await
+                .put(key, vec![], Instant::now() + PROBE_FAILURE_TTL);
+        }
+        (Vec::new(), PROBE_FAILURE_TTL.as_secs() as u32)
+    }
+}
+
+fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(domain).chain(
+        domain
+            .match_indices('.')
+            .map(|(offset, _)| &domain[offset + 1..]),
+    )
 }
 
 fn public_address(ip: IpAddr) -> bool {
@@ -296,6 +397,10 @@ pub(super) fn requests_dnssec(query: &[u8]) -> bool {
     };
     opt.len() < 11 || opt[..3] != [0, 0, 41] || opt[7] & 0x80 != 0
 }
+
+#[cfg(test)]
+#[path = "cn_preference_tests.rs"]
+mod resolver_tests;
 
 #[cfg(test)]
 mod tests {

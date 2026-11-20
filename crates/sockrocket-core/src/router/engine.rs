@@ -133,16 +133,6 @@ impl RuleEntry {
         let action = RouteAction::from_target(&r.target);
 
         let rule = match r.rule_type.to_lowercase().as_str() {
-            "domain" => MatchRule::Domain(r.pattern.to_lowercase()),
-            "domain-suffix" => {
-                let suffix = r.pattern.to_lowercase();
-                MatchRule::DomainSuffix(if suffix.starts_with('.') {
-                    suffix
-                } else {
-                    format!(".{}", suffix)
-                })
-            }
-            "domain-keyword" => MatchRule::DomainKeyword(r.pattern.to_lowercase()),
             "ip-cidr" => match parse_cidr(&r.pattern) {
                 Some((addr, prefix_len)) => MatchRule::IpCidr { addr, prefix_len },
                 None => {
@@ -159,10 +149,10 @@ impl RuleEntry {
                 }
             },
             "match" | "final" => MatchRule::MatchAll,
-            _ => {
+            kind => MatchRule::compile_domain(kind, &r.pattern).or_else(|| {
                 tracing::warn!("Unknown rule type: {}", r.rule_type);
-                return None;
-            }
+                None
+            })?,
         };
 
         let source = if r.source.is_empty() {
@@ -402,6 +392,34 @@ impl RouteDecision {
 }
 
 impl MatchRule {
+    pub(crate) fn compile_domain(kind: &str, pattern: &str) -> Option<Self> {
+        match kind {
+            "domain" => Some(Self::Domain(pattern.to_lowercase())),
+            "domain-suffix" => {
+                let suffix = pattern.to_lowercase();
+                Some(Self::DomainSuffix(if suffix.starts_with('.') {
+                    suffix
+                } else {
+                    format!(".{suffix}")
+                }))
+            }
+            "domain-keyword" => Some(Self::DomainKeyword(pattern.to_lowercase())),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn matches_domain(&self, host_lower: &str) -> bool {
+        match self {
+            Self::Domain(domain) => host_lower == domain,
+            Self::DomainSuffix(suffix) => {
+                host_lower.ends_with(suffix.as_str())
+                    || host_lower == suffix.trim_start_matches('.')
+            }
+            Self::DomainKeyword(keyword) => host_lower.contains(keyword.as_str()),
+            _ => false,
+        }
+    }
+
     fn needs_ip(&self) -> bool {
         matches!(self, Self::IpCidr { .. } | Self::GeoIp(_))
     }
@@ -530,13 +548,7 @@ impl Router {
             if !source_matches(entry.source, source) {
                 continue;
             }
-            let matched = match entry.rule {
-                MatchRule::Domain(_) | MatchRule::DomainSuffix(_) | MatchRule::DomainKeyword(_) => {
-                    self.rule_matches(entry.rule, &host_lower, None, 0)
-                }
-                _ => false,
-            };
-            if matched {
+            if entry.rule.matches_domain(&host_lower) {
                 return Some(entry.action.clone());
             }
         }
@@ -616,14 +628,9 @@ impl Router {
         port: u16,
     ) -> bool {
         match rule {
-            MatchRule::Domain(domain) => host_lower == domain,
-
-            MatchRule::DomainSuffix(suffix) => {
-                host_lower.ends_with(suffix.as_str())
-                    || host_lower == suffix.trim_start_matches('.')
+            MatchRule::Domain(_) | MatchRule::DomainSuffix(_) | MatchRule::DomainKeyword(_) => {
+                rule.matches_domain(host_lower)
             }
-
-            MatchRule::DomainKeyword(keyword) => host_lower.contains(keyword.as_str()),
 
             MatchRule::IpCidr { addr, prefix_len } => {
                 ip.is_some_and(|ip| cidr_match(ip, *addr, *prefix_len))
