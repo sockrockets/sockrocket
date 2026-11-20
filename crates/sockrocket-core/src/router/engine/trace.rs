@@ -76,22 +76,29 @@ impl Router {
                 if resolve_dns {
                     resolved = resolve_trace_host(&lower).await;
                     trace.resolved_ip = resolved.first().copied();
-                    trace.dns = if resolved.is_empty() { "failed" } else { "resolved" };
+                    trace.dns = if resolved.is_empty() {
+                        "failed"
+                    } else {
+                        "resolved"
+                    };
                 } else {
                     trace.dns = "skipped";
                 }
             }
-            let ips = if ip.is_some() { ip.as_slice() } else { &resolved };
+            let ips = if ip.is_some() {
+                ip.as_slice()
+            } else {
+                &resolved
+            };
             let outcome = if !source_ok {
                 "source_mismatch"
             } else if needs_ip && ips.is_empty() {
                 trace.definitive = false;
                 "needs_ip"
             } else if needs_ip {
-                if let Some(matched) = ips
-                    .iter()
-                    .find(|candidate| self.rule_matches(entry.rule, &lower, Some(**candidate), port))
-                {
+                if let Some(matched) = ips.iter().find(|candidate| {
+                    self.rule_matches(entry.rule, &lower, Some(**candidate), port)
+                }) {
                     trace.resolved_ip = Some(*matched);
                     "matched"
                 } else {

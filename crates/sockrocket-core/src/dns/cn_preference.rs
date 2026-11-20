@@ -18,22 +18,41 @@ impl DnsResolver {
         let Some((_, tld)) = domain.rsplit_once('.') else {
             return false;
         };
-        if matches!(tld, "localhost" | "local" | "arpa" | "lan" | "internal" | "home" | "onion" | "invalid" | "example" | "test") {
+        if matches!(
+            tld,
+            "localhost"
+                | "local"
+                | "arpa"
+                | "lan"
+                | "internal"
+                | "home"
+                | "onion"
+                | "invalid"
+                | "example"
+                | "test"
+        ) {
             return false;
         }
         // An explicit primary DNS suffix is just as intentional as a direct
         // suffix. Match at label boundaries without creating suffix strings.
-        let suffixes = std::iter::once(domain)
-            .chain(domain.match_indices('.').map(|(offset, _)| &domain[offset + 1..]));
+        let suffixes = std::iter::once(domain).chain(
+            domain
+                .match_indices('.')
+                .map(|(offset, _)| &domain[offset + 1..]),
+        );
         for suffix in suffixes {
-            if self.config.domain_rules.contains_key(suffix) || self.config.node_hosts.contains(suffix) {
+            if self.config.domain_rules.contains_key(suffix)
+                || self.config.node_hosts.contains(suffix)
+            {
                 return false;
             }
         }
         self.outbound.as_ref().is_none_or(|outbound| {
-            !outbound.0.is_direct() && outbound.0.routing_policy().is_none_or(|router| {
-                router.route_domain_only(domain).is_none()
-            })
+            !outbound.0.is_direct()
+                && outbound
+                    .0
+                    .routing_policy()
+                    .is_none_or(|router| router.route_domain_only(domain).is_none())
         })
     }
 
@@ -62,13 +81,17 @@ impl DnsResolver {
             return build_dns_response_with_ttl(query, &[], 0);
         }
         static MAINLAND: OnceLock<GeoIpDb> = OnceLock::new();
-        let geo = self.geoip.as_deref().unwrap_or_else(|| {
-            MAINLAND.get_or_init(crate::router::china_geoip_db)
-        });
+        let geo = self
+            .geoip
+            .as_deref()
+            .unwrap_or_else(|| MAINLAND.get_or_init(crate::router::china_geoip_db));
         let qualifies = |ip: &IpAddr| public_address(*ip) && geo.is_cn(*ip);
         let mut selected: Vec<_> = original.iter().copied().filter(qualifies).collect();
         let mut ttl = wire::answer_ttl(&primary)?;
-        let primary_servers = self.primary_override.as_deref().unwrap_or(&self.config.servers);
+        let primary_servers = self
+            .primary_override
+            .as_deref()
+            .unwrap_or(&self.config.servers);
         if selected.is_empty()
             && original.iter().all(|ip| public_address(*ip))
             && !self.config.fallback.is_empty()
@@ -83,7 +106,8 @@ impl DnsResolver {
                 // Do not copy the client's EDNS subnet/cookie into the optional probe.
                 let probe = build_dns_query(domain, qtype);
                 let deadline = latest_probe.min(now + Duration::from_millis(250));
-                if let Ok(Ok(reply)) = tokio::time::timeout_at(deadline, direct.exchange_raw(&probe)).await
+                if let Ok(Ok(reply)) =
+                    tokio::time::timeout_at(deadline, direct.exchange_raw(&probe)).await
                     && let Ok(ips) = address_records(&reply, qtype)
                 {
                     selected = ips.into_iter().filter(qualifies).collect();
@@ -117,7 +141,11 @@ impl DnsResolver {
             // A response may contain addresses belonging to an unrelated
             // owner. Keep those out of both the wire answer and route input.
             let count = original.len().min(128);
-            return build_dns_response_with_ttl(query, &original[..count], wire::answer_ttl(&primary)?);
+            return build_dns_response_with_ttl(
+                query,
+                &original[..count],
+                wire::answer_ttl(&primary)?,
+            );
         };
         let fake = if qtype == QTYPE_A {
             vec![IpAddr::V4(pool.allocate(domain))]
@@ -134,15 +162,23 @@ fn public_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, _, _] = ip.octets();
-            a != 0 && a < 224 && !ip.is_private() && !ip.is_link_local() && !ip.is_loopback()
-                && !ip.is_documentation() && !(a == 100 && (64..128).contains(&b))
-                && !(a == 198 && (18..=19).contains(&b)) && !(a == 192 && b == 0 && ip.octets()[2] == 0)
+            a != 0
+                && a < 224
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_loopback()
+                && !ip.is_documentation()
+                && !(a == 100 && (64..128).contains(&b))
+                && !(a == 198 && (18..=19).contains(&b))
+                && !(a == 192 && b == 0 && ip.octets()[2] == 0)
         }
         IpAddr::V6(ip) => {
             let segments = ip.segments();
-            segments[0] >> 13 == 1 && !(segments[0] == 0x2001 && segments[1] < 0x0200)
+            segments[0] >> 13 == 1
+                && !(segments[0] == 0x2001 && segments[1] < 0x0200)
                 && !(segments[0] == 0x2001 && segments[1] == 0xdb8)
-                && segments[0] != 0x2002 && !(segments[0] == 0x3fff && segments[1] < 0x1000)
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] < 0x1000)
         }
     }
 }
@@ -170,7 +206,11 @@ fn read_name(data: &[u8], mut pos: usize) -> Option<(Vec<u8>, usize)> {
                 return None;
             }
             name.push(len as u8);
-            name.extend(data.get(pos + 1..pos + 1 + len)?.iter().map(u8::to_ascii_lowercase));
+            name.extend(
+                data.get(pos + 1..pos + 1 + len)?
+                    .iter()
+                    .map(u8::to_ascii_lowercase),
+            );
             pos += 1 + len;
         }
     }
@@ -180,27 +220,40 @@ fn read_name(data: &[u8], mut pos: usize) -> Option<(Vec<u8>, usize)> {
 // addresses owned by its terminal CNAME belong to that lookup. Unrelated
 // answer records and records in additional/authority cannot select a route.
 fn address_records(reply: &[u8], qtype: u16) -> Result<Vec<IpAddr>> {
-    anyhow::ensure!(reply.len() >= 12 && reply[3] & 15 == 0, "no successful DNS answer");
+    anyhow::ensure!(
+        reply.len() >= 12 && reply[3] & 15 == 0,
+        "no successful DNS answer"
+    );
     let count = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
     anyhow::ensure!(count <= 256, "too many address records");
-    let (mut target, mut pos) = read_name(reply, 12).ok_or_else(|| anyhow::anyhow!("invalid question name"))?;
+    let (mut target, mut pos) =
+        read_name(reply, 12).ok_or_else(|| anyhow::anyhow!("invalid question name"))?;
     pos += 4;
     let mut aliases = HashMap::new();
     let mut ips = Vec::new();
     for _ in 0..count {
-        let (owner, next) = read_name(reply, pos).ok_or_else(|| anyhow::anyhow!("invalid answer name"))?;
-        let header = reply.get(next..next + 10).ok_or_else(|| anyhow::anyhow!("missing record header"))?;
+        let (owner, next) =
+            read_name(reply, pos).ok_or_else(|| anyhow::anyhow!("invalid answer name"))?;
+        let header = reply
+            .get(next..next + 10)
+            .ok_or_else(|| anyhow::anyhow!("missing record header"))?;
         let kind = u16::from_be_bytes([header[0], header[1]]);
         let size = usize::from(u16::from_be_bytes([header[8], header[9]]));
         let start = next + 10;
         pos = start + size;
-        let body = reply.get(start..pos).ok_or_else(|| anyhow::anyhow!("truncated record"))?;
+        let body = reply
+            .get(start..pos)
+            .ok_or_else(|| anyhow::anyhow!("truncated record"))?;
         if header[2..4] != [0, 1] {
             continue;
         }
         if kind == 5 {
-            let (name, end) = read_name(reply, start).ok_or_else(|| anyhow::anyhow!("invalid alias"))?;
-            anyhow::ensure!(end == pos && aliases.insert(owner, name).is_none(), "ambiguous alias");
+            let (name, end) =
+                read_name(reply, start).ok_or_else(|| anyhow::anyhow!("invalid alias"))?;
+            anyhow::ensure!(
+                end == pos && aliases.insert(owner, name).is_none(),
+                "ambiguous alias"
+            );
         } else if kind == qtype {
             let ip = match (kind, size) {
                 (QTYPE_A, 4) => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(body)?)),
@@ -214,7 +267,10 @@ fn address_records(reply: &[u8], qtype: u16) -> Result<Vec<IpAddr>> {
         if let Some(next) = aliases.get(&target) {
             target = next.clone();
         } else {
-            return Ok(ips.into_iter().filter_map(|(owner, ip)| (owner == target).then_some(ip)).collect());
+            return Ok(ips
+                .into_iter()
+                .filter_map(|(owner, ip)| (owner == target).then_some(ip))
+                .collect());
         }
     }
     bail!("CNAME loop")
@@ -262,14 +318,26 @@ mod tests {
         reply.extend_from_slice(b"\x04edge\xc0\x10");
         reply.extend_from_slice(&[0xc0, target as u8, 0, 1, 0, 1, 0, 0, 0, 4, 0, 4]);
         reply.extend_from_slice(&cn);
-        assert_eq!(address_records(&reply, QTYPE_A).unwrap(), vec![IpAddr::from(cn)]);
+        assert_eq!(
+            address_records(&reply, QTYPE_A).unwrap(),
+            vec![IpAddr::from(cn)]
+        );
         assert!(address_records(&reply, QTYPE_AAAA).unwrap().is_empty());
     }
 
     #[test]
     fn synthetic_and_non_public_prefixes_are_ineligible() {
-        for ip in ["127.0.0.1", "100.64.0.2", "198.19.0.1", "192.0.2.2", "224.0.0.1",
-                   "2001:db8::8", "2001:2:0:4765::c612:2", "fd00::1", "::ffff:116.205.40.114"] {
+        for ip in [
+            "127.0.0.1",
+            "100.64.0.2",
+            "198.19.0.1",
+            "192.0.2.2",
+            "224.0.0.1",
+            "2001:db8::8",
+            "2001:2:0:4765::c612:2",
+            "fd00::1",
+            "::ffff:116.205.40.114",
+        ] {
             assert!(!public_address(ip.parse().unwrap()), "{ip}");
         }
         for ip in ["116.205.40.114", "2400:3200::1"] {

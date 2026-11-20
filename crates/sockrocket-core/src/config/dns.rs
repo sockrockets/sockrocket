@@ -421,10 +421,12 @@ mod tests {
     #[test]
     fn cn_preference_follows_routing_changes_and_the_merlin_template() {
         let settings = DnsSettings::default();
-        let prefers_cn = |app: &AppConfig| settings.resolver_for_app(app).unwrap().prefer_cn_answers;
+        let prefers_cn =
+            |app: &AppConfig| settings.resolver_for_app(app).unwrap().prefer_cn_answers;
         assert!(prefers_cn(&AppConfig::default()));
         let mut app =
-            AppConfig::from_yaml_str(include_str!("../../../../merlin/config.yaml.template")).unwrap();
+            AppConfig::from_yaml_str(include_str!("../../../../merlin/config.yaml.template"))
+                .unwrap();
         assert!(prefers_cn(&app));
 
         for mode in [ProxyMode::Global, ProxyMode::Direct] {

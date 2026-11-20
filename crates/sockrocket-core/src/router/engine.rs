@@ -488,7 +488,8 @@ impl Router {
     /// Evaluate routing rules for a given destination.
     /// `host` can be a domain name or IP address string.
     pub fn route(&self, host: &str, port: u16) -> RouteAction {
-        self.cached_decision(host, port, self.client_source()).action
+        self.cached_decision(host, port, self.client_source())
+            .action
     }
 
     fn cached_decision(&self, host: &str, port: u16, source: Option<IpAddr>) -> RouteDecision {
@@ -652,7 +653,8 @@ async fn resolve_host(host: &str) -> Vec<IpAddr> {
     use crate::proxy::routing::{TunFamily, tun_family};
     let family = tun_family();
     let eligible = |ip: IpAddr| {
-        crate::dns::fakeip::fake_ipv4(ip).is_none() && family.is_none_or(|family| family.matches(ip))
+        crate::dns::fakeip::fake_ipv4(ip).is_none()
+            && family.is_none_or(|family| family.matches(ip))
     };
     if let Some(result) = crate::dns::scoped_resolve(host).await {
         let mut ips = result.unwrap_or_default();
@@ -660,7 +662,8 @@ async fn resolve_host(host: &str) -> Vec<IpAddr> {
         return ips;
     }
     let lookup = tokio::net::lookup_host((host, 0));
-    let Ok(Ok(addrs)) = tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await else {
+    let Ok(Ok(addrs)) = tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await
+    else {
         return Vec::new();
     };
     let mut ips = Vec::new();

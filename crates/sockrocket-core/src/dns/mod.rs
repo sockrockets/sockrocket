@@ -1211,7 +1211,12 @@ pub(crate) async fn lookup_ips_udp(
     qtype: u16,
 ) -> Result<Vec<IpAddr>> {
     let query = build_dns_query(domain, qtype);
-    let socket = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+    let socket = UdpSocket::bind(if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
     crate::proxy::outbound_bind::apply_to_udp_socket(&socket, server.is_ipv6())?;
     socket.connect(server).await?;
     socket.send(&query).await?;
@@ -1219,7 +1224,12 @@ pub(crate) async fn lookup_ips_udp(
     let size = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf)).await??;
     validate_response(&query, &buf[..size])?;
     let mut ips = parse_dns_response(&buf[..size])?;
-    ips.retain(|ip| matches!((qtype, ip), (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))));
+    ips.retain(|ip| {
+        matches!(
+            (qtype, ip),
+            (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))
+        )
+    });
     Ok(ips)
 }
 

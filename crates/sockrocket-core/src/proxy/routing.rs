@@ -313,11 +313,9 @@ mod tests {
             },
             RouteAction::Direct,
         );
-        let outbound = RoutingOutbound::new(
-            Arc::new(Router::new(rules)),
-            SharedOutbound(proxy.clone()),
-        )
-        .with_test_direct(SharedOutbound(direct.clone()));
+        let outbound =
+            RoutingOutbound::new(Arc::new(Router::new(rules)), SharedOutbound(proxy.clone()))
+                .with_test_direct(SharedOutbound(direct.clone()));
         let host = "mixed.example";
         let mut config = DnsConfig::default();
         config.hosts.insert(
